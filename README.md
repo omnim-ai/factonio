@@ -52,6 +52,20 @@ hermes factonio add owner/repo
 
 Then ask your Hermes chat session to implement a feature or fix an issue on `owner/repo`.
 
+### Edit repository settings
+
+Change any per-repository parameter after registration without re-adding the repository (only the flags you pass are changed):
+
+```bash
+hermes factonio update owner/repo --merge-policy ask --max-fix-rounds 5
+hermes factonio update owner-repo --default-branch develop
+hermes factonio update owner/repo --design-provider hermes --design-approval auto
+hermes factonio update owner/repo --design-provider inherit   # clear override, use global default
+hermes factonio edit owner/repo --merge-policy auto --json    # `edit` is an alias
+```
+
+Agents can do the same with the `factonio_update_repo` tool, and Hermes Desktop clients can call `PATCH /api/plugins/factonio/repos/<slug>` with a JSON object of editable fields (`merge_policy`, `max_fix_rounds`, `default_branch`, `design_provider`, `design_approval`). Updates are validated and persisted to `<HERMES_HOME>/plugin-data/factonio/repos.json`; repositories originally defined in `config.yaml` are copied there with all their fields intact.
+
 ## Running tests
 
 Tests run strictly in an isolated temporary `HERMES_HOME` and never touch your real `~/.hermes`:

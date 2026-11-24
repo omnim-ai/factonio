@@ -62,12 +62,19 @@ class TestPluginRegistration(unittest.TestCase):
                 assert p is not None
                 self.assertTrue(p.is_file())
 
+            # 2b. Agent tools declared in plugin.yaml, including factonio_update_repo
+            self.assertIn("factonio_update_repo", manifest.provides_tools)
+            plugin_yaml = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
+            self.assertIn("- factonio_update_repo", plugin_yaml)
+
             # 3. Slim system prompt section (<3,000 chars), suppressed for workers
             section = mgr._system_prompt_sections.get("factonio-routing")
             self.assertIsNotNone(section)
             assert section is not None
             rendered = section.content({}) if callable(section.content) else section.content
             self.assertTrue(100 < len(rendered) < 3000)
+            self.assertIn("factonio_update_repo", rendered)
+            self.assertIn("hermes factonio update", rendered)
 
             os.environ["HERMES_KANBAN_TASK"] = "t_worker123"
             worker_rendered = section.content({}) if callable(section.content) else section.content
