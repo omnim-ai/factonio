@@ -1,7 +1,8 @@
 // Factonio Desktop UI — strictly public @hermes/plugin-sdk surfaces only.
 // Registers:
 //  - /factonio page (ROUTES_AREA + SIDEBAR_NAV_AREA + PALETTE_AREA)
-//  - Factonio tab in the left sidebar (PANES_AREA, hideable, docked beside Sessions)
+//  - Factonio tab in the right sidebar (PANES_AREA, hideable, docked as a tab
+//    beside Files; `enforce` re-homes existing installs on boot/reload)
 //    + 'Show Factonio Sidebar' palette command
 //  - Running/blocked card count pill (STATUSBAR_AREAS.right)
 //  - ::your-turn manual step card (TRANSCRIPT_DIRECTIVE_AREA)
@@ -570,7 +571,7 @@ function FactonioPage({ ctx }) {
 }
 
 // ---------------------------------------------------------------------------
-// Factonio sidebar tab (left sidebar, docked beside Sessions).
+// Factonio sidebar tab (right sidebar, docked in the Files tab strip).
 // Pure derivation helpers are ported 1:1 from the approved Phase 1b design
 // (design/preview.html) and reuse fmtDur / formatPhaseModelLabel above.
 // ---------------------------------------------------------------------------
@@ -1506,11 +1507,11 @@ export default {
         area: PANES_AREA,
         title: 'Factonio',
         data: {
-          placement: 'left',
+          placement: 'right',
           width: '280px',
           collapsible: true,
           hideOnly: true,
-          dock: { pane: 'sessions', pos: 'center', enforce: true }
+          dock: { pane: 'files', pos: 'center', enforce: true }
         },
         render: () => jsx(FactonioSidebar, { ctx })
       },

@@ -2,8 +2,8 @@
 
 Covers the Settings → Plugins → Factonio landing page registration, the
 Auxiliary Models deep-links on both the settings page and the /factonio
-dashboard, the hideable left-sidebar Factonio tab (registration, reveal,
-visibility-aware polling, scope/status/phase filters, workstream pipeline,
+dashboard, the hideable right-sidebar Factonio tab docked beside Files
+(registration, reveal, visibility-aware polling, scope/status/phase filters, workstream pipeline,
 card details and quick actions), older-host compatibility, and Desktop SDK
 surface lint.
 
@@ -837,8 +837,8 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertNotIn("Could not load", self.report["dashboard"]["loading"]["text"])
         self.assertNotIn("Could not load", self.report["dashboard"]["full"]["text"])
 
-    # --- left-sidebar tab: registration & reveal --------------------------
-    def test_pane_registers_as_hideable_left_sidebar_tab(self):
+    # --- right-sidebar tab (beside Files): registration & reveal ----------
+    def test_pane_registers_as_hideable_right_sidebar_tab_beside_files(self):
         reg = self.report["sidebar"]["paneRegistration"]
         self.assertEqual(reg["title"], "Factonio")
         self.assertEqual(reg["area"], "panes")
@@ -846,11 +846,11 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual(
             reg["data"],
             {
-                "placement": "left",
+                "placement": "right",
                 "width": "280px",
                 "collapsible": True,
                 "hideOnly": True,
-                "dock": {"pane": "sessions", "pos": "center", "enforce": True},
+                "dock": {"pane": "files", "pos": "center", "enforce": True},
             },
         )
         self.assertIn("show-pane", self.report["registeredIds"])
