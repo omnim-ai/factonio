@@ -465,27 +465,31 @@ function seedRepoDraft(repo) {
   }
 }
 
-// Normalized draft values used for change detection (trimmed text, '' overrides -> null).
+// Normalized draft values used for change detection (trimmed text, '' overrides -> null,
+// safe-integer rounds compared numerically so '007' equals 7).
 function normalizeRepoDraft(d) {
+  const rounds = String(d.max_fix_rounds ?? '').trim()
+  const n = /^[0-9]+$/.test(rounds) ? Number(rounds) : NaN
   return {
     default_branch: String(d.default_branch ?? '').trim(),
     merge_policy: String(d.merge_policy ?? ''),
-    max_fix_rounds: String(d.max_fix_rounds ?? '').trim(),
+    max_fix_rounds: Number.isSafeInteger(n) ? String(n) : rounds,
     design_provider: d.design_provider || null,
     design_approval: d.design_approval || null
   }
 }
 
-// The PATCH body: only fields the user changed. With a `baseline` (the draft seeded
-// when editing started) a field counts only if it differs from that baseline, so
-// background refreshes of `repo` never turn untouched fields into changes (which
-// would revert other writers' updates). Without a baseline, diff against `repo`.
-function repoDraftChanges(draft, repo, baseline) {
-  const next = normalizeRepoDraft(draft || {})
-  const base = normalizeRepoDraft(baseline || seedRepoDraft(repo || {}))
+// The PATCH body: only fields present in `edits` (the fields the user explicitly
+// changed) whose normalized value differs from the current live `repo`. Fields the
+// user never touched are never sent, so background refreshes are not reverted; an
+// explicit choice equal to an older value is still sent once `repo` has moved on.
+function repoDraftChanges(edits, repo) {
+  const own = edits || {}
+  const next = normalizeRepoDraft({ ...seedRepoDraft(repo || {}), ...own })
+  const base = normalizeRepoDraft(seedRepoDraft(repo || {}))
   const body = {}
   for (const k of REPO_FIELD_ORDER) {
-    if (next[k] === base[k]) continue
+    if (!Object.prototype.hasOwnProperty.call(own, k) || next[k] === base[k]) continue
     body[k] = k === 'max_fix_rounds' ? Number(next[k]) : next[k]
   }
   return body
@@ -607,13 +611,12 @@ function AlertIcon() {
 
 function RepoEditor({ ctx, repo, defaults, autoResolved, reposQ, editorId, saving, setSaving, onClose, onSaved }) {
   const queryClient = useQueryClient()
-  // Immutable edit-start baseline: dirty fields are those the user changed from it.
-  const [baseline] = useState(() => seedRepoDraft(repo))
-  const [edits, setDraft] = useState(() => seedRepoDraft(repo))
-  // Untouched fields track the live (refreshed) repo; user-edited fields keep the draft.
+  // Explicit per-field edits: { [field]: userValue } only for fields the user changed.
+  // Untouched fields always show the live (possibly refreshed) repo value and are never
+  // PATCHed; edited fields keep the user's value across background refreshes.
+  const [edits, setEdits] = useState({})
   const live = seedRepoDraft(repo)
-  const draft = {}
-  for (const k of REPO_FIELD_ORDER) draft[k] = edits[k] !== baseline[k] ? edits[k] : live[k]
+  const draft = { ...live, ...edits }
   const [errors, setErrors] = useState({})
   const [apiError, setApiError] = useState(null)
   const branchRef = useRef(null)
@@ -624,13 +627,19 @@ function RepoEditor({ ctx, repo, defaults, autoResolved, reposQ, editorId, savin
     branchRef.current?.focus?.()
   }, [])
 
-  const changes = repoDraftChanges(edits, repo, baseline)
+  const changes = repoDraftChanges(edits, repo)
   const count = Object.keys(changes).length
   const errorCount = Object.keys(errors).length
   const fid = name => `${editorId}-${name}`
 
   const setField = (name, value) => {
-    setDraft(prev => ({ ...prev, [name]: value }))
+    setEdits(prev => {
+      const next = { ...prev }
+      // Choosing the current live value drops the edit (field tracks live again).
+      if (value === live[name]) delete next[name]
+      else next[name] = value
+      return next
+    })
     // Live re-validation only for fields already flagged (each rule is per-field).
     setErrors(prev => {
       if (!prev[name]) return prev

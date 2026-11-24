@@ -825,11 +825,13 @@ async function runReposScenarios(report) {
     unsafe: Object.fromEntries([['pow53', '9007199254740992'], ['pow53plus1', '9007199254740993'], ['overflow309', '9'.repeat(309)], ['pow53Num', 9007199254740992], ['bigNum', 1e300]].map(([k, n]) => [k, msgs('main', n).max_fix_rounds || null])),
     safeMax: [['9007199254740991'], [Number.MAX_SAFE_INTEGER], ['0009007199254740991'], ['007']].map(([n]) => v('main', n))
   }
-  r.changesBaseline = mod.repoDraftChanges(
-    { ...mod.seedRepoDraft(REPOS[0]), default_branch: 'user-feature' },
-    { ...REPOS[0], merge_policy: 'ask', design_provider: 'hermes' },
-    mod.seedRepoDraft(REPOS[0])
-  )
+  const refreshedRepo0 = { ...REPOS[0], merge_policy: 'ask', design_provider: 'hermes' }
+  r.changesEdits = {
+    onlyEdited: mod.repoDraftChanges({ default_branch: 'user-feature' }, refreshedRepo0),
+    explicitOriginal: mod.repoDraftChanges({ merge_policy: 'auto', design_provider: '' }, refreshedRepo0),
+    equalLive: mod.repoDraftChanges({ merge_policy: 'ask', design_provider: 'hermes', default_branch: ' main ', max_fix_rounds: '003' }, refreshedRepo0),
+    none: mod.repoDraftChanges({}, refreshedRepo0)
+  }
   r.changes = mod.repoDraftChanges({ default_branch: ' main ', merge_policy: 'ask', max_fix_rounds: '7', design_provider: '', design_approval: 'auto' }, REPOS[1])
   r.describe = {
     ipc422: mod.describeSaveError(new Error("Error invoking remote method 'hermes:api': Error: 422: {\"detail\":\"max_fix_rounds must be >= 1\"}")),
@@ -981,6 +983,62 @@ async function runReposScenarios(report) {
   B.keepEdit = readEditor(tree)
   await submitForm(tree)
   B.keepEditRests = [...m.rests]
+
+  // Post-refresh: explicitly choosing the edit-start value again is a real edit.
+  const E = r.editBack = {}
+  const openTozes = data => {
+    m = mountRepos({ data: { repos: [data || REPOS[0], REPOS[1], REPOS[2]], defaults: REPO_DEFAULTS }, client })
+    tree = m.render()
+    fire(editBtnHit(tree, 'tozes-factonio')); tree = m.render()
+  }
+  const refreshTo = patch => {
+    m.setData({ repos: [{ ...REPOS[0], ...patch }, REPOS[1], REPOS[2]], defaults: REPO_DEFAULTS })
+    tree = m.render()
+  }
+  const saveOk = async () => {
+    m.setRest(async () => ({ ok: true }))
+    await submitForm(tree); tree = m.render()
+    return [...m.rests]
+  }
+  // 1. merge_policy auto -> refresh ask -> choose auto
+  openTozes(); refreshTo({ merge_policy: 'ask' })
+  E.merge = { refreshed: readEditor(tree) }
+  change(tree, 'merge_policy', 'auto'); tree = m.render()
+  E.merge.chosen = readEditor(tree)
+  E.merge.rests = await saveOk()
+  // 2. design_provider inherited -> refresh hermes -> choose Inherit global
+  openTozes(); refreshTo({ design_provider: 'hermes', effective_design_provider: 'hermes', resolved_design_provider: 'hermes' })
+  E.provider = { refreshed: readEditor(tree) }
+  change(tree, 'design_provider', ''); tree = m.render()
+  E.provider.chosen = readEditor(tree)
+  E.provider.rests = await saveOk()
+  // 3. branch/rounds main/3 -> refresh develop/5 -> type main/3
+  openTozes(); refreshTo({ default_branch: 'develop', max_fix_rounds: 5 })
+  E.text = { refreshed: readEditor(tree) }
+  change(tree, 'default_branch', 'main'); change(tree, 'max_fix_rounds', '3'); tree = m.render()
+  E.text.chosen = readEditor(tree)
+  E.text.rests = await saveOk()
+  // 4. edit only branch, refresh others, then explicitly choose original values
+  openTozes()
+  change(tree, 'default_branch', 'user-feature'); tree = m.render()
+  refreshTo({ merge_policy: 'ask', design_provider: 'hermes', effective_design_provider: 'hermes', resolved_design_provider: 'hermes' })
+  E.mixed = { refreshed: readEditor(tree) }
+  m.setRest(async () => ({ ok: true }))
+  await submitForm(tree); tree = m.render()
+  E.mixed.firstRests = [...m.rests]
+  openTozes({ ...REPOS[0] })
+  change(tree, 'default_branch', 'user-feature'); tree = m.render()
+  refreshTo({ merge_policy: 'ask', design_provider: 'hermes', effective_design_provider: 'hermes', resolved_design_provider: 'hermes' })
+  change(tree, 'merge_policy', 'auto'); change(tree, 'design_provider', ''); tree = m.render()
+  E.mixed.chosen = readEditor(tree)
+  E.mixed.allRests = await saveOk()
+  // Reverting an edit to the live value drops it; the field then follows later refreshes.
+  openTozes()
+  change(tree, 'merge_policy', 'ask'); tree = m.render()
+  change(tree, 'merge_policy', 'auto'); tree = m.render()
+  E.revert = { msg: readEditor(tree).msg.text, save: readEditor(tree).save }
+  refreshTo({ merge_policy: 'ask' })
+  E.revert.after = readEditor(tree)
 
   // Unsafe max_fix_rounds are rejected in the editor: no PATCH, draft preserved.
   const U = r.unsafe = {}
@@ -1641,8 +1699,62 @@ class TestDesktopPlugin(unittest.TestCase):
                 if "focus" in u:
                     self.assertEqual(u["focus"], [u["roundsId"]])
 
-    def test_repo_draft_changes_against_edit_start_baseline(self):
-        self.assertEqual(self.report["repos"]["changesBaseline"], {"default_branch": "user-feature"})
+    def test_repo_draft_changes_only_explicit_edits_against_live_repo(self):
+        c = self.report["repos"]["changesEdits"]
+        self.assertEqual(c["onlyEdited"], {"default_branch": "user-feature"})
+        self.assertEqual(c["explicitOriginal"], {"merge_policy": "auto", "design_provider": None})
+        self.assertEqual(c["equalLive"], {})
+        self.assertEqual(c["none"], {})
+
+    def _patch(self, body):
+        return [{"path": "/repos/tozes-factonio", "opts": {"method": "PATCH", "body": body}}]
+
+    def test_refresh_then_explicit_original_merge_policy_is_kept_and_sent(self):
+        e = self.report["repos"]["editBack"]["merge"]
+        self.assertEqual(self._ed_vals(e["refreshed"])["merge_policy"], "ask")
+        self.assertTrue(e["refreshed"]["save"]["disabled"])
+        self.assertEqual(self._ed_vals(e["chosen"])["merge_policy"], "auto")
+        self.assertEqual(e["chosen"]["msg"]["text"], "1 unsaved change")
+        self.assertFalse(e["chosen"]["save"]["disabled"])
+        self.assertEqual(e["rests"], self._patch({"merge_policy": "auto"}))
+
+    def test_refresh_then_explicit_inherit_global_provider_is_kept_and_sent(self):
+        e = self.report["repos"]["editBack"]["provider"]
+        self.assertEqual(self._ed_vals(e["refreshed"])["design_provider"], "hermes")
+        self.assertEqual(self._ed_vals(e["chosen"])["design_provider"], "")
+        self.assertEqual(e["chosen"]["msg"]["text"], "1 unsaved change")
+        self.assertFalse(e["chosen"]["save"]["disabled"])
+        self.assertEqual(e["rests"], self._patch({"design_provider": None}))
+
+    def test_refresh_then_explicit_original_branch_and_rounds_are_kept_and_sent(self):
+        e = self.report["repos"]["editBack"]["text"]
+        self.assertEqual(self._ed_vals(e["refreshed"])["default_branch"], "develop")
+        self.assertEqual(self._ed_vals(e["refreshed"])["max_fix_rounds"], "5")
+        self.assertEqual(self._ed_vals(e["chosen"])["default_branch"], "main")
+        self.assertEqual(self._ed_vals(e["chosen"])["max_fix_rounds"], "3")
+        self.assertEqual(e["chosen"]["msg"]["text"], "2 unsaved changes")
+        self.assertFalse(e["chosen"]["save"]["disabled"])
+        self.assertEqual(e["rests"], self._patch({"default_branch": "main", "max_fix_rounds": 3}))
+
+    def test_refresh_untouched_fields_follow_live_then_explicit_originals_are_sent(self):
+        e = self.report["repos"]["editBack"]["mixed"]
+        vals = self._ed_vals(e["refreshed"])
+        self.assertEqual((vals["default_branch"], vals["merge_policy"], vals["design_provider"]), ("user-feature", "ask", "hermes"))
+        self.assertEqual(e["refreshed"]["msg"]["text"], "1 unsaved change")
+        self.assertEqual(e["firstRests"], self._patch({"default_branch": "user-feature"}))
+        vals = self._ed_vals(e["chosen"])
+        self.assertEqual((vals["default_branch"], vals["merge_policy"], vals["design_provider"]), ("user-feature", "auto", ""))
+        self.assertEqual(e["chosen"]["msg"]["text"], "3 unsaved changes")
+        self.assertEqual(
+            e["allRests"],
+            self._patch({"default_branch": "user-feature", "merge_policy": "auto", "design_provider": None}),
+        )
+
+    def test_reverting_edit_to_live_value_drops_it_and_follows_refresh(self):
+        e = self.report["repos"]["editBack"]["revert"]
+        self.assertTrue(e["save"]["disabled"])
+        self.assertEqual(self._ed_vals(e["after"])["merge_policy"], "ask")
+        self.assertTrue(e["after"]["save"]["disabled"])
 
     def test_repo_editor_background_refresh_does_not_revert_untouched_fields(self):
         b = self.report["repos"]["refresh"]
