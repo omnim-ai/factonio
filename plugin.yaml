@@ -1,0 +1,64 @@
+name: factonio
+label: Factonio
+version: 0.1.0
+manifest_version: 2
+description: >
+  Pure-Hermes, phase-based software factory plugin for any GitHub repository.
+  Runs Definition, Implementation, and isolated parallel Verification (Diff Check
+  and Black-Box Check) in a dedicated headless factonio worker profile with
+  configurable per-phase model selection, tick watchdog, and Desktop metrics UI.
+author: tozes
+license: MIT
+requires_hermes: ">=0.1.0"
+provides_tools:
+  - factonio_add_repo
+  - factonio_start
+  - factonio_spawn_implement
+  - factonio_spawn_verify
+  - factonio_status
+  - factonio_pr_gate
+  - factonio_merge_pr
+provides_hooks:
+  - on_kanban_dispatch_tick
+config_schema:
+  repos_root:
+    type: str
+    default: "~/dev"
+    label: "Repositories directory"
+    description: "Default directory where `hermes factonio add owner/repo` clones repositories."
+  max_concurrent_workers:
+    type: int
+    default: 4
+    label: "Max concurrent workers"
+    description: "Default concurrent worker limit for the dedicated factonio profile."
+  default_merge_policy:
+    type: str
+    choices: [auto, ask]
+    default: auto
+    label: "Default PR merge policy"
+    description: "auto squash-merges once CI and both isolated verification checks pass; ask waits for human approval."
+  default_max_fix_rounds:
+    type: int
+    default: 3
+    label: "Default max fix rounds"
+    description: "Maximum review/QA repair loops per PR before escalating to the user."
+  watchdog_interval_minutes:
+    type: int
+    default: 5
+    label: "Watchdog interval (minutes)"
+    description: "Minimum interval between in-process stall and triage checks on Kanban dispatch ticks."
+  stale_heartbeat_minutes:
+    type: int
+    default: 20
+    label: "Stale heartbeat threshold (minutes)"
+    description: "Minutes without a heartbeat before a running Factonio card is flagged as silent."
+  blocked_reminder_minutes:
+    type: int
+    default: 45
+    label: "Blocked reminder threshold (minutes)"
+    description: "Minutes a needs_input card waits before escalating to the owning thread."
+  repos:
+    type: dict
+    default: {}
+    label: "Registered repositories"
+    description: "Per-repository settings keyed by slug (managed by `hermes factonio add`)."
