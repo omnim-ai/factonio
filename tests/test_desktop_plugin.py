@@ -512,6 +512,22 @@ async function runSidebarScenarios(report, registered, oldRegistered) {
   m = mountPane({ storage, os, focused: 'sess_9c41e2' })
   tree = m.render()
   filters.restored = { header: headerOf(tree), sections: sectionsOf(tree).map(s => ({ tenant: s.tenant, cards: s.cards })) }
+  // Regression: a disclosure collapsed under All must not stay collapsed when entering Done.
+  const reentry = {}
+  m = mountPane({ storage: makeStorage({ 'sidebar.scope': 'all' }), os, focused: 'sess_9c41e2' })
+  tree = m.render()
+  const secOf = tenant => sectionsOf(tree).find(s => s.tenant === tenant)
+  const toggleDone = tenant => { fire(find(find(tree, n => n.type === 'section' && n.props['data-tenant'] === tenant).node, n => n.props.className === 'fc-sb-done-toggle')); tree = m.render() }
+  const statusTile = v => { fire(find(tree, n => n.props.className === 'fc-sb-stat' && n.props['data-value'] === v)); tree = m.render() }
+  toggleDone(SIDEBAR); reentry.allExpanded = secOf(SIDEBAR).doneToggle
+  toggleDone(SIDEBAR); reentry.allCollapsed = { doneToggle: secOf(SIDEBAR).doneToggle, cards: secOf(SIDEBAR).cards }
+  statusTile('done'); reentry.done = { doneToggle: secOf(SIDEBAR).doneToggle, cards: secOf(SIDEBAR).cards }
+  toggleDone(SIDEBAR); reentry.doneCollapsed = { doneToggle: secOf(SIDEBAR).doneToggle, cards: secOf(SIDEBAR).cards }
+  toggleDone(SIDEBAR); reentry.doneReexpanded = secOf(SIDEBAR).doneToggle
+  toggleDone(SIDEBAR)
+  statusTile('all'); reentry.backToAll = { doneToggle: secOf(SIDEBAR).doneToggle, cards: secOf(SIDEBAR).cards }
+  statusTile('done'); reentry.doneAgain = secOf(SIDEBAR).doneToggle
+  filters.reentry = reentry
   sb.populated = pop
   sb.filters = filters
 
@@ -901,6 +917,25 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual(done["tozes-factonio-improve-factonio-sidebar"]["doneToggle"]["expanded"], "true")
         self.assertEqual(done["tozes-factonio-enrich-cards-metadata"]["doneToggle"]["expanded"], "true")
         self.assertEqual(f["done"]["tiles"]["done"]["pressed"], "true")
+
+    def test_done_filter_expands_after_disclosure_collapsed_under_all(self):
+        r = self.report["sidebar"]["filters"]["reentry"]
+        completed = ["t_4ab36a09", "t_4ab36a0b", "t_4ab36a0d", "t_4ab36a10"]
+        self.assertEqual(r["allExpanded"]["expanded"], "true")
+        self.assertEqual(r["allCollapsed"]["doneToggle"]["expanded"], "false")
+        self.assertTrue(set(completed).isdisjoint(r["allCollapsed"]["cards"]))
+        # entering Done auto-expands despite the earlier collapse under All
+        self.assertEqual(r["done"]["doneToggle"]["expanded"], "true")
+        for cid in completed:
+            self.assertIn(cid, r["done"]["cards"])
+        # the user can still collapse / re-expand while in Done
+        self.assertEqual(r["doneCollapsed"]["doneToggle"]["expanded"], "false")
+        self.assertTrue(set(completed).isdisjoint(r["doneCollapsed"]["cards"]))
+        self.assertEqual(r["doneReexpanded"]["expanded"], "true")
+        # returning to All restores the All choice (collapsed); re-entering Done auto-expands again
+        self.assertEqual(r["backToAll"]["doneToggle"]["expanded"], "false")
+        self.assertTrue(set(completed).isdisjoint(r["backToAll"]["cards"]))
+        self.assertEqual(r["doneAgain"]["expanded"], "true")
 
     def test_filters_persist_via_ctx_storage(self):
         f = self.report["sidebar"]["filters"]

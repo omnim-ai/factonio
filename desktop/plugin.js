@@ -1269,11 +1269,21 @@ function usePersistedChoice(ctx, key, allowed, fallback) {
 function ThreadCardsPane({ ctx, visible = true }) {
   const sessionId = useValue(host.state.focusedStoredSessionId) || null
   const [scopeChoice, setScope] = usePersistedChoice(ctx, 'sidebar.scope', SCOPES, null)
-  const [status, setStatus] = usePersistedChoice(ctx, 'sidebar.status', STATUS_FILTERS, 'all')
+  const [status, setStatusChoice] = usePersistedChoice(ctx, 'sidebar.status', STATUS_FILTERS, 'all')
   const [phase, setPhase] = usePersistedChoice(ctx, 'sidebar.phase', PHASE_FILTERS, 'all')
   const [wsOpen, setWsOpen] = useState({})
-  const [doneOpen, setDoneOpen] = useState({})
+  const [doneOpenByMode, setDoneOpenByMode] = useState({ other: {}, done: {} })
   const [cardOpen, setCardOpen] = useState({})
+  // "N completed" overrides are partitioned by filter mode (Done vs everything else), and the
+  // Done partition is reset on entry, so entering Done always auto-expands completed cards
+  // while returning to All/Active/Attention restores the user's earlier choices there.
+  const doneMode = status === 'done' ? 'done' : 'other'
+  const doneOpen = doneOpenByMode[doneMode] || {}
+  const setDoneOpen = next => setDoneOpenByMode({ ...doneOpenByMode, [doneMode]: next })
+  const setStatus = next => {
+    if (next === 'done' && status !== 'done') setDoneOpenByMode({ ...doneOpenByMode, done: {} })
+    setStatusChoice(next)
+  }
 
   // Initial scope follows focus; an explicit user choice sticks even when focus changes.
   const scope = scopeChoice || (sessionId ? 'thread' : 'all')
