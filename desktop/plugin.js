@@ -4,6 +4,8 @@
 //  - Thread Cards right-side pane (PANES_AREA)
 //  - Running/blocked card count pill (STATUSBAR_AREAS.right)
 //  - ::your-turn manual step card (TRANSCRIPT_DIRECTIVE_AREA)
+//  - Settings → Plugins → Factonio landing page (ctx.registerSettingsPage);
+//    Hermes Desktop folds plugin.yaml config_schema underneath as "Agent settings"
 
 import {
   ROUTES_AREA,
@@ -21,6 +23,21 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 import { useState } from 'react'
 
 const ROUTE_PATH = '/factonio'
+
+// Factonio phase models live in Hermes Auxiliary Models (Settings → Model →
+// Auxiliary) under the `factonio_<phase>` aux task keys.
+const PHASE_ORDER = ['define', 'implement', 'verify', 'watchdog']
+
+function auxModelRoute(phase) {
+  return `/settings?tab=config:model&aux=factonio_${phase}`
+}
+
+const DEFAULT_AUX_MODEL_ROUTE = auxModelRoute('define')
+
+function formatPhaseModelLabel(info) {
+  const i = info || {}
+  return i.provider && i.model ? `${i.provider}/${i.model}` : (i.model || '(profile default)')
+}
 
 const STYLES = `
 .fc-page { height: 100%; overflow: auto; background: var(--ui-chat-surface-background); color: var(--ui-text-primary); font-size: 13px; line-height: 1.45; }
@@ -57,6 +74,11 @@ const STYLES = `
 .fc-step { border: 1px solid var(--ui-stroke-secondary); border-radius: 8px; padding: 10px 12px; margin: 8px 0; display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
 .fc-step-cmd { background: var(--ui-bg-elevated, rgba(127,127,127,0.08)); padding: 6px 8px; border-radius: 5px; font-family: var(--dt-font-mono, ui-monospace, monospace); font-size: 11px; overflow-x: auto; }
 .fc-step-actions { display: flex; gap: 8px; align-items: center; }
+.fc-sec-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+.fc-sec-head h2 { margin: 0; }
+.fc-settings { padding: 4px 0 24px; color: var(--ui-text-primary); font-size: 13px; line-height: 1.45; }
+.fc-settings-note { border: 1px solid var(--ui-stroke-secondary); border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; font-size: 12px; color: var(--ui-text-secondary); }
+.fc-settings-err { color: var(--ui-text-secondary); font-size: 12px; margin-bottom: 10px; }
 `
 
 function fmtDur(seconds) {
@@ -78,6 +100,112 @@ function statusDotClass(status) {
   if (status === 'blocked' || status === 'triage') return 'fc-dot fc-dot-red'
   if (status === 'ready') return 'fc-dot fc-dot-amber'
   return 'fc-dot fc-dot-muted'
+}
+
+function PhaseModelsTable({ models }) {
+  const map = models || {}
+  return jsxs('table', {
+    className: 'fc-table',
+    children: [
+      jsx('thead', {
+        children: jsxs('tr', {
+          children: [
+            jsx('th', { children: 'Phase' }),
+            jsx('th', { children: 'Provider / Model' }),
+            jsx('th', { children: 'Source' }),
+            jsx('th', { children: '' })
+          ]
+        })
+      }),
+      jsx('tbody', {
+        children: PHASE_ORDER.map(phase => {
+          const info = map[phase] || {}
+          return jsxs('tr', {
+            key: phase,
+            children: [
+              jsx('td', { className: 'fc-mono', children: phase }),
+              jsx('td', { className: 'fc-mono', children: formatPhaseModelLabel(info) }),
+              jsx('td', { className: 'fc-mono', children: info.source || '—' }),
+              jsx('td', {
+                style: { textAlign: 'right' },
+                children: jsx('button', {
+                  type: 'button',
+                  className: 'fc-btn',
+                  title: `Configure the ${phase} phase model in Auxiliary Models`,
+                  'aria-label': `Configure ${phase} model`,
+                  onClick: () => host.navigate(auxModelRoute(phase)),
+                  children: 'Configure'
+                })
+              })
+            ]
+          })
+        })
+      })
+    ]
+  })
+}
+
+function ConfigurePhaseModelsButton() {
+  return jsx('button', {
+    type: 'button',
+    className: 'fc-btn',
+    onClick: () => host.navigate(DEFAULT_AUX_MODEL_ROUTE),
+    children: 'Configure phase models'
+  })
+}
+
+// Shared explanatory note: always rendered (independent of /models query
+// state) on both the Settings landing page and the /factonio dashboard.
+function AuxModelsNote({ suffix }) {
+  return jsxs('span', {
+    className: 'fc-aux-note',
+    children: [
+      'Factonio phase models (define, implement, verify, watchdog) are configured in ',
+      jsx('strong', { children: 'Hermes Auxiliary Models' }),
+      ' (Settings → Model → Auxiliary).',
+      suffix || null
+    ]
+  })
+}
+
+// Compact, non-blocking status for the /models query.
+function ModelsQueryStatus({ query }) {
+  if (query?.isError) {
+    return jsx('div', {
+      className: 'fc-settings-err',
+      children: 'Could not load resolved phase models; showing defaults. Configuration links still work.'
+    })
+  }
+  if (query?.isLoading) {
+    return jsx('div', { className: 'fc-settings-err', children: 'Loading resolved phase models…' })
+  }
+  return null
+}
+
+function FactonioSettingsPage({ ctx }) {
+  const modelsQ = useQuery({
+    queryKey: ['factonio', 'models'],
+    queryFn: () => ctx.rest('/models'),
+    refetchInterval: 30000
+  })
+  const models = modelsQ.data?.models || {}
+  const warn = modelsQ.data?.cross_model_warning
+
+  return jsxs('div', {
+    className: 'fc-settings',
+    children: [
+      jsxs('div', {
+        className: 'fc-settings-note',
+        children: [
+          jsx(AuxModelsNote, { suffix: ' Plugin options are under Agent settings.' }),
+          jsx(ConfigurePhaseModelsButton, {})
+        ]
+      }),
+      warn ? jsx('div', { className: 'fc-warn', children: warn }) : null,
+      jsx(ModelsQueryStatus, { query: modelsQ }),
+      jsx(PhaseModelsTable, { models })
+    ]
+  })
 }
 
 function FactonioPage({ ctx }) {
@@ -239,35 +367,16 @@ function FactonioPage({ ctx }) {
           jsxs('div', {
             className: 'fc-sec',
             children: [
-              jsx('h2', { children: 'Phase Model Configuration' }),
-              jsxs('table', {
-                className: 'fc-table',
+              jsxs('div', {
+                className: 'fc-sec-head',
                 children: [
-                  jsx('thead', {
-                    children: jsxs('tr', {
-                      children: [
-                        jsx('th', { children: 'Phase' }),
-                        jsx('th', { children: 'Provider / Model' }),
-                        jsx('th', { children: 'Source' })
-                      ]
-                    })
-                  }),
-                  jsx('tbody', {
-                    children: ['define', 'implement', 'verify', 'watchdog'].map(phase => {
-                      const info = models[phase] || {}
-                      const label = info.provider && info.model ? `${info.provider}/${info.model}` : (info.model || '(profile default)')
-                      return jsxs('tr', {
-                        key: phase,
-                        children: [
-                          jsx('td', { className: 'fc-mono', children: phase }),
-                          jsx('td', { className: 'fc-mono', children: label }),
-                          jsx('td', { className: 'fc-mono', children: info.source || '—' })
-                        ]
-                      })
-                    })
-                  })
+                  jsx('h2', { children: 'Phase Model Configuration' }),
+                  jsx(ConfigurePhaseModelsButton, {})
                 ]
-              })
+              }),
+              jsx('p', { className: 'fc-hint', children: jsx(AuxModelsNote, {}) }),
+              jsx(ModelsQueryStatus, { query: modelsQ }),
+              jsx(PhaseModelsTable, { models })
             ]
           }),
           jsxs('div', {
@@ -510,5 +619,14 @@ export default {
         data: { name: 'your-turn', render: props => jsx(YourTurnCard, { ...props }) }
       }
     ])
+
+    // Settings → Plugins → Factonio landing page. Feature-detected for older
+    // hosts; config_schema is auto-folded beneath it as "Agent settings".
+    ctx.registerSettingsPage?.({
+      id: 'settings',
+      title: 'Factonio',
+      icon: 'circuit-board',
+      render: () => jsx(FactonioSettingsPage, { ctx })
+    })
   }
 }
