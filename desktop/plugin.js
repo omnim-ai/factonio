@@ -640,9 +640,23 @@ function mergeStates(a, b) {
   if (a === b) return a // both done or both pending
   return 'queued' // one done, one not started
 }
+// Newest card of a phase: highest created_at, ties broken deterministically by id.
+function latestCard(cs) {
+  let best = null
+  for (const c of cs) {
+    if (!best) { best = c; continue }
+    const d = (c.created_at ?? 0) - (best.created_at ?? 0)
+    if (d > 0 || (d === 0 && String(c.id ?? '') > String(best.id ?? ''))) best = c
+  }
+  return best
+}
+// Each stage resolves from its latest card only (spec §3): a newer fix-round card
+// supersedes older blocked/rejected attempts of the same phase. Unresolved historical
+// rejections still drive workstream/card attention via isAttention().
 function computePipelineStages(wsCards) {
   const node = ph => {
-    const cs = wsCards.filter(c => c.phase === ph)
+    const last = latestCard(wsCards.filter(c => c.phase === ph))
+    const cs = last ? [last] : []
     const state = stageState(cs, wsCards)
     return { state, word: stageWord(state, cs) }
   }
@@ -1010,7 +1024,7 @@ function CardRow({ ctx, card: c, wsCards, open, onToggle }) {
   const attn = isAttention(c, wsCards)
   const tone = verdictTone(c.verdict)
   const rework = c.phase === 'implement' && c.runs > 1
-  const dur = c.active_duration_seconds || c.elapsed_seconds
+  const dur = c.active_duration_seconds ?? c.elapsed_seconds
   const drawerId = `fc-sb-card-${domSafe(c.id)}`
   const title = stripTag(c.title)
   const callouts = cardCallouts(c, wsCards)

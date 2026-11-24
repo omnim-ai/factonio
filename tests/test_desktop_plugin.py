@@ -224,6 +224,39 @@ const RECOVERY = [
   card({ id: 't_u2', tenant: null, phase: 'implement', status: 'running', title: '[implement] http pr', pr: { repo: 'evil/y', number: 2, url: 'http://example.com/pull/2' }, created_at: 650 })
 ]
 
+// Superseded phase cards: each pipeline stage resolves from its latest card (spec §3).
+const SUP = 'tozes-factonio-sup-'
+const supRound = (t, latest) => [
+  card({ id: `t_${t}1`, tenant: SUP + t, phase: 'define', status: 'done', title: '[define] d', created_at: 100 }),
+  card({ id: `t_${t}2`, tenant: SUP + t, phase: 'implement', status: 'done', title: '[implement] i', created_at: 200 }),
+  card({ id: `t_${t}3`, tenant: SUP + t, phase: 'verify-diff', status: 'done', verdict: 'pass', title: '[verify:diff] r1', created_at: 300 }),
+  card({ id: `t_${t}4`, tenant: SUP + t, phase: 'verify-blackbox', status: 'done', verdict: 'reject', last_outcome: 'changes_requested', title: '[verify:blackbox] r1', created_at: 300 }),
+  card({ id: `t_${t}5`, tenant: SUP + t, phase: 'verify-blackbox', title: '[verify:blackbox] r2', created_at: 500, ...latest })
+]
+const SUPERSEDED = [
+  ...supRound('rq', { status: 'todo', last_outcome: null }),
+  ...supRound('rr', { status: 'running', last_outcome: null }),
+  ...supRound('rp', { status: 'done', verdict: 'pass' }),
+  ...supRound('rj', { status: 'done', verdict: 'reject', last_outcome: 'changes_requested' }),
+  // Same created_at: deterministic id tie-break (t_tie9 > t_tie1) picks the running card.
+  card({ id: 't_tie1', tenant: SUP + 'tie', phase: 'verify-diff', status: 'done', verdict: 'reject', title: '[verify:diff] a', created_at: 700 }),
+  card({ id: 't_tie9', tenant: SUP + 'tie', phase: 'verify-diff', status: 'running', title: '[verify:diff] b', created_at: 700 }),
+  // Non-verify: old blocked implement superseded by a newer running / done implement.
+  card({ id: 't_ib1', tenant: SUP + 'ibr', phase: 'implement', status: 'blocked', block_kind: 'needs_input', block_reason: 'q', title: '[implement] old', created_at: 200 }),
+  card({ id: 't_ib2', tenant: SUP + 'ibr', phase: 'implement', status: 'running', title: '[implement] new', created_at: 400 }),
+  card({ id: 't_id1', tenant: SUP + 'ibd', phase: 'implement', status: 'triage', title: '[implement] old', created_at: 200 }),
+  card({ id: 't_id2', tenant: SUP + 'ibd', phase: 'implement', status: 'done', title: '[implement] new', created_at: 400 }),
+  card({ id: 't_ir1', tenant: SUP + 'irb', phase: 'implement', status: 'done', title: '[implement] old', created_at: 200 }),
+  card({ id: 't_ir2', tenant: SUP + 'irb', phase: 'implement', status: 'blocked', block_kind: 'capability', block_reason: 'no access', title: '[implement] new', created_at: 400 })
+]
+// Duration fallback: active=0 is a valid value; only null/missing falls back to wall time.
+const DURATION = [
+  card({ id: 't_dz', tenant: 'tozes-factonio-dur', phase: 'implement', status: 'running', title: '[implement] zero', created_at: 100, active_duration_seconds: 0, elapsed_seconds: 3600 }),
+  card({ id: 't_dn', tenant: 'tozes-factonio-dur', phase: 'implement', status: 'running', title: '[implement] null', created_at: 110, active_duration_seconds: null, elapsed_seconds: 3600 }),
+  (() => { const c = card({ id: 't_dm', tenant: 'tozes-factonio-dur', phase: 'implement', status: 'running', title: '[implement] missing', created_at: 120, elapsed_seconds: 125 }); delete c.active_duration_seconds; return c })(),
+  card({ id: 't_dp', tenant: 'tozes-factonio-dur', phase: 'implement', status: 'running', title: '[implement] positive', created_at: 130, active_duration_seconds: 65, elapsed_seconds: 3600 })
+]
+
 function walk(node, visit, anc = []) {
   if (node == null || typeof node !== 'object') return
   if (Array.isArray(node)) { node.forEach(n => walk(n, visit, anc)); return }
@@ -571,6 +604,27 @@ async function runSidebarScenarios(report, registered, oldRegistered) {
   tree = m.render()
   rec.recoverExpanded = sectionsOf(tree).find(s => s.tenant === 'tozes-factonio-recover')
   sb.recovery = rec
+
+  // Superseded phase cards: expand every workstream and read its pipeline stages.
+  cardsState = { data: { cards: SUPERSEDED }, isLoading: false, isError: false }
+  m = mountPane({ focused: null })
+  tree = m.render()
+  for (const s of sectionsOf(tree)) {
+    if (s.expanded === 'false') {
+      fire(find(find(tree, n => n.type === 'section' && n.props['data-tenant'] === s.tenant).node, byAttr('data-action', 'toggle-ws')))
+      tree = m.render()
+    }
+  }
+  sb.superseded = Object.fromEntries(sectionsOf(tree).map(s => [s.tenant.slice(SUP.length), { state: s.state, stages: s.stages }]))
+
+  // Duration rendering on card rows.
+  cardsState = { data: { cards: DURATION }, isLoading: false, isError: false }
+  m = mountPane({ focused: null })
+  tree = m.render()
+  sb.durations = Object.fromEntries(findAll(tree, n => n.type === 'article').map(h => {
+    const d = find(h.node, n => n.props.className === 'fc-sb-dur').node
+    return [h.node.props['data-id'], { text: text(d).trim(), title: d.props.title }]
+  }))
 }
 const mod = await import(process.env.FC_PLUGIN_URL)
 const plugin = mod.default
@@ -967,6 +1021,36 @@ class TestDesktopPlugin(unittest.TestCase):
         )
         self.assertEqual(rec["header"]["tiles"]["attention"]["n"], "1")  # resolved reject is not attention
         self.assertEqual(rec["ungroupedCallouts"], ["triage Waiting for triage"])
+
+    def test_pipeline_resolves_latest_card_per_phase(self):
+        sup = self.report["sidebar"]["superseded"]
+        verify = {k: sup[k]["stages"][3] for k in ("rq", "rr", "rp", "rj")}
+        self.assertEqual(verify["rq"], "Verify: diff done, black-box queued")
+        self.assertEqual(verify["rr"], "Verify: diff done, black-box running")
+        self.assertEqual(verify["rp"], "Verify: diff done, black-box done")
+        self.assertEqual(verify["rj"], "Verify: diff done, black-box rejected")
+        for k in ("rq", "rr", "rp", "rj"):
+            self.assertEqual(sup[k]["stages"][:3], ["Define: done", "Design: skipped", "Implement: done"])
+        # Historical rejection stays workstream attention until a newer verification passes.
+        self.assertEqual(sup["rq"]["state"], "attention")
+        self.assertEqual(sup["rr"]["state"], "attention")
+        self.assertEqual(sup["rp"]["state"], "completed")
+        self.assertEqual(sup["rj"]["state"], "attention")
+        self.assertIn("diff running", sup["tie"]["stages"][-1])
+
+    def test_pipeline_superseded_non_verify_cards(self):
+        sup = self.report["sidebar"]["superseded"]
+        self.assertIn("Implement: running", sup["ibr"]["stages"])
+        self.assertIn("Implement: done", sup["ibd"]["stages"])
+        self.assertIn("Implement: blocked", sup["irb"]["stages"])
+
+    def test_zero_active_duration_is_not_replaced_by_wall_time(self):
+        d = self.report["sidebar"]["durations"]
+        self.assertEqual(d["t_dz"]["text"], "0s")
+        self.assertEqual(d["t_dz"]["title"], "Active 0s · Wall 1h 0m")
+        self.assertEqual(d["t_dn"]["text"], "1h 0m")
+        self.assertEqual(d["t_dm"]["text"], "2m 5s")
+        self.assertEqual(d["t_dp"]["text"], "1m 5s")
 
     def test_card_rows_and_callouts(self):
         pop = self.report["sidebar"]["populated"]
