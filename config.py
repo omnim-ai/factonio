@@ -116,11 +116,48 @@ def _read_plugin_settings_from_file(config_path: Path) -> dict[str, Any]:
         return {}
 
 
+def _repos_store_path() -> Path:
+    return get_root_hermes_home_path() / "plugin-data" / PLUGIN_ID / "repos.json"
+
+
+def _read_repos_store() -> dict[str, dict[str, Any]]:
+    import json
+
+    path = _repos_store_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return dict(data) if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_repos_store(repos: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Persist registered repositories to durable plugin-data/factonio/repos.json."""
+    import json
+
+    path = _repos_store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(dict(repos), indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+    return _read_repos_store()
+
+
 def save_settings(updates: Mapping[str, Any], *, config_path: Optional[Path] = None) -> dict[str, Any]:
-    """Persist Factonio settings into config.yaml under plugins.entries.factonio.settings."""
+    """Persist Factonio settings into config.yaml (and durable repos.json for `repos`)."""
     import hermes_yaml as yaml
 
+    remaining = dict(updates)
+    if "repos" in remaining and isinstance(remaining["repos"], Mapping) and config_path is None:
+        save_repos_store(remaining.pop("repos"))
+        if not remaining:
+            return load_settings(use_root=True)
+
     target = config_path or (get_root_hermes_home_path() / "config.yaml")
+    if target.is_symlink():
+        target = target.resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     data: dict[str, Any] = {}
     if target.is_file():
@@ -145,7 +182,7 @@ def save_settings(updates: Mapping[str, Any], *, config_path: Optional[Path] = N
         settings = {}
         entry["settings"] = settings
 
-    for key, value in updates.items():
+    for key, value in remaining.items():
         settings[key] = copy.deepcopy(value)
 
     target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
@@ -153,9 +190,11 @@ def save_settings(updates: Mapping[str, Any], *, config_path: Optional[Path] = N
 
 
 def list_repos() -> dict[str, dict[str, Any]]:
-    """Return registered repositories keyed by slug."""
-    repos = load_settings().get("repos")
-    return dict(repos) if isinstance(repos, dict) else {}
+    """Return registered repositories keyed by slug (config.yaml merged with plugin-data/repos.json)."""
+    from_cfg = load_settings().get("repos")
+    merged: dict[str, dict[str, Any]] = dict(from_cfg) if isinstance(from_cfg, dict) else {}
+    merged.update(_read_repos_store())
+    return merged
 
 
 def get_repo(slug_or_full: str) -> Optional[dict[str, Any]]:

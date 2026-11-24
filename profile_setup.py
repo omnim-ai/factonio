@@ -47,8 +47,9 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 def _write_yaml(path: Path, data: dict[str, Any]) -> None:
     import hermes_yaml as yaml
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    target = path.resolve() if path.is_symlink() else path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
 
 def _ensure_plugin_link(profile_dir: Path, plugin_dir: Path) -> dict[str, Any]:
