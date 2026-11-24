@@ -154,6 +154,34 @@ function ConfigurePhaseModelsButton() {
   })
 }
 
+// Shared explanatory note: always rendered (independent of /models query
+// state) on both the Settings landing page and the /factonio dashboard.
+function AuxModelsNote({ suffix }) {
+  return jsxs('span', {
+    className: 'fc-aux-note',
+    children: [
+      'Factonio phase models (define, implement, verify, watchdog) are configured in ',
+      jsx('strong', { children: 'Hermes Auxiliary Models' }),
+      ' (Settings → Model → Auxiliary).',
+      suffix || null
+    ]
+  })
+}
+
+// Compact, non-blocking status for the /models query.
+function ModelsQueryStatus({ query }) {
+  if (query?.isError) {
+    return jsx('div', {
+      className: 'fc-settings-err',
+      children: 'Could not load resolved phase models; showing defaults. Configuration links still work.'
+    })
+  }
+  if (query?.isLoading) {
+    return jsx('div', { className: 'fc-settings-err', children: 'Loading resolved phase models…' })
+  }
+  return null
+}
+
 function FactonioSettingsPage({ ctx }) {
   const modelsQ = useQuery({
     queryKey: ['factonio', 'models'],
@@ -169,24 +197,12 @@ function FactonioSettingsPage({ ctx }) {
       jsxs('div', {
         className: 'fc-settings-note',
         children: [
-          jsxs('span', {
-            children: [
-              'Factonio phase models (define, implement, verify, watchdog) are configured in ',
-              jsx('strong', { children: 'Hermes Auxiliary Models' }),
-              ' (Settings → Model → Auxiliary). Plugin options are under Agent settings.'
-            ]
-          }),
+          jsx(AuxModelsNote, { suffix: ' Plugin options are under Agent settings.' }),
           jsx(ConfigurePhaseModelsButton, {})
         ]
       }),
       warn ? jsx('div', { className: 'fc-warn', children: warn }) : null,
-      modelsQ.isError
-        ? jsx('div', {
-            className: 'fc-settings-err',
-            children: 'Could not load resolved phase models; showing defaults. Configuration links still work.'
-          })
-        : null,
-      modelsQ.isLoading ? jsx('div', { className: 'fc-settings-err', children: 'Loading resolved phase models…' }) : null,
+      jsx(ModelsQueryStatus, { query: modelsQ }),
       jsx(PhaseModelsTable, { models })
     ]
   })
@@ -358,6 +374,8 @@ function FactonioPage({ ctx }) {
                   jsx(ConfigurePhaseModelsButton, {})
                 ]
               }),
+              jsx('p', { className: 'fc-hint', children: jsx(AuxModelsNote, {}) }),
+              jsx(ModelsQueryStatus, { query: modelsQ }),
               jsx(PhaseModelsTable, { models })
             ]
           }),

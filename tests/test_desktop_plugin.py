@@ -312,6 +312,19 @@ class TestDesktopPlugin(unittest.TestCase):
             self.assertIn("(profile default)", t)
         self.assertIn("Could not load", self.report["settings"]["error"]["text"])
 
+    def test_dashboard_retains_aux_models_note_in_all_states(self):
+        for state in ("full", "noWarn", "loading", "error"):
+            with self.subTest(state=state):
+                t = self.report["dashboard"][state]["text"]
+                self.assertIn("Hermes Auxiliary Models", t)
+                self.assertIn("Settings → Model → Auxiliary", t)
+                for phase in PHASES:
+                    self.assertIn(phase, t)
+                self.assertIn("(profile default)" if state in ("loading", "error") else "anthropic/claude-x", t)
+        self.assertIn("Could not load", self.report["dashboard"]["error"]["text"])
+        self.assertNotIn("Could not load", self.report["dashboard"]["loading"]["text"])
+        self.assertNotIn("Could not load", self.report["dashboard"]["full"]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()
