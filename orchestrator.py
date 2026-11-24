@@ -63,6 +63,59 @@ def _phase_model_kwargs(phase: str, repo_slug: str, subphase: Optional[str] = No
     }
 
 
+def _resolve_calling_session_id(explicit: Optional[str] = None) -> Optional[str]:
+    """Resolve the active chat session id from explicit kwargs or Hermes session context."""
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()
+    try:
+        from gateway.session_context import get_session_env
+
+        for key in ("HERMES_SESSION_CHAT_ID", "HERMES_SESSION_KEY"):
+            val = (get_session_env(key, "") or "").strip()
+            if val:
+                return val
+    except Exception:
+        pass
+    return None
+
+
+def _auto_subscribe_task(conn: Any, task_id: str, *, session_id: Optional[str] = None) -> bool:
+    """Subscribe the calling chat session to completion/block wakes (matches `kanban_create`)."""
+    try:
+        from tools.kanban_tools import _maybe_auto_subscribe
+
+        if _maybe_auto_subscribe(conn, task_id):
+            return True
+    except Exception:
+        pass
+
+    # Fallback when called with an explicit session_id outside gateway ContextVars (e.g. API/tests).
+    if not session_id:
+        return False
+    try:
+        from hermes_cli import kanban_db_notify as kbn
+
+        chat_id = str(session_id).strip()
+        if not chat_id:
+            return False
+        if any(
+            sub["platform"] == "local" and sub["chat_id"] == chat_id
+            for sub in kbn.list_notify_subs(conn, task_id)
+        ):
+            return True
+        kbn.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="local",
+            chat_id=chat_id,
+            notifier_profile="default",
+            delivery_mode="notify+wake",
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _completion_contract_for_repo(repo: dict[str, Any]) -> str:
     """Use native GitHub PR contract when branch protection defines required checks."""
     ci_mode = str(repo.get("ci_contract") or "auto").lower()
@@ -160,6 +213,7 @@ def start_workstream(
         workspace_path = repo_path
         contract = "local-only"
 
+    effective_session_id = _resolve_calling_session_id(session_id)
     with connect_closing(board=board) as conn:
         task_id = kb.create_task(
             conn,
@@ -175,10 +229,11 @@ def start_workstream(
             model_override=model_info["model_override"],
             provider_override=model_info["provider_override"],
             goal_mode=goal_mode,
-            session_id=session_id,
+            session_id=effective_session_id,
             board=board,
             completion_contract=contract,
         )
+        subscribed = _auto_subscribe_task(conn, task_id, session_id=effective_session_id)
 
     return {
         "ok": True,
@@ -192,6 +247,7 @@ def start_workstream(
         "holdout_dir": str(holdout_dir),
         "model": model_info["resolved"],
         "completion_contract": contract,
+        "subscribed": subscribed,
     }
 
 
@@ -234,6 +290,7 @@ def spawn_implementation_card(
         f"Read only the repository and `{spec_path}`. Do not search for or read any `holdout/` files.\n"
     )
 
+    effective_session_id = _resolve_calling_session_id(session_id)
     with connect_closing(board=board) as conn:
         task_id = kb.create_task(
             conn,
@@ -251,10 +308,11 @@ def spawn_implementation_card(
             model_override=model_info["model_override"],
             provider_override=model_info["provider_override"],
             goal_mode=False,
-            session_id=session_id,
+            session_id=effective_session_id,
             board=board,
             completion_contract=contract,
         )
+        subscribed = _auto_subscribe_task(conn, task_id, session_id=effective_session_id)
 
     return {
         "ok": True,
@@ -264,6 +322,7 @@ def spawn_implementation_card(
         "repo": full_repo,
         "model": model_info["resolved"],
         "completion_contract": contract,
+        "subscribed": subscribed,
     }
 
 
@@ -331,6 +390,7 @@ def spawn_verification_pair(
         f"`repo: {full_repo}`, `scenarios_run`, and `findings: [...]`.\n"
     )
 
+    effective_session_id = _resolve_calling_session_id(session_id)
     with connect_closing(board=board) as conn:
         diff_id = kb.create_task(
             conn,
@@ -346,7 +406,7 @@ def spawn_verification_pair(
             model_override=diff_model["model_override"],
             provider_override=diff_model["provider_override"],
             goal_mode=False,
-            session_id=session_id,
+            session_id=effective_session_id,
             board=board,
             completion_contract="local-only",
         )
@@ -364,10 +424,12 @@ def spawn_verification_pair(
             model_override=bb_model["model_override"],
             provider_override=bb_model["provider_override"],
             goal_mode=False,
-            session_id=session_id,
+            session_id=effective_session_id,
             board=board,
             completion_contract="local-only",
         )
+        diff_sub = _auto_subscribe_task(conn, diff_id, session_id=effective_session_id)
+        bb_sub = _auto_subscribe_task(conn, bb_id, session_id=effective_session_id)
 
     return {
         "ok": True,
@@ -378,6 +440,7 @@ def spawn_verification_pair(
         "verify_blackbox_task_id": bb_id,
         "diff_model": diff_model["resolved"],
         "blackbox_model": bb_model["resolved"],
+        "subscribed": bool(diff_sub and bb_sub),
     }
 
 

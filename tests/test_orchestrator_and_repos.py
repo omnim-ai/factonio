@@ -100,6 +100,28 @@ class TestOrchestratorAndRepos(unittest.TestCase):
             self.assertIn(started["holdout_dir"], bb_task.body or "")
             self.assertIn("NEVER run `git diff`", bb_task.body or "")
 
+            # Auto-subscribe + Thread Cards assertions: every created card must subscribe
+            # the calling session for notify+wake and resolve parent edges via task_links.
+            self.assertTrue(started["subscribed"])
+            self.assertTrue(impl["subscribed"])
+            self.assertTrue(ver["subscribed"])
+            from hermes_cli import kanban_db_notify as kbn
+            from factonio.orchestrator import workstream_status
+
+            with connect_closing() as conn:
+                for tid in (started["task_id"], impl["task_id"], ver["verify_diff_task_id"], ver["verify_blackbox_task_id"]):
+                    subs = kbn.list_notify_subs(conn, tid)
+                    self.assertTrue(
+                        any(s["chat_id"] == "sess_abc" and s["delivery_mode"] == "notify+wake" for s in subs),
+                        f"Missing notify+wake subscription for {tid}: {subs}",
+                    )
+            ws = workstream_status(session_id="sess_abc")
+            by_id = {c["id"]: c for c in ws["cards"]}
+            self.assertEqual(len(by_id), 4)
+            self.assertIn(started["task_id"], by_id[impl["task_id"]]["parents"])
+            self.assertIn(impl["task_id"], by_id[ver["verify_diff_task_id"]]["parents"])
+            self.assertIn(impl["task_id"], by_id[ver["verify_blackbox_task_id"]]["parents"])
+
     def test_pr_gate_and_merge_refuse_red_or_stale_head(self):
         from factonio.repos import inspect_pr_gate, merge_pr
 

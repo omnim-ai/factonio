@@ -321,22 +321,43 @@ def thread_cards(
                 where.append("tenant = ?")
                 params.append(tenant)
             elif session_id:
-                # Include cards directly stamped with session_id AND sibling cards sharing their tenant.
-                seed_tenants = [
-                    r["tenant"]
+                # Include cards directly stamped with session_id, subscribed via kanban_notify_subs,
+                # and sibling cards sharing their tenant.
+                matched_ids: set[str] = set()
+                seed_tenants_set: set[str] = set()
+                for r in conn.execute(
+                    "SELECT id, tenant FROM tasks WHERE session_id = ?",
+                    (session_id,),
+                ).fetchall():
+                    matched_ids.add(r["id"])
+                    if r["tenant"]:
+                        seed_tenants_set.add(r["tenant"])
+                try:
                     for r in conn.execute(
-                        "SELECT DISTINCT tenant FROM tasks WHERE session_id = ? AND tenant IS NOT NULL AND tenant != ''",
+                        """
+                        SELECT t.id, t.tenant
+                          FROM kanban_notify_subs s
+                          JOIN tasks t ON t.id = s.task_id
+                         WHERE s.chat_id = ?
+                        """,
                         (session_id,),
-                    ).fetchall()
-                ]
-                if seed_tenants:
-                    ph = ",".join("?" for _ in seed_tenants)
-                    where.append(f"(session_id = ? OR tenant IN ({ph}))")
-                    params.append(session_id)
-                    params.extend(seed_tenants)
-                else:
-                    where.append("session_id = ?")
-                    params.append(session_id)
+                    ).fetchall():
+                        matched_ids.add(r["id"])
+                        if r["tenant"]:
+                            seed_tenants_set.add(r["tenant"])
+                except sqlite3.Error:
+                    pass
+                clauses = ["session_id = ?"]
+                params.append(session_id)
+                if matched_ids:
+                    ph_ids = ",".join("?" for _ in matched_ids)
+                    clauses.append(f"id IN ({ph_ids})")
+                    params.extend(sorted(matched_ids))
+                if seed_tenants_set:
+                    ph_t = ",".join("?" for _ in seed_tenants_set)
+                    clauses.append(f"tenant IN ({ph_t})")
+                    params.extend(sorted(seed_tenants_set))
+                where.append("(" + " OR ".join(clauses) + ")")
 
             rows = [
                 dict(r)
@@ -364,14 +385,16 @@ def thread_cards(
                     task_ids,
                 ).fetchall():
                     runs_by_task.setdefault(run["task_id"], []).append(dict(run))
-                try:
-                    for edge in conn.execute(
-                        f"SELECT parent_id, child_id FROM task_deps WHERE child_id IN ({ph})",
-                        task_ids,
-                    ).fetchall():
-                        parents_by_child.setdefault(edge["child_id"], []).append(edge["parent_id"])
-                except sqlite3.Error:
-                    pass
+                for link_table in ("task_links", "task_deps"):
+                    try:
+                        for edge in conn.execute(
+                            f"SELECT parent_id, child_id FROM {link_table} WHERE child_id IN ({ph})",
+                            task_ids,
+                        ).fetchall():
+                            parents_by_child.setdefault(edge["child_id"], []).append(edge["parent_id"])
+                        break
+                    except sqlite3.Error:
+                        continue
 
             counts = {"running": 0, "blocked": 0, "triage": 0, "ready": 0, "done": 0}
             cards: list[dict[str, Any]] = []

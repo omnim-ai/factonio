@@ -25,7 +25,7 @@ def isolated_hermes_home() -> Iterator[Path]:
         ws_root = home / "kanban" / "workspaces"
         ws_root.mkdir(parents=True, exist_ok=True)
 
-        keys = (
+        keys = [
             "HOME",
             "HERMES_HOME",
             "HERMES_PROFILE",
@@ -33,7 +33,8 @@ def isolated_hermes_home() -> Iterator[Path]:
             "HERMES_KANBAN_BOARD",
             "HERMES_KANBAN_WORKSPACES_ROOT",
             "HERMES_KANBAN_TASK",
-        )
+            *(k for k in os.environ if k.startswith("HERMES_SESSION_")),
+        ]
         saved = {k: os.environ.get(k) for k in keys}
         os.environ["HOME"] = str(fake_user_home)
         os.environ["HERMES_HOME"] = str(home)
@@ -42,6 +43,9 @@ def isolated_hermes_home() -> Iterator[Path]:
         os.environ["HERMES_KANBAN_WORKSPACES_ROOT"] = str(ws_root)
         os.environ.pop("HERMES_PROFILE", None)
         os.environ.pop("HERMES_KANBAN_TASK", None)
+        for k in list(os.environ):
+            if k.startswith("HERMES_SESSION_"):
+                os.environ.pop(k, None)
 
         # Reset Hermes's cached HERMES_HOME override / kanban init cache if loaded.
         try:
