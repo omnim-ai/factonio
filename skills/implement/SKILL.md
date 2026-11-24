@@ -16,7 +16,8 @@ Deliver one scoped, tested change inside your assigned git worktree and publish 
 
 ## Information Barrier
 
-- Read only the repository files, `spec.md` (if linked), and review/fix findings attached to this card.
+- Read only the repository files, `spec.md` (if linked), approved `design/` artifacts (if linked on this card), and review/fix findings attached to this card.
+- When an Approved Design directory is linked, treat `DESIGN.md` and its previews/tokens as binding UI acceptance criteria alongside `spec.md`.
 - Never search for, open, or reference any `holdout/` directory or hidden test files. Holding back those scenarios is what keeps Black-Box Verification independent.
 
 ## Procedure

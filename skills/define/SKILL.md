@@ -78,6 +78,7 @@ Call `kanban_complete` with a 2-sentence `summary` and structured `metadata`:
 {
   "phase": "define",
   "spec_path": "<absolute path to spec.md>",
+  "has_ui": false,
   "holdout_count": 3,
   "units": [
     {"slug": "unit-1", "title": "...", "depends_on": []}
@@ -85,6 +86,8 @@ Call `kanban_complete` with a 2-sentence `summary` and structured `metadata`:
   "run_hint": "<command to build/run for black-box verification>"
 }
 ```
+
+Set `"has_ui": true` whenever the change introduces or visibly alters user-facing UI, layouts, styling, or interactive views so the orchestrator can dispatch Phase 1b (Design) before UI implementation.
 
 ## Error Handling
 

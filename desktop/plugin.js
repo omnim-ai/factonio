@@ -26,7 +26,7 @@ const ROUTE_PATH = '/factonio'
 
 // Factonio phase models live in Hermes Auxiliary Models (Settings → Model →
 // Auxiliary) under the `factonio_<phase>` aux task keys.
-const PHASE_ORDER = ['define', 'implement', 'verify', 'watchdog']
+const PHASE_ORDER = ['define', 'design', 'implement', 'verify', 'watchdog']
 
 function auxModelRoute(phase) {
   return `/settings?tab=config:model&aux=factonio_${phase}`
@@ -160,7 +160,7 @@ function AuxModelsNote({ suffix }) {
   return jsxs('span', {
     className: 'fc-aux-note',
     children: [
-      'Factonio phase models (define, implement, verify, watchdog) are configured in ',
+      'Factonio phase models (define, design, implement, verify, watchdog) are configured in ',
       jsx('strong', { children: 'Hermes Auxiliary Models' }),
       ' (Settings → Model → Auxiliary).',
       suffix || null
@@ -346,7 +346,7 @@ function FactonioPage({ ctx }) {
                     })
                   }),
                   jsx('tbody', {
-                    children: ['define', 'implement', 'verify-diff', 'verify-blackbox'].map(phase => {
+                    children: ['define', 'design', 'implement', 'verify-diff', 'verify-blackbox'].map(phase => {
                       const row = m?.phases?.[phase] || {}
                       return jsxs('tr', {
                         key: phase,

@@ -9,7 +9,10 @@ from typing import Any, Mapping, Optional
 PLUGIN_ID = "factonio"
 WORKER_PROFILE = "factonio"
 
-PHASES: tuple[str, ...] = ("define", "implement", "verify", "watchdog")
+PHASES: tuple[str, ...] = ("define", "design", "implement", "verify", "watchdog")
+
+DESIGN_PROVIDERS: tuple[str, ...] = ("auto", "claude-design", "hermes", "off")
+DESIGN_APPROVAL_POLICIES: tuple[str, ...] = ("ask", "auto")
 
 AUX_TASK_SPECS: tuple[dict[str, str], ...] = (
     {
@@ -17,6 +20,12 @@ AUX_TASK_SPECS: tuple[dict[str, str], ...] = (
         "phase": "define",
         "display_name": "Factonio: Definition",
         "description": "Codebase exploration, spec and task DAG authoring, bug root-cause diagnosis, and hidden holdout checks.",
+    },
+    {
+        "key": "factonio_design",
+        "phase": "design",
+        "display_name": "Factonio: Design",
+        "description": "Optional UI/UX design subphase (Phase 1b): supervises interactive Claude Design (/design) or generates pure-Hermes HTML/CSS prototypes.",
     },
     {
         "key": "factonio_implement",
@@ -43,6 +52,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "max_concurrent_workers": 4,
     "default_merge_policy": "auto",
     "default_max_fix_rounds": 3,
+    "design_provider": "auto",
+    "design_approval": "ask",
     "watchdog_interval_minutes": 5,
     "stale_heartbeat_minutes": 20,
     "blocked_reminder_minutes": 45,
@@ -335,6 +346,84 @@ def resolve_phase_model(
 def resolve_all_phase_models(*, repo_slug: Optional[str] = None) -> dict[str, dict[str, Any]]:
     """Return resolved model metadata for every Factonio phase."""
     return {phase: resolve_phase_model(phase, repo_slug=repo_slug) for phase in PHASES}
+
+
+def detect_claude_design_support() -> dict[str, Any]:
+    """Detect whether Claude Code CLI and local auth credentials are present for `/design`."""
+    import os
+    import shutil
+
+    claude_bin = shutil.which("claude")
+    home = Path(os.environ.get("HOME") or str(Path.home())).expanduser()
+    creds_path = home / ".claude" / ".credentials.json"
+    has_creds = creds_path.is_file() or bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
+    return {
+        "claude_bin": claude_bin,
+        "has_credentials": has_creds,
+        "available": bool(claude_bin and has_creds),
+    }
+
+
+def resolve_design_provider(
+    *,
+    repo_slug: Optional[str] = None,
+    override: Optional[str] = None,
+) -> dict[str, Any]:
+    """Resolve the effective Phase 1b design provider and approval policy."""
+    settings = load_settings(use_root=True)
+    repo = get_repo(repo_slug) if repo_slug else None
+
+    configured = (
+        override
+        or (repo.get("design_provider") if isinstance(repo, dict) else None)
+        or settings.get("design_provider")
+        or "auto"
+    )
+    configured = str(configured).strip().lower()
+    if configured not in DESIGN_PROVIDERS:
+        raise ValueError(
+            f"Unsupported design_provider {configured!r} (expected one of {', '.join(DESIGN_PROVIDERS)})"
+        )
+
+    approval = (
+        (repo.get("design_approval") if isinstance(repo, dict) else None)
+        or settings.get("design_approval")
+        or "ask"
+    )
+    approval = str(approval).strip().lower()
+    if approval not in DESIGN_APPROVAL_POLICIES:
+        approval = "ask"
+
+    probe = detect_claude_design_support()
+    if configured == "off":
+        effective = "off"
+        reason = "Phase 1b (Design) is disabled by design_provider=off."
+    elif configured == "hermes":
+        effective = "hermes"
+        reason = "Configured to use pure-Hermes prototyping."
+    elif configured == "claude-design":
+        effective = "claude-design"
+        reason = (
+            "Claude Code CLI and credentials detected."
+            if probe["available"]
+            else "design_provider=claude-design requires `claude` CLI on PATH and Claude login (~/.claude/.credentials.json)."
+        )
+    else:
+        if probe["available"]:
+            effective = "claude-design"
+            reason = "auto selected claude-design (claude CLI + credentials detected)."
+        else:
+            effective = "hermes"
+            reason = "auto fell back to pure-Hermes prototyping (claude CLI or credentials not found)."
+
+    return {
+        "configured": configured,
+        "effective": effective,
+        "approval": approval,
+        "claude_available": probe["available"],
+        "claude_bin": probe["claude_bin"],
+        "reason": reason,
+    }
 
 
 def check_cross_model_warning(*, repo_slug: Optional[str] = None) -> Optional[str]:

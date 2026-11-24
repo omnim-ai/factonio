@@ -15,6 +15,7 @@ from .config import (
     get_root_hermes_home_path,
     load_settings,
     resolve_all_phase_models,
+    resolve_design_provider,
     save_settings,
 )
 
@@ -26,9 +27,10 @@ You are a headless Factonio worker executing one scoped Kanban card inside a ded
 
 1. Start every card by following the preloaded `factonio:*` skill instructions for your phase.
 2. Stay strictly within the scope and information barrier of your card:
-   - Implementation cards read `spec.md` and code; never look for or read `holdout/` scenarios.
-   - Diff Check cards read `spec.md` and the PR diff; never read `holdout/`.
-   - Black-Box Check cards read acceptance criteria and `holdout/` and run the built artifact; never read `git diff` or implementation source files.
+   - Design cards read `spec.md` and the repo; never look for or read `holdout/` scenarios.
+   - Implementation cards read `spec.md`, approved `design/` artifacts (if linked), and code; never look for or read `holdout/` scenarios.
+   - Diff Check cards read `spec.md`, approved `design/` artifacts (if linked), and the PR diff; never read `holdout/`.
+   - Black-Box Check cards read acceptance criteria, approved `design/` previews (if linked), and `holdout/` and run the built artifact; never read `git diff` or implementation source files.
 3. Verify claims with real commands and test output before completing a card.
 4. Keep comments and completion summaries concise and structured. Put changed files, PR URLs, check results, and verdicts in `metadata`.
 5. Never invent secrets, never bypass CI gates, and block with `needs_input` only when a genuine human decision is required.
@@ -296,10 +298,23 @@ def run_doctor(plugin_dir: Path) -> dict[str, Any]:
     if cross_warn:
         warnings.append(cross_warn)
 
+    design_info = resolve_design_provider()
+    if design_info["configured"] == "claude-design":
+        checks.append({
+            "name": "claude_design",
+            "ok": bool(design_info["claude_available"]),
+            "detail": design_info["reason"],
+        })
+    elif design_info["configured"] == "auto" and not design_info["claude_available"]:
+        warnings.append(
+            "Phase 1b design_provider=auto: Claude CLI/credentials not detected, will use pure-Hermes prototyping fallback."
+        )
+
     return {
         "ok": all(c["ok"] for c in checks),
         "checks": checks,
         "warnings": warnings,
         "models": models,
+        "design": design_info,
         "plugin_dir": str(plugin_dir.resolve()),
     }

@@ -24,7 +24,7 @@ import yaml
 from tests._env import PLUGIN_ROOT
 
 PLUGIN_JS = PLUGIN_ROOT / "desktop" / "plugin.js"
-PHASES = ["define", "implement", "verify", "watchdog"]
+PHASES = ["define", "design", "implement", "verify", "watchdog"]
 
 
 def aux_route(phase: str) -> str:
@@ -84,6 +84,7 @@ globalThis.document = {
 const MODELS = {
   models: {
     define: { provider: 'anthropic', model: 'claude-x', source: 'auxiliary.factonio_define' },
+    design: { provider: 'anthropic', model: 'claude-design-m', source: 'auxiliary.factonio_design' },
     implement: { provider: 'openai', model: 'gpt-y', source: 'auxiliary.factonio_implement' },
     verify: { provider: '', model: 'solo-model', source: 'auxiliary.factonio_verify' },
     watchdog: {}

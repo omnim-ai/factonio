@@ -68,11 +68,15 @@ def classify_phase(task: dict[str, Any]) -> str:
         return "verify-blackbox"
     if "factonio:define" in skill_set:
         return "define"
+    if "factonio:design" in skill_set:
+        return "design"
     if "factonio:implement" in skill_set:
         return "implement"
     title = str(task.get("title") or "").lower()
     if title.startswith("[define]") or "definition:" in title:
         return "define"
+    if title.startswith("[design]") or "design:" in title:
+        return "design"
     if title.startswith("[verify:diff]") or "diff check" in title:
         return "verify-diff"
     if title.startswith("[verify:blackbox]") or "black-box" in title:
@@ -143,7 +147,7 @@ def compute_metrics(
         "totals": {"cards": 0, "done": 0, "running": 0, "blocked": 0, "triage": 0, "workstreams": 0},
         "phases": {
             p: {"count": 0, "done": 0, "median_seconds": None, "p90_seconds": None}
-            for p in ("define", "implement", "verify-diff", "verify-blackbox")
+            for p in ("define", "design", "implement", "verify-diff", "verify-blackbox")
         },
         "verification": {
             "diff": {"pass": 0, "reject": 0, "pass_rate": None},
@@ -194,6 +198,7 @@ def compute_metrics(
 
             phase_durations: dict[str, list[float]] = {
                 "define": [],
+                "design": [],
                 "implement": [],
                 "verify-diff": [],
                 "verify-blackbox": [],

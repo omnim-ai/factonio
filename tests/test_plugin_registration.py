@@ -38,17 +38,19 @@ class TestPluginRegistration(unittest.TestCase):
             mgr = PluginManager()
             mgr.discover_and_load(force=True)
 
-            # 1. All 4 phase auxiliary tasks registered
+            # 1. All 5 phase auxiliary tasks registered
             aux_keys = set(mgr._aux_tasks.keys())
             self.assertTrue(
-                {"factonio_define", "factonio_implement", "factonio_verify", "factonio_watchdog"} <= aux_keys,
+                {"factonio_define", "factonio_design", "factonio_implement", "factonio_verify", "factonio_watchdog"}
+                <= aux_keys,
                 f"Missing aux tasks: {aux_keys}",
             )
 
-            # 2. All 5 bundled skills resolvable as `factonio:<name>`
+            # 2. All 6 bundled skills resolvable as `factonio:<name>`
             expected_skills = {
                 "factonio:orchestrator",
                 "factonio:define",
+                "factonio:design",
                 "factonio:implement",
                 "factonio:verify-diff",
                 "factonio:verify-blackbox",

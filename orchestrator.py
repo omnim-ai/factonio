@@ -13,6 +13,7 @@ from .config import (
     get_repo,
     get_root_hermes_home_path,
     load_settings,
+    resolve_design_provider,
     resolve_phase_model,
 )
 from .metrics import thread_cards
@@ -48,6 +49,24 @@ def holdout_dir_path(tenant: str) -> Path:
     path = run_data_dir(tenant) / "holdout"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def design_dir_path(tenant: str) -> Path:
+    path = run_data_dir(tenant) / "design"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _has_design_artifacts(tenant: str) -> Optional[Path]:
+    """Return the run's design/ directory if Phase 1b produced files there, else None."""
+    d = run_data_dir(tenant) / "design"
+    if d.is_dir():
+        try:
+            if any(p.name != ".gitkeep" for p in d.iterdir()):
+                return d
+        except OSError:
+            pass
+    return None
 
 
 def _phase_model_kwargs(phase: str, repo_slug: str, subphase: Optional[str] = None) -> dict[str, Any]:
@@ -251,6 +270,109 @@ def start_workstream(
     }
 
 
+def spawn_design_card(
+    repo_spec: str,
+    tenant: str,
+    *,
+    title: Optional[str] = None,
+    brief: Optional[str] = None,
+    provider: Optional[str] = None,
+    parents: Optional[list[str]] = None,
+    session_id: Optional[str] = None,
+    board: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> dict[str, Any]:
+    """Create a Phase 1b Design card (interactive Claude Design `/design` or pure-Hermes fallback)."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+
+    repo = get_repo(repo_spec)
+    if repo is None:
+        raise ValueError(f"Repository {repo_spec!r} is not registered with Factonio.")
+
+    slug = str(repo["slug"])
+    full_repo = str(repo["repo"])
+    repo_path = str(repo["path"])
+    spec_path = spec_file_path(tenant)
+    design_dir = design_dir_path(tenant)
+    design_info = resolve_design_provider(repo_slug=slug, override=provider)
+
+    if design_info["effective"] == "off":
+        return {
+            "ok": False,
+            "skipped": True,
+            "phase": "design",
+            "tenant": tenant,
+            "repo": full_repo,
+            "design_provider": design_info,
+            "reason": design_info["reason"],
+        }
+
+    if design_info["configured"] == "claude-design" and not design_info["claude_available"]:
+        raise ValueError(
+            f"{design_info['reason']} Install/authenticate `claude`, or set `design_provider` to `auto` or `hermes`."
+        )
+
+    model_info = _phase_model_kwargs("design", slug)
+    short_title = (title or f"UI/UX design for {tenant}").strip()[:108]
+    brief_block = f"\n## Design Brief\n{brief.strip()}\n" if (brief and brief.strip()) else ""
+
+    body = (
+        f"## Factonio Design Card (Phase 1b)\n"
+        f"- Repository: `{full_repo}` (`{repo_path}`)\n"
+        f"- Workstream tenant: `{tenant}`\n"
+        f"- Spec: `{spec_path}`\n"
+        f"- Design output directory: `{design_dir}`\n"
+        f"- Design provider: `{design_info['effective']}` (configured: `{design_info['configured']}`)\n"
+        f"- Approval policy: `{design_info['approval']}`\n"
+        f"{brief_block}\n"
+        f"## Information Barrier\n"
+        f"Read only the repository and `{spec_path}`. Do not search for or read any `holdout/` files.\n\n"
+        f"## Instructions\n"
+        f"Follow the preloaded `factonio:design` skill using provider `{design_info['effective']}`. "
+        f"Write `{design_dir}/DESIGN.md` plus self-contained static HTML previews and rendered screenshots under `{design_dir}` "
+        f"(and record the `claude.ai/artifact/<id>` link when using `claude-design`). "
+        f"Do not edit repository production code or open a PR from this card.\n"
+    )
+
+    effective_session_id = _resolve_calling_session_id(session_id)
+    with connect_closing(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title=f"[design] {short_title}"[:120],
+            body=body,
+            assignee=WORKER_PROFILE,
+            created_by=PLUGIN_ID,
+            workspace_kind="dir",
+            workspace_path=repo_path,
+            project_id="",
+            tenant=tenant,
+            parents=parents or [],
+            idempotency_key=idempotency_key,
+            skills=["factonio:design"],
+            model_override=model_info["model_override"],
+            provider_override=model_info["provider_override"],
+            goal_mode=True,
+            session_id=effective_session_id,
+            board=board,
+            completion_contract="local-only",
+        )
+        subscribed = _auto_subscribe_task(conn, task_id, session_id=effective_session_id)
+
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "phase": "design",
+        "skill": "factonio:design",
+        "tenant": tenant,
+        "repo": full_repo,
+        "design_dir": str(design_dir),
+        "design_provider": design_info,
+        "model": model_info["resolved"],
+        "subscribed": subscribed,
+    }
+
+
 def spawn_implementation_card(
     repo_spec: str,
     tenant: str,
@@ -275,19 +397,23 @@ def spawn_implementation_card(
     repo_path = str(repo["path"])
     project_slug = str(repo.get("project_slug") or slug)
     spec_path = spec_file_path(tenant)
+    design_dir = _has_design_artifacts(tenant)
     model_info = _phase_model_kwargs("implement", slug)
     contract = _completion_contract_for_repo(repo)
+    design_line = f"- Approved Design directory: `{design_dir}` (treat `DESIGN.md` and previews as binding UI acceptance)\n" if design_dir else ""
+    design_barrier_note = f" and `{design_dir}`" if design_dir else ""
 
     body = (
         f"## Factonio Implementation Card\n"
         f"- Repository: `{full_repo}` (`{repo_path}`)\n"
         f"- Workstream tenant: `{tenant}`\n"
         f"- Spec: `{spec_path}`\n"
+        f"{design_line}"
         f"- Default branch: `{repo.get('default_branch', 'main')}`\n"
         f"- Max fix rounds: `{repo.get('max_fix_rounds', 3)}`\n\n"
         f"## Work Unit\n{unit_body.strip()}\n\n"
         f"## Information Barrier\n"
-        f"Read only the repository and `{spec_path}`. Do not search for or read any `holdout/` files.\n"
+        f"Read only the repository, `{spec_path}`{design_barrier_note}. Do not search for or read any `holdout/` files.\n"
     )
 
     effective_session_id = _resolve_calling_session_id(session_id)
@@ -350,28 +476,33 @@ def spawn_verification_pair(
     repo_path = str(repo["path"])
     spec_path = spec_file_path(tenant)
     holdout_dir = holdout_dir_path(tenant)
+    design_dir = _has_design_artifacts(tenant)
     parents = [impl_card_id] if impl_card_id else []
     sha_line = f"- Expected HEAD SHA: `{head_sha}`\n" if head_sha else ""
+    design_line = f"- Approved Design directory: `{design_dir}`\n" if design_dir else ""
     pr_ref = f"{full_repo}#{int(pr_number)}"
 
     diff_model = _phase_model_kwargs("verify", slug, subphase="verify_diff")
     bb_model = _phase_model_kwargs("verify", slug, subphase="verify_blackbox")
 
-    # Diff Check: sees spec + PR diff; NEVER given holdout_dir.
+    # Diff Check: sees spec + approved design (if any) + PR diff; NEVER given holdout_dir.
     diff_body = (
         f"## Factonio Diff Verification Card\n"
         f"- Repository: `{full_repo}` (`{repo_path}`)\n"
         f"- Pull Request: `{pr_ref}`\n"
         f"{sha_line}"
         f"- Workstream tenant: `{tenant}`\n"
-        f"- Spec: `{spec_path}`\n\n"
+        f"- Spec: `{spec_path}`\n"
+        f"{design_line}\n"
         f"## Information Barrier\n"
-        f"Audit the PR diff (`gh pr diff {int(pr_number)} --repo {full_repo}`) against `{spec_path}`. "
+        f"Audit the PR diff (`gh pr diff {int(pr_number)} --repo {full_repo}`) against `{spec_path}`"
+        f"{f' and `{design_dir}`' if design_dir else ''}. "
         f"Do not inspect any `holdout/` directory. Return structured metadata with `verdict: pass|reject`, "
         f"`pr_number: {int(pr_number)}`, `repo: {full_repo}`, and `findings: [...]`.\n"
     )
 
-    # Black-Box Check: sees acceptance criteria + holdout + built app; FORBIDDEN from reading git diff or source files.
+    # Black-Box Check: sees acceptance criteria + approved design previews (if any) + holdout + built app;
+    # FORBIDDEN from reading git diff or source files.
     hint_section = f"\n## Run / Target Hint\n{run_hint.strip()}\n" if run_hint else ""
     bb_body = (
         f"## Factonio Black-Box Verification Card\n"
@@ -380,11 +511,13 @@ def spawn_verification_pair(
         f"{sha_line}"
         f"- Workstream tenant: `{tenant}`\n"
         f"- Acceptance spec: `{spec_path}` (read ONLY the Goals & Acceptance Criteria sections)\n"
+        f"{design_line}"
         f"- Hidden holdout directory: `{holdout_dir}`\n"
         f"{hint_section}\n"
         f"## Information Barrier\n"
         f"Verify observable behavior only by building/running the PR branch in a fresh checkout or test harness "
-        f"and executing the acceptance criteria plus every scenario under `{holdout_dir}`. "
+        f"and executing the acceptance criteria plus every scenario under `{holdout_dir}`"
+        f"{f', comparing rendered UI fidelity against `{design_dir}`' if design_dir else ''}. "
         f"NEVER run `git diff`, NEVER inspect PR diffs, and NEVER read implementation source code. "
         f"Return structured metadata with `verdict: pass|reject`, `pr_number: {int(pr_number)}`, "
         f"`repo: {full_repo}`, `scenarios_run`, and `findings: [...]`.\n"

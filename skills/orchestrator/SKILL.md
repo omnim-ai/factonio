@@ -6,7 +6,7 @@ license: MIT
 
 # Factonio Orchestrator
 
-Coordinate software delivery on registered GitHub repositories across three phases (Definition, Implementation, and isolated parallel Verification) using the dedicated `factonio` worker profile.
+Coordinate software delivery on registered GitHub repositories across Definition, optional Phase 1b Design (interactive Claude Design `/design` or pure-Hermes fallback), Implementation, and isolated parallel Verification using the dedicated `factonio` worker profile.
 
 ## When to Use
 
@@ -26,18 +26,27 @@ Coordinate software delivery on registered GitHub repositories across three phas
 1. Confirm the target repository is registered using `factonio_status`. If missing, register it with `factonio_add_repo`.
 2. Ask at most one concise batch of clarifying questions if scope, acceptance criteria, or constraints are genuinely ambiguous.
 3. Choose the entry path:
-   - **Feature (`kind="feature"`):** Definition -> parallel Implementation -> parallel Verification -> Merge.
+   - **Feature (`kind="feature"`):** Definition -> optional Phase 1b Design (when `has_ui: true` or requested) -> parallel Implementation -> parallel Verification -> Merge.
    - **Bug (`kind="bug"`):** Definition (diagnosis mode) -> Implementation -> parallel Verification -> Merge.
    - **Small obvious change (`kind="quick"`):** Implementation -> Verification -> Merge.
 4. If the user reports a regression in work that previously passed Verification, pass `escaped_from="<verify_card_id>"` to `factonio_start` so escape rate stays accurate.
 
-### 2. Fan-Out Implementation
+### 2. Optional Phase 1b Design (UI Work)
 
-1. When a Definition card completes, inspect its `spec.md` path and completion metadata. Never open or quote `holdout/` files in Implementation briefs or chat summaries meant for implementers.
-2. Dispatch every independent task unit from the spec DAG in parallel using `factonio_spawn_implement`, chaining only true dependencies via `parents`.
+1. When Definition completes with `has_ui: true` (or the user explicitly requests a design pass) and `design_provider` is not `off`, call `factonio_spawn_design(repo, tenant, title=..., brief=..., parents=[define_task_id])`.
+2. Non-UI implementation units from the spec DAG can still run in parallel; UI units wait on Design approval.
+3. When the Design card completes:
+   - Inspect `design_dir`, `artifact_url` (if `claude-design` ran), `preview_files`, and `screenshots` in completion metadata.
+   - If `approval_policy == "ask"`: present the `claude.ai/artifact/...` link, inline static HTML previews (`::preview{file="..."}`), and screenshots (`MEDIA:...`) to the user and wait for explicit approval (or revision feedback) before spawning UI Implementation cards.
+   - If `approval_policy == "auto"`: proceed directly to Implementation.
+
+### 3. Fan-Out Implementation
+
+1. When Definition (and approved Phase 1b Design, if applicable) completes, inspect `spec.md` and completion metadata. Never open or quote `holdout/` files in Implementation briefs or chat summaries meant for implementers.
+2. Dispatch every independent task unit from the spec DAG in parallel using `factonio_spawn_implement` (which automatically attaches approved `design/` artifacts when present), chaining only true dependencies via `parents`.
 3. End your turn after dispatching cards; Kanban notifies you on block or completion. Do not sleep-poll in the foreground.
 
-### 3. Isolated Parallel Verification
+### 4. Isolated Parallel Verification
 
 1. When an Implementation card finishes with a PR number and `head_sha`, immediately call `factonio_spawn_verify` with `repo`, `tenant`, `pr_number`, `impl_card_id`, and `head_sha`.
 2. That launches two independent cards concurrently on the configured Verification model:
@@ -48,7 +57,7 @@ Coordinate software delivery on registered GitHub repositories across three phas
    - Within budget: spawn or reopen an Implementation fix round with the concrete findings (still never leaking `holdout/` text; report only observable failure symptoms from Black-Box Check).
    - Over budget: stop and escalate the findings and options to the user.
 
-### 4. Merge Gate
+### 5. Merge Gate
 
 1. When both `verify-diff` and `verify-blackbox` complete with `verdict: pass`, call `factonio_pr_gate(repo, pr_number)`.
 2. Verify `ready_to_merge: true` and that live `head_sha` matches the verified commit SHA.

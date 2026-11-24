@@ -17,7 +17,7 @@ Verify observable behavior end to end against acceptance criteria and hidden hol
 ## Strict Information Barrier
 
 This barrier is the entire reason Black-Box Verification runs in an isolated card:
-- **Allowed:** Acceptance criteria from `spec.md`, every scenario file under the card's `holdout/` directory, build/run/test entrypoints (`README.md`, `package.json`, `Makefile`, `pyproject.toml`), and running the built binary, CLI, API, or web UI (`terminal` or `browser_exec`).
+- **Allowed:** Acceptance criteria from `spec.md`, approved `design/` previews and `DESIGN.md` (if linked on this card), every scenario file under the card's `holdout/` directory, build/run/test entrypoints (`README.md`, `package.json`, `Makefile`, `pyproject.toml`), and running the built binary, CLI, API, or web UI (`terminal` or `browser_exec`).
 - **Forbidden:** Never run `git diff`, `git show`, `gh pr diff`, or read implementation source files under `src/`, `lib/`, `app/`, etc. Judge the software strictly by what a user or caller observes.
 
 ## Procedure
@@ -38,7 +38,7 @@ This barrier is the entire reason Black-Box Verification runs in an isolated car
 1. Read the Goals and Acceptance Criteria section of `spec.md` (stop before Technical approach).
 2. Read every scenario file inside the card's `holdout/` directory.
 3. Build or start the application using the documented command or `run_hint`.
-4. Execute every holdout scenario and acceptance check, capturing exact commands, exit codes, stdout/stderr, HTTP responses, or browser observations.
+4. Execute every holdout scenario and acceptance check, capturing exact commands, exit codes, stdout/stderr, HTTP responses, or browser observations. When an Approved Design directory is linked, render the built UI in a browser and compare visual hierarchy, states, and layout fidelity against the approved design previews.
 5. Shut down any temporary server processes you started before finishing.
 
 ### 3. Record Verdict

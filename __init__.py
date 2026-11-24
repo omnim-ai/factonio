@@ -19,6 +19,7 @@ PLUGIN_DIR = Path(__file__).resolve().parent
 SKILL_NAMES: tuple[str, ...] = (
     "orchestrator",
     "define",
+    "design",
     "implement",
     "verify-diff",
     "verify-blackbox",
@@ -26,11 +27,11 @@ SKILL_NAMES: tuple[str, ...] = (
 
 ORCHESTRATOR_PROMPT_SECTION = """## Factonio Software Factory
 
-Factonio is active for orchestrating software delivery on registered GitHub repositories using three phases (Definition, Implementation, and isolated parallel Verification) on the dedicated headless `factonio` worker profile.
+Factonio is active for orchestrating software delivery on registered GitHub repositories using Definition, optional Phase 1b Design (interactive Claude Design `/design` or pure-Hermes fallback), Implementation, and isolated parallel Verification on the dedicated headless `factonio` worker profile.
 
 - When the user asks to work on a GitHub repo through Factonio, load `factonio:orchestrator` via `skill_view(name="factonio:orchestrator")` for the full workflow.
 - Register new repositories with `factonio_add_repo` (or `hermes factonio add owner/repo`).
-- Start workstreams with `factonio_start`, fan out parallel worktree units with `factonio_spawn_implement`, and always verify PRs with `factonio_spawn_verify` (which launches Diff Check and Black-Box Check in parallel with mutually exclusive inputs to prevent confirmation bias).
+- Start workstreams with `factonio_start`, spawn Phase 1b UI design with `factonio_spawn_design` when a task touches UI (or on request), fan out parallel worktree units with `factonio_spawn_implement`, and always verify PRs with `factonio_spawn_verify` (which launches Diff Check and Black-Box Check in parallel with mutually exclusive inputs to prevent confirmation bias).
 - Before reporting a PR ready or merging, verify live HEAD and CI via `factonio_pr_gate`. Auto-merge with `factonio_merge_pr` only when CI and both isolated verification checks pass (unless the repo sets `merge_policy: ask`).
 - If the user reports a bug in work that passed Verification, start the fix with `escaped_from=<verify_card_id>` so escape rate stays measurable.
 """

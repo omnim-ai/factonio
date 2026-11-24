@@ -5,8 +5,15 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .config import PLUGIN_ID, check_cross_model_warning, list_repos, resolve_all_phase_models
+from .config import (
+    PLUGIN_ID,
+    check_cross_model_warning,
+    list_repos,
+    resolve_all_phase_models,
+    resolve_design_provider,
+)
 from .orchestrator import (
+    spawn_design_card,
     spawn_implementation_card,
     spawn_verification_pair,
     start_workstream,
@@ -106,6 +113,53 @@ def register_tools(ctx: Any) -> None:
         handler=handle_start,
     )
 
+    def handle_spawn_design(args: dict[str, Any], **kwargs: Any) -> str:
+        try:
+            res = spawn_design_card(
+                str(args["repo"]),
+                str(args["tenant"]),
+                title=args.get("title"),
+                brief=args.get("brief"),
+                provider=args.get("provider"),
+                parents=args.get("parents"),
+                session_id=kwargs.get("session_id"),
+                idempotency_key=args.get("idempotency_key"),
+            )
+            return _json_ok(res)
+        except Exception as exc:
+            return _json_err(exc)
+
+    ctx.register_tool(
+        name="factonio_spawn_design",
+        toolset=PLUGIN_ID,
+        schema={
+            "name": "factonio_spawn_design",
+            "description": (
+                "Spawn a Phase 1b Design card for UI/UX work in an existing Factonio workstream. "
+                "Drives interactive Claude Design (/design) when available or falls back to pure-Hermes prototyping, "
+                "writing DESIGN.md, static HTML previews, and screenshots to the run's design/ directory without exposing holdout/."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Registered repo slug or 'owner/repo'."},
+                    "tenant": {"type": "string", "description": "Workstream tenant slug."},
+                    "title": {"type": "string", "description": "Short design task title."},
+                    "brief": {"type": "string", "description": "UI/UX design brief, constraints, and surface scope."},
+                    "provider": {
+                        "type": "string",
+                        "enum": ["auto", "claude-design", "hermes", "off"],
+                        "description": "Optional per-card override for design_provider.",
+                    },
+                    "parents": {"type": "array", "items": {"type": "string"}, "description": "Parent card ids (e.g. Definition card)."},
+                    "idempotency_key": {"type": "string", "description": "Optional retry-safe key."},
+                },
+                "required": ["repo", "tenant"],
+            },
+        },
+        handler=handle_spawn_design,
+    )
+
     def handle_spawn_implement(args: dict[str, Any], **kwargs: Any) -> str:
         try:
             res = spawn_implementation_card(
@@ -194,6 +248,7 @@ def register_tools(ctx: Any) -> None:
             )
             res["repos"] = list(list_repos().keys())
             res["models"] = resolve_all_phase_models(repo_slug=args.get("repo"))
+            res["design"] = resolve_design_provider(repo_slug=args.get("repo"))
             res["cross_model_warning"] = check_cross_model_warning(repo_slug=args.get("repo"))
             return _json_ok(res)
         except Exception as exc:

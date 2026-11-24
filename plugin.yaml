@@ -13,6 +13,7 @@ requires_hermes: ">=0.1.0"
 provides_tools:
   - factonio_add_repo
   - factonio_start
+  - factonio_spawn_design
   - factonio_spawn_implement
   - factonio_spawn_verify
   - factonio_status
@@ -42,6 +43,18 @@ config_schema:
     default: 3
     label: "Default max fix rounds"
     description: "Maximum review/QA repair loops per PR before escalating to the user."
+  design_provider:
+    type: str
+    choices: [auto, claude-design, hermes, off]
+    default: auto
+    label: "Design subphase provider"
+    description: "auto uses interactive Claude Design (/design) when claude CLI is authenticated, else falls back to pure-Hermes prototyping; off skips Phase 1b."
+  design_approval:
+    type: str
+    choices: [ask, auto]
+    default: ask
+    label: "Design approval policy"
+    description: "ask pauses after Phase 1b (Design) to present previews/artifacts before Implementation; auto proceeds immediately."
   watchdog_interval_minutes:
     type: int
     default: 5
