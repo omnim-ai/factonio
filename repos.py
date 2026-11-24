@@ -15,6 +15,7 @@ from .config import (
     get_repo,
     list_repos,
     load_settings,
+    repos_store_lock,
     save_settings,
 )
 
@@ -283,9 +284,51 @@ def add_repo(
 
     project_slug = _ensure_hermes_project(slug, full_repo, checkout) if checkout.exists() else None
 
-    repos = list_repos()
-    raw_existing = repos.get(slug)
-    existing = raw_existing if isinstance(raw_existing, dict) else {}
+    # Re-read the live store under the transaction lock so concurrent writers that
+    # landed during the (slow, unlocked) clone/inspect above are merged, not clobbered.
+    with repos_store_lock():
+        repos = list_repos()
+        raw_existing = repos.get(slug)
+        existing = raw_existing if isinstance(raw_existing, dict) else {}
+        if merge_policy is None and existing.get("merge_policy"):
+            policy = str(existing["merge_policy"])
+        if max_fix_rounds is None and existing.get("max_fix_rounds") is not None:
+            rounds = existing["max_fix_rounds"]
+        entry = _build_added_entry(
+            existing,
+            slug=slug,
+            full_repo=full_repo,
+            remote_info=remote_info,
+            checkout=checkout,
+            project_slug=project_slug,
+            explicit_branch=explicit_branch,
+            policy=policy,
+            rounds=rounds,
+            design_updates=design_updates,
+        )
+        repos[slug] = entry
+        save_settings({"repos": repos})
+
+    return {
+        "ok": True,
+        "cloned": cloned,
+        "repo": entry,
+    }
+
+
+def _build_added_entry(
+    existing: dict[str, Any],
+    *,
+    slug: str,
+    full_repo: str,
+    remote_info: dict[str, Any],
+    checkout: Path,
+    project_slug: Optional[str],
+    explicit_branch: Optional[str],
+    policy: Any,
+    rounds: Any,
+    design_updates: dict[str, Optional[str]],
+) -> dict[str, Any]:
     entry: dict[str, Any] = {
         **existing,
         "slug": slug,
@@ -305,14 +348,7 @@ def add_repo(
             entry.pop(field, None)
         else:
             entry[field] = value
-    repos[slug] = entry
-    save_settings({"repos": repos})
-
-    return {
-        "ok": True,
-        "cloned": cloned,
-        "repo": entry,
-    }
+    return entry
 
 
 def update_repo(
@@ -351,17 +387,22 @@ def update_repo(
     validated = _validate_editable_fields(supplied)
 
     slug = str(found["slug"])
-    repos = list_repos()
-    base = repos.get(slug)
-    entry: dict[str, Any] = dict(base) if isinstance(base, dict) else dict(found)
-    entry["slug"] = slug
-    for field, value in validated.items():
-        if field in ("design_provider", "design_approval") and value is None:
-            entry.pop(field, None)
-        else:
-            entry[field] = value
-    repos[slug] = entry
-    save_settings({"repos": repos})
+    # Serialize the whole read-modify-write: re-read the live store while holding the
+    # cross-process lock and apply only the supplied fields to the fresh entry.
+    with repos_store_lock():
+        repos = list_repos()
+        base = repos.get(slug)
+        if not isinstance(base, dict):
+            raise RepoNotFoundError(f"Repository {slug_or_full!r} is not registered.")
+        entry: dict[str, Any] = dict(base)
+        entry["slug"] = slug
+        for field, value in validated.items():
+            if field in ("design_provider", "design_approval") and value is None:
+                entry.pop(field, None)
+            else:
+                entry[field] = value
+        repos[slug] = entry
+        save_settings({"repos": repos})
 
     return {"ok": True, "repo": entry, "updated_fields": sorted(validated)}
 
@@ -372,9 +413,10 @@ def remove_repo(slug_or_full: str) -> dict[str, Any]:
     if found is None:
         return {"ok": False, "error": f"Repository {slug_or_full!r} is not registered."}
     slug = str(found["slug"])
-    repos = list_repos()
-    repos.pop(slug, None)
-    save_settings({"repos": repos})
+    with repos_store_lock():
+        repos = list_repos()
+        repos.pop(slug, None)
+        save_settings({"repos": repos})
     return {"ok": True, "removed": slug, "repo": found.get("repo")}
 
 

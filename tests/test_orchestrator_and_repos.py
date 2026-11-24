@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -500,6 +502,137 @@ class TestRepoUpdate(unittest.TestCase):
             self.assertNotIn("design_approval", r)
             self.assertEqual(r["merge_policy"], "auto")
             self.assertEqual(r["max_fix_rounds"], 3)
+
+
+def _mp_update_worker(barrier, kwargs, queue):
+    """Child-process entry: wait on the barrier, then call update_repo concurrently."""
+    try:
+        from factonio.repos import update_repo
+
+        barrier.wait(timeout=30)
+        res = update_repo("acme/sample", **kwargs)
+        queue.put(("ok", bool(res.get("ok"))))
+    except BaseException as exc:  # noqa: BLE001 - report every failure to the parent
+        queue.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+class TestRepoStoreConcurrency(unittest.TestCase):
+    def _register(self, home: Path, spec: str):
+        from factonio.repos import add_repo
+
+        local = home / "dev" / spec.split("/")[1]
+        local.mkdir(parents=True, exist_ok=True)
+        (local / ".git").mkdir(exist_ok=True)
+        return add_repo(spec, local_path=str(local), clone=False, inspect_remote=False)
+
+    def _store_path(self, home: Path) -> Path:
+        return home / "plugin-data" / "factonio" / "repos.json"
+
+    def test_concurrent_thread_updates_preserve_all_changes(self):
+        import threading
+
+        from factonio import config as cfg
+        from factonio.repos import update_repo
+
+        with isolated_hermes_home() as home:
+            self._register(home, "acme/sample")
+            self._register(home, "acme/other")
+
+            # Widen the race window: every read of the store yields to other threads.
+            real_read = cfg._read_repos_store
+
+            def slow_read():
+                data = real_read()
+                time.sleep(0.02)
+                return data
+
+            jobs = [
+                ("acme/sample", {"merge_policy": "ask"}),
+                ("acme/sample", {"max_fix_rounds": 7}),
+                ("acme/other", {"default_branch": "develop"}),
+                ("acme/other", {"design_provider": "hermes"}),
+            ]
+            barrier = threading.Barrier(len(jobs))
+            results: list = [None] * len(jobs)
+
+            def run(i, repo, kwargs):
+                barrier.wait(timeout=10)
+                try:
+                    results[i] = update_repo(repo, **kwargs)
+                except BaseException as exc:  # noqa: BLE001
+                    results[i] = exc
+
+            with mock.patch.object(cfg, "_read_repos_store", slow_read):
+                threads = [threading.Thread(target=run, args=(i, r, k)) for i, (r, k) in enumerate(jobs)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=30)
+
+            for res in results:
+                self.assertIsInstance(res, dict, msg=repr(res))
+                self.assertTrue(res["ok"])
+            store = json.loads(self._store_path(home).read_text(encoding="utf-8"))
+            self.assertEqual(store["acme-sample"]["merge_policy"], "ask")
+            self.assertEqual(store["acme-sample"]["max_fix_rounds"], 7)
+            self.assertEqual(store["acme-other"]["default_branch"], "develop")
+            self.assertEqual(store["acme-other"]["design_provider"], "hermes")
+            self.assertEqual(store["acme-other"]["merge_policy"], "auto")
+            self.assertEqual(store["acme-other"]["max_fix_rounds"], 3)
+            leftovers = [p.name for p in self._store_path(home).parent.glob("*.tmp")]
+            self.assertEqual(leftovers, [])
+
+    def test_concurrent_process_updates_never_corrupt_store(self):
+        import multiprocessing
+
+        from factonio.config import get_repo
+
+        try:
+            ctx = multiprocessing.get_context("fork")
+        except ValueError:
+            self.skipTest("fork start method unavailable on this platform")
+
+        trials = 8
+        for trial in range(trials):
+            with self.subTest(trial=trial), isolated_hermes_home() as home:
+                self._register(home, "acme/sample")
+                barrier = ctx.Barrier(2)
+                queue = ctx.Queue()
+                procs = [
+                    ctx.Process(target=_mp_update_worker, args=(barrier, {"merge_policy": "ask"}, queue)),
+                    ctx.Process(target=_mp_update_worker, args=(barrier, {"max_fix_rounds": 9}, queue)),
+                ]
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    for p in procs:
+                        p.start()
+                outcomes = [queue.get(timeout=60) for _ in procs]
+                for p in procs:
+                    p.join(timeout=60)
+                    self.assertEqual(p.exitcode, 0)
+                self.assertEqual(outcomes, [("ok", True), ("ok", True)], msg=repr(outcomes))
+
+                raw = self._store_path(home).read_text(encoding="utf-8")
+                store = json.loads(raw)  # must be well-formed JSON
+                self.assertEqual(store["acme-sample"]["merge_policy"], "ask")
+                self.assertEqual(store["acme-sample"]["max_fix_rounds"], 9)
+                repo = get_repo("acme/sample")
+                self.assertIsNotNone(repo)
+                leftovers = [p.name for p in self._store_path(home).parent.glob("*.tmp")]
+                self.assertEqual(leftovers, [])
+
+    def test_save_repos_store_uses_unique_temp_and_cleans_up_on_failure(self):
+        from factonio import config as cfg
+
+        with isolated_hermes_home() as home:
+            self._register(home, "acme/sample")
+            before = self._store_path(home).read_text(encoding="utf-8")
+            with mock.patch.object(cfg.os, "replace", side_effect=OSError("boom")):
+                with self.assertRaises(OSError):
+                    cfg.save_repos_store({"x": {"repo": "a/b"}})
+            self.assertEqual(self._store_path(home).read_text(encoding="utf-8"), before)
+            self.assertEqual(list(self._store_path(home).parent.glob("*.tmp")), [])
+            self.assertFalse((self._store_path(home).parent / "repos.json.tmp").exists())
 
 
 if __name__ == "__main__":

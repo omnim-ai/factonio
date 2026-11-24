@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import os
+import tempfile
+import threading
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Iterator, Mapping, Optional
+
+try:  # POSIX cross-process advisory locking; absent on Windows.
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback (in-process lock only)
+    _fcntl = None  # type: ignore[assignment]
 
 PLUGIN_ID = "factonio"
 WORKER_PROFILE = "factonio"
@@ -145,16 +154,85 @@ def _read_repos_store() -> dict[str, dict[str, Any]]:
         return {}
 
 
+_REPOS_STORE_THREAD_LOCK = threading.RLock()
+_REPOS_STORE_LOCK_STATE = threading.local()
+
+
+def _repos_store_lock_path() -> Path:
+    return _repos_store_path().with_name("repos.json.lock")
+
+
+@contextlib.contextmanager
+def repos_store_lock() -> Iterator[None]:
+    """Serialize repository-store read-modify-write transactions.
+
+    Acquires an in-process re-entrant lock plus an exclusive ``fcntl.flock`` on a sibling
+    ``repos.json.lock`` file so writers in other threads *and* other processes are
+    serialized. Re-entrant within the same thread: nested acquisitions reuse the outer
+    lock (the lockfile is opened once per outermost acquisition so each holder has its
+    own open file description, which is what makes ``flock`` exclude across processes).
+    """
+    with _REPOS_STORE_THREAD_LOCK:
+        depth = getattr(_REPOS_STORE_LOCK_STATE, "depth", 0)
+        if depth > 0:
+            _REPOS_STORE_LOCK_STATE.depth = depth + 1
+            try:
+                yield
+            finally:
+                _REPOS_STORE_LOCK_STATE.depth -= 1
+            return
+
+        lock_path = _repos_store_lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            if _fcntl is not None:
+                _fcntl.flock(fd, _fcntl.LOCK_EX)
+            _REPOS_STORE_LOCK_STATE.depth = 1
+            try:
+                yield
+            finally:
+                _REPOS_STORE_LOCK_STATE.depth = 0
+                if _fcntl is not None:
+                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def save_repos_store(repos: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    """Persist registered repositories to durable plugin-data/factonio/repos.json."""
+    """Persist registered repositories to durable plugin-data/factonio/repos.json.
+
+    Writes go to a unique temporary file in the same directory (fsynced) which then
+    atomically replaces ``repos.json``; the whole write runs under ``repos_store_lock()``
+    (re-entrant, so callers already holding the lock for a read-modify-write are fine).
+    """
     import json
 
-    path = _repos_store_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(dict(repos), indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(path)
-    return _read_repos_store()
+    payload = json.dumps(dict(repos), indent=2, sort_keys=True)
+    with repos_store_lock():
+        path = _repos_store_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=".repos.",
+                suffix=".tmp",
+                delete=False,
+            ) as fh:
+                tmp_path = fh.name
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_path, path)
+            tmp_path = None
+        finally:
+            if tmp_path is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+        return _read_repos_store()
 
 
 def save_settings(updates: Mapping[str, Any], *, config_path: Optional[Path] = None) -> dict[str, Any]:
