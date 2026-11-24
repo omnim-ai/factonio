@@ -24,6 +24,88 @@ _PR_REF_RE = re.compile(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
 _PR_URL_RE = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(\d+)")
 
 
+_COUNT_KEYS = ("running", "blocked", "triage", "ready", "done", "todo", "review")
+_REJECT_VERDICTS = frozenset({"reject", "fail", "block", "changes_requested"})
+_VERIFY_PHASES = frozenset({"verify-diff", "verify-blackbox"})
+# Run outcomes that are not failures: a clean latest run clears any stale error.
+_CLEAN_OUTCOMES = frozenset({"completed", "review_requested", "changes_requested", "scheduled", "approved"})
+
+
+def _empty_counts() -> dict[str, int]:
+    counts = {k: 0 for k in _COUNT_KEYS}
+    counts.update({"rejected": 0, "attention": 0, "total": 0})
+    return counts
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        return {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    except sqlite3.Error:
+        return set()
+
+
+def _text_or_none(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _active_duration_seconds(runs: list[dict[str, Any]], now_ts: float) -> Optional[int]:
+    """Sum of run durations, including live elapsed time for an in-flight run."""
+    total = 0.0
+    seen = False
+    for run in runs:
+        started = run.get("started_at")
+        if started is None:
+            continue
+        try:
+            start_f = float(started)
+            ended = run.get("ended_at")
+            end_f = float(ended) if ended is not None else now_ts
+        except (TypeError, ValueError):
+            continue
+        seen = True
+        total += max(0.0, end_f - start_f)
+    return int(total) if seen else None
+
+
+def _card_verdict(phase: str, status: str, runs: list[dict[str, Any]]) -> Optional[str]:
+    last = runs[-1] if runs else {}
+    verdict = str(_parse_json_dict(last.get("metadata")).get("verdict") or "").strip().lower()
+    if verdict:
+        return verdict
+    if phase in _VERIFY_PHASES:
+        if last.get("outcome") == "changes_requested":
+            return "reject"
+        if status == "done":
+            return "pass"
+    return None
+
+
+def _card_summary(task: dict[str, Any], status: str, runs: list[dict[str, Any]]) -> Optional[str]:
+    for run in reversed(runs):
+        text = _text_or_none(run.get("summary"))
+        if text:
+            return text
+    if status not in ("blocked", "triage"):
+        return _text_or_none(task.get("result"))
+    return None
+
+
+def _card_last_error(task: dict[str, Any], status: str, runs: list[dict[str, Any]]) -> Optional[str]:
+    if runs:
+        last = runs[-1]
+        if last.get("outcome") in _CLEAN_OUTCOMES:
+            return None
+        err = _text_or_none(last.get("error"))
+        if err:
+            return err
+    if status != "done":
+        return _text_or_none(task.get("last_failure_error"))
+    return None
+
+
 def _open_ro(db_path: Path) -> Optional[sqlite3.Connection]:
     if not db_path.is_file():
         return None
@@ -316,7 +398,7 @@ def thread_cards(
     """Return Factonio Kanban cards for a chat session (or all active cards if omitted)."""
     conn = _open_ro(db_path)
     if conn is None:
-        return {"cards": [], "counts": {"running": 0, "blocked": 0, "triage": 0, "ready": 0, "done": 0}}
+        return {"cards": [], "counts": _empty_counts()}
 
     try:
         with closing(conn):
@@ -364,13 +446,15 @@ def thread_cards(
                     params.extend(sorted(seed_tenants_set))
                 where.append("(" + " OR ".join(clauses) + ")")
 
+            task_cols = _table_columns(conn, "tasks")
+            task_extra = ", last_failure_error" if "last_failure_error" in task_cols else ""
             rows = [
                 dict(r)
                 for r in conn.execute(
                     f"""
                     SELECT id, title, assignee, status, tenant, session_id, skills,
                            model_override, provider_override, block_kind,
-                           created_at, started_at, completed_at, result, body
+                           created_at, started_at, completed_at, result, body{task_extra}
                       FROM tasks
                      WHERE {' AND '.join(where)}
                      ORDER BY created_at DESC
@@ -385,8 +469,10 @@ def thread_cards(
             parents_by_child: dict[str, list[str]] = {}
             if task_ids:
                 ph = ",".join("?" for _ in task_ids)
+                run_cols = _table_columns(conn, "task_runs")
+                run_extra = "".join(f", {c}" for c in ("summary", "error") if c in run_cols)
                 for run in conn.execute(
-                    f"SELECT id, task_id, started_at, ended_at, outcome, metadata FROM task_runs WHERE task_id IN ({ph}) ORDER BY id ASC",
+                    f"SELECT id, task_id, started_at, ended_at, outcome, metadata{run_extra} FROM task_runs WHERE task_id IN ({ph}) ORDER BY id ASC",
                     task_ids,
                 ).fetchall():
                     runs_by_task.setdefault(run["task_id"], []).append(dict(run))
@@ -401,7 +487,7 @@ def thread_cards(
                     except sqlite3.Error:
                         continue
 
-            counts = {"running": 0, "blocked": 0, "triage": 0, "ready": 0, "done": 0}
+            counts = _empty_counts()
             cards: list[dict[str, Any]] = []
             now_ts = time.time()
             for r in rows:
@@ -415,11 +501,15 @@ def thread_cards(
                 if created:
                     end = float(completed) if completed else now_ts
                     elapsed = max(0, int(end - float(created)))
+                phase = classify_phase(r)
+                verdict = _card_verdict(phase, st, runs)
+                if verdict in _REJECT_VERDICTS:
+                    counts["rejected"] += 1
                 cards.append({
                     "id": r["id"],
                     "title": r["title"],
                     "status": st,
-                    "phase": classify_phase(r),
+                    "phase": phase,
                     "tenant": r.get("tenant"),
                     "parents": parents_by_child.get(r["id"], []),
                     "model": r.get("model_override"),
@@ -431,7 +521,16 @@ def thread_cards(
                     "elapsed_seconds": elapsed,
                     "created_at": created,
                     "completed_at": completed,
+                    "started_at": r.get("started_at"),
+                    "session_id": r.get("session_id"),
+                    "active_duration_seconds": _active_duration_seconds(runs, now_ts),
+                    "verdict": verdict,
+                    "summary": _card_summary(r, st, runs),
+                    "last_outcome": runs[-1].get("outcome") if runs else None,
+                    "last_error": _card_last_error(r, st, runs),
                 })
+            counts["attention"] = counts["blocked"] + counts["triage"] + counts["rejected"]
+            counts["total"] = len(cards)
             return {"cards": cards, "counts": counts}
     except sqlite3.Error:
-        return {"cards": [], "counts": {"running": 0, "blocked": 0, "triage": 0, "ready": 0, "done": 0}}
+        return {"cards": [], "counts": _empty_counts()}

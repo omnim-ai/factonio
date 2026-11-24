@@ -217,5 +217,232 @@ class TestWatchdogMetricsAndApi(unittest.TestCase):
             self.assertTrue((PLUGIN_ROOT / "dashboard" / "manifest.json").is_file())
 
 
+def _seed_enrichment_db(db_path: Path, now_ts: float) -> None:
+    """Cards exercising enriched /cards metadata: recovery, rejects, live runs, statuses."""
+    from hermes_cli.kanban_db_connect import connect_closing
+
+    def task(conn, tid, title, status, tenant, session, skill, created, **extra):
+        cols = ["id", "title", "assignee", "status", "tenant", "session_id", "skills", "created_at", *extra]
+        vals = [tid, title, "factonio", status, tenant, session, json.dumps([skill]), created, *extra.values()]
+        conn.execute(
+            f"INSERT INTO tasks ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})", vals
+        )
+
+    def run(conn, tid, status, started, ended=None, outcome=None, metadata=None, summary=None, error=None):
+        conn.execute(
+            """
+            INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, metadata, summary, error)
+            VALUES (?, 'factonio', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (tid, status, started, ended, outcome, json.dumps(metadata or {}), summary, error),
+        )
+
+    with connect_closing(db_path=db_path) as conn:
+        # Implement card: run 1 crashed, run 2 completed cleanly; stale last_failure_error remains.
+        task(conn, "t_rec", "[implement] Recovered", "done", "ws-a", "sess_a", "factonio:implement",
+             now_ts - 1000, started_at=now_ts - 900, completed_at=now_ts - 500,
+             result="Implemented PR", last_failure_error="Traceback: boom")
+        run(conn, "t_rec", "crashed", now_ts - 1000, now_ts - 900, "crashed", error="Traceback: boom")
+        run(conn, "t_rec", "completed", now_ts - 800, now_ts - 500, "completed",
+            {"repo": "acme/api", "pr_number": 7}, summary="Opened PR #7")
+
+        # Diff verify rejected via explicit metadata verdict (upper-case -> normalized).
+        task(conn, "t_vd_rej", "[verify:diff] acme/api#7", "done", "ws-a", "sess_a", "factonio:verify-diff",
+             now_ts - 450, started_at=now_ts - 450, completed_at=now_ts - 400)
+        run(conn, "t_vd_rej", "completed", now_ts - 450, now_ts - 400, "completed",
+            {"verdict": "REJECT"}, summary="Missing tests")
+
+        # Black-box verify: no metadata verdict, latest outcome changes_requested -> fallback reject.
+        task(conn, "t_vb_cr", "[verify:blackbox] acme/api#7", "ready", "ws-a", "sess_a", "factonio:verify-blackbox",
+             now_ts - 440, started_at=now_ts - 440, result="Holdout 2 failed")
+        run(conn, "t_vb_cr", "changes_requested", now_ts - 440, now_ts - 380, "changes_requested",
+            summary="Holdout 2 failed")
+
+        # Black-box verify done without verdict metadata -> fallback pass.
+        task(conn, "t_vb_ok", "[verify:blackbox] acme/api#8", "done", "ws-b", "sess_b", "factonio:verify-blackbox",
+             now_ts - 300, started_at=now_ts - 300, completed_at=now_ts - 250, result="All holdouts passed")
+        run(conn, "t_vb_ok", "completed", now_ts - 300, now_ts - 250, "completed")
+
+        # Running implement card: one finished crashed run (60s) + live in-flight run (120s).
+        task(conn, "t_live", "[implement] Live", "running", "ws-b", "sess_b", "factonio:implement",
+             now_ts - 400, started_at=now_ts - 120, last_failure_error="spawn failed")
+        run(conn, "t_live", "crashed", now_ts - 400, now_ts - 340, "spawn_failed", error="spawn failed")
+        run(conn, "t_live", "running", now_ts - 120)
+
+        # Blocked card: summary from run, but result not used as summary fallback when blocked.
+        task(conn, "t_blk", "[implement] Blocked", "blocked", "ws-b", "sess_b", "factonio:implement",
+             now_ts - 200, block_kind="needs_input", result="Need API key")
+        # Triage card without runs.
+        task(conn, "t_tri", "[escape] [define] Escaped", "triage", "ws-c", "sess_c", "factonio:define",
+             now_ts - 150, result="Escalated")
+        # Todo + review cards without runs.
+        task(conn, "t_todo", "[implement] Later", "todo", "ws-c", "sess_c", "factonio:implement", now_ts - 140)
+        task(conn, "t_rev", "[implement] In review", "review", "ws-c", "sess_c", "factonio:implement", now_ts - 130)
+        conn.commit()
+
+
+class TestCardsEnrichment(unittest.TestCase):
+    NEW_FIELDS = ("started_at", "session_id", "active_duration_seconds", "verdict", "summary",
+                  "last_outcome", "last_error")
+
+    def _assert_enriched(self, data: dict, now_ts: float) -> None:
+        cards = {c["id"]: c for c in data["cards"]}
+        for c in cards.values():
+            for field in self.NEW_FIELDS:
+                self.assertIn(field, c, f"{c['id']} missing {field}")
+            # Legacy keys preserved.
+            for legacy in ("id", "title", "status", "phase", "tenant", "parents", "model", "provider",
+                           "block_kind", "block_reason", "pr", "runs", "elapsed_seconds", "created_at",
+                           "completed_at"):
+                self.assertIn(legacy, c)
+
+        rec = cards["t_rec"]
+        self.assertEqual(rec["session_id"], "sess_a")
+        self.assertAlmostEqual(rec["started_at"], now_ts - 900, delta=1)
+        self.assertEqual(rec["runs"], 2)
+        self.assertEqual(rec["last_outcome"], "completed")
+        self.assertIsNone(rec["last_error"])  # clean retry clears stale failures
+        self.assertEqual(rec["summary"], "Opened PR #7")
+        self.assertIsNone(rec["verdict"])
+        self.assertAlmostEqual(rec["active_duration_seconds"], 100 + 300, delta=2)
+        self.assertEqual(rec["pr"]["number"], 7)
+
+        vd = cards["t_vd_rej"]
+        self.assertEqual(vd["verdict"], "reject")
+        self.assertEqual(vd["summary"], "Missing tests")
+        self.assertIsNone(vd["last_error"])
+
+        vb_cr = cards["t_vb_cr"]
+        self.assertEqual(vb_cr["verdict"], "reject")
+        self.assertEqual(vb_cr["last_outcome"], "changes_requested")
+        self.assertIsNone(vb_cr["last_error"])
+
+        vb_ok = cards["t_vb_ok"]
+        self.assertEqual(vb_ok["verdict"], "pass")
+        self.assertEqual(vb_ok["summary"], "All holdouts passed")  # falls back to tasks.result
+
+        live = cards["t_live"]
+        self.assertIsNone(live["last_outcome"])
+        self.assertEqual(live["last_error"], "spawn failed")  # task not done -> last_failure_error
+        self.assertGreaterEqual(live["active_duration_seconds"], 60 + 120 - 2)
+        self.assertLessEqual(live["active_duration_seconds"], 60 + 120 + 30)
+
+        blk = cards["t_blk"]
+        self.assertIsNone(blk["summary"])  # result is the block reason, not a summary
+        self.assertEqual(blk["block_reason"], "Need API key")
+        self.assertIsNone(blk["active_duration_seconds"])
+        self.assertIsNone(blk["last_outcome"])
+        self.assertIsNone(blk["verdict"])
+        self.assertIsNone(cards["t_tri"]["summary"])
+        self.assertIsNone(cards["t_todo"]["started_at"])
+
+    def _assert_all_counts(self, counts: dict) -> None:
+        self.assertEqual(counts, {
+            "running": 1, "blocked": 1, "triage": 1, "ready": 1, "done": 3,
+            "todo": 1, "review": 1, "rejected": 2, "attention": 4, "total": 9,
+        })
+
+    def test_thread_cards_enriched_fields_and_counts(self):
+        from factonio import metrics
+
+        with isolated_hermes_home() as home:
+            now_ts = time.time()
+            db_path = home / "kanban.db"
+            _seed_enrichment_db(db_path, now_ts)
+
+            all_cards = metrics.thread_cards(db_path)
+            self._assert_enriched(all_cards, now_ts)
+            self._assert_all_counts(all_cards["counts"])
+
+            sess_a = metrics.thread_cards(db_path, session_id="sess_a")
+            self.assertEqual({c["id"] for c in sess_a["cards"]}, {"t_rec", "t_vd_rej", "t_vb_cr"})
+            self.assertEqual(sess_a["counts"]["rejected"], 2)
+            self.assertEqual(sess_a["counts"]["attention"], 2)
+            self.assertEqual(sess_a["counts"]["total"], 3)
+
+    def test_cards_api_enriched_fields_and_counts(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        with isolated_hermes_home() as home:
+            now_ts = time.time()
+            _seed_enrichment_db(home / "kanban.db", now_ts)
+
+            spec = importlib.util.spec_from_file_location(
+                "factonio_test_plugin_api_enrich", PLUGIN_ROOT / "dashboard" / "plugin_api.py"
+            )
+            assert spec is not None and spec.loader is not None
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            app = FastAPI()
+            app.include_router(mod.router, prefix="/api/plugins/factonio")
+            client = TestClient(app)
+
+            r_all = client.get("/api/plugins/factonio/cards")
+            self.assertEqual(r_all.status_code, 200)
+            self._assert_enriched(r_all.json(), now_ts)
+            self._assert_all_counts(r_all.json()["counts"])
+
+            r_b = client.get("/api/plugins/factonio/cards?session_id=sess_b")
+            self.assertEqual(r_b.status_code, 200)
+            body = r_b.json()
+            self.assertEqual({c["id"] for c in body["cards"]}, {"t_vb_ok", "t_live", "t_blk"})
+            self.assertEqual(body["counts"]["blocked"], 1)
+            self.assertEqual(body["counts"]["rejected"], 0)
+            self.assertEqual(body["counts"]["attention"], 1)
+            self.assertEqual(body["counts"]["total"], 3)
+            self.assertTrue(all(c["session_id"] == "sess_b" for c in body["cards"]))
+
+            r_status = client.get("/api/plugins/factonio/status")
+            self.assertEqual(r_status.status_code, 200)
+            self.assertEqual(r_status.json()["counts"]["total"], 9)
+
+    def test_thread_cards_minimal_legacy_schema_and_missing_db(self):
+        from factonio import metrics
+
+        with isolated_hermes_home() as home:
+            missing = metrics.thread_cards(home / "nope.db")
+            self.assertEqual(missing["cards"], [])
+            self.assertEqual(missing["counts"]["total"], 0)
+            self.assertEqual(missing["counts"]["attention"], 0)
+            self.assertIn("todo", missing["counts"])
+
+            now_ts = time.time()
+            db_path = home / "legacy.db"
+            conn = sqlite3.connect(db_path)
+            conn.executescript(
+                """
+                CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, assignee TEXT, status TEXT,
+                    tenant TEXT, session_id TEXT, skills TEXT, model_override TEXT,
+                    provider_override TEXT, block_kind TEXT, created_at REAL, started_at REAL,
+                    completed_at REAL, result TEXT, body TEXT);
+                CREATE TABLE task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT,
+                    started_at REAL, ended_at REAL, outcome TEXT, metadata TEXT);
+                """
+            )
+            conn.execute(
+                "INSERT INTO tasks (id, title, assignee, status, tenant, session_id, skills, created_at, started_at, result)"
+                " VALUES ('t_old', '[verify:diff] x/y#1', 'factonio', 'blocked', 'ws', 's1', ?, ?, ?, 'stuck')",
+                (json.dumps(["factonio:verify-diff"]), now_ts - 100, now_ts - 100),
+            )
+            conn.execute(
+                "INSERT INTO task_runs (task_id, started_at, ended_at, outcome, metadata) VALUES ('t_old', ?, ?, 'blocked', '{}')",
+                (now_ts - 100, now_ts - 40),
+            )
+            conn.commit()
+            conn.close()
+
+            data = metrics.thread_cards(db_path)
+            self.assertEqual(len(data["cards"]), 1)
+            card = data["cards"][0]
+            self.assertIsNone(card["summary"])
+            self.assertIsNone(card["last_error"])
+            self.assertIsNone(card["verdict"])
+            self.assertEqual(card["last_outcome"], "blocked")
+            self.assertAlmostEqual(card["active_duration_seconds"], 60, delta=1)
+            self.assertEqual(data["counts"]["attention"], 1)
+            self.assertEqual(data["counts"]["total"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
