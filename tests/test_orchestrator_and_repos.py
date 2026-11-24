@@ -268,5 +268,239 @@ class TestOrchestratorAndRepos(unittest.TestCase):
                 self.assertTrue(merged["merged"])
 
 
+_CONFIG_REPO_YAML = """plugins:
+  entries:
+    factonio:
+      settings:
+        design_provider: hermes
+        design_approval: ask
+        repos:
+          acme-legacy:
+            slug: acme-legacy
+            repo: acme/legacy
+            url: https://github.com/acme/legacy
+            path: /tmp/acme-legacy
+            project_slug: acme-legacy
+            default_branch: trunk
+            merge_policy: ask
+            max_fix_rounds: 2
+            has_required_checks: true
+            required_checks: [ci, lint]
+            ci_contract: strict
+            design_provider: "off"
+            design_approval: auto
+            models:
+              implement: {provider: anthropic, model: claude-x}
+"""
+
+
+class TestRepoUpdate(unittest.TestCase):
+    def _register(self, home: Path, spec: str = "acme/sample", **kw):
+        from factonio.repos import add_repo
+
+        local = home / "dev" / spec.split("/")[1]
+        local.mkdir(parents=True, exist_ok=True)
+        (local / ".git").mkdir(exist_ok=True)
+        return add_repo(spec, local_path=str(local), clone=False, inspect_remote=False, **kw)
+
+    def _store(self, home: Path) -> dict:
+        return json.loads((home / "plugin-data" / "factonio" / "repos.json").read_text(encoding="utf-8"))
+
+    def test_merge_policies_constant(self):
+        from factonio.config import MERGE_POLICIES
+
+        self.assertEqual(MERGE_POLICIES, ("auto", "ask"))
+
+    def test_update_repo_updates_only_supplied_fields(self):
+        from factonio.config import get_repo
+        from factonio.repos import update_repo
+
+        with isolated_hermes_home() as home:
+            self._register(home)
+            res = update_repo("acme/sample", merge_policy=" ASK ", max_fix_rounds=5)
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["updated_fields"], ["max_fix_rounds", "merge_policy"])
+            self.assertEqual(res["repo"]["merge_policy"], "ask")
+            self.assertEqual(res["repo"]["max_fix_rounds"], 5)
+            stored = self._store(home)["acme-sample"]
+            self.assertEqual(stored["merge_policy"], "ask")
+            self.assertEqual(stored["max_fix_rounds"], 5)
+            self.assertEqual(stored["default_branch"], "main")
+
+            res2 = update_repo("acme-sample", default_branch="  develop ", design_provider="Hermes", design_approval="auto")
+            self.assertEqual(res2["repo"]["default_branch"], "develop")
+            repo = get_repo("acme-sample")
+            assert repo is not None
+            self.assertEqual(repo["design_provider"], "hermes")
+            self.assertEqual(repo["design_approval"], "auto")
+            self.assertEqual(repo["merge_policy"], "ask")
+
+    def test_update_repo_validation_is_strict_and_atomic(self):
+        from factonio.repos import RepoNotFoundError, update_repo
+
+        with isolated_hermes_home() as home:
+            self._register(home)
+            before = self._store(home)
+
+            with self.assertRaises(RepoNotFoundError):
+                update_repo("nope/missing", merge_policy="ask")
+            self.assertTrue(issubclass(RepoNotFoundError, LookupError))
+            with self.assertRaises(ValueError):
+                update_repo("acme/sample")
+
+            bad_cases = [
+                {"merge_policy": None},
+                {"merge_policy": ""},
+                {"merge_policy": "always"},
+                {"max_fix_rounds": True},
+                {"max_fix_rounds": 2.0},
+                {"max_fix_rounds": None},
+                {"max_fix_rounds": "3"},
+                {"max_fix_rounds": 0},
+                {"max_fix_rounds": -1},
+                {"default_branch": None},
+                {"default_branch": "   "},
+                {"default_branch": "-main"},
+                {"default_branch": "a..b"},
+                {"default_branch": "my branch"},
+                {"default_branch": "ma\x01in"},
+                {"design_provider": "claude"},
+                {"design_provider": 3},
+                {"design_approval": "never"},
+                # Valid field + invalid field: nothing must be written.
+                {"merge_policy": "ask", "max_fix_rounds": 0},
+            ]
+            for kwargs in bad_cases:
+                with self.subTest(kwargs=kwargs):
+                    with self.assertRaises(ValueError):
+                        update_repo("acme/sample", **kwargs)
+            self.assertEqual(self._store(home), before)
+
+    def test_clearing_design_overrides_inherits_global_defaults(self):
+        from factonio.config import resolve_design_provider, save_settings
+        from factonio.repos import update_repo
+
+        with isolated_hermes_home() as home:
+            self._register(home)
+            save_settings({"design_provider": "off", "design_approval": "auto"})
+            update_repo("acme/sample", design_provider="hermes", design_approval="ask")
+            d = resolve_design_provider(repo_slug="acme-sample")
+            self.assertEqual((d["configured"], d["approval"]), ("hermes", "ask"))
+
+            for token in (None, "", "inherit", "DEFAULT"):
+                with self.subTest(token=token):
+                    update_repo("acme/sample", design_provider="hermes", design_approval="ask")
+                    update_repo("acme/sample", design_provider=token, design_approval=token)
+                    stored = self._store(home)["acme-sample"]
+                    self.assertNotIn("design_provider", stored)
+                    self.assertNotIn("design_approval", stored)
+                    d = resolve_design_provider(repo_slug="acme-sample")
+                    self.assertEqual((d["configured"], d["approval"]), ("off", "auto"))
+
+    def test_update_config_yaml_only_repo_migrates_all_fields(self):
+        from factonio.config import get_repo, list_repos, resolve_design_provider, resolve_phase_model
+        from factonio.repos import update_repo
+
+        with isolated_hermes_home() as home:
+            (home / "config.yaml").write_text(_CONFIG_REPO_YAML, encoding="utf-8")
+            self.assertFalse((home / "plugin-data" / "factonio" / "repos.json").exists())
+            original = list_repos()["acme-legacy"]
+
+            res = update_repo("acme/legacy", max_fix_rounds=7, design_provider="inherit")
+            self.assertEqual(res["updated_fields"], ["design_provider", "max_fix_rounds"])
+            stored = self._store(home)["acme-legacy"]
+            expected = {k: v for k, v in original.items() if k != "design_provider"}
+            expected["max_fix_rounds"] = 7
+            self.assertEqual(stored, expected)
+            self.assertEqual(stored["required_checks"], ["ci", "lint"])
+            self.assertEqual(stored["models"], {"implement": {"provider": "anthropic", "model": "claude-x"}})
+
+            repo = get_repo("acme-legacy")
+            assert repo is not None
+            self.assertNotIn("design_provider", repo)
+            d = resolve_design_provider(repo_slug="acme-legacy")
+            self.assertEqual(d["configured"], "hermes")
+            self.assertEqual(d["approval"], "auto")
+            self.assertEqual(resolve_phase_model("implement", repo_slug="acme-legacy")["model"], "claude-x")
+            # config.yaml itself is untouched.
+            self.assertEqual((home / "config.yaml").read_text(encoding="utf-8"), _CONFIG_REPO_YAML)
+
+    def test_list_repos_returns_deep_copies(self):
+        from factonio.config import list_repos
+
+        with isolated_hermes_home() as home:
+            (home / "config.yaml").write_text(_CONFIG_REPO_YAML, encoding="utf-8")
+            first = list_repos()
+            first["acme-legacy"]["required_checks"].append("mutated")
+            first["acme-legacy"]["models"]["implement"]["model"] = "mutated"
+            second = list_repos()
+            self.assertEqual(second["acme-legacy"]["required_checks"], ["ci", "lint"])
+            self.assertEqual(second["acme-legacy"]["models"]["implement"]["model"], "claude-x")
+
+    def test_add_repo_rerun_preserves_overrides(self):
+        from factonio.config import list_repos, save_settings
+        from factonio.repos import update_repo
+
+        with isolated_hermes_home() as home:
+            self._register(home)
+            update_repo(
+                "acme/sample",
+                merge_policy="ask",
+                max_fix_rounds=6,
+                default_branch="develop",
+                design_provider="off",
+                design_approval="auto",
+            )
+            repos = list_repos()
+            repos["acme-sample"]["ci_contract"] = "strict"
+            repos["acme-sample"]["models"] = {"verify": "other-model"}
+            save_settings({"repos": repos})
+
+            res = self._register(home)
+            r = res["repo"]
+            self.assertEqual(r["merge_policy"], "ask")
+            self.assertEqual(r["max_fix_rounds"], 6)
+            self.assertEqual(r["default_branch"], "develop")
+            self.assertEqual(r["design_provider"], "off")
+            self.assertEqual(r["design_approval"], "auto")
+            self.assertEqual(r["ci_contract"], "strict")
+            self.assertEqual(r["models"], {"verify": "other-model"})
+
+            res = self._register(
+                home,
+                merge_policy="auto",
+                max_fix_rounds=2,
+                default_branch="release",
+                design_provider="inherit",
+                design_approval="ask",
+            )
+            r = res["repo"]
+            self.assertEqual((r["merge_policy"], r["max_fix_rounds"], r["default_branch"]), ("auto", 2, "release"))
+            self.assertNotIn("design_provider", r)
+            self.assertEqual(r["design_approval"], "ask")
+
+    def test_add_repo_uses_shared_validators(self):
+        with isolated_hermes_home() as home:
+            for kwargs in (
+                {"merge_policy": "always"},
+                {"max_fix_rounds": 0},
+                {"max_fix_rounds": True},
+                {"default_branch": "bad branch"},
+                {"design_provider": "nope"},
+                {"design_approval": "never"},
+            ):
+                with self.subTest(kwargs=kwargs):
+                    with self.assertRaises(ValueError):
+                        self._register(home, **kwargs)
+            self.assertFalse((home / "plugin-data" / "factonio" / "repos.json").exists())
+
+            r = self._register(home, default_branch="develop", design_provider="hermes")["repo"]
+            self.assertEqual(r["default_branch"], "develop")
+            self.assertEqual(r["design_provider"], "hermes")
+            self.assertNotIn("design_approval", r)
+            self.assertEqual(r["merge_policy"], "auto")
+            self.assertEqual(r["max_fix_rounds"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

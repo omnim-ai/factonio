@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -14,7 +15,7 @@ from .config import (
 )
 from .orchestrator import workstream_status
 from .profile_setup import init_factonio_profile, run_doctor
-from .repos import add_repo, inspect_pr_gate, remove_repo
+from .repos import RepoNotFoundError, add_repo, inspect_pr_gate, remove_repo, update_repo
 
 
 def _print_result(data: dict[str, Any], as_json: bool) -> None:
@@ -43,6 +44,34 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         p_add.add_argument("--max-fix-rounds", type=int, default=None, help="Max verification fix rounds per PR.")
         p_add.add_argument("--no-clone", action="store_true", help="Do not clone if local directory is absent.")
 
+        p_upd = sub.add_parser(
+            "update",
+            aliases=["edit"],
+            help="Update configuration parameters for a registered repository.",
+        )
+        p_upd.add_argument("repo", help="Repo slug or 'owner/repo'.")
+        p_upd.add_argument("--merge-policy", choices=["auto", "ask"], default=None, help="PR merge policy.")
+        p_upd.add_argument("--max-fix-rounds", type=int, default=None, help="Max verification fix rounds per PR (>= 1).")
+        p_upd.add_argument("--default-branch", default=None, help="Base branch for PRs and worktrees.")
+        p_upd.add_argument(
+            "--design-provider",
+            choices=["auto", "claude-design", "hermes", "off", "inherit"],
+            default=None,
+            help="Phase 1b design provider override ('inherit' clears it to use the global default).",
+        )
+        p_upd.add_argument(
+            "--design-approval",
+            choices=["ask", "auto", "inherit"],
+            default=None,
+            help="Design approval override ('inherit' clears it to use the global default).",
+        )
+        p_upd.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Output machine-readable JSON.",
+        )
+
         p_rm = sub.add_parser("remove", help="Unregister a repository from Factonio (keeps local files).")
         p_rm.add_argument("repo", help="Repo slug or 'owner/repo'.")
 
@@ -65,7 +94,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         as_json = bool(getattr(args, "json", False))
 
         if not cmd:
-            print("Usage: hermes factonio {init|add|remove|list|models|status|pr-gate|doctor} [--json]")
+            print("Usage: hermes factonio {init|add|update|remove|list|models|status|pr-gate|doctor} [--json]")
             return
 
         if cmd == "init":
@@ -110,6 +139,38 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             print(f"  Merge policy: {r['merge_policy']} | Max fix rounds: {r['max_fix_rounds']}")
             return
 
+        if cmd in ("update", "edit"):
+            flag_map = {
+                "merge_policy": getattr(args, "merge_policy", None),
+                "max_fix_rounds": getattr(args, "max_fix_rounds", None),
+                "default_branch": getattr(args, "default_branch", None),
+                "design_provider": getattr(args, "design_provider", None),
+                "design_approval": getattr(args, "design_approval", None),
+            }
+            kwargs = {k: v for k, v in flag_map.items() if v is not None}
+            try:
+                res = update_repo(args.repo, **kwargs)
+            except (RepoNotFoundError, ValueError) as exc:
+                if as_json:
+                    print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+                else:
+                    print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            if as_json:
+                print(json.dumps(res, indent=2, default=str))
+                return
+            r = res["repo"]
+            print(f"Updated {r.get('repo')} (slug: {r['slug']}): {', '.join(res['updated_fields'])}")
+            print(
+                f"  Branch: {r.get('default_branch', 'main')} | Merge policy: {r.get('merge_policy', 'auto')}"
+                f" | Max fix rounds: {r.get('max_fix_rounds', 3)}"
+            )
+            print(
+                f"  Design provider: {r.get('design_provider') or 'inherit'}"
+                f" | Design approval: {r.get('design_approval') or 'inherit'}"
+            )
+            return
+
         if cmd == "remove":
             res = remove_repo(args.repo)
             if as_json:
@@ -129,7 +190,17 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                 print("No repositories registered. Run: hermes factonio add owner/repo")
                 return
             for slug, r in sorted(repos.items()):
-                print(f"- {slug}: {r.get('repo')} ({r.get('path')}) [merge={r.get('merge_policy', 'auto')}]")
+                tags = [
+                    f"branch={r.get('default_branch', 'main')}",
+                    f"merge={r.get('merge_policy', 'auto')}",
+                    f"fix_rounds={r.get('max_fix_rounds', 3)}",
+                ]
+                if r.get("design_provider"):
+                    tags.append(f"design={r['design_provider']}")
+                if r.get("design_approval"):
+                    tags.append(f"design_approval={r['design_approval']}")
+                print(f"- {slug}: {r.get('repo')} ({r.get('path')}) [{' '.join(tags)}]")
+            print("\nEdit settings with: hermes factonio update <repo> --merge-policy ... (see --help)")
             return
 
         if cmd == "models":
@@ -192,7 +263,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
 
     ctx.register_cli_command(
         "factonio",
-        help="Manage the Factonio pure-Hermes software factory (init, add, models, status, doctor).",
+        help="Manage the Factonio pure-Hermes software factory (init, add, update, models, status, doctor).",
         setup_fn=setup_parser,
         handler_fn=handle_cli,
     )

@@ -25,11 +25,12 @@ Coordinate software delivery on registered GitHub repositories across Definition
 
 1. Confirm the target repository is registered using `factonio_status`. If missing, register it with `factonio_add_repo`.
 2. Ask at most one concise batch of clarifying questions if scope, acceptance criteria, or constraints are genuinely ambiguous.
-3. Choose the entry path:
+3. If the user asks to change a registered repository's settings (merge policy, max fix rounds, default branch, design provider/approval), call `factonio_update_repo(repo, <only the fields to change>)` (CLI: `hermes factonio update <repo> --merge-policy ask ...`). Pass `"inherit"` for `design_provider`/`design_approval` to clear the per-repo override and fall back to the global default. Do not re-run `factonio_add_repo` just to edit settings.
+4. Choose the entry path:
    - **Feature (`kind="feature"`):** Definition -> optional Phase 1b Design (when `has_ui: true` or requested) -> parallel Implementation -> parallel Verification -> Merge.
    - **Bug (`kind="bug"`):** Definition (diagnosis mode) -> Implementation -> parallel Verification -> Merge.
    - **Small obvious change (`kind="quick"`):** Implementation -> Verification -> Merge.
-4. If the user reports a regression in work that previously passed Verification, pass `escaped_from="<verify_card_id>"` to `factonio_start` so escape rate stays accurate.
+5. If the user reports a regression in work that previously passed Verification, pass `escaped_from="<verify_card_id>"` to `factonio_start` so escape rate stays accurate.
 
 ### 2. Optional Phase 1b Design (UI Work)
 

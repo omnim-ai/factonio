@@ -13,6 +13,7 @@ PHASES: tuple[str, ...] = ("define", "design", "implement", "verify", "watchdog"
 
 DESIGN_PROVIDERS: tuple[str, ...] = ("auto", "claude-design", "hermes", "off")
 DESIGN_APPROVAL_POLICIES: tuple[str, ...] = ("ask", "auto")
+MERGE_POLICIES: tuple[str, ...] = ("auto", "ask")
 
 AUX_TASK_SPECS: tuple[dict[str, str], ...] = (
     {
@@ -201,10 +202,14 @@ def save_settings(updates: Mapping[str, Any], *, config_path: Optional[Path] = N
 
 
 def list_repos() -> dict[str, dict[str, Any]]:
-    """Return registered repositories keyed by slug (config.yaml merged with plugin-data/repos.json)."""
-    from_cfg = load_settings().get("repos")
-    merged: dict[str, dict[str, Any]] = dict(from_cfg) if isinstance(from_cfg, dict) else {}
-    merged.update(_read_repos_store())
+    """Return registered repositories keyed by slug (config.yaml merged with plugin-data/repos.json).
+
+    Always reads the root profile's settings so worker profiles see the same canonical
+    store as the orchestrator. Returned dicts are deep copies, safe for callers to mutate.
+    """
+    from_cfg = load_settings(use_root=True).get("repos")
+    merged: dict[str, dict[str, Any]] = copy.deepcopy(dict(from_cfg)) if isinstance(from_cfg, dict) else {}
+    merged.update(copy.deepcopy(_read_repos_store()))
     return merged
 
 

@@ -19,7 +19,7 @@ from .orchestrator import (
     start_workstream,
     workstream_status,
 )
-from .repos import add_repo, inspect_pr_gate, merge_pr
+from .repos import EDITABLE_REPO_FIELDS, add_repo, inspect_pr_gate, merge_pr, update_repo
 
 
 def _json_ok(payload: dict[str, Any]) -> str:
@@ -68,6 +68,53 @@ def register_tools(ctx: Any) -> None:
             },
         },
         handler=handle_add_repo,
+    )
+
+    def handle_update_repo(args: dict[str, Any], **kwargs: Any) -> str:
+        try:
+            updates = {k: v for k, v in args.items() if k != "repo"}
+            unknown = sorted(set(updates) - set(EDITABLE_REPO_FIELDS))
+            if unknown:
+                raise ValueError(
+                    f"Unknown or immutable field(s): {', '.join(unknown)}. "
+                    f"Editable fields: {', '.join(EDITABLE_REPO_FIELDS)}"
+                )
+            return _json_ok(update_repo(str(args["repo"]), **updates))
+        except Exception as exc:
+            return _json_err(exc)
+
+    ctx.register_tool(
+        name="factonio_update_repo",
+        toolset=PLUGIN_ID,
+        schema={
+            "name": "factonio_update_repo",
+            "description": (
+                "Update settings of an already-registered Factonio repository. Only fields you pass are changed: "
+                "merge_policy, max_fix_rounds, default_branch, design_provider, design_approval. Pass 'inherit' "
+                "(or null) for design_provider/design_approval to clear the per-repo override and use the global default."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Registered repo slug or 'owner/repo'."},
+                    "merge_policy": {"type": "string", "enum": ["auto", "ask"], "description": "PR merge policy."},
+                    "max_fix_rounds": {"type": "integer", "minimum": 1, "description": "Max repair loops per PR."},
+                    "default_branch": {"type": "string", "description": "Base branch for PRs and worktrees."},
+                    "design_provider": {
+                        "type": "string",
+                        "enum": ["auto", "claude-design", "hermes", "off", "inherit"],
+                        "description": "Phase 1b design provider override; 'inherit' clears it.",
+                    },
+                    "design_approval": {
+                        "type": "string",
+                        "enum": ["ask", "auto", "inherit"],
+                        "description": "Design approval override; 'inherit' clears it.",
+                    },
+                },
+                "required": ["repo"],
+            },
+        },
+        handler=handle_update_repo,
     )
 
     def handle_start(args: dict[str, Any], **kwargs: Any) -> str:

@@ -1,13 +1,13 @@
-"""Factonio read-only dashboard API routes mounted at `/api/plugins/factonio/`."""
+"""Factonio dashboard API routes mounted at `/api/plugins/factonio/`."""
 
 from __future__ import annotations
 
 import importlib
 import sys
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
 
 from hermes_constants import get_hermes_home
 
@@ -31,6 +31,7 @@ if _PKG_NAME not in sys.modules:
 _config = importlib.import_module(f"{_PKG_NAME}.config")
 _metrics = importlib.import_module(f"{_PKG_NAME}.metrics")
 _profile_setup = importlib.import_module(f"{_PKG_NAME}.profile_setup")
+_repos = importlib.import_module(f"{_PKG_NAME}.repos")
 
 router = APIRouter()
 Range = Literal["7d", "30d", "90d", "all"]
@@ -56,25 +57,91 @@ def status(profile: Optional[str] = Query(None)):
     }
 
 
+def _repo_defaults(settings: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "merge_policy": settings.get("default_merge_policy") or "auto",
+        "max_fix_rounds": settings.get("default_max_fix_rounds") or 3,
+        "design_provider": settings.get("design_provider") or "auto",
+        "design_approval": settings.get("design_approval") or "ask",
+    }
+
+
+def _serialize_repo(slug: str, info: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    """Serialize one registered repository with explicit and effective settings."""
+    defaults = _repo_defaults(settings)
+    explicit_provider = info.get("design_provider") or None
+    explicit_approval = info.get("design_approval") or None
+    try:
+        design = _config.resolve_design_provider(repo_slug=slug)
+        effective_provider = design.get("configured")
+        effective_approval = design.get("approval")
+        resolved_provider = design.get("effective")
+    except ValueError:
+        effective_provider = explicit_provider or defaults["design_provider"]
+        effective_approval = explicit_approval or defaults["design_approval"]
+        resolved_provider = None
+    return {
+        "slug": slug,
+        "repo": info.get("repo"),
+        "url": info.get("url"),
+        "path": info.get("path"),
+        "default_branch": info.get("default_branch", "main"),
+        "merge_policy": info.get("merge_policy", defaults["merge_policy"]),
+        "max_fix_rounds": info.get("max_fix_rounds", defaults["max_fix_rounds"]),
+        "design_provider": explicit_provider,
+        "design_approval": explicit_approval,
+        "effective_design_provider": effective_provider,
+        "effective_design_approval": effective_approval,
+        "resolved_design_provider": resolved_provider,
+        "has_required_checks": bool(info.get("has_required_checks")),
+        "models": _config.resolve_all_phase_models(repo_slug=slug),
+    }
+
+
 @router.get("/repos")
 def repos(profile: Optional[str] = Query(None)):
-    """Registered repositories and their effective settings."""
+    """Registered repositories with explicit/effective settings plus global defaults."""
+    settings = _config.load_settings(use_root=True)
     items = []
     for slug, info in sorted(_config.list_repos().items()):
         if not isinstance(info, dict):
             continue
-        items.append({
-            "slug": slug,
-            "repo": info.get("repo"),
-            "url": info.get("url"),
-            "path": info.get("path"),
-            "default_branch": info.get("default_branch", "main"),
-            "merge_policy": info.get("merge_policy", "auto"),
-            "max_fix_rounds": info.get("max_fix_rounds", 3),
-            "has_required_checks": bool(info.get("has_required_checks")),
-            "models": _config.resolve_all_phase_models(repo_slug=slug),
-        })
-    return {"repos": items}
+        items.append(_serialize_repo(slug, info, settings))
+    return {"repos": items, "defaults": _repo_defaults(settings)}
+
+
+@router.patch("/repos/{slug}")
+def patch_repo(
+    slug: str,
+    payload: Any = Body(...),
+    profile: Optional[str] = Query(None),
+):
+    """Update editable parameters of a registered repository."""
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="Request body must be a JSON object.")
+    if not payload:
+        raise HTTPException(
+            status_code=422,
+            detail="At least one editable field must be provided: " + ", ".join(_repos.EDITABLE_REPO_FIELDS),
+        )
+    unknown = sorted(set(payload) - set(_repos.EDITABLE_REPO_FIELDS))
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Unknown or immutable field(s): {', '.join(unknown)}. "
+                f"Editable fields: {', '.join(_repos.EDITABLE_REPO_FIELDS)}"
+            ),
+        )
+    try:
+        res = _repos.update_repo(slug, **payload)
+    except _repos.RepoNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    entry = res["repo"]
+    settings = _config.load_settings(use_root=True)
+    return {"ok": True, "repo": _serialize_repo(str(entry["slug"]), entry, settings)}
 
 
 @router.get("/models")
@@ -112,5 +179,5 @@ def cards(
 
 @router.get("/doctor")
 def doctor(profile: Optional[str] = Query(None)):
-    """Read-only environment and profile readiness report."""
+    """Environment and profile readiness report."""
     return _profile_setup.run_doctor(_PLUGIN_ROOT)

@@ -12,6 +12,7 @@ license: MIT
 requires_hermes: ">=0.1.0"
 provides_tools:
   - factonio_add_repo
+  - factonio_update_repo
   - factonio_start
   - factonio_spawn_design
   - factonio_spawn_implement
@@ -74,4 +75,4 @@ config_schema:
     type: dict
     default: {}
     label: "Registered repositories"
-    description: "Per-repository settings keyed by slug (managed by `hermes factonio add`)."
+    description: "Per-repository settings keyed by slug (managed by `hermes factonio add` / `hermes factonio update`)."

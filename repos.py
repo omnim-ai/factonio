@@ -8,13 +8,103 @@ import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
-from .config import get_repo, list_repos, load_settings, save_settings
+from .config import (
+    DESIGN_APPROVAL_POLICIES,
+    DESIGN_PROVIDERS,
+    MERGE_POLICIES,
+    get_repo,
+    list_repos,
+    load_settings,
+    save_settings,
+)
 
 _GITHUB_URL_RE = re.compile(
     r"^(?:https?://github\.com/|git@github\.com:)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$"
 )
 _OWNER_REPO_RE = re.compile(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)$")
 _SLUG_SAFE_RE = re.compile(r"[^a-z0-9-]+")
+
+
+class RepoNotFoundError(LookupError):
+    """Raised when a repository slug or `owner/repo` is not registered with Factonio."""
+
+
+_UNSET: Any = object()
+
+EDITABLE_REPO_FIELDS: tuple[str, ...] = (
+    "merge_policy",
+    "max_fix_rounds",
+    "default_branch",
+    "design_provider",
+    "design_approval",
+)
+
+_INHERIT_TOKENS = frozenset({"", "inherit", "default"})
+
+
+def _validate_merge_policy(value: Any) -> str:
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in MERGE_POLICIES:
+            return norm
+    raise ValueError(f"merge_policy must be one of {', '.join(MERGE_POLICIES)}; got {value!r}")
+
+
+def _validate_max_fix_rounds(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"max_fix_rounds must be an integer >= 1; got {value!r}")
+    if value < 1:
+        raise ValueError(f"max_fix_rounds must be an integer >= 1; got {value!r}")
+    return int(value)
+
+
+def _validate_default_branch(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"default_branch must be a non-empty branch name; got {value!r}")
+    branch = value.strip()
+    if branch.startswith("-"):
+        raise ValueError(f"default_branch must not start with '-'; got {value!r}")
+    if ".." in branch:
+        raise ValueError(f"default_branch must not contain '..'; got {value!r}")
+    if any(ch.isspace() for ch in branch):
+        raise ValueError(f"default_branch must not contain whitespace; got {value!r}")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in branch):
+        raise ValueError(f"default_branch must not contain control characters; got {value!r}")
+    return branch
+
+
+def _validate_design_override(field: str, value: Any, allowed: tuple[str, ...]) -> Optional[str]:
+    """Validate a per-repo design override; returns None when the override should be cleared."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in _INHERIT_TOKENS:
+            return None
+        if norm in allowed:
+            return norm
+    raise ValueError(
+        f"{field} must be one of {', '.join(allowed)} (or 'inherit'/null to use the global default); got {value!r}"
+    )
+
+
+def _validate_editable_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    """Validate supplied editable fields; returns normalized values (None = clear override)."""
+    validated: dict[str, Any] = {}
+    for field, value in fields.items():
+        if field == "merge_policy":
+            validated[field] = _validate_merge_policy(value)
+        elif field == "max_fix_rounds":
+            validated[field] = _validate_max_fix_rounds(value)
+        elif field == "default_branch":
+            validated[field] = _validate_default_branch(value)
+        elif field == "design_provider":
+            validated[field] = _validate_design_override(field, value, DESIGN_PROVIDERS)
+        elif field == "design_approval":
+            validated[field] = _validate_design_override(field, value, DESIGN_APPROVAL_POLICIES)
+        else:
+            raise ValueError(f"Unknown editable repository field {field!r}")
+    return validated
 
 
 def normalize_repo(repo_spec: str) -> tuple[str, str]:
@@ -121,18 +211,47 @@ def add_repo(
     max_fix_rounds: Optional[int] = None,
     clone: bool = True,
     inspect_remote: bool = True,
+    default_branch: Optional[str] = None,
+    design_provider: Any = _UNSET,
+    design_approval: Any = _UNSET,
 ) -> dict[str, Any]:
-    """Register a GitHub repository with Factonio and anchor a Hermes Project."""
+    """Register a GitHub repository with Factonio and anchor a Hermes Project.
+
+    Re-running on an already-registered repository preserves existing per-repo overrides
+    (merge policy, fix rounds, default branch, design settings, CI contract, models)
+    unless explicitly overridden by the caller.
+    """
     full_repo, slug = normalize_repo(repo_spec)
     settings = load_settings(use_root=True)
 
-    policy = (merge_policy or settings.get("default_merge_policy") or "auto").strip().lower()
-    if policy not in {"auto", "ask"}:
-        raise ValueError(f"merge_policy must be 'auto' or 'ask', got {policy!r}")
+    raw_existing = list_repos().get(slug)
+    existing: dict[str, Any] = raw_existing if isinstance(raw_existing, dict) else {}
 
-    rounds = int(max_fix_rounds if max_fix_rounds is not None else settings.get("default_max_fix_rounds") or 3)
-    if rounds < 1:
-        raise ValueError("max_fix_rounds must be >= 1")
+    # Validate every explicit argument before any side effects (clone, project, disk writes).
+    if merge_policy is not None:
+        policy = _validate_merge_policy(merge_policy)
+    elif existing.get("merge_policy"):
+        policy = str(existing["merge_policy"])
+    else:
+        policy = _validate_merge_policy(settings.get("default_merge_policy") or "auto")
+
+    if max_fix_rounds is not None:
+        rounds = _validate_max_fix_rounds(max_fix_rounds)
+    elif existing.get("max_fix_rounds") is not None:
+        rounds = existing["max_fix_rounds"]
+    else:
+        rounds = _validate_max_fix_rounds(int(settings.get("default_max_fix_rounds") or 3))
+
+    explicit_branch = _validate_default_branch(default_branch) if default_branch is not None else None
+    design_updates: dict[str, Optional[str]] = {}
+    if design_provider is not _UNSET:
+        design_updates["design_provider"] = _validate_design_override(
+            "design_provider", design_provider, DESIGN_PROVIDERS
+        )
+    if design_approval is not _UNSET:
+        design_updates["design_approval"] = _validate_design_override(
+            "design_approval", design_approval, DESIGN_APPROVAL_POLICIES
+        )
 
     repo_name = full_repo.split("/", 1)[1]
     if local_path:
@@ -166,7 +285,7 @@ def add_repo(
 
     repos = list_repos()
     raw_existing = repos.get(slug)
-    existing: dict[str, Any] = raw_existing if isinstance(raw_existing, dict) else {}
+    existing = raw_existing if isinstance(raw_existing, dict) else {}
     entry: dict[str, Any] = {
         **existing,
         "slug": slug,
@@ -174,13 +293,18 @@ def add_repo(
         "url": remote_info["url"],
         "path": str(checkout),
         "project_slug": project_slug or existing.get("project_slug") or slug,
-        "default_branch": remote_info["default_branch"],
+        "default_branch": explicit_branch or existing.get("default_branch") or remote_info["default_branch"],
         "has_required_checks": bool(remote_info["has_required_checks"]),
         "required_checks": list(remote_info["required_checks"]),
         "merge_policy": policy,
         "max_fix_rounds": rounds,
-        "ci_contract": "auto",
+        "ci_contract": existing.get("ci_contract") or "auto",
     }
+    for field, value in design_updates.items():
+        if value is None:
+            entry.pop(field, None)
+        else:
+            entry[field] = value
     repos[slug] = entry
     save_settings({"repos": repos})
 
@@ -189,6 +313,57 @@ def add_repo(
         "cloned": cloned,
         "repo": entry,
     }
+
+
+def update_repo(
+    slug_or_full: str,
+    *,
+    merge_policy: Any = _UNSET,
+    max_fix_rounds: Any = _UNSET,
+    default_branch: Any = _UNSET,
+    design_provider: Any = _UNSET,
+    design_approval: Any = _UNSET,
+) -> dict[str, Any]:
+    """Update editable parameters of a registered repository (only fields explicitly supplied).
+
+    All supplied values are validated before anything is written (all-or-nothing). The full
+    entry (including fields that only lived in config.yaml) is persisted atomically to
+    ``plugin-data/factonio/repos.json``. Passing ``None``/``""``/``"inherit"``/``"default"`` for
+    ``design_provider`` or ``design_approval`` removes the per-repo override so the global
+    default applies.
+    """
+    found = get_repo(slug_or_full)
+    if found is None:
+        raise RepoNotFoundError(f"Repository {slug_or_full!r} is not registered.")
+
+    supplied = {
+        "merge_policy": merge_policy,
+        "max_fix_rounds": max_fix_rounds,
+        "default_branch": default_branch,
+        "design_provider": design_provider,
+        "design_approval": design_approval,
+    }
+    supplied = {k: v for k, v in supplied.items() if v is not _UNSET}
+    if not supplied:
+        raise ValueError(
+            "At least one editable field must be provided (" + ", ".join(EDITABLE_REPO_FIELDS) + ")."
+        )
+    validated = _validate_editable_fields(supplied)
+
+    slug = str(found["slug"])
+    repos = list_repos()
+    base = repos.get(slug)
+    entry: dict[str, Any] = dict(base) if isinstance(base, dict) else dict(found)
+    entry["slug"] = slug
+    for field, value in validated.items():
+        if field in ("design_provider", "design_approval") and value is None:
+            entry.pop(field, None)
+        else:
+            entry[field] = value
+    repos[slug] = entry
+    save_settings({"repos": repos})
+
+    return {"ok": True, "repo": entry, "updated_fields": sorted(validated)}
 
 
 def remove_repo(slug_or_full: str) -> dict[str, Any]:

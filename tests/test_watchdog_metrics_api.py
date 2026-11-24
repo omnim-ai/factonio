@@ -201,6 +201,106 @@ class TestWatchdogMetricsAndApi(unittest.TestCase):
                 resp = client.get(f"/api/plugins/factonio{ep}")
                 self.assertEqual(resp.status_code, 200, f"Endpoint {ep} failed: {resp.text}")
 
+    def test_repos_api_get_defaults_and_patch(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from unittest import mock
+
+        from factonio.config import save_settings
+        from factonio.repos import add_repo
+
+        with isolated_hermes_home() as home:
+            local = home / "dev" / "sample"
+            (local / ".git").mkdir(parents=True)
+            add_repo("acme/sample", local_path=str(local), clone=False, inspect_remote=False)
+            save_settings({"design_provider": "auto", "design_approval": "ask"})
+
+            spec = importlib.util.spec_from_file_location(
+                "factonio_test_plugin_api_repos", PLUGIN_ROOT / "dashboard" / "plugin_api.py"
+            )
+            assert spec is not None and spec.loader is not None
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            app = FastAPI()
+            app.include_router(mod.router, prefix="/api/plugins/factonio")
+            client = TestClient(app)
+            base = "/api/plugins/factonio"
+            no_claude = {"claude_bin": None, "has_credentials": False, "available": False}
+
+            with mock.patch.object(mod._config, "detect_claude_design_support", return_value=no_claude):
+                r = client.get(f"{base}/repos")
+                self.assertEqual(r.status_code, 200)
+                body = r.json()
+                self.assertEqual(
+                    body["defaults"],
+                    {"merge_policy": "auto", "max_fix_rounds": 3, "design_provider": "auto", "design_approval": "ask"},
+                )
+                item = body["repos"][0]
+                for key in ("slug", "repo", "url", "path", "default_branch", "merge_policy", "max_fix_rounds",
+                            "has_required_checks", "models"):
+                    self.assertIn(key, item)
+                self.assertIsNone(item["design_provider"])
+                self.assertIsNone(item["design_approval"])
+                self.assertEqual(item["effective_design_provider"], "auto")
+                self.assertEqual(item["effective_design_approval"], "ask")
+                self.assertEqual(item["resolved_design_provider"], "hermes")
+
+                r = client.patch(
+                    f"{base}/repos/acme-sample",
+                    json={"merge_policy": "ask", "max_fix_rounds": 4, "default_branch": "develop",
+                          "design_provider": "off", "design_approval": "auto"},
+                )
+                self.assertEqual(r.status_code, 200, r.text)
+                body = r.json()
+                self.assertTrue(body["ok"])
+                repo = body["repo"]
+                self.assertEqual(repo["merge_policy"], "ask")
+                self.assertEqual(repo["max_fix_rounds"], 4)
+                self.assertEqual(repo["default_branch"], "develop")
+                self.assertEqual(repo["design_provider"], "off")
+                self.assertEqual(repo["effective_design_provider"], "off")
+                self.assertEqual(repo["resolved_design_provider"], "off")
+                self.assertEqual(repo["design_approval"], "auto")
+
+                r = client.patch(f"{base}/repos/acme-sample", json={"design_provider": None, "design_approval": "inherit"})
+                self.assertEqual(r.status_code, 200, r.text)
+                repo = r.json()["repo"]
+                self.assertIsNone(repo["design_provider"])
+                self.assertIsNone(repo["design_approval"])
+                self.assertEqual(repo["effective_design_provider"], "auto")
+                self.assertEqual(repo["effective_design_approval"], "ask")
+
+                store = json.loads((home / "plugin-data" / "factonio" / "repos.json").read_text(encoding="utf-8"))
+                before = store
+                bad = [
+                    {},
+                    [],
+                    {"slug": "x"},
+                    {"repo": "evil/repo"},
+                    {"path": "/tmp"},
+                    {"models": {}},
+                    {"merge_policy": "ask", "bogus": 1},
+                    {"merge_policy": "always"},
+                    {"max_fix_rounds": 0},
+                    {"max_fix_rounds": "3"},
+                    {"max_fix_rounds": True},
+                    {"default_branch": ""},
+                    {"default_branch": "a b"},
+                    {"design_provider": "nope"},
+                ]
+                for payload in bad:
+                    with self.subTest(payload=payload):
+                        r = client.patch(f"{base}/repos/acme-sample", json=payload)
+                        self.assertEqual(r.status_code, 422, r.text)
+                after = json.loads((home / "plugin-data" / "factonio" / "repos.json").read_text(encoding="utf-8"))
+                self.assertEqual(before, after)
+
+                r = client.patch(f"{base}/repos/nope-missing", json={"merge_policy": "ask"})
+                self.assertEqual(r.status_code, 404, r.text)
+
+                r = client.get(f"{base}/repos")
+                self.assertEqual(r.json()["repos"][0]["merge_policy"], "ask")
+
     def test_dashboard_manifest_discovered_by_hermes(self):
         from hermes_cli.web_server_dashboard import _discover_dashboard_plugins
 
@@ -215,6 +315,8 @@ class TestWatchdogMetricsAndApi(unittest.TestCase):
             self.assertTrue(entry.get("has_api"))
             self.assertEqual(entry.get("_api_file"), "plugin_api.py")
             self.assertTrue((PLUGIN_ROOT / "dashboard" / "manifest.json").is_file())
+            manifest = json.loads((PLUGIN_ROOT / "dashboard" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertNotIn("read-only", manifest["description"].lower())
 
 
 def _seed_enrichment_db(db_path: Path, now_ts: float) -> None:
