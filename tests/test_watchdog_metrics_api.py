@@ -201,6 +201,21 @@ class TestWatchdogMetricsAndApi(unittest.TestCase):
                 resp = client.get(f"/api/plugins/factonio{ep}")
                 self.assertEqual(resp.status_code, 200, f"Endpoint {ep} failed: {resp.text}")
 
+    def test_dashboard_manifest_discovered_by_hermes(self):
+        from hermes_cli.web_server_dashboard import _discover_dashboard_plugins
+
+        with isolated_hermes_home() as home:
+            plugins_dir = home / "plugins"
+            plugins_dir.mkdir(parents=True, exist_ok=True)
+            (plugins_dir / "factonio").symlink_to(PLUGIN_ROOT)
+
+            discovered = {p.get("name"): p for p in _discover_dashboard_plugins()}
+            self.assertIn("factonio", discovered)
+            entry = discovered["factonio"]
+            self.assertTrue(entry.get("has_api"))
+            self.assertEqual(entry.get("_api_file"), "plugin_api.py")
+            self.assertTrue((PLUGIN_ROOT / "dashboard" / "manifest.json").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
