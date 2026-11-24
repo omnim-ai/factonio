@@ -720,7 +720,7 @@ function mountRepos({ data, client }) {
     hooks.flush()
     return tree
   }
-  return { rests, render, focusLog, refetches, setRest: fn => { restImpl = fn } }
+  return { rests, render, focusLog, refetches, setRest: fn => { restImpl = fn }, setData: next => { data = next } }
 }
 const reposSec = tree => find(tree, n => n.type === 'table' && String(n.props.className).includes('fc-repos'))
 function readRepos(tree) {
@@ -821,8 +821,15 @@ async function runReposScenarios(report) {
   r.validate = {
     valid: [['main', '3'], ['  feature/x  ', ' 2 '], ['release/v2', 1], ['a.b', '10'], ['x', 99]].map(([b, n]) => v(b, n)),
     branch: Object.fromEntries([['empty', ''], ['blank', '   '], ['null', null], ['space', 'feat x'], ['tab', 'feat\tx'], ['dots', 'feature..bad'], ['dash', '-main'], ['ctrl', 'ma\u0001in'], ['del', 'ma\u007fin']].map(([k, b]) => [k, msgs(b, '3').default_branch || null])),
-    rounds: Object.fromEntries([['zero', '0'], ['neg', '-1'], ['float', '1.5'], ['floatNum', 2.5], ['zeroNum', 0], ['text', 'abc'], ['empty', ''], ['null', null], ['bool', true], ['plus', '+3'], ['exp', '1e2']].map(([k, n]) => [k, msgs('main', n).max_fix_rounds || null]))
+    rounds: Object.fromEntries([['zero', '0'], ['neg', '-1'], ['float', '1.5'], ['floatNum', 2.5], ['zeroNum', 0], ['text', 'abc'], ['empty', ''], ['null', null], ['bool', true], ['plus', '+3'], ['exp', '1e2'], ['infNum', Infinity], ['nanNum', NaN], ['zeros', '000']].map(([k, n]) => [k, msgs('main', n).max_fix_rounds || null])),
+    unsafe: Object.fromEntries([['pow53', '9007199254740992'], ['pow53plus1', '9007199254740993'], ['overflow309', '9'.repeat(309)], ['pow53Num', 9007199254740992], ['bigNum', 1e300]].map(([k, n]) => [k, msgs('main', n).max_fix_rounds || null])),
+    safeMax: [['9007199254740991'], [Number.MAX_SAFE_INTEGER], ['0009007199254740991'], ['007']].map(([n]) => v('main', n))
   }
+  r.changesBaseline = mod.repoDraftChanges(
+    { ...mod.seedRepoDraft(REPOS[0]), default_branch: 'user-feature' },
+    { ...REPOS[0], merge_policy: 'ask', design_provider: 'hermes' },
+    mod.seedRepoDraft(REPOS[0])
+  )
   r.changes = mod.repoDraftChanges({ default_branch: ' main ', merge_policy: 'ask', max_fix_rounds: '7', design_provider: '', design_approval: 'auto' }, REPOS[1])
   r.describe = {
     ipc422: mod.describeSaveError(new Error("Error invoking remote method 'hermes:api': Error: 422: {\"detail\":\"max_fix_rounds must be >= 1\"}")),
@@ -947,6 +954,53 @@ async function runReposScenarios(report) {
   fire(editBtnHit(tree, 'acme-cli-tools')); tree = m.render()
   X.toggleClosed = readEditor(tree)
   X.rests = [...m.rests]
+
+  // Background refresh while editing: only user-edited fields are dirty / PATCHed;
+  // untouched fields reconcile to refreshed values and are never reverted.
+  const B = r.refresh = {}
+  m = mountRepos({ data: { repos: REPOS, defaults: REPO_DEFAULTS }, client })
+  tree = m.render()
+  fire(editBtnHit(tree, 'tozes-factonio')); tree = m.render()
+  change(tree, 'default_branch', 'user-feature'); tree = m.render()
+  B.before = readEditor(tree)
+  const refreshed = { ...REPOS[0], merge_policy: 'ask', design_provider: 'hermes', effective_design_provider: 'hermes', resolved_design_provider: 'hermes' }
+  m.setData({ repos: [refreshed, REPOS[1], REPOS[2]], defaults: REPO_DEFAULTS })
+  tree = m.render()
+  B.after = readEditor(tree)
+  m.setRest(async () => ({ ok: true }))
+  await submitForm(tree); tree = m.render()
+  B.rests = [...m.rests]
+  B.closed = readEditor(tree) === null
+  // Editing a field, then refresh changes that same field: the user's edit wins.
+  m = mountRepos({ data: { repos: REPOS, defaults: REPO_DEFAULTS }, client })
+  tree = m.render()
+  fire(editBtnHit(tree, 'tozes-factonio')); tree = m.render()
+  change(tree, 'merge_policy', 'ask'); tree = m.render()
+  m.setData({ repos: [{ ...REPOS[0], merge_policy: 'auto', max_fix_rounds: 6 }, REPOS[1], REPOS[2]], defaults: REPO_DEFAULTS })
+  tree = m.render()
+  B.keepEdit = readEditor(tree)
+  await submitForm(tree)
+  B.keepEditRests = [...m.rests]
+
+  // Unsafe max_fix_rounds are rejected in the editor: no PATCH, draft preserved.
+  const U = r.unsafe = {}
+  for (const [k, n] of [['pow53', '9007199254740992'], ['pow53plus1', '9007199254740993'], ['overflow309', '9'.repeat(309)]]) {
+    m = mountRepos({ data: { repos: REPOS, defaults: REPO_DEFAULTS }, client })
+    tree = m.render()
+    fire(editBtnHit(tree, 'tozes-factonio')); tree = m.render()
+    change(tree, 'max_fix_rounds', n); tree = m.render()
+    m.focusLog.length = 0
+    await submitForm(tree); tree = m.render()
+    const ed = readEditor(tree)
+    U[k] = { rests: [...m.rests], value: ed.fields.max_fix_rounds.value, expected: n, invalid: ed.fields.max_fix_rounds.invalid, err: ed.fields.max_fix_rounds.err && ed.fields.max_fix_rounds.err.text, focus: [...m.focusLog], roundsId: ed.fields.max_fix_rounds.id }
+  }
+  // Numeric unsafe value (e.g. a programmatic draft) is equally rejected.
+  m = mountRepos({ data: { repos: REPOS, defaults: REPO_DEFAULTS }, client })
+  tree = m.render()
+  fire(editBtnHit(tree, 'tozes-factonio')); tree = m.render()
+  change(tree, 'max_fix_rounds', 9007199254740992); tree = m.render()
+  await submitForm(tree); tree = m.render()
+  { const ed = readEditor(tree); U.pow53Num = { rests: [...m.rests], value: ed.fields.max_fix_rounds.value, expected: 9007199254740992, invalid: ed.fields.max_fix_rounds.invalid, err: ed.fields.max_fix_rounds.err && ed.fields.max_fix_rounds.err.text } }
 
   globalThis.__fcReposState = undefined
   globalThis.__fcQueryClient = undefined
@@ -1570,6 +1624,48 @@ class TestDesktopPlugin(unittest.TestCase):
         for case, msg in v["rounds"].items():
             with self.subTest(case=case):
                 self.assertEqual(msg, "Must be a whole number, 1 or more.")
+
+    def test_validate_repo_draft_rejects_unsafe_max_fix_rounds(self):
+        v = self.report["repos"]["validate"]
+        rng = "Must be 9007199254740991 or less."
+        self.assertEqual(v["unsafe"], {"pow53": rng, "pow53plus1": rng, "overflow309": rng, "pow53Num": rng, "bigNum": rng})
+        self.assertEqual(v["safeMax"], [[], [], [], []])
+
+    def test_repo_editor_rejects_unsafe_max_fix_rounds(self):
+        for case, u in self.report["repos"]["unsafe"].items():
+            with self.subTest(case=case):
+                self.assertEqual(u["rests"], [])
+                self.assertEqual(u["value"], u["expected"])  # draft preserved
+                self.assertEqual(u["invalid"], "true")
+                self.assertEqual(u["err"], "Must be 9007199254740991 or less.")
+                if "focus" in u:
+                    self.assertEqual(u["focus"], [u["roundsId"]])
+
+    def test_repo_draft_changes_against_edit_start_baseline(self):
+        self.assertEqual(self.report["repos"]["changesBaseline"], {"default_branch": "user-feature"})
+
+    def test_repo_editor_background_refresh_does_not_revert_untouched_fields(self):
+        b = self.report["repos"]["refresh"]
+        self.assertEqual(b["before"]["msg"]["text"], "1 unsaved change")
+        self.assertEqual(b["after"]["msg"]["text"], "1 unsaved change")
+        # Untouched fields reconcile to refreshed values; the user's edit is preserved.
+        self.assertEqual(
+            self._ed_vals(b["after"]),
+            {"default_branch": "user-feature", "merge_policy": "ask", "max_fix_rounds": "3", "design_provider": "hermes", "design_approval": ""},
+        )
+        self.assertEqual(
+            b["rests"],
+            [{"path": "/repos/tozes-factonio", "opts": {"method": "PATCH", "body": {"default_branch": "user-feature"}}}],
+        )
+        self.assertTrue(b["closed"])
+        k = b["keepEdit"]
+        self.assertEqual(k["msg"]["text"], "1 unsaved change")
+        self.assertEqual(self._ed_vals(k)["merge_policy"], "ask")
+        self.assertEqual(self._ed_vals(k)["max_fix_rounds"], "6")
+        self.assertEqual(
+            b["keepEditRests"],
+            [{"path": "/repos/tozes-factonio", "opts": {"method": "PATCH", "body": {"merge_policy": "ask"}}}],
+        )
 
     def test_patch_body_only_changed_fields_and_error_parsing(self):
         rep = self.report["repos"]

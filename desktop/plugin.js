@@ -430,13 +430,29 @@ function validateRepoDraft(draft) {
   else if (branch.startsWith('-')) errors.default_branch = 'Branch can’t start with “-”.'
   else if (controlChars(branch)) errors.default_branch = 'Branch has invalid characters.'
 
-  const rounds = d.max_fix_rounds
-  let roundsOk
-  if (typeof rounds === 'number') roundsOk = Number.isInteger(rounds) && rounds >= 1
-  else if (typeof rounds === 'string') roundsOk = /^[0-9]+$/.test(rounds.trim()) && Number(rounds.trim()) >= 1
-  else roundsOk = false
-  if (!roundsOk) errors.max_fix_rounds = 'Must be a whole number, 1 or more.'
+  const roundsErr = validateRounds(d.max_fix_rounds)
+  if (roundsErr) errors.max_fix_rounds = roundsErr
   return errors
+}
+
+// Max fix rounds must be a canonical base-10 integer in [1, Number.MAX_SAFE_INTEGER]
+// so `Number(...)` in the PATCH body is exact (no silent rounding / Infinity -> null).
+const ROUNDS_WHOLE_MSG = 'Must be a whole number, 1 or more.'
+const ROUNDS_RANGE_MSG = `Must be ${Number.MAX_SAFE_INTEGER} or less.`
+function validateRounds(rounds) {
+  let big
+  if (typeof rounds === 'number') {
+    if (!Number.isInteger(rounds) || rounds < 1) return ROUNDS_WHOLE_MSG
+    if (!Number.isSafeInteger(rounds)) return ROUNDS_RANGE_MSG
+    return null
+  }
+  if (typeof rounds !== 'string') return ROUNDS_WHOLE_MSG
+  const t = rounds.trim()
+  if (!/^[0-9]+$/.test(t)) return ROUNDS_WHOLE_MSG
+  try { big = BigInt(t) } catch { return ROUNDS_WHOLE_MSG }
+  if (big < 1n) return ROUNDS_WHOLE_MSG
+  if (big > BigInt(Number.MAX_SAFE_INTEGER)) return ROUNDS_RANGE_MSG
+  return null
 }
 
 function seedRepoDraft(repo) {
@@ -449,17 +465,28 @@ function seedRepoDraft(repo) {
   }
 }
 
-// The PATCH body: only fields whose (normalized) draft value differs from the repo.
-function repoDraftChanges(draft, repo) {
+// Normalized draft values used for change detection (trimmed text, '' overrides -> null).
+function normalizeRepoDraft(d) {
+  return {
+    default_branch: String(d.default_branch ?? '').trim(),
+    merge_policy: String(d.merge_policy ?? ''),
+    max_fix_rounds: String(d.max_fix_rounds ?? '').trim(),
+    design_provider: d.design_provider || null,
+    design_approval: d.design_approval || null
+  }
+}
+
+// The PATCH body: only fields the user changed. With a `baseline` (the draft seeded
+// when editing started) a field counts only if it differs from that baseline, so
+// background refreshes of `repo` never turn untouched fields into changes (which
+// would revert other writers' updates). Without a baseline, diff against `repo`.
+function repoDraftChanges(draft, repo, baseline) {
+  const next = normalizeRepoDraft(draft || {})
+  const base = normalizeRepoDraft(baseline || seedRepoDraft(repo || {}))
   const body = {}
-  const branch = String(draft.default_branch ?? '').trim()
-  if (branch !== String(repo.default_branch ?? '')) body.default_branch = branch
-  if (draft.merge_policy !== String(repo.merge_policy ?? '')) body.merge_policy = draft.merge_policy
-  const rounds = String(draft.max_fix_rounds ?? '').trim()
-  if (rounds !== String(repo.max_fix_rounds ?? '')) body.max_fix_rounds = Number(rounds)
-  for (const k of ['design_provider', 'design_approval']) {
-    const next = draft[k] || null
-    if (next !== (repo[k] || null)) body[k] = next
+  for (const k of REPO_FIELD_ORDER) {
+    if (next[k] === base[k]) continue
+    body[k] = k === 'max_fix_rounds' ? Number(next[k]) : next[k]
   }
   return body
 }
@@ -580,7 +607,13 @@ function AlertIcon() {
 
 function RepoEditor({ ctx, repo, defaults, autoResolved, reposQ, editorId, saving, setSaving, onClose, onSaved }) {
   const queryClient = useQueryClient()
-  const [draft, setDraft] = useState(() => seedRepoDraft(repo))
+  // Immutable edit-start baseline: dirty fields are those the user changed from it.
+  const [baseline] = useState(() => seedRepoDraft(repo))
+  const [edits, setDraft] = useState(() => seedRepoDraft(repo))
+  // Untouched fields track the live (refreshed) repo; user-edited fields keep the draft.
+  const live = seedRepoDraft(repo)
+  const draft = {}
+  for (const k of REPO_FIELD_ORDER) draft[k] = edits[k] !== baseline[k] ? edits[k] : live[k]
   const [errors, setErrors] = useState({})
   const [apiError, setApiError] = useState(null)
   const branchRef = useRef(null)
@@ -591,7 +624,7 @@ function RepoEditor({ ctx, repo, defaults, autoResolved, reposQ, editorId, savin
     branchRef.current?.focus?.()
   }, [])
 
-  const changes = repoDraftChanges(draft, repo)
+  const changes = repoDraftChanges(edits, repo, baseline)
   const count = Object.keys(changes).length
   const errorCount = Object.keys(errors).length
   const fid = name => `${editorId}-${name}`
@@ -1983,7 +2016,7 @@ function YourTurnCard({ attrs, sessionId }) {
 }
 
 // Pure helpers exposed for clean-room tests; the host only consumes the default export.
-export { validateRepoDraft, repoDraftChanges, describeSaveError }
+export { validateRepoDraft, repoDraftChanges, seedRepoDraft, describeSaveError }
 
 export default {
   id: 'factonio',
