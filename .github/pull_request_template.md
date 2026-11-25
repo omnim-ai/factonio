@@ -17,5 +17,6 @@
 - [ ] `python3 tools/check_repo_integrity.py` and `node --check desktop/plugin.js` pass
 - [ ] Preserves the `holdout/` information barrier (Implement & Diff Check never see `holdout/`; Black-Box Check never sees `git diff`)
 - [ ] `desktop/plugin.js` uses only public `@hermes/plugin-sdk` surfaces and host theme tokens (if touched)
+- [ ] **UI / README media:** if `desktop/plugin.js` changed visually, regenerated affected screenshots/GIFs via `.agents/skills/update-readme-media/SKILL.md` (`python3 tools/capture_readme_media.py --capture`) and verified them visually (or labeled the PR `no-visual-change` and explained why)
 - [ ] Added a bullet under `## Unreleased` in [CHANGELOG.md](../CHANGELOG.md), or labeled the PR `no-changelog`
 - [ ] Relevant docs updated, or explained why none apply

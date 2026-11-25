@@ -8,6 +8,7 @@ Every user-facing pull request adds an entry under `## Unreleased`.
 - Moved canonical repository to `omnim-ai/factonio` and updated `plugin.yaml` metadata (`homepage`, `tags`).
 - Added GitHub Actions CI pipeline (lint, manifest/link integrity, full 90-test suite against pinned Hermes Agent, and changelog gate) plus daily upstream Hermes compatibility checks and Dependabot config.
 - Added open-source contributor documentation: `CONTRIBUTING.md`, `SECURITY.md`, `AGENTS.md`, `docs/development.md`, `docs/architecture.md`, PR/issue templates, and visual `README.md` with Desktop UI screenshots, architecture diagram, and animated feature demos.
+- Added project-local contributor skill `.agents/skills/update-readme-media/SKILL.md`, upgraded `tools/capture_readme_media.py` (`--check-deps`, `--only`, `--qa-dir`, cross-platform browser discovery, image header validation), and added the mechanical `README media freshness` CI check (with `no-visual-change` label override) and review checklist.
 - Added reproducible media capture harness (`tools/capture_readme_media.py`) and static integrity checker (`tools/check_repo_integrity.py`).
 
 ## 0.1.0

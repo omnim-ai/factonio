@@ -19,6 +19,7 @@ import argparse
 import glob
 import http.server
 import mimetypes
+import os
 import shutil
 import socketserver
 import subprocess
@@ -1503,21 +1504,112 @@ def serve(port: int) -> None:
         httpd.serve_forever()
 
 
+VALID_TARGETS = ("dashboard", "sidebar", "settings", "workflow", "repo-editor", "architecture")
+DEFAULT_CAPTURE_TARGETS = ("dashboard", "sidebar", "settings", "workflow", "repo-editor")
+GIF_TARGETS = frozenset({"workflow", "repo-editor"})
+
+
 def find_chrome() -> str:
-    """Locate a headless Chromium / Chrome binary on PATH or in Playwright's cache."""
-    for name in ("chromium", "chromium-browser", "google-chrome", "chrome-headless-shell"):
+    """Locate a headless Chromium / Chrome binary across Linux, macOS, and Playwright caches."""
+    env_chrome = os.environ.get("CHROME_BIN", "").strip()
+    if env_chrome:
+        p = Path(env_chrome).expanduser()
+        if p.is_file():
+            return str(p)
+        raise FileNotFoundError(f"CHROME_BIN points to a missing file: {env_chrome}")
+
+    for name in (
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+        "chrome-headless-shell",
+        "brave-browser",
+        "microsoft-edge",
+    ):
         hit = shutil.which(name)
         if hit:
             return hit
-    candidates = sorted(
-        glob.glob(str(Path.home() / ".cache/ms-playwright/chromium*/**/chrome-headless-shell"), recursive=True)
-        + glob.glob(str(Path.home() / ".cache/ms-playwright/chromium*/**/chrome"), recursive=True),
-        reverse=True,
+
+    mac_paths = (
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
     )
-    for path in candidates:
+    for mp in mac_paths:
+        if Path(mp).is_file():
+            return mp
+
+    cache_roots = (
+        Path.home() / ".cache" / "ms-playwright",
+        Path.home() / "Library" / "Caches" / "ms-playwright",
+    )
+    candidates: list[str] = []
+    for root in cache_roots:
+        if root.is_dir():
+            candidates.extend(glob.glob(str(root / "chromium*" / "**" / "chrome-headless-shell"), recursive=True))
+            candidates.extend(glob.glob(str(root / "chromium*" / "**" / "chrome"), recursive=True))
+            candidates.extend(glob.glob(str(root / "chromium*" / "**" / "Google Chrome for Testing"), recursive=True))
+    for path in sorted(candidates, reverse=True):
         if Path(path).is_file():
             return path
-    raise FileNotFoundError("Could not find chromium, google-chrome, or Playwright chrome-headless-shell")
+    raise FileNotFoundError(
+        "Could not find Chrome/Chromium. Install chromium/google-chrome, run `npx playwright install chromium`, "
+        "or set CHROME_BIN=/path/to/chrome."
+    )
+
+
+def find_ffmpeg() -> str | None:
+    return shutil.which("ffmpeg")
+
+
+def check_deps() -> int:
+    """Report availability of headless Chrome/Chromium and ffmpeg."""
+    ok = True
+    try:
+        chrome = find_chrome()
+        print(f"  [OK  ] chrome: {chrome}")
+    except FileNotFoundError as exc:
+        print(f"  [FAIL] chrome: {exc}")
+        ok = False
+
+    ffmpeg = find_ffmpeg()
+    if ffmpeg:
+        print(f"  [OK  ] ffmpeg: {ffmpeg}")
+    else:
+        print("  [WARN] ffmpeg: not found on PATH (needed only for GIF targets: workflow, repo-editor)")
+        print("         Install with: brew install ffmpeg | sudo apt install ffmpeg | sudo dnf install ffmpeg")
+    return 0 if ok else 1
+
+
+def _verify_image(path: Path, expected_magic: bytes) -> None:
+    data = path.read_bytes()
+    if len(data) < len(expected_magic) or not data.startswith(expected_magic):
+        raise RuntimeError(f"Generated file {path} failed {expected_magic!r} header validation ({len(data)} bytes)")
+
+
+def parse_targets(raw_only: list[str] | None) -> list[str]:
+    if not raw_only:
+        return list(DEFAULT_CAPTURE_TARGETS)
+    selected: list[str] = []
+    for item in raw_only:
+        for tok in item.split(","):
+            name = tok.strip().lower()
+            if not name:
+                continue
+            if name == "all":
+                for t in DEFAULT_CAPTURE_TARGETS:
+                    if t not in selected:
+                        selected.append(t)
+                continue
+            if name not in VALID_TARGETS:
+                raise ValueError(
+                    f"Unknown target {name!r}. Valid targets: all, {', '.join(VALID_TARGETS)}"
+                )
+            if name not in selected:
+                selected.append(name)
+    return selected or list(DEFAULT_CAPTURE_TARGETS)
 
 
 def capture_url(chrome: str, url: str, dest: Path, width: int, height: int, scale: int = 2) -> None:
@@ -1539,12 +1631,21 @@ def capture_url(chrome: str, url: str, dest: Path, width: int, height: int, scal
         capture_output=True,
         timeout=30,
     )
+    _verify_image(dest, b"\x89PNG")
 
 
-def capture_all(out_dir: Path) -> None:
-    """Render every static screenshot and animated GIF into `out_dir`."""
+def capture_selected(out_dir: Path, targets: list[str], qa_dir: Path | None = None) -> None:
+    """Render the requested static screenshots and animated GIFs into `out_dir`."""
     chrome = find_chrome()
+    if any(t in GIF_TARGETS for t in targets) and not find_ffmpeg():
+        raise FileNotFoundError(
+            "ffmpeg is required to encode GIF targets (workflow, repo-editor). "
+            "Install ffmpeg or restrict capture to static PNGs with --only dashboard,sidebar,settings."
+        )
+
     out_dir.mkdir(parents=True, exist_ok=True)
+    if qa_dir is not None:
+        qa_dir.mkdir(parents=True, exist_ok=True)
 
     class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         allow_reuse_address = True
@@ -1556,42 +1657,88 @@ def capture_all(out_dir: Path) -> None:
     base = f"http://127.0.0.1:{port}"
 
     try:
-        capture_url(chrome, f"{base}/__harness/dashboard.html", out_dir / "dashboard.png", 1240, 1100, scale=2)
-        print(f"Wrote {out_dir / 'dashboard.png'} ({(out_dir / 'dashboard.png').stat().st_size} bytes)")
-        capture_url(chrome, f"{base}/__harness/sidebar.html", out_dir / "sidebar.png", 1100, 770, scale=2)
-        print(f"Wrote {out_dir / 'sidebar.png'} ({(out_dir / 'sidebar.png').stat().st_size} bytes)")
-        capture_url(chrome, f"{base}/__harness/settings.html", out_dir / "settings.png", 980, 680, scale=2)
-        print(f"Wrote {out_dir / 'settings.png'} ({(out_dir / 'settings.png').stat().st_size} bytes)")
+        if "dashboard" in targets:
+            dest = out_dir / "dashboard.png"
+            capture_url(chrome, f"{base}/__harness/dashboard.html", dest, 1240, 1100, scale=2)
+            print(f"Wrote {dest} ({dest.stat().st_size} bytes)")
+        if "sidebar" in targets:
+            dest = out_dir / "sidebar.png"
+            capture_url(chrome, f"{base}/__harness/sidebar.html", dest, 1100, 770, scale=2)
+            print(f"Wrote {dest} ({dest.stat().st_size} bytes)")
+        if "settings" in targets:
+            dest = out_dir / "settings.png"
+            capture_url(chrome, f"{base}/__harness/settings.html", dest, 980, 680, scale=2)
+            print(f"Wrote {dest} ({dest.stat().st_size} bytes)")
+        if "architecture" in targets or qa_dir is not None:
+            arch_dest = (qa_dir or out_dir) / "architecture.png"
+            if "architecture" in targets or (REPO_ROOT / "docs" / "images" / "architecture.svg").is_file():
+                capture_url(chrome, f"{base}/docs/images/architecture.svg", arch_dest, 1080, 530, scale=2)
+                print(f"Wrote QA preview {arch_dest} ({arch_dest.stat().st_size} bytes)")
 
-        with tempfile.TemporaryDirectory(prefix="factonio-media-") as tmp:
-            tmp_path = Path(tmp)
-            wf_dir = tmp_path / "workflow"
-            re_dir = tmp_path / "repo-editor"
-            wf_dir.mkdir()
-            re_dir.mkdir()
+        if any(t in GIF_TARGETS for t in targets):
+            with tempfile.TemporaryDirectory(prefix="factonio-media-") as tmp:
+                tmp_path = Path(tmp)
 
-            wf_frames: list[Path] = []
-            for i in range(8):
-                frame = wf_dir / f"frame_{i:02d}.png"
-                capture_url(chrome, f"{base}/__harness/workflow-demo.html?step={i}", frame, 960, 660, scale=2)
-                wf_frames.append(frame)
-            encode_gif(wf_frames, [2.2, 2.0, 2.0, 2.2, 3.0, 2.0, 2.5, 3.2], out_dir / "demo-workflow.gif", width=960)
-            print(f"Wrote {out_dir / 'demo-workflow.gif'} ({(out_dir / 'demo-workflow.gif').stat().st_size} bytes)")
+                if "workflow" in targets:
+                    wf_dir = tmp_path / "workflow"
+                    wf_dir.mkdir()
+                    wf_frames: list[Path] = []
+                    for i in range(8):
+                        frame = wf_dir / f"frame_{i:02d}.png"
+                        capture_url(chrome, f"{base}/__harness/workflow-demo.html?step={i}", frame, 960, 660, scale=2)
+                        wf_frames.append(frame)
+                    out_gif = out_dir / "demo-workflow.gif"
+                    encode_gif(wf_frames, [2.2, 2.0, 2.0, 2.2, 3.0, 2.0, 2.5, 3.2], out_gif, width=960)
+                    _verify_image(out_gif, b"GIF89a")
+                    print(f"Wrote {out_gif} ({out_gif.stat().st_size} bytes)")
+                    if qa_dir is not None:
+                        for idx in (0, 4, 7):
+                            qa_dest = qa_dir / f"workflow_step{idx}.png"
+                            shutil.copy2(wf_frames[idx], qa_dest)
+                            print(f"Wrote QA keyframe {qa_dest}")
 
-            re_frames: list[Path] = []
-            for i in range(6):
-                frame = re_dir / f"frame_{i:02d}.png"
-                capture_url(chrome, f"{base}/__harness/repo-editor-demo.html?step={i}", frame, 960, 580, scale=2)
-                re_frames.append(frame)
-            encode_gif(re_frames, [2.0, 1.8, 1.5, 1.5, 2.0, 3.0], out_dir / "demo-repo-editor.gif", width=960)
-            print(f"Wrote {out_dir / 'demo-repo-editor.gif'} ({(out_dir / 'demo-repo-editor.gif').stat().st_size} bytes)")
+                if "repo-editor" in targets:
+                    re_dir = tmp_path / "repo-editor"
+                    re_dir.mkdir()
+                    re_frames: list[Path] = []
+                    for i in range(6):
+                        frame = re_dir / f"frame_{i:02d}.png"
+                        capture_url(chrome, f"{base}/__harness/repo-editor-demo.html?step={i}", frame, 960, 580, scale=2)
+                        re_frames.append(frame)
+                    out_gif = out_dir / "demo-repo-editor.gif"
+                    encode_gif(re_frames, [2.0, 1.8, 1.5, 1.5, 2.0, 3.0], out_gif, width=960)
+                    _verify_image(out_gif, b"GIF89a")
+                    print(f"Wrote {out_gif} ({out_gif.stat().st_size} bytes)")
+                    if qa_dir is not None:
+                        for idx in (0, 4, 5):
+                            qa_dest = qa_dir / f"repo-editor_step{idx}.png"
+                            shutil.copy2(re_frames[idx], qa_dest)
+                            print(f"Wrote QA keyframe {qa_dest}")
     finally:
         httpd.shutdown()
 
 
+def capture_all(out_dir: Path) -> None:
+    """Backwards-compatible helper capturing all README PNGs and GIFs."""
+    capture_selected(out_dir, list(DEFAULT_CAPTURE_TARGETS))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Factonio README media harness and GIF encoder.")
-    parser.add_argument("--capture", action="store_true", help="Capture all README screenshots and animated GIFs.")
+    parser.add_argument("--check-deps", action="store_true", help="Check Chrome/Chromium and ffmpeg availability.")
+    parser.add_argument("--capture", action="store_true", help="Capture README screenshots and animated GIFs.")
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=None,
+        help="Comma-separated target(s) for --capture: all, dashboard, sidebar, settings, workflow, repo-editor, architecture.",
+    )
+    parser.add_argument(
+        "--qa-dir",
+        type=Path,
+        default=None,
+        help="Optional scratch directory where GIF keyframe PNGs and architecture.svg PNG preview are exported for visual QA.",
+    )
     parser.add_argument("--serve-only", action="store_true", help="Serve the live HTML harness for browser inspection/capture.")
     parser.add_argument("--port", type=int, default=18432, help="Loopback port (default: 18432).")
     parser.add_argument("--encode-gifs", action="store_true", help="Encode GIFs from captured PNG frames.")
@@ -1599,8 +1746,20 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=REPO_ROOT / "docs" / "images", help="Output directory for PNGs and GIFs.")
     args = parser.parse_args()
 
+    if args.check_deps:
+        return check_deps()
+
     if args.capture:
-        capture_all(args.out)
+        try:
+            targets = parse_targets(args.only)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        try:
+            capture_selected(args.out, targets, qa_dir=args.qa_dir)
+        except FileNotFoundError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
         return 0
 
     if args.serve_only:

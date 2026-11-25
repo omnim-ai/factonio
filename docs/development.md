@@ -36,8 +36,11 @@ tests/
   test_watchdog_metrics_api.py
   test_desktop_plugin.py     Node ESM smoke tests + Desktop SDK surface lint (59 tests)
 tools/
-  check_repo_integrity.py    Manifest, skill frontmatter, and Markdown link verifier
+  check_repo_integrity.py    Manifest, skill frontmatter (runtime + contributor), and Markdown link verifier
   capture_readme_media.py    Offline Chromium harness & ffmpeg GIF encoder for docs/images/
+.agents/
+  skills/
+    update-readme-media/     Project-local contributor skill for auto-regenerating & QA'ing README visuals
 docs/
   architecture.md            Deep dive on phases, information barrier, storage, and APIs
   development.md             This file
@@ -114,21 +117,30 @@ Factonio runs two GitHub Actions workflows:
 1. **`.github/workflows/ci.yml`** (runs on pushes to `main`, non-draft pull requests, and `workflow_dispatch`):
    - **Changelog entry:** Ensures non-draft PRs update `CHANGELOG.md` (under `## Unreleased`) or carry the `no-changelog` label.
    - **Lint & manifest:** Runs `compileall`, `ruff check --select E9,F`, `node --check desktop/plugin.js`, and `tools/check_repo_integrity.py`.
-   - **Test suite on Hermes (pinned):** Checks out `NousResearch/hermes-agent` at `HERMES_REF`, syncs with `uv`, and runs all 90 unit and Desktop UI tests.
+   - **README media freshness:** Ensures PRs modifying `desktop/plugin.js` or `tools/capture_readme_media.py` also refresh `docs/images/`, unless the PR carries the `no-visual-change` label.
+   - **Test suite on Hermes (pinned):** Checks out `NousResearch/hermes-agent` at `HERMES_REF`, syncs with `uv`, and runs all unit and Desktop UI tests.
    - **CI passed:** Single aggregator check required by branch protection on `main`.
 2. **`.github/workflows/hermes-upstream.yml`** (runs daily and on `workflow_dispatch`):
    - Runs the full test suite against `NousResearch/hermes-agent` `main` (or a custom `hermes_ref`) to catch upstream API changes early.
 
 ## Regenerating README screenshots and animations
 
-The screenshots and animated GIFs in `docs/images/` are rendered directly from the unmodified `desktop/plugin.js` inside headless Chromium via `tools/capture_readme_media.py`:
+The screenshots and animated GIFs in `docs/images/` are rendered directly from the unmodified `desktop/plugin.js` inside headless Chromium via `tools/capture_readme_media.py`.
+
+Contributors using AI coding agents (Hermes Agent, Codex, Claude Code, etc.) can let their agent handle this automatically via the project-local skill at [`.agents/skills/update-readme-media/SKILL.md`](../.agents/skills/update-readme-media/SKILL.md) (in Hermes, run `hermes skills trust` once inside this repository to auto-load `.agents/skills/`).
 
 ```bash
+# Check local Chrome/Chromium and ffmpeg availability (override with CHROME_BIN=/path/to/chrome)
+python3 tools/capture_readme_media.py --check-deps
+
 # Preview every harness scene interactively in your browser
 python3 tools/capture_readme_media.py --serve-only --port 18432
 
-# Re-render all PNG screenshots and encode both animated GIFs (requires Chromium + ffmpeg)
-python3 tools/capture_readme_media.py --capture
+# Regenerate only affected surfaces and export GIF keyframe PNGs for visual QA
+python3 tools/capture_readme_media.py --capture --only sidebar,workflow --qa-dir /tmp/factonio-media-qa
+
+# Or regenerate every PNG screenshot and animated GIF
+python3 tools/capture_readme_media.py --capture --only all --qa-dir /tmp/factonio-media-qa
 ```
 
-Only regenerate media when UI changes materially alter the screenshots or demos, and visually inspect the rendered PNGs and GIF frames before committing.
+Valid `--only` targets: `all`, `dashboard`, `sidebar`, `settings`, `workflow`, `repo-editor`, `architecture`. Always visually inspect the regenerated PNGs and `--qa-dir` keyframes before committing (and delete the temporary `--qa-dir` folder afterward). For non-visual refactors to `desktop/plugin.js`, skip media churn and add the `no-visual-change` label to the PR.

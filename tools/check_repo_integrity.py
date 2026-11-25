@@ -28,6 +28,10 @@ EXPECTED_SKILLS = (
     "verify-blackbox",
 )
 
+EXPECTED_CONTRIBUTOR_SKILLS = (
+    "update-readme-media",
+)
+
 MD_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 HTML_SRC_RE = re.compile(r"""(?:src|href)=["']([^"']+)["']""")
 
@@ -65,28 +69,33 @@ def check_dashboard_manifest(errors: list[str]) -> None:
         errors.append("Missing dashboard/plugin_api.py")
 
 
+def _check_skill_file(skill_md: Path, expected_name: str, errors: list[str]) -> None:
+    if not skill_md.is_file():
+        errors.append(f"Missing skill file: {skill_md.relative_to(REPO_ROOT)}")
+        return
+    text = skill_md.read_text(encoding="utf-8")
+    if not text.startswith("---"):
+        errors.append(f"{skill_md.relative_to(REPO_ROOT)} missing YAML frontmatter")
+        return
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        errors.append(f"{skill_md.relative_to(REPO_ROOT)} has unterminated YAML frontmatter")
+        return
+    fm = yaml.safe_load(parts[1]) or {}
+    if not isinstance(fm, dict):
+        errors.append(f"{skill_md.relative_to(REPO_ROOT)} frontmatter is not a mapping")
+        return
+    if fm.get("name") != expected_name:
+        errors.append(f"{skill_md.relative_to(REPO_ROOT)} frontmatter name={fm.get('name')!r} != {expected_name!r}")
+    if not str(fm.get("description") or "").strip():
+        errors.append(f"{skill_md.relative_to(REPO_ROOT)} frontmatter missing description")
+
+
 def check_skills(errors: list[str]) -> None:
     for skill in EXPECTED_SKILLS:
-        skill_md = REPO_ROOT / "skills" / skill / "SKILL.md"
-        if not skill_md.is_file():
-            errors.append(f"Missing skill file: {skill_md.relative_to(REPO_ROOT)}")
-            continue
-        text = skill_md.read_text(encoding="utf-8")
-        if not text.startswith("---"):
-            errors.append(f"{skill_md.relative_to(REPO_ROOT)} missing YAML frontmatter")
-            continue
-        parts = text.split("---", 2)
-        if len(parts) < 3:
-            errors.append(f"{skill_md.relative_to(REPO_ROOT)} has unterminated YAML frontmatter")
-            continue
-        fm = yaml.safe_load(parts[1]) or {}
-        if not isinstance(fm, dict):
-            errors.append(f"{skill_md.relative_to(REPO_ROOT)} frontmatter is not a mapping")
-            continue
-        if fm.get("name") != skill:
-            errors.append(f"{skill_md.relative_to(REPO_ROOT)} frontmatter name={fm.get('name')!r} != {skill!r}")
-        if not str(fm.get("description") or "").strip():
-            errors.append(f"{skill_md.relative_to(REPO_ROOT)} frontmatter missing description")
+        _check_skill_file(REPO_ROOT / "skills" / skill / "SKILL.md", skill, errors)
+    for skill in EXPECTED_CONTRIBUTOR_SKILLS:
+        _check_skill_file(REPO_ROOT / ".agents" / "skills" / skill / "SKILL.md", skill, errors)
 
 
 def _check_target(md_file: Path, raw_target: str, errors: list[str]) -> None:
@@ -109,6 +118,7 @@ def check_markdown_links(errors: list[str]) -> None:
         REPO_ROOT / "AGENTS.md",
         REPO_ROOT / "CHANGELOG.md",
         *sorted((REPO_ROOT / "docs").glob("*.md")),
+        *sorted((REPO_ROOT / ".agents" / "skills").glob("*/SKILL.md")),
     ]
     for md_file in md_files:
         if not md_file.is_file():
