@@ -5,6 +5,7 @@ Every user-facing pull request adds an entry under `## Unreleased`.
 
 ## Unreleased
 
+- Upgraded the worker execution contract (`WORKER_SOUL_MD`) and all five phase skills with pstack-derived rigor: Architect step, empirical prototypes, Throughput Checkpoint and binary-search bug diagnosis (`define`); Attack the Premise, skeptical review-thread triage with prompt-injection hygiene, comment hygiene and a `<=40-line` PR briefing (`implement`); run-proven findings, blast-radius proof and base-vs-PR attribution (`verify-diff`); tri-state `pass`/`reject`/`inconclusive` verdicts (`verify-blackbox`); and the 4-tier PR gate, live merge readback, fresh-worker fix rounds and `git patch-id` verdict continuity (`orchestrator`). Credited Lauren Tan (@poteto) and pstack in `README.md` and added `THIRD_PARTY_NOTICES.md` with pstack's MIT notice.
 - Added Concept A ("Machined Winged Cogwheel") Factorio × Hermes brand assets under `docs/images/` (dark/light README banners, dark/light/monochrome logo variants, PNG exports, and 1280×640 2:1 social/marketplace cover), wired the light/dark `<picture>` hero banner into `README.md`, and extended `tools/check_repo_integrity.py` to verify HTML `srcset` paths.
 - Moved canonical repository to `omnim-ai/factonio` and updated `plugin.yaml` metadata (`homepage`, `tags`).
 - Added GitHub Actions CI pipeline (lint, manifest/link integrity, full 90-test suite against pinned Hermes Agent, and changelog gate) plus daily upstream Hermes compatibility checks and Dependabot config.

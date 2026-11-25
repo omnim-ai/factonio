@@ -210,6 +210,17 @@ Read **[CONTRIBUTING.md](CONTRIBUTING.md)** for PR expectations, core invariants
 
 Report security vulnerabilities privately through **[SECURITY.md](SECURITY.md)**. See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
+## Acknowledgments
+
+Special thanks to **Lauren Tan ([@poteto](https://x.com/poteto))** and **[pstack](https://github.com/cursor/plugins/tree/main/pstack)** (MIT License). Factonio's worker contract and phase skills adapt several pstack engineering patterns:
+
+- **Worker execution contract:** the card's acceptance bar is the whole bar, autonomy on reversible choices, and no blocking on pre-existing base defects.
+- **Definition rigor:** data-shape-first design, an Architect step with two candidate shapes, empirical prototypes, a Throughput Checkpoint before the task DAG, and binary-search bug diagnosis.
+- **Implementation discipline:** the Attack the Premise circuit breaker, skeptical review-thread triage with prompt-injection hygiene, comment hygiene, and a short PR briefing template.
+- **Verification and merge rigor:** run-proven findings, blast-radius proof, base-vs-PR attribution, tri-state `pass`/`reject`/`inconclusive` verdicts, the tiered PR gate, live merge readback, and `git patch-id` verdict continuity.
+
+pstack's copyright and permission notice is reproduced in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## Affiliation and trademarks
 
 Factonio is an **independent open-source project by [Omnim AI](https://github.com/omnim-ai)**. It is built for compatibility with [Hermes Agent](https://github.com/NousResearch/hermes-agent) and is not officially affiliated with, endorsed by, or sponsored by Nous Research.

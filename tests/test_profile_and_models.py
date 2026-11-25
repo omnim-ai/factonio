@@ -52,6 +52,40 @@ class TestProfileAndModels(unittest.TestCase):
             for key in ("worker_profile", "worker_plugin_link", "worker_plugin_enabled", "worker_approvals_off"):
                 self.assertTrue(by_name[key]["ok"], f"Check {key} failed: {by_name[key]}")
 
+    def test_worker_soul_execution_contract_preserves_information_barriers(self):
+        from factonio.profile_setup import WORKER_SOUL_MD, init_factonio_profile
+
+        with isolated_hermes_home() as home:
+            init_factonio_profile(PLUGIN_ROOT)
+            soul = (home / "profiles" / "factonio" / "SOUL.md").read_text(encoding="utf-8")
+        self.assertEqual(soul, WORKER_SOUL_MD)
+
+        # The original five rules stay intact and in order.
+        for rule in (
+            "1. Start every card by following the preloaded `factonio:*` skill instructions for your phase.",
+            "2. Stay strictly within the scope and information barrier of your card:",
+            "3. Verify claims with real commands and test output before completing a card.",
+            "4. Keep comments and completion summaries concise and structured.",
+            "5. Never invent secrets, never bypass CI gates,",
+        ):
+            self.assertIn(rule, soul)
+
+        # Information barriers per phase are unchanged.
+        self.assertIn("Design cards read `spec.md` and the repo; never look for or read `holdout/` scenarios.", soul)
+        self.assertIn("Implementation cards read `spec.md`, approved `design/` artifacts (if linked), and code; never look for or read `holdout/` scenarios.", soul)
+        self.assertIn("Diff Check cards read `spec.md`, approved `design/` artifacts (if linked), and the PR diff; never read `holdout/`.", soul)
+        self.assertIn("never read `git diff` or implementation source files.", soul)
+
+        # New execution contract adapted from pstack's worker.md.
+        self.assertIn("## Execution Contract", soul)
+        self.assertIn("acceptance bar is the whole bar", soul)
+        self.assertIn("reversible implementation choices", soul)
+        self.assertIn("record the rationale", soul)
+        self.assertIn("product decisions, missing access, or irreversible risk", soul)
+        self.assertIn("pre-existing base defects", soul)
+        self.assertIn("newly reaches or copies", soul)
+        self.assertLess(soul.index("5. Never invent secrets"), soul.index("## Execution Contract"))
+
     def test_phase_model_resolution_precedence_and_cross_model_warning(self):
         from factonio.config import check_cross_model_warning, resolve_phase_model, save_settings
         from factonio.profile_setup import init_factonio_profile

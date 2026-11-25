@@ -43,23 +43,35 @@ This barrier is the entire reason Black-Box Verification runs in an isolated car
 
 ### 3. Record Verdict
 
-- Return `verdict: "pass"` only when every reachable acceptance criterion and holdout scenario succeeds. Clearly list any unreachable environment checks under `disclosed_limits`.
-- Return `verdict: "reject"` if any scenario fails, crashes, or disagrees with expected observable behavior. Describe failures purely in terms of **inputs, observed behavior, and expected behavior** — never quote hidden holdout filenames or full holdout scripts if they would let an implementer hardcode answers; summarize the failing behavioral contract instead.
+Every Black-Box card ends in exactly one of three verdicts:
+
+| Verdict | When | Effect |
+|---|---|---|
+| `pass` | Every acceptance criterion and holdout scenario was run against the PR head and succeeded. | Eligible for the merge gate. |
+| `reject` | Any scenario fails, crashes, or disagrees with expected observable behavior. | Triggers an Implementation fix round. |
+| `inconclusive` | One or more required scenarios or acceptance surfaces could not be run (missing credentials, unreachable service, unbuildable environment, no browser), and none of the runnable ones failed. | Blocks auto-merge; the orchestrator must resolve the gap or ask the user. |
+
+- Return `verdict: "pass"` only when every acceptance criterion and holdout scenario was actually executed and succeeded. Optional environment checks you could not reach may still be listed under `disclosed_limits`, but a skipped **required** scenario means the verdict is not `pass`.
+- Return `verdict: "reject"` if any scenario fails, crashes, or disagrees with expected observable behavior. A failure outranks unrunnable scenarios: report `reject`, not `inconclusive`. Describe failures purely in terms of **inputs, observed behavior, and expected behavior** — never quote hidden holdout filenames or full holdout scripts if they would let an implementer hardcode answers; summarize the failing behavioral contract instead.
+- Return `verdict: "inconclusive"` when required scenarios could not run. `inconclusive` must never silently pass: do not round it up to `pass`, do not omit it from `summary`, and list **every** skipped or unrunnable surface, scenario, or check under `disclosed_limits` with the exact reason and the command or step that failed to run.
+- Any verdict with a non-empty `disclosed_limits` must mention those limits in the card `summary`.
 
 ## Output Format
 
-Complete the card with `kanban_complete` using a concise `summary` and this `metadata` shape:
+Complete the card with `kanban_complete` using a concise `summary` and this `metadata` shape (`verdict` is one of `pass`, `reject`, or `inconclusive`):
 
 ```json
 {
   "phase": "verify-blackbox",
-  "verdict": "pass",
+  "verdict": "inconclusive",
   "repo": "owner/repo",
   "pr_number": 42,
   "head_sha": "<40-char commit sha>",
-  "scenarios_run": 4,
-  "scenarios_passed": 4,
-  "disclosed_limits": [],
+  "scenarios_run": 3,
+  "scenarios_passed": 3,
+  "disclosed_limits": [
+    "Payment webhook scenario not run: STRIPE_TEST_KEY unavailable in worker environment (`curl -X POST .../webhook` returned 401)."
+  ],
   "findings": []
 }
 ```
@@ -68,4 +80,4 @@ Complete the card with `kanban_complete` using a concise `summary` and this `met
 
 - **Build or startup fails:** Return `verdict: "reject"` with the exact failing build/startup command and stderr output.
 - **No holdout scenarios exist (e.g., quick task):** Execute the acceptance criteria and repository smoke/integration tests against the checked-out PR commit, then record `scenarios_run` accurately.
-- **Missing external credentials or unreachable deployment:** Record under `disclosed_limits`; block with `needs_input` only if zero meaningful verification could run.
+- **Missing external credentials or unreachable deployment:** List each affected scenario under `disclosed_limits` and return `verdict: "inconclusive"` (or `reject` if anything runnable failed); block with `needs_input` only if zero meaningful verification could run.
