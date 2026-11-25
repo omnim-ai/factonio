@@ -198,6 +198,136 @@ class TestTrailStore(unittest.TestCase):
             self.assertIn("_No decisions recorded._", trail.render_trail_markdown([]))
 
 
+_COLD_START_CHILD = """
+import sys, time
+from pathlib import Path
+from factonio import trail
+db, go, tag = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+while not go.exists():
+    time.sleep(0.001)
+if tag.endswith("a"):
+    ok = trail.record_transition("auto:" + tag, tenant="mp", db_path=db) is not None
+else:
+    try:
+        trail.log_decision("explicit:" + tag, tenant="mp", db_path=db)
+        ok = True
+    except Exception as exc:
+        print(repr(exc), file=sys.stderr)
+        ok = False
+sys.exit(0 if ok else 3)
+"""
+
+
+class TestConcurrentColdStart(unittest.TestCase):
+    """First writers racing on a brand-new trail.db must never lose a decision."""
+
+    STORES = 12
+    WRITERS = 12
+    ROUNDS = 3
+
+    def test_concurrent_first_writers_threads_persist_every_row(self):
+        import threading
+
+        from factonio import trail
+
+        with isolated_hermes_home() as home:
+            failures: list[str] = []
+            fail_lock = threading.Lock()
+            stores = [home / f"cold-{i}" / "trail.db" for i in range(self.STORES * self.ROUNDS)]
+
+            def writer(db: Path, n: int, barrier: threading.Barrier) -> None:
+                barrier.wait()
+                tag = f"{db.parent.name}-{n}"
+                if n % 2:
+                    ok = trail.record_transition(f"auto:{tag}", tenant="cold", db_path=db) is not None
+                    err = "record_transition dropped the decision"
+                else:
+                    try:
+                        trail.log_decision(f"explicit:{tag}", tenant="cold", db_path=db)
+                        ok, err = True, ""
+                    except Exception as exc:  # collected and asserted below
+                        ok, err = False, repr(exc)
+                if not ok:
+                    with fail_lock:
+                        failures.append(f"{tag}: {err}")
+
+            total = 0
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                for r in range(self.ROUNDS):
+                    batch = stores[r * self.STORES : (r + 1) * self.STORES]
+                    barrier = threading.Barrier(len(batch) * self.WRITERS)
+                    threads = [
+                        threading.Thread(target=writer, args=(db, n, barrier))
+                        for db in batch
+                        for n in range(self.WRITERS)
+                    ]
+                    for t in threads:
+                        t.start()
+                    for t in threads:
+                        t.join(timeout=120)
+                    total += len(threads)
+                gc.collect()
+
+            self.assertEqual(failures, [], f"{len(failures)}/{total} cold-start writes failed")
+            for db in stores:
+                rows = trail.query_decisions(db_path=db, limit=1000)
+                self.assertEqual(len(rows), self.WRITERS, db)
+                self.assertEqual(len({r["id"] for r in rows}), self.WRITERS, db)
+            leaked = [w for w in caught if issubclass(w.category, ResourceWarning)]
+            self.assertEqual(leaked, [], [str(w.message) for w in leaked])
+
+    def test_concurrent_first_writers_processes_persist_every_row(self):
+        import subprocess
+        import time
+
+        from factonio import trail
+
+        with isolated_hermes_home() as home:
+            env = dict(os.environ)
+            env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
+            go = home / "go"
+            stores = [home / f"mp-{i}" / "trail.db" for i in range(4)]
+            procs = []
+            for db in stores:
+                for n in range(6):
+                    tag = f"{db.parent.name}-{n}{'a' if n % 2 else 'e'}"
+                    procs.append(subprocess.Popen(
+                        [sys.executable, "-c", _COLD_START_CHILD, str(db), str(go), tag],
+                        env=env, stderr=subprocess.PIPE, text=True,
+                    ))
+            time.sleep(1.0)
+            go.touch()
+            results = [(p.wait(timeout=120), p.stderr.read()) for p in procs]
+            for p in procs:
+                p.stderr.close()
+            failed = [r for r in results if r[0] != 0]
+            self.assertEqual(failed, [], f"{len(failed)}/{len(procs)} cross-process cold-start writes failed")
+            for db in stores:
+                self.assertEqual(len(trail.query_decisions(db_path=db, limit=1000)), 6, db)
+
+    def test_corrupt_store_fails_fast_without_retry(self):
+        import time
+
+        from factonio import trail
+
+        with isolated_hermes_home() as home:
+            db = home / "bad" / "trail.db"
+            db.parent.mkdir(parents=True)
+            db.write_bytes(b"this is not a sqlite database" * 64)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                started = time.monotonic()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    trail.log_decision("x", db_path=db)
+                elapsed = time.monotonic() - started
+                self.assertIsNone(trail.record_transition("y", db_path=db))
+                gc.collect()
+            self.assertLess(elapsed, 1.0)
+            leaked = [w for w in caught if issubclass(w.category, ResourceWarning)]
+            self.assertEqual(leaked, [], [str(w.message) for w in leaked])
+
+
 class TestAutomaticTransitions(unittest.TestCase):
     def test_orchestrator_transitions_and_escape_gap_analysis(self):
         from hermes_cli import kanban_db as kb

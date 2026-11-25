@@ -10,13 +10,21 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import sqlite3
+import threading
+import time
 import uuid
 from collections import Counter
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, TypeVar
+
+try:
+    import fcntl
+except ImportError:  # non-POSIX: fall back to the in-process lock plus retry
+    fcntl = None  # type: ignore[assignment]
 
 from .config import PLUGIN_ID, get_root_hermes_home_path
 
@@ -25,6 +33,13 @@ logger = logging.getLogger("factonio.trail")
 SCHEMA_VERSION = "1"
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 1000
+
+_BUSY_TIMEOUT_MS = 5000
+_RETRY_ATTEMPTS = 8
+_RETRY_BASE_DELAY = 0.02
+_RETRY_MAX_DELAY = 0.5
+_INIT_LOCK = threading.Lock()
+_T = TypeVar("_T")
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -91,26 +106,72 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def _is_transient(exc: BaseException) -> bool:
+    """SQLITE_BUSY / SQLITE_LOCKED surface as OperationalError; corruption never does."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+def _with_retry(op: Callable[[], _T]) -> _T:
+    """Run ``op``, retrying transient lock contention with jittered exponential backoff."""
+    delay = _RETRY_BASE_DELAY
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            return op()
+        except sqlite3.OperationalError as exc:
+            if not _is_transient(exc) or attempt == _RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(delay * (0.5 + random.random()))
+            delay = min(delay * 2, _RETRY_MAX_DELAY)
+    raise AssertionError("unreachable")
+
+
+@contextmanager
+def _init_guard(path: Path) -> Iterator[None]:
+    """Serialize WAL switch + schema creation across threads and (on POSIX) processes.
+
+    Switching a fresh file to WAL needs an exclusive lock and SQLite does not always
+    invoke the busy handler for it, so racing first writers would otherwise fail fast.
+    """
+    with _INIT_LOCK:
+        if fcntl is None:
+            yield
+            return
+        with open(path.with_name(path.name + ".lock"), "a") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _open(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(path), timeout=_BUSY_TIMEOUT_MS / 1000)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA foreign_keys=ON")
+        with _init_guard(path):
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript(_SCHEMA_SQL)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_meta(key, value, updated_at) VALUES ('schema_version', ?, ?)",
+                (SCHEMA_VERSION, _now_iso()),
+            )
+            conn.commit()
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
 def _connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
     """Open (creating if needed) the trail store with WAL, busy timeout, and FK enforcement."""
     path = Path(db_path) if db_path is not None else trail_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=5.0)
-    try:
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.executescript(_SCHEMA_SQL)
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_meta(key, value, updated_at) VALUES ('schema_version', ?, ?)",
-            (SCHEMA_VERSION, _now_iso()),
-        )
-        conn.commit()
-    except Exception:
-        conn.close()
-        raise
-    return conn
+    return _with_retry(lambda: _open(path))
 
 
 def _resolve_repo_slug(repo: Optional[str]) -> str:
@@ -208,34 +269,41 @@ def log_decision(
     evidence_json = json.dumps(evidence_obj, sort_keys=True, default=str)
     sup = str(supersedes_id).strip() if supersedes_id else None
 
-    with closing(_connect(db_path)) as conn:
-        if sup is not None:
-            if conn.execute("SELECT 1 FROM decisions WHERE id = ?", (sup,)).fetchone() is None:
-                raise ValueError(f"supersedes_id {sup!r} does not reference an existing decision")
-        row_id = f"d_{uuid.uuid4().hex[:12]}"
-        conn.execute(
-            """
-            INSERT INTO decisions(id, ts, tenant, repo_slug, phase, card_id, actor, decision, why, evidence_json, result, supersedes_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                row_id,
-                _now_iso(),
-                str(tenant or "").strip(),
-                _resolve_repo_slug(repo_slug),
-                str(phase or "").strip(),
-                str(card_id or "").strip(),
-                str(actor or "").strip() or "orchestrator",
-                text,
-                str(why or "").strip(),
-                evidence_json,
-                str(result or "").strip(),
-                sup,
-            ),
-        )
-        conn.commit()
-        stored = conn.execute("SELECT * FROM decisions WHERE id = ?", (row_id,)).fetchone()
-        return _enrich(conn, [stored])[0]
+    row_id = f"d_{uuid.uuid4().hex[:12]}"
+    values = (
+        row_id,
+        _now_iso(),
+        str(tenant or "").strip(),
+        _resolve_repo_slug(repo_slug),
+        str(phase or "").strip(),
+        str(card_id or "").strip(),
+        str(actor or "").strip() or "orchestrator",
+        text,
+        str(why or "").strip(),
+        evidence_json,
+        str(result or "").strip(),
+        sup,
+    )
+
+    def _append() -> dict[str, Any]:
+        with closing(_connect(db_path)) as conn:
+            if sup is not None:
+                if conn.execute("SELECT 1 FROM decisions WHERE id = ?", (sup,)).fetchone() is None:
+                    raise ValueError(f"supersedes_id {sup!r} does not reference an existing decision")
+            # Idempotent under retry: a commit that landed before a transient error is not duplicated.
+            if conn.execute("SELECT 1 FROM decisions WHERE id = ?", (row_id,)).fetchone() is None:
+                conn.execute(
+                    """
+                    INSERT INTO decisions(id, ts, tenant, repo_slug, phase, card_id, actor, decision, why, evidence_json, result, supersedes_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+                conn.commit()
+            stored = conn.execute("SELECT * FROM decisions WHERE id = ?", (row_id,)).fetchone()
+            return _enrich(conn, [stored])[0]
+
+    return _with_retry(_append)
 
 
 def record_transition(decision: str, **kwargs: Any) -> Optional[dict[str, Any]]:

@@ -108,7 +108,7 @@ Writes acquire an in-process re-entrant thread lock plus an exclusive POSIX `fcn
 
 ## Decision trail (`trail.db`)
 
-`trail.py` owns `<root HERMES_HOME>/plugin-data/factonio/trail.db`, Factonio's own SQLite store (`journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`). `schema_meta` records `schema_version = "1"` so future metrics tables can live here without writing to Hermes's fenced `kanban.db`.
+`trail.py` owns `<root HERMES_HOME>/plugin-data/factonio/trail.db`, Factonio's own SQLite store (`journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`). `schema_meta` records `schema_version = "1"` so future metrics tables can live here without writing to Hermes's fenced `kanban.db`. Fresh-store initialization (WAL switch + schema) is serialized by an in-process lock plus a POSIX `flock` on the sidecar `trail.db.lock`, and transient `database is locked`/`busy` errors are retried with jittered exponential backoff (corruption errors fail fast), so concurrent first writers never drop decisions.
 
 - **Append-only:** the `decisions` table (`id`, `ts`, `tenant`, `repo_slug`, `phase`, `card_id`, `actor`, `decision`, `why`, `evidence_json`, `result`, `supersedes_id`) has `trg_decisions_no_update` / `trg_decisions_no_delete` triggers that abort any `UPDATE` or `DELETE`. A correction is a new row whose `supersedes_id` must reference an existing row (validated in `log_decision` and by a foreign key).
 - **Automatic transitions:** `start_workstream` (plus an `escape` row when `escaped_from` is set), `spawn_design_card`, `spawn_implementation_card`, `spawn_verification_pair`, and the `factonio_pr_gate` / `factonio_merge_pr` tools record rows best-effort; a trail write failure is logged and never blocks card creation or merging.
