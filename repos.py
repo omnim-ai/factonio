@@ -1043,12 +1043,14 @@ def merge_pr(
 
 WORKTREE_BUCKETS: tuple[str, ...] = ("hold-wip", "hold-active-card", "hold-open-pr", "safe", "review")
 _INACTIVE_CARD_STATUSES = ("done", "archived", "cancelled")
-# Untracked paths that are regenerable build/tool output; anything else untracked counts as WIP.
-_SCRATCH_PATTERNS: tuple[str, ...] = (
-    "__pycache__/", "*.pyc", ".pytest_cache/", ".ruff_cache/", ".mypy_cache/", ".tox/", ".venv/",
-    "venv/", "node_modules/", "dist/", "build/", ".coverage", "coverage/", "*.log", ".DS_Store",
-    "*.orig", "*.rej", "*.swp", "tmp/", ".tmp/", ".cache/",
+# Ignored paths that tooling regenerates on demand. Any other ignored file (``.env``, local
+# databases, data dumps) is unique local data and holds the worktree like a tracked edit.
+_REGENERABLE_IGNORED_DIRS: tuple[str, ...] = (
+    "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache", "node_modules", ".venv", "venv",
+    "build", "dist", ".tox", ".eggs", "*.egg-info",
 )
+_REGENERABLE_IGNORED_FILES: tuple[str, ...] = ("*.pyc", ".coverage", ".DS_Store")
+_MAX_LISTED_PATHS = 50
 
 
 def _human_size(num_bytes: int) -> str:
@@ -1108,38 +1110,75 @@ def _parse_worktree_porcelain(text: str) -> list[dict[str, Any]]:
     return entries
 
 
-def _is_scratch_path(rel: str) -> bool:
-    rel = rel.strip().strip('"')
-    name = rel.rstrip("/").rsplit("/", 1)[-1]
-    for pat in _SCRATCH_PATTERNS:
-        if pat.endswith("/"):
-            dir_name = pat.rstrip("/")
-            if rel.rstrip("/") == dir_name or rel.startswith(pat) or f"/{pat}" in f"/{rel}/":
-                return True
-        elif fnmatch.fnmatch(name, pat):
-            return True
-    return False
+def parse_status_z(text: str) -> list[tuple[str, str]]:
+    """Parse ``git status --porcelain=v1 -z`` into ``(XY, path)`` pairs (rename sources skipped)."""
+    out: list[tuple[str, str]] = []
+    records = text.split("\0")
+    i = 0
+    while i < len(records):
+        rec = records[i]
+        i += 1
+        if len(rec) < 4:
+            continue
+        code, path = rec[:2], rec[3:]
+        out.append((code, path))
+        if "R" in code or "C" in code:
+            i += 1  # the next record is the rename/copy source path
+    return out
 
 
-def _classify_dirty(wt_path: Path) -> str:
-    proc = _run_git(["status", "--porcelain", "--untracked-files=normal"], cwd=wt_path)
+def _is_regenerable_ignored(rel: str) -> bool:
+    parts = [p for p in rel.strip("/").split("/") if p]
+    if not parts:
+        return False
+    if any(fnmatch.fnmatchcase(part, pat) for part in parts for pat in _REGENERABLE_IGNORED_DIRS):
+        return True
+    return any(fnmatch.fnmatchcase(parts[-1], pat) for pat in _REGENERABLE_IGNORED_FILES)
+
+
+def _dirty_inventory(wt_path: Path) -> dict[str, Any]:
+    """Classify a worktree's local state, including ignored files.
+
+    ``wip:N`` counts tracked edits plus ignored files outside the regenerable allowlist;
+    ``scratch:N`` counts untracked (non-ignored) files when nothing protected exists.
+    """
+    proc = _run_git(
+        ["status", "--porcelain=v1", "-z", "--ignored=matching", "--untracked-files=all"], cwd=wt_path
+    )
     if proc.returncode != 0:
         # Unknown state must never look prunable.
-        return "wip:?"
-    wip = scratch = 0
-    for line in proc.stdout.splitlines():
-        if not line.strip():
-            continue
-        code, rel = line[:2], line[3:]
-        if code == "??" and _is_scratch_path(rel):
-            scratch += 1
+        return {"dirty": "wip:?", "tracked": [], "ignored_data": [], "scratch": [], "hold_reason": "git status failed"}
+    tracked: list[str] = []
+    ignored_data: list[str] = []
+    scratch: list[str] = []
+    for code, rel in parse_status_z(proc.stdout):
+        if code == "??":
+            scratch.append(rel)
+        elif code == "!!":
+            if not _is_regenerable_ignored(rel):
+                ignored_data.append(rel)
         else:
-            wip += 1
+            tracked.append(rel)
+    wip = len(tracked) + len(ignored_data)
     if wip:
-        return f"wip:{wip}"
-    if scratch:
-        return f"scratch:{scratch}"
-    return "clean"
+        dirty = f"wip:{wip}"
+        parts = []
+        if tracked:
+            parts.append(f"{len(tracked)} tracked edit(s)")
+        if ignored_data:
+            parts.append(f"{len(ignored_data)} ignored local data file(s), e.g. {ignored_data[0]}")
+        reason = f"uncommitted work ({dirty}: {', '.join(parts)})"
+    elif scratch:
+        dirty, reason = f"scratch:{len(scratch)}", ""
+    else:
+        dirty, reason = "clean", ""
+    return {
+        "dirty": dirty,
+        "tracked": tracked[:_MAX_LISTED_PATHS],
+        "ignored_data": ignored_data[:_MAX_LISTED_PATHS],
+        "scratch": scratch[:_MAX_LISTED_PATHS],
+        "hold_reason": reason,
+    }
 
 
 def _classify_remote(wt_path: Path, branch: Optional[str]) -> str:
@@ -1295,7 +1334,7 @@ def _origin_full_repo(main_path: Path) -> Optional[str]:
 def _bucket_for(entry: dict[str, Any]) -> tuple[str, str]:
     dirty = str(entry.get("dirty") or "")
     if dirty.startswith("wip:"):
-        return "hold-wip", f"uncommitted work ({dirty})"
+        return "hold-wip", str(entry.get("dirty_reason") or f"uncommitted work ({dirty})")
     if entry.get("active_card"):
         return "hold-active-card", f"active card {entry['active_card']} ({entry.get('active_card_status') or 'active'})"
     pr_state = str(entry.get("pr_state") or "").upper()
@@ -1393,7 +1432,10 @@ def _audit_one_repo(
             probe = _run_git(["merge-base", "--is-ancestor", head_sha, resolved_base], cwd=main_path)
             merged = True if probe.returncode == 0 else (False if probe.returncode == 1 else None)
         entry["merged"] = merged
-        entry["dirty"] = _classify_dirty(wt_path) if exists else "clean"
+        inventory = _dirty_inventory(wt_path) if exists else {"dirty": "clean", "hold_reason": ""}
+        entry["dirty"] = inventory["dirty"]
+        if inventory.get("hold_reason"):
+            entry["dirty_reason"] = inventory["hold_reason"]
         entry["remote"] = _classify_remote(wt_path, branch) if exists else ("detached" if not branch else "no-remote")
 
         pr = prs.get(branch) if branch else None
@@ -1509,15 +1551,17 @@ def prune_safe_worktrees(
                 continue
             wt_path = Path(wt["path"])
             # Re-check right before deleting: work may have appeared since the audit.
+            dropped_scratch: list[str] = []
             if wt_path.is_dir():
-                fresh = _classify_dirty(wt_path)
-                if fresh.startswith("wip:"):
+                fresh = _dirty_inventory(wt_path)
+                if str(fresh["dirty"]).startswith("wip:"):
                     held.append({
                         "path": wt["path"], "branch": wt["branch"], "bucket": "hold-wip",
-                        "hold_reason": f"uncommitted work appeared before removal ({fresh})",
+                        "hold_reason": f"work appeared before removal: {fresh['hold_reason']}",
                         "size_bytes": wt["size_bytes"],
                     })
                     continue
+                dropped_scratch = list(fresh["scratch"])
             touched = True
             proc = _run_git(["worktree", "remove", "--force", str(wt_path)], cwd=main_path, timeout=120)
             note = "git worktree remove"
@@ -1530,7 +1574,7 @@ def prune_safe_worktrees(
                     continue
             removed.append({
                 "path": wt["path"], "branch": wt["branch"], "size_bytes": wt["size_bytes"],
-                "size_human": wt["size_human"], "method": note,
+                "size_human": wt["size_human"], "method": note, "dropped_scratch": dropped_scratch,
             })
         if touched:
             _run_git(["worktree", "prune"], cwd=main_path)

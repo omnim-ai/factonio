@@ -279,6 +279,42 @@ class TestWatchdogLiveness(unittest.TestCase):
             found = _scan(db, future, pid_alive_fn=lambda pid: True, runs_root=home / "none")
             self.assertNotIn("t_git", found)
 
+    def test_fresh_nested_file_in_old_untracked_dir_is_a_side_effect(self):
+        with isolated_hermes_home() as home, mock.patch.dict(os.environ, GIT_ENV):
+            now = time.time()
+            db = home / "kanban.db"
+            ws = home / "ws"
+            ws.mkdir()
+            subprocess.run(["git", "init", "-q", str(ws)], check=True)
+            (ws / "a.txt").write_text("a", encoding="utf-8")
+            subprocess.run(["git", "-C", str(ws), "add", "a.txt"], check=True)
+            old = now - 7200
+            subprocess.run(
+                ["git", "-C", str(ws), "commit", "-qm", "a"], check=True,
+                env={**os.environ, "GIT_AUTHOR_DATE": f"@{int(old)}", "GIT_COMMITTER_DATE": f"@{int(old)}"},
+            )
+            newdir = ws / "newdir" / "deep"
+            newdir.mkdir(parents=True)
+            (newdir / "work.py").write_text("x = 1\n", encoding="utf-8")
+            (ws / "newdir" / "old.txt").write_text("old", encoding="utf-8")
+            for path in (ws / "a.txt", ws / "newdir" / "old.txt", newdir, ws / "newdir", ws / ".git" / "index"):
+                os.utime(path, (old, old))
+            # Fresh write to an existing nested file leaves both directory mtimes old.
+            (newdir / "work.py").write_text("x = 2\n", encoding="utf-8")
+            os.utime(newdir, (old, old))
+            os.utime(ws / "newdir", (old, old))
+
+            _add_task(db, "t_nested", now=now, started_ago=3600, heartbeat_ago=30, pid=1,
+                      events=(("heartbeat", 30), ("claimed", 3600)), workspace=str(ws))
+            triage = _CountingTriage({"classification": "stalled", "rationale": "loop"})
+            found = _scan(db, now, pid_alive_fn=lambda pid: True, triage_fn=triage)
+            self.assertEqual(found, {})
+            self.assertEqual(triage.calls, [])
+
+            from factonio.watchdog import _workspace_activity_ts
+
+            self.assertGreaterEqual(_workspace_activity_ts(str(ws)), now - 60)
+
     def test_heartbeating_loop_without_side_effects(self):
         with isolated_hermes_home() as home:
             now = time.time()
@@ -427,6 +463,53 @@ class TestWatchdogLiveness(unittest.TestCase):
                 conn.commit()
             third = run_watchdog_tick(ctx, now=now + 720, **kw)
             self.assertEqual(len(third["alerts"]), 1)
+
+    def test_dedup_is_kind_aware_so_escalation_alerts_once(self):
+        from factonio.watchdog import run_watchdog_tick
+
+        with isolated_hermes_home() as home:
+            now = time.time()
+            db = home / "kanban.db"
+            _add_task(db, "t_a", now=now, started_ago=3600, heartbeat_ago=3000, pid=4242)
+            ctx = _FakeCtx()
+            alive = {"value": True}
+            kw = dict(db_path_override=db, pid_alive_fn=lambda p: alive["value"], runs_root=home / "none")
+
+            first = run_watchdog_tick(ctx, now=now, **kw)
+            self.assertEqual([a["kind"] for a in first["alerts"]], ["stale_running"])
+
+            alive["value"] = False
+            second = run_watchdog_tick(ctx, now=now + 360, **kw)
+            self.assertEqual([a["kind"] for a in second["alerts"]], ["dead_worker"])
+            self.assertEqual([e[1]["kind"] for e in ctx.events], ["stale_running", "dead_worker"])
+
+            third = run_watchdog_tick(ctx, now=now + 720, **kw)
+            self.assertTrue(third["ran"])
+            self.assertEqual(third["alerts"], [])
+            self.assertEqual(len(ctx.events), 2)
+
+    def test_dedup_realerts_for_a_new_run(self):
+        from hermes_cli.kanban_db_connect import connect_closing
+
+        from factonio.watchdog import run_watchdog_tick
+
+        with isolated_hermes_home() as home:
+            now = time.time()
+            db = home / "kanban.db"
+            _add_task(db, "t_a", now=now, started_ago=3600, heartbeat_ago=3000, pid=4242)
+            ctx = _FakeCtx()
+            kw = dict(db_path_override=db, pid_alive_fn=lambda p: False, runs_root=home / "none")
+            self.assertEqual(len(run_watchdog_tick(ctx, now=now, **kw)["alerts"]), 1)
+            self.assertEqual(run_watchdog_tick(ctx, now=now + 360, **kw)["alerts"], [])
+            with connect_closing(db_path=db) as conn:
+                conn.execute(
+                    "INSERT INTO task_runs (task_id, profile, status, started_at, worker_pid)"
+                    " VALUES ('t_a', 'factonio', 'running', ?, 4243)",
+                    (now + 400,),
+                )
+                conn.commit()
+            third = run_watchdog_tick(ctx, now=now + 720, **kw)
+            self.assertEqual([a["kind"] for a in third["alerts"]], ["dead_worker"])
 
     def test_minimal_legacy_schema(self):
         with isolated_hermes_home() as home:

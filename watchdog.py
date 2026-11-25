@@ -26,6 +26,7 @@ from .config import (
     resolve_stale_heartbeat_minutes,
 )
 from .metrics import classify_phase
+from .repos import parse_status_z
 
 logger = logging.getLogger("factonio.watchdog")
 
@@ -42,6 +43,7 @@ _RATIONALE_MAX = 300
 _NON_PROGRESS_EVENT_KINDS = ("heartbeat",)
 # Bounded metadata walks so a huge worktree/run dir cannot stall the dispatcher tick.
 _MTIME_WALK_LIMIT = 2000
+_STATUS_MTIME_LIMIT = 2000
 _GIT_TIMEOUT_S = 5
 
 TriageFn = Callable[[dict[str, Any]], Any]
@@ -77,6 +79,16 @@ def _card_revision_digest(task: dict[str, Any], comments: list[dict[str, Any]]) 
         "comments": [(c.get("author"), c.get("body"), c.get("created_at")) for c in human_comments[:4]],
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+
+def _alert_dedup_key(finding: dict[str, Any]) -> str:
+    """Stable alert identity: card revision + finding kind + current run.
+
+    Age counters and triage rationale are deliberately excluded so a persisting condition is
+    reported once, while an escalation (e.g. ``stale_running`` -> ``dead_worker``) or a new run
+    re-alerts immediately.
+    """
+    return f"{finding.get('digest')}:{finding.get('kind')}:{finding.get('run_id')}"
 
 
 def _is_pid_alive(pid: int) -> Optional[bool]:
@@ -158,8 +170,9 @@ def _walk_max_mtime(root: Path, *, skip_dirs: tuple[str, ...] = ()) -> Optional[
 
 def _git(args: list[str], cwd: Path) -> Optional[str]:
     try:
+        # --no-optional-locks: never refresh/lock the worker's index from a read-only probe.
         proc = subprocess.run(
-            ["git", *args],
+            ["git", "--no-optional-locks", *args],
             cwd=str(cwd),
             capture_output=True,
             text=True,
@@ -191,15 +204,13 @@ def _workspace_activity_ts(workspace_path: Any) -> Optional[float]:
             stamps.append((Path(git_dir.strip()) / "index").stat().st_mtime)
         except OSError:
             pass
-    status = _git(["status", "--porcelain", "-z", "--untracked-files=normal"], ws)
+    # ``--untracked-files=all`` lists files inside new directories individually, so a fresh
+    # write to an existing nested file is seen (a collapsed ``newdir/`` mtime would not change).
+    status = _git(["status", "--porcelain=v1", "-z", "--untracked-files=all"], ws)
     if status:
-        for i, rec in enumerate(status.split("\0")):
-            if i >= 200:
-                break
-            if len(rec) < 4:
-                continue
+        for _code, rel in parse_status_z(status)[:_STATUS_MTIME_LIMIT]:
             try:
-                stamps.append((ws / rec[3:]).lstat().st_mtime)
+                stamps.append((ws / rel).lstat().st_mtime)
             except OSError:
                 continue
     return max(stamps) if stamps else None
@@ -470,6 +481,7 @@ def scan_stuck_cards(
                     "session_id": task.get("session_id") or "",
                     "status": status,
                     "digest": _card_revision_digest(task, comments),
+                    "run_id": (run or {}).get("id"),
                 }
 
                 if status == "triage":
@@ -751,9 +763,10 @@ def run_watchdog_tick(
 
     for item in findings:
         tid = item["task_id"]
-        if reported.get(tid) == item["digest"]:
+        key = _alert_dedup_key(item)
+        if reported.get(tid) == key:
             continue
-        reported[tid] = item["digest"]
+        reported[tid] = key
         emitted.append(item)
         try:
             ctx.emit("watchdog_alert", item)

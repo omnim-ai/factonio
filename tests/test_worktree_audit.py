@@ -95,7 +95,7 @@ def _build_fixture(home: Path) -> dict[str, Path]:
     p = add("closed", "feat-closed")
     _commit(p, "closed.txt")
 
-    # hold-wip: merged base but uncommitted edits + untracked source file.
+    # hold-wip: merged base but an uncommitted tracked edit (plus an untracked file).
     p = add("wip", "feat-wip")
     (p / "README.md").write_text("edited", encoding="utf-8")
     (p / "new_module.py").write_text("x = 1\n", encoding="utf-8")
@@ -176,6 +176,14 @@ def _cli():
     return run
 
 
+def _exclude(main: Path, *patterns: str) -> None:
+    """Add ignore patterns via the shared ``info/exclude`` (applies to every linked worktree)."""
+    common = Path(_git(main, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+    (common / "info").mkdir(exist_ok=True)
+    with (common / "info" / "exclude").open("a", encoding="utf-8") as fh:
+        fh.write("".join(f"{p}\n" for p in patterns))
+
+
 def _worktree_paths(main: Path) -> set[str]:
     out = _git(main, "worktree", "list", "--porcelain")
     return {line[len("worktree "):] for line in out.splitlines() if line.startswith("worktree ")}
@@ -241,8 +249,9 @@ class TestWorktreeAudit(unittest.TestCase):
             self.assertIsNone(m["active_card"])  # archived card does not count
 
             self.assertEqual(by_name["scratch"]["dirty"], "scratch:1")
-            self.assertEqual(by_name["wip"]["dirty"], "wip:2")
-            self.assertIn("wip:2", by_name["wip"]["hold_reason"])
+            self.assertEqual(by_name["wip"]["dirty"], "wip:1")
+            self.assertIn("wip:1", by_name["wip"]["hold_reason"])
+            self.assertIn("1 tracked edit", by_name["wip"]["hold_reason"])
             self.assertEqual(by_name["card"]["active_card"], "t_card")
             self.assertEqual(by_name["card-branch"]["active_card"], "t_card_branch")
             self.assertEqual(by_name["pr"]["pr"], "#7/open")
@@ -261,7 +270,7 @@ class TestWorktreeAudit(unittest.TestCase):
         with isolated_hermes_home() as home:
             paths = _build_fixture(home)
             _seed_cards(home / "kanban.db", paths)
-            (paths["card"] / "edit.py").write_text("y = 2\n", encoding="utf-8")
+            (paths["card"] / "README.md").write_text("edited\n", encoding="utf-8")
             from hermes_cli.kanban_db_connect import connect_closing
 
             with connect_closing(db_path=home / "kanban.db") as conn:
@@ -345,21 +354,94 @@ class TestWorktreeAudit(unittest.TestCase):
 
         with isolated_hermes_home() as home:
             paths = _build_fixture(home)
-            real_classify = repos._classify_dirty
+            _exclude(paths["main"], "local-data/")
+            real_inventory = repos._dirty_inventory
             calls: dict[str, int] = {}
 
-            def late_edit(wt_path: Path) -> str:
+            def late_work(wt_path: Path) -> dict[str, Any]:
                 calls[wt_path.name] = calls.get(wt_path.name, 0) + 1
-                if wt_path.name == "merged" and calls[wt_path.name] == 2:
-                    (wt_path / "late.py").write_text("z = 3\n", encoding="utf-8")
-                return real_classify(wt_path)
+                if calls[wt_path.name] == 2:
+                    if wt_path.name == "merged":
+                        (wt_path / "merged.txt").write_text("late edit", encoding="utf-8")
+                    elif wt_path.name == "closed":
+                        (wt_path / "local-data").mkdir()
+                        (wt_path / "local-data" / "late.db").write_bytes(b"unique")
+                return real_inventory(wt_path)
 
             with mock.patch.object(repos, "_run_gh", side_effect=_gh_ok), \
-                    mock.patch.object(repos, "_classify_dirty", side_effect=late_edit):
+                    mock.patch.object(repos, "_dirty_inventory", side_effect=late_work):
                 res = repos.prune_safe_worktrees(str(paths["main"]))
-            self.assertTrue(paths["merged"].is_dir())
             held = {Path(h["path"]).name: h for h in res["held"]}
+            self.assertTrue(paths["merged"].is_dir())
             self.assertEqual(held["merged"]["bucket"], "hold-wip")
+            self.assertIn("tracked edit", held["merged"]["hold_reason"])
+            self.assertEqual((paths["closed"] / "local-data" / "late.db").read_bytes(), b"unique")
+            self.assertEqual(held["closed"]["bucket"], "hold-wip")
+            self.assertIn("ignored local data", held["closed"]["hold_reason"])
+
+    def test_ignored_local_data_holds_worktree_and_survives_prune(self):
+        from factonio import repos
+
+        with isolated_hermes_home() as home:
+            paths = _build_fixture(home)
+            _exclude(paths["main"], "local-data/", ".env", "__pycache__/", "*.pyc", "node_modules/")
+            (paths["merged"] / "local-data").mkdir()
+            (paths["merged"] / "local-data" / "important.json").write_text('{"k": 1}', encoding="utf-8")
+            (paths["closed"] / ".env").write_text("TOKEN=local\n", encoding="utf-8")
+
+            by_name = {Path(w["path"]).name: w for w in self._audit(paths)["worktrees"]}
+            for name in ("merged", "closed"):
+                self.assertEqual(by_name[name]["dirty"], "wip:1", by_name[name])
+                self.assertEqual(by_name[name]["bucket"], "hold-wip")
+                self.assertIn("ignored local data", by_name[name]["hold_reason"])
+            self.assertIn("local-data/", by_name["merged"]["hold_reason"])
+            # Ignored regenerable caches never block safety.
+            self.assertEqual(by_name["scratch"]["dirty"], "clean")
+            self.assertEqual(by_name["scratch"]["bucket"], "safe")
+
+            with mock.patch.object(repos, "_run_gh", side_effect=_gh_ok):
+                res = repos.prune_safe_worktrees(str(paths["main"]))
+            removed = {Path(r["path"]).name for r in res["removed"]}
+            self.assertNotIn("merged", removed)
+            self.assertNotIn("closed", removed)
+            self.assertIn("scratch", removed)
+            self.assertEqual(
+                (paths["merged"] / "local-data" / "important.json").read_text(encoding="utf-8"), '{"k": 1}'
+            )
+            self.assertEqual((paths["closed"] / ".env").read_text(encoding="utf-8"), "TOKEN=local\n")
+
+    def test_scratch_only_merged_worktree_is_safe_and_pruned(self):
+        from factonio import repos
+
+        with isolated_hermes_home() as home:
+            paths = _build_fixture(home)
+            _exclude(paths["main"], "__pycache__/", "*.pyc")
+            (paths["merged"] / "notes.txt").write_text("n" * 8192, encoding="utf-8")
+            (paths["merged"] / "pkg").mkdir()
+            (paths["merged"] / "pkg" / "__pycache__").mkdir()
+            (paths["merged"] / "pkg" / "__pycache__" / "foo.cpython.pyc").write_bytes(b"\0" * 512)
+
+            by_name = {Path(w["path"]).name: w for w in self._audit(paths)["worktrees"]}
+            self.assertEqual(by_name["merged"]["dirty"], "scratch:1")
+            self.assertEqual(by_name["merged"]["bucket"], "safe")
+
+            with mock.patch.object(repos, "_run_gh", side_effect=_gh_ok):
+                res = repos.prune_safe_worktrees(str(paths["main"]))
+            removed = {Path(r["path"]).name: r for r in res["removed"]}
+            self.assertIn("merged", removed)
+            self.assertEqual(removed["merged"]["dropped_scratch"], ["notes.txt"])
+            self.assertFalse(paths["merged"].exists())
+            self.assertNotIn(str(paths["merged"]), _worktree_paths(paths["main"]))
+            self.assertGreater(res["reclaimed_bytes"], 8192)
+
+    def test_parse_status_z_handles_renames_and_spaces(self):
+        from factonio.repos import parse_status_z
+
+        raw = "R  new name.py\0old name.py\0 M a.txt\0?? dir/x y.txt\0!! .env\0"
+        self.assertEqual(
+            parse_status_z(raw),
+            [("R ", "new name.py"), (" M", "a.txt"), ("??", "dir/x y.txt"), ("!!", ".env")],
+        )
 
     def test_unknown_repo_spec_raises(self):
         from factonio.repos import RepoNotFoundError, audit_worktrees

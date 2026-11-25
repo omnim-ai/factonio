@@ -62,6 +62,9 @@ def _print_audit(res: dict[str, Any]) -> None:
 def _print_prune(res: dict[str, Any]) -> None:
     for item in res["removed"]:
         print(f"Removed {item['path']} ({item['size_human']}, {item['method']})")
+        dropped = item.get("dropped_scratch") or []
+        if dropped:
+            print(f"        dropped untracked scratch: {', '.join(dropped)}")
     for item in res["held"]:
         print(f"Held    {item['path']} [{item['bucket']}: {item['hold_reason']}]")
     for item in res["errors"]:
