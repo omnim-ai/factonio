@@ -5,8 +5,9 @@ editable Registered Repositories table on /factonio (GET/PATCH /repos), the
 Auxiliary Models deep-links on both the settings page and the /factonio
 dashboard, the hideable right-sidebar Factonio tab docked beside Files
 (registration, reveal, visibility-aware polling, scope/status/phase filters, workstream pipeline,
-card details and quick actions), older-host compatibility, and Desktop SDK
-surface lint.
+card details and quick actions), the Decision Trail (dashboard section,
+sidebar strips and card-drawer decisions), older-host compatibility, and
+Desktop SDK surface lint.
 
 The smoke test executes ``desktop/plugin.js`` under Node's ESM loader with
 ``node:module`` ``registerHooks`` stubbing ``@hermes/plugin-sdk``, ``react``
@@ -156,6 +157,8 @@ const MODELS = {
 let queryState = { data: MODELS, isLoading: false, isError: false }
 let cardsState = { data: undefined, isLoading: true, isError: false }
 const cardsQueries = []
+let trailState = { data: undefined, isLoading: true, isError: false }
+const trailQueries = []
 globalThis.__fcUseQuery = opts => {
   const key = opts.queryKey.join('/')
   if (key === 'factonio/models') {
@@ -167,6 +170,10 @@ globalThis.__fcUseQuery = opts => {
   }
   if (key === 'factonio/repos' && globalThis.__fcReposState) {
     return globalThis.__fcReposState
+  }
+  if (opts.queryKey[1] === 'trail') {
+    trailQueries.push({ key: opts.queryKey, interval: opts.refetchInterval, fn: opts.queryFn })
+    return typeof trailState === 'function' ? trailState(opts) : trailState
   }
   if (opts.queryKey[1] === 'cards') {
     cardsQueries.push({ key: opts.queryKey, enabled: opts.enabled !== false, interval: opts.refetchInterval, fn: opts.queryFn })
@@ -691,12 +698,13 @@ function deferred() {
   const promise = new Promise((res, rej) => { resolve = res; reject = rej })
   return { promise, resolve, reject }
 }
+const scrollLog = []
 function attachRefs(tree, focusLog) {
   walk(tree, n => {
     const ref = n.props.ref
     if (!ref) return
     const name = n.props.id || n.props['aria-label'] || text(n).trim()
-    const el = { tag: n.type, name, focus: () => focusLog.push(name) }
+    const el = { tag: n.type, name, focus: () => focusLog.push(name), scrollIntoView: opts => scrollLog.push([name, opts || null]) }
     if (typeof ref === 'function') ref(el)
     else ref.current = el
   })
@@ -849,7 +857,8 @@ async function runReposScenarios(report) {
   // Empty state
   let m = mountRepos({ data: { repos: [], defaults: REPO_DEFAULTS } })
   let tree = m.render()
-  r.empty = { text: text(tree).replace(/\s+/g, ' '), table: !!reposSec(tree), legend: !!find(tree, n => n.props.className === 'fc-legend'), sub: !!find(tree, n => n.props.className === 'fc-sec-sub') }
+  const reposBlock = find(tree, n => n.props.className === 'fc-sec' && !!find(n, byText('h2', 'Registered Repositories')))
+  r.empty = { text: text(reposBlock.node).replace(/\s+/g, ' '), table: !!reposSec(tree), legend: !!find(reposBlock.node, n => n.props.className === 'fc-legend'), sub: !!find(reposBlock.node, n => n.props.className === 'fc-sec-sub') }
 
   // Populated read state
   const notified = () => [...notifications]
@@ -1068,6 +1077,308 @@ async function runReposScenarios(report) {
   globalThis.__fcReposState = undefined
   globalThis.__fcQueryClient = undefined
 }
+
+// ---------------------------------------------------------------------------
+// Decision Trail harness (/factonio TrailSection + sidebar strips / card drawers)
+// ---------------------------------------------------------------------------
+const W2 = 'omnim-ai-factonio-wave-2-watchdog-liveness'
+const ACME_T = 'acme-api-i42'
+const dec = o => ({ tenant: W2, repo_slug: 'omnim-ai-factonio', supersedes_id: null, superseded_by: [], is_superseded: false, evidence: {}, ...o })
+// Same sample ledger as the approved design/preview.html (API order: newest first).
+const TRAIL = [
+  dec({ id: 'd_f012c8a47b99', ts: '2026-11-25T16:40:00.000000Z', phase: 'merge', card_id: 't_bcf5502a', actor: 'orchestrator', decision: 'pr_merged', why: 'Squash-merged PR #12 after GraphQL readback confirmed all four gate tiers green.', evidence: { pr_number: 12, head_sha: '5d178304', tests_passed: 114 }, result: 'merged' }),
+  dec({ id: 'd_7e30f91b5c04', ts: '2026-11-25T16:25:00.000000Z', phase: 'escape', card_id: 't_1658b10a', actor: 'orchestrator', decision: 'escape_gap_opened', why: 'A liveness bug from #9 reached main despite a passing verify.', evidence: { escaped_from: 'omnim-ai/factonio#9', card_id: 't_1658b10a' }, result: 'recorded' }),
+  dec({ id: 'd_c4f08e2a91b7', ts: '2026-11-25T16:12:00.000000Z', phase: 'verify', card_id: 't_bcf5502a', actor: 'orchestrator', decision: 'verify_carryover', why: 'Reused the prior verify-diff pass after git patch-id matched the unchanged hunks.', evidence: { pr_number: 12, head_sha: '5d178304', patch_id: '91e4f0a2c7b1', tests_passed: 114, tests_failed: 0 }, result: 'pass', supersedes_id: 'd_9a1e4c0b2f31' }),
+  dec({ id: 'd_2d67a4e8f012', ts: '2026-11-25T15:58:00.000000Z', phase: 'watchdog', card_id: 't_caf57a3b', actor: 'watchdog', decision: 'stall_detected', why: 'Worker 48219 is alive but has made no side effect for 27 minutes.', evidence: { card_id: 't_caf57a3b', worker_pid: 48219, side_effect_age_s: 1620 }, result: 'stalled' }),
+  dec({ id: 'd_9a1e4c0b2f31', ts: '2026-11-25T15:41:00.000000Z', phase: 'verify', card_id: 't_bcf5502a', actor: 'orchestrator', decision: 'pr_gate_wait', why: 'Held the PR gate: e2e-linux failed once on a known-flaky timeout.', evidence: { pr_number: 12, head_sha: '5d178304', failing_check: 'e2e-linux', nested: { a: 1 } }, result: 'inconclusive', superseded_by: ['d_c4f08e2a91b7'], is_superseded: true }),
+  dec({ id: 'd_11aa82b90c3e', ts: '2026-11-25T15:02:00.000000Z', tenant: ACME_T, repo_slug: 'acme-api', phase: 'implement', card_id: 't_77d0e3a1', actor: 'worker', decision: 'spawn_implement', why: 'Spawned the implement worker for issue #42.', evidence: { card_id: 't_77d0e3a1', pr_number: 7 }, result: 'spawned' }),
+  dec({ id: 'd_6f19b3d28e45', ts: '2026-11-25T14:38:00.000000Z', phase: 'design', card_id: 't_8bee4979', actor: 'human', decision: 'design_approved', why: 'Approved the Decision Trail UI.', evidence: { card_id: 't_8bee4979', design_provider: 'claude-design' }, result: 'approved' }),
+  dec({ id: 'd_4b81e2c0a119', ts: '2026-11-25T14:05:00.123456Z', phase: 'define', card_id: 't_5a2c91e0', actor: 'worker', decision: 'attack_the_premise_pivot', why: 'Pivoted to a dedicated append-only trail.db.', evidence: { card_id: 't_5a2c91e0', rejected: 'kanban.db table' }, result: 'pivot' })
+]
+const TRAIL_SUMMARY = { total: 8, active: 7, superseded: 1, by_phase: {}, by_actor: {}, by_tenant: { [W2]: 7, [ACME_T]: 1 }, latest_ts: TRAIL[0].ts }
+const TRAIL_DATA = { decisions: TRAIL, summary: TRAIL_SUMMARY, filters: { tenant: null, repo: null, phase: null, card_id: null, limit: 200 } }
+const TRAIL_REPOS = [
+  { ...REPOS[0], slug: 'omnim-ai-factonio', repo: 'omnim-ai/factonio' },
+  { ...REPOS[1], slug: 'acme-api', repo: 'acme/api' }
+]
+const norm = n => text(n).replace(/\s+/g, ' ').trim()
+function readTrail(tree) {
+  const sec = find(tree, n => n.type === 'section' && n.props.className === 'fc-sec fc-trail')
+  if (!sec) return null
+  const s = sec.node
+  const q = pred => find(s, pred)
+  const bar = q(n => n.props.className === 'fc-trail-bar')
+  const stateBox = q(n => n.props.className === 'fc-trail-state')
+  const alert = q(n => n.props.role === 'alert')
+  const live = q(n => n.props.className === 'fc-trail-sr' && n.props['aria-live'] === 'polite')
+  const list = q(n => n.type === 'ol')
+  return {
+    state: s.props['data-state'],
+    busy: s.props['aria-busy'],
+    labelledBy: s.props['aria-labelledby'],
+    heading: { text: norm(q(n => n.type === 'h2').node), id: q(n => n.type === 'h2').node.props.id },
+    stats: findAll(s, n => n.props.className === 'fc-trail-stat').map(h => ({ stat: h.node.props['data-stat'] || null, type: h.node.type, text: norm(h.node), pressed: h.node.props['aria-pressed'] ?? null })),
+    bar: bar ? {
+      disabled: bar.node.props['data-disabled'],
+      role: bar.node.props.role,
+      selects: Object.fromEntries(findAll(bar.node, n => n.type === 'select').map(h => [h.node.props['data-filter'], { value: h.node.props.value, set: h.node.props['data-set'], disabled: !!h.node.props.disabled, options: findAll(h.node, n => n.type === 'option').map(o => [o.node.props.value, norm(o.node)]) }])),
+      phases: findAll(find(bar.node, n => n.props.className === 'fc-trail-phases').node, n => n.type === 'button').map(h => ({ phase: h.node.props['data-phase'], pressed: h.node.props['aria-pressed'], disabled: !!h.node.props.disabled, text: norm(h.node) })),
+      end: norm(find(bar.node, n => n.props.className === 'fc-trail-bar-end').node),
+      clear: !!find(bar.node, byAttr('data-action', 'clear'))
+    } : null,
+    list: list ? { label: list.node.props['aria-label'] } : null,
+    rows: findAll(s, n => n.props.className === 'fc-trail-row').map(h => {
+      const r = h.node
+      const res = find(r, n => n.props.className === 'fc-trail-result').node
+      const why = find(r, n => n.props.className === 'fc-trail-why')
+      return {
+        id: r.props['data-id'],
+        domId: r.props.id,
+        tabIndex: r.props.tabIndex,
+        superseded: r.props['data-superseded'],
+        flash: r.props['data-flash'],
+        datetime: find(r, n => n.type === 'time').node.props.dateTime,
+        phase: norm(find(r, n => n.props.className === 'fc-trail-phase').node),
+        actor: find(r, n => n.props.className === 'fc-trail-actor').node.props['data-actor'],
+        title: norm(find(r, n => n.type === 'h3').node),
+        rawTitle: find(r, n => n.type === 'h3').node.props.title,
+        result: norm(res),
+        tone: res.props['data-tone'] ?? null,
+        why: why ? norm(why.node) : null,
+        links: findAll(r, n => n.props.className === 'fc-trail-link').map(l => ({ kind: l.node.props['data-kind'], jump: l.node.props['data-jump'], label: l.node.props['aria-label'], text: norm(l.node) })),
+        pills: findAll(r, n => n.props.className === 'fc-trail-pill').map(pl => ({ ev: pl.node.props['data-ev'], text: norm(pl.node), tone: pl.node.props['data-tone'] ?? null, href: pl.node.props.href ?? null, title: pl.node.props.title }))
+      }
+    }),
+    skeletons: findAll(s, n => n.props.className === 'fc-trail-skel').length,
+    srLoading: !!q(n => n.props.className === 'fc-trail-sr' && norm(n) === 'Loading decision trail…'),
+    alert: alert ? { text: norm(alert.node), retry: !!find(alert.node, byAttr('data-action', 'retry')) } : null,
+    box: stateBox ? {
+      kind: stateBox.node.props['data-state'],
+      title: norm(find(stateBox.node, n => n.type === 'h3').node),
+      text: norm(stateBox.node),
+      chips: findAll(stateBox.node, n => n.props.className === 'fc-trail-pill').map(h => norm(h.node)),
+      cmd: (() => { const c = find(stateBox.node, n => n.props.className === 'fc-step-cmd'); return c ? norm(c.node) : null })(),
+      clear: (() => { const b = find(stateBox.node, byAttr('data-action', 'clear')); return b ? { cls: b.node.props.className, text: norm(b.node) } : null })()
+    } : null,
+    live: live ? norm(live.node) : null
+  }
+}
+const lastTrailQuery = () => { const q = trailQueries[trailQueries.length - 1]; return q ? { key: q.key, interval: q.interval } : null }
+const trailSelect = (tree, filter, value) => find(find(tree, n => n.props.className === 'fc-sec fc-trail').node, n => n.type === 'select' && n.props['data-filter'] === filter).node.props.onChange({ target: { value } })
+const trailPhase = (tree, phase) => fire(find(find(tree, n => n.props.className === 'fc-trail-phases').node, n => n.type === 'button' && n.props['data-phase'] === phase))
+const trailAction = (tree, action) => fire(find(find(tree, n => n.props.className === 'fc-sec fc-trail').node, n => n.type === 'button' && n.props['data-action'] === action))
+const trailLink = (tree, rowId, kind) => fire(find(find(tree, n => n.props.className === 'fc-trail-row' && n.props['data-id'] === rowId).node, n => n.props.className === 'fc-trail-link' && n.props['data-kind'] === kind))
+
+async function runTrailScenarios(report) {
+  const T = report.trail = {}
+  const client = { invalidateQueries: () => Promise.resolve() }
+  const mountDash = () => mountRepos({ data: { repos: TRAIL_REPOS, defaults: REPO_DEFAULTS }, client })
+  const dash = T.dashboard = {}
+
+  // Loading (first load): skeletons, dashed stats, disabled filter bar.
+  trailState = { data: undefined, isLoading: true, isError: false }
+  trailQueries.length = 0
+  let m = mountDash()
+  let tree = m.render()
+  dash.loading = readTrail(tree)
+  dash.query = lastTrailQuery()
+  dash.restPath = (await trailQueries[trailQueries.length - 1].fn(), m.rests[m.rests.length - 1].path)
+  dash.sectionOrder = findAll(tree, n => n.type === 'h2').map(h => norm(h.node))
+
+  // Populated.
+  trailState = { data: TRAIL_DATA, isLoading: false, isError: false }
+  m = mountDash()
+  tree = m.render()
+  dash.populated = readTrail(tree)
+  windowOpens.length = 0
+  const prPill = find(tree, n => n.props.className === 'fc-trail-pill' && n.type === 'a')
+  const prFire = fire(prPill)
+  await tick()
+  dash.prClick = { prevented: prFire.prevented, windowOpens: windowOpens.map(a => a[0]) }
+  windowOpens.length = 0
+
+  // Filter: repo -> one row (ws pill shown), then + phase merge -> no match, then Clear.
+  trailSelect(tree, 'repo', 'acme-api'); tree = m.render()
+  dash.repoFiltered = readTrail(tree)
+  trailPhase(tree, 'merge'); tree = m.render()
+  dash.noMatch = readTrail(tree)
+  fire(find(find(tree, n => n.props.className === 'fc-trail-state').node, byAttr('data-action', 'clear'))); tree = m.render()
+  dash.cleared = readTrail(tree)
+  // Tenant filter + phase counts that respect it.
+  trailSelect(tree, 'tenant', W2); tree = m.render()
+  dash.tenantFiltered = readTrail(tree)
+  trailAction(tree, 'clear'); tree = m.render()
+
+  // Hide superseded, then jump from the superseding row to its hidden target.
+  trailAction(tree, 'toggle-sup'); tree = m.render()
+  dash.supHidden = readTrail(tree)
+  trailPhase(tree, 'verify'); tree = m.render()
+  dash.verifyOnly = readTrail(tree)
+  scrollLog.length = 0; m.focusLog.length = 0
+  trailLink(tree, 'd_c4f08e2a91b7', 'supersedes'); tree = m.render()
+  dash.jumpHidden = { trail: readTrail(tree), scroll: JSON.parse(JSON.stringify(scrollLog)), focus: [...m.focusLog] }
+  scrollLog.length = 0; m.focusLog.length = 0
+  trailLink(tree, 'd_9a1e4c0b2f31', 'superseded-by'); tree = m.render()
+  dash.jumpVisible = { trail: readTrail(tree), scroll: JSON.parse(JSON.stringify(scrollLog)), focus: [...m.focusLog] }
+  trailAction(tree, 'toggle-sup'); tree = m.render()
+  dash.supShownAgain = readTrail(tree).stats
+
+  // Empty.
+  trailState = { data: { decisions: [], summary: { total: 0, active: 0, superseded: 0, by_tenant: {} }, filters: {} }, isLoading: false, isError: false }
+  m = mountDash(); tree = m.render()
+  dash.empty = readTrail(tree)
+
+  // API error without data, then with stale rows; Retry refetches.
+  const refetches = []
+  trailState = { data: undefined, isLoading: false, isError: true, error: new Error('503: {"detail":"trail.db is locked"}'), refetch: () => refetches.push('dash') }
+  m = mountDash(); tree = m.render()
+  dash.error = readTrail(tree)
+  trailAction(tree, 'retry')
+  dash.errorRetry = [...refetches]
+  trailState = { data: TRAIL_DATA, isLoading: false, isError: true, error: new Error('fetch failed') }
+  m = mountDash(); tree = m.render()
+  dash.errorStale = readTrail(tree)
+
+  // Deep link from the sidebar: /factonio?tenant=… scopes the fetch and the filter.
+  trailQueries.length = 0
+  trailState = opts => (opts.queryKey.includes('tenant') ? { data: { ...TRAIL_DATA, decisions: TRAIL.filter(d => d.tenant === ACME_T), summary: { total: 1, active: 1, superseded: 0, by_tenant: { [ACME_T]: 1 } }, filters: { tenant: ACME_T } }, isLoading: false, isError: false } : { data: TRAIL_DATA, isLoading: false, isError: false })
+  globalThis.location = { hash: `#/factonio?tenant=${encodeURIComponent(ACME_T)}`, search: '' }
+  scrollLog.length = 0
+  m = mountDash(); tree = m.render()
+  const scopedQuery = lastTrailQuery()
+  await trailQueries[trailQueries.length - 1].fn()
+  dash.deepLink = { query: scopedQuery, rest: m.rests[m.rests.length - 1].path, trail: readTrail(tree), scroll: JSON.parse(JSON.stringify(scrollLog)) }
+  delete globalThis.location
+  trailSelect(tree, 'tenant', ''); tree = m.render()
+  dash.deepLinkCleared = { query: lastTrailQuery(), rows: readTrail(tree).rows.length }
+
+  // ---- sidebar -------------------------------------------------------------
+  const sb = T.sidebar = {}
+  const SB_TRAIL = [
+    dec({ id: 'd_m7', ts: '2026-11-25T16:40:00.000000Z', tenant: META, repo_slug: 'tozes-factonio', phase: 'verify', card_id: 't_a1b2c3e0', actor: 'watchdog', decision: 'stall_detected', why: 'No side effect for 27 minutes.', evidence: { worker_pid: 4821, side_effect_age_s: 1620, card_id: 't_a1b2c3e0' }, result: 'stalled' }),
+    dec({ id: 'd_m6', ts: '2026-11-25T16:30:00.000000Z', tenant: META, repo_slug: 'tozes-factonio', phase: 'gate', card_id: 't_a1b2c3d4', actor: 'orchestrator', decision: 'pr_gate', why: 'All merge gate tiers clear.', evidence: { pr_number: 42, head_sha: 'abcdef1234', patch_id: '91e4f0a2c7', tests_passed: 88, card_id: 't_a1b2c3d4' }, result: 'ready', supersedes_id: 'd_m3' }),
+    dec({ id: 'd_m5', ts: '2026-11-25T16:20:00.000000Z', tenant: META, repo_slug: 'tozes-factonio', phase: 'implement', card_id: 't_a1b2c3d4', actor: 'worker', decision: 'fix_round', why: 'Rework after diff review.', evidence: {}, result: 'recorded' }),
+    dec({ id: 'd_m4', ts: '2026-11-25T16:10:00.000000Z', tenant: META, repo_slug: 'tozes-factonio', phase: 'design', card_id: 't_x', actor: 'human', decision: 'design_approved', why: '', evidence: {}, result: 'approved' }),
+    dec({ id: 'd_m3', ts: '2026-11-25T16:00:00.000000Z', tenant: META, repo_slug: 'tozes-factonio', phase: 'gate', card_id: 't_a1b2c3d4', actor: 'orchestrator', decision: 'pr_gate', why: 'e2e flaked.', evidence: { pr_number: 42 }, result: 'blocked', superseded_by: ['d_m6'], is_superseded: true }),
+    dec({ id: 'd_m2', ts: '2026-11-25T15:50:00.000000Z', tenant: META, repo_slug: 'tozes-factonio', phase: 'define', card_id: 't_7d21c0e5', actor: 'orchestrator', decision: 'start_workstream', why: 'Started.', evidence: {}, result: 'spawned' }),
+    dec({ id: 'd_m1', ts: '2026-11-25T15:40:00.000000Z', tenant: META, repo_slug: 'tozes-factonio', phase: 'define', card_id: 't_7d21c0e5', actor: 'orchestrator', decision: 'escape_noted', why: '', evidence: {}, result: 'recorded' }),
+    dec({ id: 'd_s1', ts: '2026-11-25T14:00:00.000000Z', tenant: SIDEBAR, repo_slug: 'tozes-factonio', phase: 'verify', card_id: 't_4ab36a11', actor: 'orchestrator', decision: 'spawn_verify', why: 'PR #44 opened.', evidence: { pr_number: 44 }, result: 'spawned' })
+  ]
+  const SB_DATA = { decisions: SB_TRAIL, summary: { total: 8 }, filters: {} }
+  const secNode = (tree, tenant) => find(tree, n => n.type === 'section' && n.props['data-tenant'] === tenant)
+  const stripOf = (tree, tenant) => {
+    const sec = secNode(tree, tenant)
+    if (!sec) return null
+    const st = find(sec.node, n => n.props.className === 'fc-sb-trail')
+    if (!st) return null
+    const btn = find(st.node, n => n.props.className === 'fc-sb-trail-toggle').node
+    const list = find(st.node, n => n.props.className === 'fc-sb-trail-list')
+    const cards = find(sec.node, n => n.props.className === 'fc-sb-ws-cards').node.props.children.filter(Boolean)
+    const last = cards[cards.length - 1]
+    return {
+      isLastChild: !!last && (last === st.node || (last.props && last.props.className === 'fc-sb-trail')),
+      action: btn.props['data-action'],
+      text: norm(btn),
+      expanded: btn.props['aria-expanded'] ?? null,
+      controls: btn.props['aria-controls'] ?? null,
+      disabled: !!btn.props.disabled,
+      busy: btn.props['aria-busy'] ?? null,
+      phases: (() => { const p = find(btn, n => n.props.className === 'fc-sb-trail-phases'); return p ? norm(p.node) : null })(),
+      flag: (() => { const f = find(btn, n => n.props.className === 'fc-sb-trail-flag'); return f ? norm(f.node) : null })(),
+      list: list ? {
+        id: list.node.props.id,
+        label: list.node.props['aria-label'],
+        items: findAll(list.node, n => n.props.className === 'fc-sb-trail-item').map(h => readSbItem(h.node)),
+        more: (() => { const mo = find(list.node, n => n.props.className === 'fc-sb-trail-more'); return mo ? norm(mo.node) : null })()
+      } : null
+    }
+  }
+  const readSbItem = it => ({
+    id: it.props['data-id'],
+    superseded: it.props['data-superseded'],
+    tags: findAll(find(it, n => n.props.className === 'fc-sb-trail-top').node, n => n.props.className === 'fc-sb-tag').map(h => ({ text: norm(h.node), tone: h.node.props['data-tone'] ?? null })),
+    supTag: !!find(it, n => n.props.className === 'fc-sb-trail-sup'),
+    time: find(it, n => n.type === 'time').node.props.dateTime,
+    title: norm(find(it, n => n.props.className === 'fc-sb-trail-title').node),
+    why: (() => { const w = find(it, n => n.props.className === 'fc-sb-trail-why'); return w ? norm(w.node) : null })(),
+    chips: findAll(it, n => n.props.className === 'fc-sb-chip').map(h => ({ ev: h.node.props['data-ev'], text: norm(h.node), tone: h.node.props['data-tone'] ?? null, title: h.node.props.title }))
+  })
+  const drawerDecisions = (tree, id) => {
+    const art = find(tree, n => n.type === 'article' && n.props['data-id'] === id)
+    const dl = art && find(art.node, n => n.type === 'dl')
+    if (!dl) return null
+    const dt = find(dl.node, n => n.type === 'dt' && n.props.className === 'fc-sb-full fc-sb-trail-dt')
+    const dd = find(dl.node, n => n.type === 'dd' && n.props['data-field'] === 'decisions')
+    const dds = findAll(dl.node, n => n.type === 'dd').map(h => h.node.props['data-field'])
+    return { dt: dt ? norm(dt.node) : null, ddClass: dd?.node.props.className, text: dd ? norm(dd.node) : null, items: dd ? findAll(dd.node, n => n.props.className === 'fc-sb-trail-item').map(h => readSbItem(h.node)) : [], fieldOrder: dds }
+  }
+  const openCard = (m, tree, id) => { fire(find(find(tree, n => n.type === 'article' && n.props['data-id'] === id).node, byAttr('data-action', 'toggle-card'))); return m.render() }
+
+  cardsState = { data: { cards: CARDS }, isLoading: false, isError: false }
+  // Loading.
+  trailState = { data: undefined, isLoading: true, isError: false }
+  trailQueries.length = 0
+  paneVisible = true
+  m = mountPane({ storage: makeStorage({ 'sidebar.scope': 'all' }), focused: null })
+  tree = m.render()
+  sb.query = lastTrailQuery()
+  await trailQueries[trailQueries.length - 1].fn()
+  sb.restPath = m.rests[m.rests.length - 1]
+  tree = openCard(m, tree, 't_a1b2c3d4')
+  sb.loading = { strip: stripOf(tree, META), drawer: drawerDecisions(tree, 't_a1b2c3d4') }
+  paneVisible = false
+  m.render(); sb.hiddenQuery = lastTrailQuery()
+  paneVisible = true
+
+  // Populated.
+  trailState = { data: SB_DATA, isLoading: false, isError: false }
+  navigations.length = 0
+  m = mountPane({ storage: makeStorage({ 'sidebar.scope': 'all' }), focused: null })
+  tree = m.render()
+  sb.collapsed = { meta: stripOf(tree, META), sidebar: stripOf(tree, SIDEBAR), pillWsCollapsed: secNode(tree, PILL) ? stripOf(tree, PILL) : 'absent', stages: sectionsOf(tree).find(x => x.tenant === META).stages }
+  fire(find(secNode(tree, META).node, byAttr('data-action', 'toggle-trail'))); tree = m.render()
+  sb.expanded = stripOf(tree, META)
+  fire(find(secNode(tree, META).node, byAttr('data-action', 'open-trail')))
+  sb.openTrailNav = [...navigations]
+  fire(find(secNode(tree, SIDEBAR).node, byAttr('data-action', 'toggle-trail'))); tree = m.render()
+  sb.sidebarExpanded = stripOf(tree, SIDEBAR)
+  fire(find(secNode(tree, META).node, byAttr('data-action', 'toggle-trail'))); tree = m.render()
+  sb.recollapsed = stripOf(tree, META).expanded
+  tree = openCard(m, tree, 't_a1b2c3d4')
+  sb.drawer = drawerDecisions(tree, 't_a1b2c3d4')
+  tree = openCard(m, tree, 't_a1b2c3e1')
+  sb.drawerNone = drawerDecisions(tree, 't_a1b2c3e1')
+  // Card filters narrow cards, never the workstream ledger; a mismatch hides every strip.
+  fire(find(find(tree, n => n.props['aria-label'] === 'Filter by phase').node, byText('button', 'Verify'))); tree = m.render()
+  sb.phaseFiltered = stripOf(tree, META)
+  fire(find(find(tree, n => n.props['aria-label'] === 'Filter by phase').node, byText('button', 'Design'))); tree = m.render()
+  fire(find(tree, n => n.props.className === 'fc-sb-stat' && n.props['data-value'] === 'attention')); tree = m.render()
+  sb.noMatch = { empty: emptyOf(tree), strips: findAll(tree, n => n.props.className === 'fc-sb-trail').length }
+
+  // Empty trail: no strips; drawers say "None recorded".
+  trailState = { data: { decisions: [], summary: { total: 0 }, filters: {} }, isLoading: false, isError: false }
+  m = mountPane({ storage: makeStorage({ 'sidebar.scope': 'all' }), focused: null })
+  tree = m.render()
+  sb.emptyStrips = findAll(tree, n => n.props.className === 'fc-sb-trail').length
+  tree = openCard(m, tree, 't_a1b2c3d4')
+  sb.emptyDrawer = drawerDecisions(tree, 't_a1b2c3d4')
+
+  // API error: strip offers Retry (refetch), drawer reads "Unavailable".
+  const sbRefetch = []
+  trailState = { data: undefined, isLoading: false, isError: true, error: new Error('500: boom'), refetch: () => sbRefetch.push(1) }
+  m = mountPane({ storage: makeStorage({ 'sidebar.scope': 'all' }), focused: null })
+  tree = m.render()
+  sb.error = { strip: stripOf(tree, META) }
+  const retryHit = fire(find(secNode(tree, META).node, byAttr('data-action', 'retry-trail')))
+  sb.error.retry = { refetches: sbRefetch.length, stopped: retryHit.stopped }
+  tree = openCard(m, tree, 't_a1b2c3d4')
+  sb.error.drawer = drawerDecisions(tree, 't_a1b2c3d4')
+
+  trailState = { data: undefined, isLoading: true, isError: false }
+  cardsState = { data: undefined, isLoading: true, isError: false }
+  globalThis.__fcReposState = undefined
+  globalThis.__fcQueryClient = undefined
+}
 const mod = await import(process.env.FC_PLUGIN_URL)
 const plugin = mod.default
 const report = { id: plugin.id, name: plugin.name }
@@ -1120,6 +1431,7 @@ report.oldHost = { error: oldErr, registeredIds: oldRegistered.map(r => r.id) }
 
 await runSidebarScenarios(report, registered, oldRegistered)
 await runReposScenarios(report)
+await runTrailScenarios(report)
 
 // Tri-state verification verdicts: additive `inconclusive` fields from /metrics and /cards.
 {
@@ -1663,6 +1975,281 @@ class TestDesktopPlugin(unittest.TestCase):
         for imp in re.findall(r"^import .* from '([^']+)'", source, re.M):
             self.assertIn(imp, ("@hermes/plugin-sdk", "react", "react/jsx-runtime"))
 
+
+    # --- Decision Trail: /factonio TrailSection ---------------------------------
+    def _rows(self, t):
+        return [r["id"] for r in t["rows"]]
+
+    def test_trail_dashboard_query_and_placement(self):
+        d = self.report["trail"]["dashboard"]
+        self.assertEqual(d["query"], {"key": ["factonio", "trail", 200], "interval": 30000})
+        self.assertEqual(d["restPath"], "/trail?limit=200")
+        self.assertEqual(d["sectionOrder"], ["Phase Durations", "Decision Trail", "Phase Model Configuration", "Registered Repositories"])
+
+    def test_trail_dashboard_loading_state(self):
+        t = self.report["trail"]["dashboard"]["loading"]
+        self.assertEqual(t["state"], "loading")
+        self.assertEqual(t["busy"], "true")
+        self.assertEqual(t["labelledBy"], "fc-trail-h")
+        self.assertEqual(t["heading"], {"text": "Decision Trail", "id": "fc-trail-h"})
+        self.assertEqual(t["skeletons"], 3)
+        self.assertTrue(t["srLoading"])
+        self.assertEqual([s["text"] for s in t["stats"]], ["– total", "– active", "– superseded"])
+        self.assertEqual(t["bar"]["disabled"], "true")
+        self.assertTrue(all(s["disabled"] for s in t["bar"]["selects"].values()))
+        self.assertTrue(all(p["disabled"] for p in t["bar"]["phases"]))
+        self.assertEqual([p["phase"] for p in t["bar"]["phases"]][1:], ["define", "design", "implement", "verify", "gate", "merge", "escape", "watchdog"])
+        self.assertEqual(t["rows"], [])
+        self.assertIsNone(t["alert"])
+
+    def test_trail_dashboard_populated_rows_and_evidence(self):
+        t = self.report["trail"]["dashboard"]["populated"]
+        self.assertEqual(t["state"], "populated")
+        self.assertEqual(t["busy"], "false")
+        self.assertEqual(t["list"], {"label": "Decisions, newest first"})
+        self.assertEqual([s["text"] for s in t["stats"]], ["8 total", "7 active", "1 superseded"])
+        self.assertEqual(t["stats"][2]["type"], "button")
+        self.assertEqual(t["stats"][2]["pressed"], "false")
+        self.assertEqual(t["bar"]["end"], "8 of 8")
+        self.assertFalse(t["bar"]["clear"])
+        self.assertEqual(
+            [p["text"] for p in t["bar"]["phases"]],
+            ["All", "define 1", "design 1", "implement 1", "verify 2", "merge 1", "escape 1", "watchdog 1"],
+        )
+        self.assertEqual(t["bar"]["selects"]["repo"]["options"][0], ["", "All repos"])
+        self.assertIn(["omnim-ai-factonio-wave-2-watchdog-liveness", "wave-2-watchdog-liveness"], t["bar"]["selects"]["tenant"]["options"])
+        self.assertEqual(
+            self._rows(t),
+            ["d_f012c8a47b99", "d_7e30f91b5c04", "d_c4f08e2a91b7", "d_2d67a4e8f012", "d_9a1e4c0b2f31", "d_11aa82b90c3e", "d_6f19b3d28e45", "d_4b81e2c0a119"],
+        )
+        rows = {r["id"]: r for r in t["rows"]}
+        merged = rows["d_f012c8a47b99"]
+        self.assertEqual((merged["phase"], merged["actor"], merged["title"], merged["rawTitle"]), ("merge", "orchestrator", "PR merged", "pr_merged"))
+        self.assertEqual((merged["result"], merged["tone"]), ("merged", "ok"))
+        self.assertEqual(merged["domId"], "trail-d_f012c8a47b99")
+        self.assertEqual(merged["tabIndex"], -1)
+        self.assertEqual(merged["datetime"], "2026-11-25T16:40:00.000000Z")
+        self.assertEqual(
+            [(p["ev"], p["text"], p["tone"], p["href"]) for p in merged["pills"]],
+            [
+                ("pr_number", "PR #12", None, "https://github.com/omnim-ai/factonio/pull/12"),
+                ("head_sha", "5d17830", None, None),
+                ("tests_passed", "114 pass", "ok", None),
+            ],
+        )
+        carry = rows["d_c4f08e2a91b7"]
+        # tests_failed: 0 is omitted; patch-id shows 7 chars.
+        self.assertEqual([p["text"] for p in carry["pills"]], ["PR #12", "5d17830", "patch-id 91e4f0a", "114 pass"])
+        stall = rows["d_2d67a4e8f012"]
+        self.assertEqual((stall["result"], stall["tone"]), ("stalled", "bad"))
+        self.assertEqual([(p["text"], p["tone"]) for p in stall["pills"]], [("idle 27m", "bad"), ("pid 48219", None), ("t_caf57a3b", None)])
+        self.assertEqual(rows["d_7e30f91b5c04"]["tone"], "info")
+        self.assertEqual(rows["d_7e30f91b5c04"]["pills"][0]["text"], "escaped from omnim-ai/factonio#9")
+        self.assertEqual(rows["d_4b81e2c0a119"]["tone"], "warn")
+        self.assertEqual(rows["d_4b81e2c0a119"]["title"], "Attack the premise pivot")
+        self.assertEqual(rows["d_6f19b3d28e45"]["actor"], "human")
+        self.assertIn("design provider claude-design", [p["text"] for p in rows["d_6f19b3d28e45"]["pills"]])
+        # acme-api maps to its registered GitHub repo; objects/arrays in evidence are skipped.
+        self.assertEqual(rows["d_11aa82b90c3e"]["pills"][0]["href"], "https://github.com/acme/api/pull/7")
+        self.assertNotIn("nested", [p["ev"] for p in rows["d_9a1e4c0b2f31"]["pills"]])
+        for r in t["rows"]:
+            self.assertNotIn("tenant", [p["ev"] for p in r["pills"]])  # no ws pill without a filter
+        pr = self.report["trail"]["dashboard"]["prClick"]
+        self.assertTrue(pr["prevented"])
+        self.assertEqual(pr["windowOpens"], ["https://github.com/omnim-ai/factonio/pull/12"])
+
+    def test_trail_dashboard_superseded_and_superseding_lineage(self):
+        rows = {r["id"]: r for r in self.report["trail"]["dashboard"]["populated"]["rows"]}
+        old, new = rows["d_9a1e4c0b2f31"], rows["d_c4f08e2a91b7"]
+        self.assertEqual(old["superseded"], "true")
+        self.assertEqual(new["superseded"], "false")
+        self.assertEqual(old["title"], "PR gate wait (superseded)")
+        self.assertEqual((old["result"], old["tone"]), ("inconclusive", "warn"))
+        self.assertEqual(old["links"], [{"kind": "superseded-by", "jump": "d_c4f08e2a91b7", "label": "Superseded by d_c4f08e2a91b7, jump to it", "text": "Superseded by d_c4f08e2a"}])
+        self.assertEqual(new["links"], [{"kind": "supersedes", "jump": "d_9a1e4c0b2f31", "label": "Supersedes d_9a1e4c0b2f31, jump to it", "text": "Supersedes d_9a1e4c0b"}])
+        for rid, r in rows.items():
+            if rid not in ("d_9a1e4c0b2f31", "d_c4f08e2a91b7"):
+                self.assertEqual(r["links"], [], rid)
+
+    def test_trail_dashboard_filters_and_no_match(self):
+        d = self.report["trail"]["dashboard"]
+        f = d["repoFiltered"]
+        self.assertEqual(self._rows(f), ["d_11aa82b90c3e"])
+        self.assertEqual(f["bar"]["selects"]["repo"]["value"], "acme-api")
+        self.assertEqual(f["bar"]["selects"]["repo"]["set"], "true")
+        self.assertEqual(f["bar"]["end"], "1 of 8 Clear filters")
+        self.assertIn("implement 1", [p["text"] for p in f["bar"]["phases"]])
+        self.assertIn("verify 0", [p["text"] for p in f["bar"]["phases"]])  # counts respect the repo filter
+        self.assertEqual([p["text"] for p in f["rows"][0]["pills"] if p["ev"] == "tenant"], ["ws i42"])
+        self.assertEqual(f["live"], "1 decision shown.")
+        nm = d["noMatch"]
+        self.assertEqual(nm["state"], "filtered")
+        self.assertEqual(nm["rows"], [])
+        self.assertIsNotNone(nm["bar"])  # filter bar stays live
+        self.assertTrue(nm["bar"]["clear"])
+        self.assertEqual(nm["box"]["title"], "No decisions match these filters")
+        self.assertEqual(nm["box"]["chips"], ["repo acme-api", "phase merge"])
+        self.assertIn("8 decisions exist outside this view.", nm["box"]["text"])
+        self.assertEqual(nm["box"]["clear"], {"cls": "fc-btn fc-btn--primary", "text": "Clear filters"})
+        c = d["cleared"]
+        self.assertEqual(len(c["rows"]), 8)
+        self.assertEqual(c["bar"]["selects"]["repo"]["value"], "")
+        self.assertEqual(c["live"], "Filters cleared.")
+        tf = d["tenantFiltered"]
+        self.assertEqual(len(tf["rows"]), 7)
+        self.assertNotIn("d_11aa82b90c3e", self._rows(tf))
+        self.assertIn("implement 0", [p["text"] for p in tf["bar"]["phases"]])
+
+    def test_trail_dashboard_hide_superseded_and_jump(self):
+        d = self.report["trail"]["dashboard"]
+        h = d["supHidden"]
+        self.assertNotIn("d_9a1e4c0b2f31", self._rows(h))
+        self.assertEqual(h["stats"][2], {"stat": "superseded", "type": "button", "text": "1 superseded · hidden", "pressed": "true"})
+        self.assertEqual(h["live"], "Superseded decisions hidden.")
+        self.assertEqual(self._rows(d["verifyOnly"]), ["d_c4f08e2a91b7"])
+        # Jumping to a filtered-out row clears every filter, shows superseded, flashes, scrolls and focuses it.
+        j = d["jumpHidden"]
+        self.assertEqual(len(j["trail"]["rows"]), 8)
+        self.assertEqual(j["trail"]["live"], "Filters cleared to show d_9a1e4c0b2f31.")
+        self.assertEqual(j["trail"]["stats"][2]["pressed"], "false")
+        self.assertEqual({r["id"]: r["flash"] for r in j["trail"]["rows"]}["d_9a1e4c0b2f31"], "true")
+        self.assertEqual(sum(r["flash"] == "true" for r in j["trail"]["rows"]), 1)
+        self.assertEqual(j["scroll"], [["trail-d_9a1e4c0b2f31", {"block": "center", "behavior": "smooth"}]])
+        self.assertEqual(j["focus"], ["trail-d_9a1e4c0b2f31"])
+        v = d["jumpVisible"]
+        self.assertEqual(v["trail"]["live"], "Jumped to d_c4f08e2a91b7.")
+        self.assertEqual({r["id"]: r["flash"] for r in v["trail"]["rows"]}["d_c4f08e2a91b7"], "true")
+        self.assertEqual(v["focus"], ["trail-d_c4f08e2a91b7"])
+        self.assertEqual(d["supShownAgain"][2]["pressed"], "true")
+
+    def test_trail_dashboard_empty_state(self):
+        e = self.report["trail"]["dashboard"]["empty"]
+        self.assertEqual(e["state"], "empty")
+        self.assertIsNone(e["bar"])
+        self.assertEqual(e["stats"], [])
+        self.assertEqual(e["box"]["kind"], "empty")
+        self.assertEqual(e["box"]["title"], "No decisions recorded yet")
+        self.assertEqual(e["box"]["cmd"], "hermes factonio trail --limit 20")
+        self.assertIsNone(e["box"]["clear"])
+
+    def test_trail_dashboard_api_error_states(self):
+        d = self.report["trail"]["dashboard"]
+        e = d["error"]
+        self.assertEqual(e["state"], "error")
+        self.assertEqual(e["rows"], [])
+        self.assertEqual(e["skeletons"], 0)
+        self.assertEqual(e["bar"]["disabled"], "true")
+        self.assertIn("Couldn’t load the decision trail.", e["alert"]["text"])
+        self.assertIn("503", e["alert"]["text"])
+        self.assertIn("Nothing was changed.", e["alert"]["text"])
+        self.assertTrue(e["alert"]["retry"])
+        self.assertEqual(d["errorRetry"], ["dash"])
+        s = d["errorStale"]
+        self.assertEqual(len(s["rows"]), 8)  # stale rows stay visible under the alert
+        self.assertIn("could not be reached", s["alert"]["text"])
+        self.assertEqual(s["bar"]["disabled"], "false")
+
+    def test_trail_dashboard_deep_link_scopes_tenant(self):
+        d = self.report["trail"]["dashboard"]
+        dl = d["deepLink"]
+        self.assertEqual(dl["query"]["key"], ["factonio", "trail", 200, "tenant", "acme-api-i42"])
+        self.assertEqual(dl["rest"], "/trail?tenant=acme-api-i42&limit=200")
+        self.assertEqual(dl["trail"]["bar"]["selects"]["tenant"]["value"], "acme-api-i42")
+        self.assertEqual(self._rows(dl["trail"]), ["d_11aa82b90c3e"])
+        self.assertEqual(dl["scroll"][0][0], "fc-trail-h")
+        self.assertEqual(d["deepLinkCleared"], {"query": {"key": ["factonio", "trail", 200], "interval": 30000}, "rows": 8})
+
+    # --- Decision Trail: sidebar strips + CardDrawer -----------------------------
+    def test_trail_sidebar_query_is_visibility_aware(self):
+        sb = self.report["trail"]["sidebar"]
+        self.assertEqual(sb["query"], {"key": ["factonio", "trail", 200], "interval": 15000})
+        self.assertEqual(sb["restPath"], "/trail?limit=200")
+        self.assertEqual(sb["hiddenQuery"]["interval"], False)
+
+    def test_trail_sidebar_loading_state(self):
+        ld = self.report["trail"]["sidebar"]["loading"]
+        self.assertEqual(ld["strip"]["text"], "Loading decisions…")
+        self.assertTrue(ld["strip"]["disabled"])
+        self.assertEqual(ld["strip"]["busy"], "true")
+        self.assertTrue(ld["strip"]["isLastChild"])
+        self.assertEqual(ld["drawer"]["dt"], "Decisions")
+        self.assertEqual(ld["drawer"]["text"], "Loading…")
+
+    def test_trail_sidebar_workstream_counts_and_expandable_rows(self):
+        sb = self.report["trail"]["sidebar"]
+        c = sb["collapsed"]
+        self.assertEqual(c["meta"]["text"], "7 decisions verify · gate · implement · +2 1")
+        self.assertEqual(c["meta"]["expanded"], "false")
+        self.assertEqual(c["meta"]["flag"], "1")  # one active bad-tone decision; the superseded blocked one is excluded
+        self.assertTrue(c["meta"]["isLastChild"])
+        self.assertIsNone(c["meta"]["list"])
+        self.assertEqual(c["sidebar"]["text"], "1 decision verify")
+        self.assertIsNone(c["pillWsCollapsed"])  # collapsed workstream shows no strip
+        self.assertEqual(len(c["stages"]), 4)  # strip adds no pipeline stages
+        e = sb["expanded"]
+        self.assertEqual(e["expanded"], "true")
+        self.assertEqual(e["controls"], e["list"]["id"])
+        self.assertEqual(e["list"]["label"], "Decisions for this workstream, newest first")
+        self.assertEqual([i["id"] for i in e["list"]["items"]], ["d_m7", "d_m6", "d_m5", "d_m4", "d_m3"])
+        self.assertEqual(e["list"]["more"], "+2 older Open in Decision Trail ›")
+        items = {i["id"]: i for i in e["list"]["items"]}
+        self.assertEqual(items["d_m7"]["tags"], [{"text": "verify", "tone": None}, {"text": "stalled", "tone": "reject"}])
+        self.assertEqual(items["d_m6"]["tags"][1], {"text": "ready", "tone": "pass"})
+        self.assertEqual([ch["text"] for ch in items["d_m6"]["chips"]], ["PR #42", "abcdef1", "patch-id 91e4f0a", "+2"])
+        self.assertEqual(items["d_m6"]["chips"][3]["title"], "tests_passed 88, card_id t_a1b2c3d4")
+        self.assertIsNone(items["d_m6"]["why"])  # no why text in the workstream list
+        self.assertEqual(items["d_m5"]["tags"][1]["tone"], "info")
+        self.assertEqual(sb["openTrailNav"], ["/factonio?tenant=tozes-factonio-enrich-cards-metadata"])
+        self.assertEqual(sb["sidebarExpanded"]["list"]["more"], "Full ledger Open in Decision Trail ›")
+        self.assertEqual(sb["recollapsed"], "false")
+
+    def test_trail_sidebar_superseded_rows(self):
+        items = {i["id"]: i for i in self.report["trail"]["sidebar"]["expanded"]["list"]["items"]}
+        self.assertEqual(items["d_m3"]["superseded"], "true")
+        self.assertTrue(items["d_m3"]["supTag"])
+        self.assertEqual(items["d_m6"]["superseded"], "false")
+        self.assertFalse(items["d_m6"]["supTag"])
+
+    def test_trail_card_drawer_decisions(self):
+        sb = self.report["trail"]["sidebar"]
+        dr = sb["drawer"]
+        self.assertEqual(dr["dt"], "Decisions · 3")
+        self.assertEqual(dr["ddClass"], "fc-sb-full fc-sb-trail-dd")
+        self.assertEqual(dr["fieldOrder"][-2:], ["decisions", "summary"])  # before Worker summary
+        self.assertEqual([i["id"] for i in dr["items"]], ["d_m6", "d_m5", "d_m3"])
+        self.assertEqual(dr["items"][0]["why"], "All merge gate tiers clear.")
+        self.assertNotIn("card_id", [ch["ev"] for i in dr["items"] for ch in i["chips"]])
+        self.assertEqual(dr["items"][0]["chips"][-1], {"ev": "more", "text": "+1", "tone": None, "title": "tests_passed 88"})
+        self.assertTrue(dr["items"][2]["supTag"])
+        self.assertEqual(sb["drawerNone"]["dt"], "Decisions · 0")
+        self.assertEqual(sb["drawerNone"]["text"], "None recorded")
+
+    def test_trail_sidebar_filtered_empty_and_error_states(self):
+        sb = self.report["trail"]["sidebar"]
+        # Card filters narrow cards but never the workstream ledger count.
+        self.assertEqual(sb["phaseFiltered"]["text"], "7 decisions verify · gate · implement · +2 1")
+        self.assertEqual(sb["noMatch"]["empty"]["title"], "No cards match these filters")
+        self.assertEqual(sb["noMatch"]["strips"], 0)
+        self.assertEqual(sb["emptyStrips"], 0)
+        self.assertEqual(sb["emptyDrawer"]["text"], "None recorded")
+        err = sb["error"]
+        self.assertEqual(err["strip"]["text"], "Decisions unavailable Retry")
+        self.assertEqual(err["strip"]["action"], "retry-trail")
+        self.assertEqual(err["retry"], {"refetches": 1, "stopped": True})
+        self.assertEqual(err["drawer"]["dt"], "Decisions")
+        self.assertEqual(err["drawer"]["text"], "Unavailable")
+
+    def test_trail_styles_use_theme_tokens_only(self):
+        source = PLUGIN_JS.read_text(encoding="utf-8")
+        start = source.index("const STYLES = `")
+        styles = source[start : source.index("`", start + len("const STYLES = `"))]
+        trail_rules = [line for line in styles.splitlines() if "fc-trail" in line or "fc-sb-trail" in line or 'fc-sb-tag[data-tone="info"]' in line]
+        self.assertGreater(len(trail_rules), 60)
+        for line in trail_rules:
+            self.assertNotRegex(line, r"#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(", line)
+        block = styles[styles.index("/* Decision Trail — dashboard") :]
+        self.assertNotRegex(block, r"#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(")
+        self.assertIn(".fc-trail *, .fc-trail-row { animation: none !important; transition: none !important; }", block)
 
     # --- Registered Repositories editor ----------------------------------------
     def _ed_vals(self, editor):
