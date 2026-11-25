@@ -35,6 +35,7 @@ Factonio is active for orchestrating software delivery on registered GitHub repo
 - Before reporting a PR ready or merging, verify live HEAD and CI via `factonio_pr_gate`. Auto-merge with `factonio_merge_pr` only when CI and both isolated verification checks pass (unless the repo sets `merge_policy: ask`).
 - Stack a unit on an unmerged parent PR with `factonio_spawn_implement(base_branch=..., stack_parent_pr=...)`; after the parent merges, run `factonio_restack_pr` and re-verify only when it reports `reverify_required`.
 - If the user reports a bug in work that passed Verification, start the fix with `escaped_from=<verify_card_id>` so escape rate stays measurable.
+- Bootstrap or refresh a repo's `.factonio/verify.md` black-box harness with `factonio_bootstrap_verify` (or `hermes factonio harness init|check|show|audit <repo>`); `factonio_spawn_verify` feeds it to Black-Box cards automatically.
 - Factory transitions are recorded in the append-only decision trail (`trail.db`); log forks, pivots, and merge countersigns with `factonio_log_decision`, and correct a decision by logging a new row with `supersedes_id`.
 """
 
@@ -51,6 +52,16 @@ RETRO_BLUEPRINT_PROMPT = """Run a Factonio `/correct` retrospective. Do not chan
 5. Prove before adopting: a proposed check or test MUST be shown to fail on a real past failure from the trail (replay the bad commit, input, or fixture) and pass on the fix. Report the exact command and both outcomes; drop any proposal you cannot prove.
 6. Record the outcome with `factonio_log_decision` (phase `retro`, evidence = occurrences + proof command), superseding earlier retro decisions it replaces.
 7. Deliver a decision-ready handoff: plain language, the key table or chart first, then one recommendation per class with its evidence and risk."""
+
+
+HARNESS_AUDIT_BLUEPRINT_PROMPT = """Run a Factonio repo verification harness drift audit. Do not edit repository code or push commits.
+
+1. List registered repositories with `hermes factonio list --json`.
+2. For each repo, run `hermes factonio harness audit <repo> --json` (strictly read-only: git probes use `--no-optional-locks`; the repo is never mutated).
+3. Report per repo: `severity` (`clean` | `stale` | `missing`), `uncovered_changed_files`, `stale_features`, `orphaned_globs`, `new_routes` / `removed_routes`, `new_cli_commands` / `removed_cli_commands`, and the `recommendations`.
+4. For `missing` or `stale` repos, recommend one action each: `hermes factonio harness init <repo>` (or `--force` to refresh; declared hooks are kept) followed by a reviewed commit of `.factonio/`, or a scoped `[implement]` card via `factonio_spawn_implement` when the Drive/Feature Map scenarios need human-quality edits.
+5. Log one `factonio_log_decision` row per drifted repo (phase `harness`, decision `harness_drift`, evidence = the audit counts and base commit).
+6. Deliver a short, decision-ready summary: a table of repos x severity first, then the recommendations."""
 
 
 def _parse_frontmatter(skill_md: Path) -> tuple[str, dict[str, Any]]:
@@ -140,3 +151,19 @@ def register(ctx: Any) -> None:
         )
     except Exception as exc:
         logger.debug("factonio blueprint registration skipped: %s", exc)
+
+    # 7. Automation Blueprint for read-only repo verification harness drift audits
+    try:
+        ctx.register_automation_blueprint(
+            "harness-audit",
+            title="Factonio Harness Drift Audit",
+            description="Read-only audit of every registered repo's .factonio/ verification harness for uncovered changes, stale features, and new/removed routes or CLI commands.",
+            schedule_template="every 24h",
+            prompt_template=HARNESS_AUDIT_BLUEPRINT_PROMPT,
+            category="engineering",
+            deliver_default="origin",
+            skills=[f"{PLUGIN_ID}:orchestrator"],
+            tags=["factonio", "harness", "verification", "engineering"],
+        )
+    except Exception as exc:
+        logger.debug("factonio harness-audit blueprint registration skipped: %s", exc)

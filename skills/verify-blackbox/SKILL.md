@@ -17,8 +17,8 @@ Verify observable behavior end to end against acceptance criteria and hidden hol
 ## Strict Information Barrier
 
 This barrier is the entire reason Black-Box Verification runs in an isolated card:
-- **Allowed:** Acceptance criteria from `spec.md`, approved `design/` previews and `DESIGN.md` (if linked on this card), every scenario file under the card's `holdout/` directory, build/run/test entrypoints (`README.md`, `package.json`, `Makefile`, `pyproject.toml`), and running the built binary, CLI, API, or web UI (`terminal` or `browser_exec`).
-- **Forbidden:** Never run `git diff`, `git show`, `gh pr diff`, or read implementation source files under `src/`, `lib/`, `app/`, etc. Judge the software strictly by what a user or caller observes.
+- **Allowed:** Acceptance criteria from `spec.md`, approved `design/` previews and `DESIGN.md` (if linked on this card), every scenario file under the card's `holdout/` directory, build/run/test entrypoints (`README.md`, `package.json`, `Makefile`, `pyproject.toml`), the repo verification harness `.factonio/verify.md` and `.factonio/harness.json` (black-box playbooks, not implementation source), and running the built binary, CLI, API, or web UI (`terminal` or `browser_exec`).
+- **Forbidden:** Never run `git diff`, `git show`, `gh pr diff`, or read implementation source files under `src/`, `lib/`, `app/`, etc. Judge the software strictly by what a user or caller observes. The `.factonio/` harness never lifts this ban: follow its commands, but do not open the source files its Feature Map globs point at.
 
 ## Procedure
 
@@ -38,6 +38,7 @@ This barrier is the entire reason Black-Box Verification runs in an isolated car
 1. Read the Goals and Acceptance Criteria section of `spec.md` (stop before Technical approach).
 2. Read every scenario file inside the card's `holdout/` directory.
 3. Build or start the application using the documented command or `run_hint`.
+   - **Repo verification harness:** when the card has a `## Repo Verification Harness` section (or the checkout contains `.factonio/verify.md`), run its stages in order: `Launch -> Doctor -> Drive -> Evidence -> Cleanup`. A failing Doctor command means the environment is not ready (fix it or report `inconclusive`, never `pass`). Run every declared hook (`visual_diff`, `invariant`, `custom`) from the checkout, or `hermes factonio harness check . --run-doctor --run-hooks --json`: a failing required hook is a `reject`; a failing or unrunnable optional hook goes under `disclosed_limits`.
 4. Execute every holdout scenario and acceptance check, capturing exact commands, exit codes, stdout/stderr, HTTP responses, or browser observations. When an Approved Design directory is linked, render the built UI in a browser and compare visual hierarchy, states, and layout fidelity against the approved design previews.
 5. Shut down any temporary server processes you started before finishing.
 

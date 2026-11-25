@@ -13,6 +13,13 @@ from .config import (
     resolve_all_phase_models,
     resolve_design_provider,
 )
+from .harness import (
+    HOOK_KINDS,
+    audit_harness,
+    bootstrap_verify_harness,
+    check_harness,
+    show_harness,
+)
 from .orchestrator import (
     spawn_design_card,
     spawn_implementation_card,
@@ -483,6 +490,83 @@ def register_tools(ctx: Any) -> None:
             },
         },
         handler=handle_merge_pr,
+    )
+
+    def handle_bootstrap_verify(args: dict[str, Any], **kwargs: Any) -> str:
+        try:
+            action = str(args.get("action") or "init").strip().lower()
+            repo = str(args["repo"])
+            if action == "init":
+                ctx_args = _trail_context(args)
+                res = bootstrap_verify_harness(
+                    repo,
+                    force=bool(args.get("force", False)),
+                    hooks=args.get("hooks"),
+                    dry_run=bool(args.get("dry_run", False)),
+                    tenant=ctx_args["tenant"] or None,
+                    card_id=ctx_args["card_id"] or None,
+                )
+            elif action == "check":
+                res = check_harness(
+                    repo,
+                    run_doctor=bool(args.get("run_doctor", False)),
+                    run_hooks=bool(args.get("run_hooks", False)),
+                )
+            elif action == "show":
+                res = show_harness(repo)
+            elif action == "audit":
+                res = audit_harness(repo, base_ref=args.get("base_ref") or None)
+            else:
+                raise ValueError(f"action must be one of init, check, show, audit; got {action!r}")
+            return _json_ok({"action": action, **res})
+        except Exception as exc:
+            return _json_err(exc)
+
+    ctx.register_tool(
+        name="factonio_bootstrap_verify",
+        toolset=PLUGIN_ID,
+        schema={
+            "name": "factonio_bootstrap_verify",
+            "description": (
+                "Manage a repository's git-tracked verification harness under `.factonio/` (`verify.md` "
+                "Launch/Doctor/Drive/Evidence/Cleanup playbook + Feature Map + Hooks, and `harness.json` schema v1). "
+                "action=init auto-detects stack/routes/CLI and writes it (refuses to overwrite unless force; dry_run "
+                "previews); check validates it (optionally running Doctor commands and hooks); show returns it; audit "
+                "reports read-only drift (uncovered changed files, stale features, new/removed routes and CLI "
+                "commands, orphaned globs). Black-Box Verification cards receive the harness automatically."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["init", "check", "show", "audit"], "default": "init"},
+                    "repo": {"type": "string", "description": "Registered repo slug, 'owner/repo', or local checkout path."},
+                    "force": {"type": "boolean", "default": False, "description": "init: overwrite an existing harness."},
+                    "dry_run": {"type": "boolean", "default": False, "description": "init: return generated content without writing."},
+                    "hooks": {
+                        "type": "array",
+                        "description": "init: hooks to declare (kept from an existing harness when omitted).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "kind": {"type": "string", "enum": list(HOOK_KINDS)},
+                                "command": {"type": "string", "description": "Shell command run in the repo root."},
+                                "optional": {"type": "boolean", "default": False},
+                                "timeout": {"type": "integer", "minimum": 1},
+                            },
+                            "required": ["name", "kind", "command"],
+                        },
+                    },
+                    "base_ref": {"type": "string", "description": "audit: compare against this git ref instead of harness.json base_commit."},
+                    "run_doctor": {"type": "boolean", "default": False, "description": "check: also run the Doctor commands."},
+                    "run_hooks": {"type": "boolean", "default": False, "description": "check: also run declared hooks."},
+                    "tenant": {"type": "string", "description": "Workstream tenant for the decision trail (defaults to the worker's tenant)."},
+                    "card_id": {"type": "string", "description": "Kanban card id for the decision trail (defaults to the worker's card)."},
+                },
+                "required": ["repo"],
+            },
+        },
+        handler=handle_bootstrap_verify,
     )
 
     def handle_restack(args: dict[str, Any], **kwargs: Any) -> str:

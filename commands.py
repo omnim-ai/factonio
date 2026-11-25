@@ -13,6 +13,7 @@ from .config import (
     list_repos,
     resolve_all_phase_models,
 )
+from .harness import audit_harness, bootstrap_verify_harness, check_harness, show_harness
 from .orchestrator import workstream_status
 from .profile_setup import init_factonio_profile, run_doctor
 from .repos import (
@@ -73,6 +74,53 @@ def _print_prune(res: dict[str, Any]) -> None:
     for item in res["errors"]:
         print(f"Error   {item['path']}: {item['error']}")
     print(f"\nReclaimed {res['reclaimed_human']} from {len(res['removed'])} worktree(s); held {len(res['held'])}.")
+
+
+def _print_harness(action: str, res: dict[str, Any]) -> None:
+    if action == "init":
+        if res.get("refused"):
+            print(f"Refused: {res['error']}")
+            return
+        verb = "Would write" if res.get("dry_run") else ("Overwrote" if res.get("overwritten") else "Wrote")
+        m = res["manifest"]
+        print(f"{verb} {res['verify_md']} and {res['harness_json']}")
+        print(
+            f"  Stack: {', '.join(m['stack']) or '-'} | features={len(m['feature_map'])} hooks={len(m['hooks'])}"
+            f" routes={len(m['discovered_surfaces']['routes'])} cli={len(m['discovered_surfaces']['cli_commands'])}"
+        )
+        if res.get("dry_run"):
+            print("\n" + res["verify_md_content"])
+        return
+    if action == "show":
+        if not res.get("ok"):
+            print(f"Error: {res.get('error')}")
+            return
+        print(res.get("verify_md_content") or "")
+        if res.get("harness_json"):
+            print(f"(manifest: {res['harness_json']}, schema_version={(res.get('manifest') or {}).get('schema_version')})")
+        return
+    if action == "check":
+        print(f"{'OK' if res['ok'] else 'FAIL'}: {res['repo']} harness ({res['mode']})")
+        for err in res["errors"]:
+            print(f"  Error: {err}")
+        for warn in res["warnings"]:
+            print(f"  Warning: {warn}")
+        for label, block in (("Doctor", res.get("doctor")), ("Hooks", res.get("hook_results"))):
+            for r in (block or {}).get("results", []):
+                name = r.get("name") or r["command"]
+                print(f"  {label}: [{'OK  ' if r['ok'] else 'FAIL'}] {name} (exit {r['exit_code']})")
+        return
+    print(f"{res['severity'].upper()}: {res['repo']} harness drift (base={str(res.get('base_commit') or '-')[:12]})")
+    for key in (
+        "uncovered_changed_files", "stale_features", "orphaned_globs",
+        "new_routes", "removed_routes", "new_cli_commands", "removed_cli_commands",
+    ):
+        if res.get(key):
+            print(f"  {key}: {', '.join(res[key])}")
+    for warn in res.get("warnings") or []:
+        print(f"  Warning: {warn}")
+    for rec in res.get("recommendations") or []:
+        print(f"  -> {rec}")
 
 
 def _print_restack_one(r: dict[str, Any]) -> None:
@@ -211,6 +259,24 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             help="Output the {decisions, summary, filters} JSON contract.",
         )
 
+        p_h = sub.add_parser(
+            "harness",
+            help="Bootstrap, validate, show, or drift-audit a repo's .factonio/ verification harness.",
+        )
+        p_h.add_argument("action", choices=["init", "check", "show", "audit"], help="Harness action.")
+        p_h.add_argument("repo", help="Repo slug, 'owner/repo', or local checkout path.")
+        p_h.add_argument("--force", action="store_true", help="init: overwrite an existing harness (hooks are kept).")
+        p_h.add_argument("--dry-run", action="store_true", help="init: print the generated harness without writing.")
+        p_h.add_argument("--base", dest="base_ref", default=None, help="audit: git ref to compare against (default: harness base_commit).")
+        p_h.add_argument("--run-doctor", action="store_true", help="check: also run the Doctor commands.")
+        p_h.add_argument("--run-hooks", action="store_true", help="check: also run declared hooks.")
+        p_h.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Output machine-readable JSON.",
+        )
+
         sub.add_parser("doctor", help="Verify git, gh auth, worker profile, Kanban config, and phase models.")
 
     def handle_cli(args: Any) -> None:
@@ -218,7 +284,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         as_json = bool(getattr(args, "json", False))
 
         if not cmd:
-            print("Usage: hermes factonio {init|add|update|remove|list|models|status|pr-gate|restack|worktrees|trail|doctor} [--json]")
+            print("Usage: hermes factonio {init|add|update|remove|list|models|status|pr-gate|restack|worktrees|harness|trail|doctor} [--json]")
             return
 
         if cmd == "init":
@@ -458,6 +524,32 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                 print(render_trail_text(payload["decisions"]))
             return
 
+        if cmd == "harness":
+            action = args.action
+            try:
+                if action == "init":
+                    res = bootstrap_verify_harness(args.repo, force=bool(args.force), dry_run=bool(args.dry_run))
+                elif action == "check":
+                    res = check_harness(args.repo, run_doctor=bool(args.run_doctor), run_hooks=bool(args.run_hooks))
+                elif action == "show":
+                    res = show_harness(args.repo)
+                else:
+                    res = audit_harness(args.repo, base_ref=args.base_ref)
+            except ValueError as exc:
+                if as_json:
+                    print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+                else:
+                    print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            if as_json:
+                print(json.dumps({"action": action, **res}, indent=2, default=str))
+            else:
+                _print_harness(action, res)
+            failed = not res.get("ok") or (action == "audit" and res.get("drifted"))
+            if failed:
+                sys.exit(1)
+            return
+
         if cmd == "doctor":
             res = run_doctor(plugin_dir)
             if as_json:
@@ -475,7 +567,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
 
     ctx.register_cli_command(
         "factonio",
-        help="Manage the Factonio pure-Hermes software factory (init, add, update, models, status, restack, worktrees, trail, doctor).",
+        help="Manage the Factonio pure-Hermes software factory (init, add, update, models, status, restack, worktrees, harness, trail, doctor).",
         setup_fn=setup_parser,
         handler_fn=handle_cli,
     )

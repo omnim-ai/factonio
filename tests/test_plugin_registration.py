@@ -84,6 +84,7 @@ class TestPluginRegistration(unittest.TestCase):
             self.assertIn("factonio", mgr._cli_commands)
             self.assertTrue(any(cb for cb in mgr._hooks.get("on_kanban_dispatch_tick", [])))
             self.assertIn("factonio:retro", mgr._automation_blueprints)
+            self.assertIn("factonio:harness-audit", mgr._automation_blueprints)
 
             # 5. Contributor-only project skills (.agents/skills/) stay out of runtime plugin skills
             self.assertNotIn("factonio:update-readme-media", mgr._plugin_skills)

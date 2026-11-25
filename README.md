@@ -159,6 +159,7 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 | `hermes factonio models [--repo SLUG] [--json]` | Show resolved provider/model per phase and cross-model warning |
 | `hermes factonio status [--tenant T] [--json]` | Show active Factonio Kanban workstreams and cards |
 | `hermes factonio pr-gate <repo> <pr_number> [--json]` | Inspect live PR HEAD SHA, mergeability, and CI check status |
+| `hermes factonio harness init\|check\|show\|audit <repo> [--force] [--dry-run] [--base REF] [--run-doctor] [--run-hooks] [--json]` | Bootstrap, validate, show, or read-only drift-audit the repo's `.factonio/verify.md` + `harness.json` black-box verification harness (`audit` exits non-zero when `stale` or `missing`) |
 | `hermes factonio restack <repo> [pr_number] [--parent-pr N] [--from-branch B] [--new-base B] [--old-base-sha SHA] [--verified-sha SHA] [--no-push] [--no-retarget] [--dry-run] [--json]` | Rebase a stacked PR (or every open child of a parent) onto its new base in a throwaway worktree and report `git patch-id` verdict continuity |
 | `hermes factonio trail [--tenant T] [--repo R] [--phase P] [--card ID] [--limit N] [--markdown] [--json]` | Show the append-only decision trail (`trail.db`) as text, a Markdown table, or the `{decisions, summary, filters}` JSON contract |
 
@@ -176,6 +177,7 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 - `factonio_status` — inspect active workstream cards, registered repos, and resolved phase models
 - `factonio_pr_gate` — verify live PR HEAD SHA and CI status checks via `gh`
 - `factonio_merge_pr` — verify exact HEAD SHA and squash-merge a verified PR
+- `factonio_bootstrap_verify` — `init` / `check` / `show` / `audit` a repo's `.factonio/` verification harness (Launch / Doctor / Drive / Evidence / Cleanup playbook, feature map, optional `visual_diff` / `invariant` / `custom` hooks); Black-Box Verification cards receive it automatically
 - `factonio_restack_pr` — after a parent PR lands, rebase its child PR(s) onto the new base, push with `--force-with-lease`, retarget, and report whether verification verdicts carry over (`verdict_continuous`)
 - `factonio_log_decision` — append a decision (fork, pivot, Attack the Premise probe, gate countersign) to the append-only `trail.db`; correct one by logging a new row with `supersedes_id`
 

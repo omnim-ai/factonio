@@ -54,13 +54,14 @@ Coordinate software delivery on registered GitHub repositories across Definition
 2. That launches two independent cards concurrently on the configured Verification model:
    - `factonio:verify-diff` (reads `spec.md` and `git diff`, never `holdout/`).
    - `factonio:verify-blackbox` (runs the built artifact against acceptance criteria and `holdout/`, never reading source code or diffs).
-3. If either card returns `verdict: reject`:
+3. **Repo verification harness:** `factonio_spawn_verify` auto-discovers `<repo>/.factonio/verify.md` (and `harness.json`) and injects its path, the `Launch -> Doctor -> Drive -> Evidence -> Cleanup` stages, and declared hooks into the Black-Box card only (never into Diff Check); the result reports `harness_present` / `harness_path`. Repos without one can get it via `factonio_bootstrap_verify` (`action=init`, or `hermes factonio harness init <repo>`, reviewed and committed like code); refresh drifted ones after `action=audit` reports `severity: stale`.
+4. If either card returns `verdict: reject`:
    - Check the fix-round count against the repo's `max_fix_rounds` (default `3`).
    - Within budget: spawn or reopen an Implementation fix round with the concrete findings (still never leaking `holdout/` text; report only observable failure symptoms from Black-Box Check).
    - Over budget: stop and escalate the findings and options to the user.
-4. If Black-Box returns `verdict: inconclusive`, treat it as **not passed**: it blocks auto-merge exactly like a missing verdict. Read `disclosed_limits`, then either fix the environment gap (credentials, service, browser) and re-run `factonio_spawn_verify`, or present the limits to the user and wait for an explicit merge decision. Never round `inconclusive` up to `pass`.
-5. **Fresh worker by default:** spawn every retry and fix round as a new card (fresh worker session) carrying the concrete findings, rather than continuing a previous worker's conversation, so failed reasoning does not anchor the next attempt. Reuse a prior session only when a fix is purely mechanical (rebase, typo) and you say so in the card.
-6. **Attack the Premise on fix round 3:** when a 3rd fix round targets the same gate that failed in rounds 1 and 2, the fix-round card body must instruct the implementer to first write down the shared assumption behind the failed fixes and test it directly (per `factonio:implement` section 3c) before pushing code. If round 3 still fails, escalate to the user with the probe evidence instead of spending more rounds.
+5. If Black-Box returns `verdict: inconclusive`, treat it as **not passed**: it blocks auto-merge exactly like a missing verdict. Read `disclosed_limits`, then either fix the environment gap (credentials, service, browser) and re-run `factonio_spawn_verify`, or present the limits to the user and wait for an explicit merge decision. Never round `inconclusive` up to `pass`.
+6. **Fresh worker by default:** spawn every retry and fix round as a new card (fresh worker session) carrying the concrete findings, rather than continuing a previous worker's conversation, so failed reasoning does not anchor the next attempt. Reuse a prior session only when a fix is purely mechanical (rebase, typo) and you say so in the card.
+7. **Attack the Premise on fix round 3:** when a 3rd fix round targets the same gate that failed in rounds 1 and 2, the fix-round card body must instruct the implementer to first write down the shared assumption behind the failed fixes and test it directly (per `factonio:implement` section 3c) before pushing code. If round 3 still fails, escalate to the user with the probe evidence instead of spending more rounds.
 
 ### 5. Merge Gate
 
