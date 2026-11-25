@@ -26,6 +26,8 @@ _PR_URL_RE = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/
 
 _COUNT_KEYS = ("running", "blocked", "triage", "ready", "done", "todo", "review")
 _REJECT_VERDICTS = frozenset({"reject", "fail", "block", "changes_requested"})
+# Tri-state verification: `inconclusive` is never a pass and always needs attention.
+_INCONCLUSIVE_VERDICTS = frozenset({"inconclusive"})
 _VERIFY_PHASES = frozenset({"verify-diff", "verify-blackbox"})
 # Run outcomes that are not failures: a clean latest run clears any stale error.
 _CLEAN_OUTCOMES = frozenset({"completed", "review_requested", "changes_requested", "scheduled", "approved"})
@@ -33,7 +35,7 @@ _CLEAN_OUTCOMES = frozenset({"completed", "review_requested", "changes_requested
 
 def _empty_counts() -> dict[str, int]:
     counts = {k: 0 for k in _COUNT_KEYS}
-    counts.update({"rejected": 0, "attention": 0, "total": 0})
+    counts.update({"rejected": 0, "inconclusive": 0, "attention": 0, "total": 0})
     return counts
 
 
@@ -71,13 +73,23 @@ def _active_duration_seconds(runs: list[dict[str, Any]], now_ts: float) -> Optio
 
 
 def _card_verdict(phase: str, status: str, runs: list[dict[str, Any]]) -> Optional[str]:
+    """Resolve a card's verdict: explicit `metadata.verdict` first, then verify-phase fallbacks.
+
+    `inconclusive` (from metadata or run outcome) is returned as-is and never defaults to `pass`;
+    `pass` is only inferred for a done verify card that recorded no verdict at all.
+    """
     last = runs[-1] if runs else {}
     verdict = str(_parse_json_dict(last.get("metadata")).get("verdict") or "").strip().lower()
+    if verdict in _INCONCLUSIVE_VERDICTS:
+        return "inconclusive"
     if verdict:
         return verdict
     if phase in _VERIFY_PHASES:
-        if last.get("outcome") == "changes_requested":
+        outcome = str(last.get("outcome") or "").strip().lower()
+        if outcome == "changes_requested":
             return "reject"
+        if outcome in _INCONCLUSIVE_VERDICTS:
+            return "inconclusive"
         if status == "done":
             return "pass"
     return None
@@ -232,8 +244,8 @@ def compute_metrics(
             for p in ("define", "design", "implement", "verify-diff", "verify-blackbox")
         },
         "verification": {
-            "diff": {"pass": 0, "reject": 0, "pass_rate": None},
-            "blackbox": {"pass": 0, "reject": 0, "pass_rate": None},
+            "diff": {"pass": 0, "reject": 0, "inconclusive": 0, "pass_rate": None},
+            "blackbox": {"pass": 0, "reject": 0, "inconclusive": 0, "pass_rate": None},
         },
         "rework": {"avg_runs_per_implement_card": None, "cards_with_rework": 0},
         "escapes": {"count": 0, "verified_total": 0, "escape_rate": None},
@@ -288,7 +300,8 @@ def compute_metrics(
             phase_counts = {p: {"count": 0, "done": 0} for p in phase_durations}
             tenants_seen: set[str] = set()
 
-            diff_pass = diff_reject = bb_pass = bb_reject = 0
+            diff_pass = diff_reject = diff_inconclusive = 0
+            bb_pass = bb_reject = bb_inconclusive = 0
             impl_run_counts: list[int] = []
             impl_rework_cards = 0
             escape_count = 0
@@ -328,23 +341,22 @@ def compute_metrics(
                     if len(runs) > 1:
                         impl_rework_cards += 1
 
-                if phase in ("verify-diff", "verify-blackbox"):
-                    last_meta = _parse_json_dict(runs[-1].get("metadata")) if runs else {}
-                    verdict = str(last_meta.get("verdict") or "").lower()
-                    if not verdict and status == "done":
-                        verdict = "pass"
-                    elif not verdict and runs and runs[-1].get("outcome") == "changes_requested":
-                        verdict = "reject"
+                if phase in _VERIFY_PHASES:
+                    verdict = _card_verdict(phase, status, runs)
                     if phase == "verify-diff":
                         if verdict == "pass":
                             diff_pass += 1
-                        elif verdict in {"reject", "fail", "block", "changes_requested"}:
+                        elif verdict in _REJECT_VERDICTS:
                             diff_reject += 1
+                        elif verdict in _INCONCLUSIVE_VERDICTS:
+                            diff_inconclusive += 1
                     else:
                         if verdict == "pass":
                             bb_pass += 1
-                        elif verdict in {"reject", "fail", "block", "changes_requested"}:
+                        elif verdict in _REJECT_VERDICTS:
                             bb_reject += 1
+                        elif verdict in _INCONCLUSIVE_VERDICTS:
+                            bb_inconclusive += 1
 
             empty["totals"]["workstreams"] = len(tenants_seen)
             for p, durs in phase_durations.items():
@@ -355,17 +367,20 @@ def compute_metrics(
                     "p90_seconds": _percentile(durs, 90),
                 }
 
-            diff_total = diff_pass + diff_reject
-            bb_total = bb_pass + bb_reject
+            # `inconclusive` counts toward the denominator: it is neither a pass nor hidden.
+            diff_total = diff_pass + diff_reject + diff_inconclusive
+            bb_total = bb_pass + bb_reject + bb_inconclusive
             empty["verification"] = {
                 "diff": {
                     "pass": diff_pass,
                     "reject": diff_reject,
+                    "inconclusive": diff_inconclusive,
                     "pass_rate": round(diff_pass / diff_total, 3) if diff_total else None,
                 },
                 "blackbox": {
                     "pass": bb_pass,
                     "reject": bb_reject,
+                    "inconclusive": bb_inconclusive,
                     "pass_rate": round(bb_pass / bb_total, 3) if bb_total else None,
                 },
             }
@@ -505,6 +520,8 @@ def thread_cards(
                 verdict = _card_verdict(phase, st, runs)
                 if verdict in _REJECT_VERDICTS:
                     counts["rejected"] += 1
+                elif verdict in _INCONCLUSIVE_VERDICTS:
+                    counts["inconclusive"] += 1
                 cards.append({
                     "id": r["id"],
                     "title": r["title"],
@@ -529,7 +546,9 @@ def thread_cards(
                     "last_outcome": runs[-1].get("outcome") if runs else None,
                     "last_error": _card_last_error(r, st, runs),
                 })
-            counts["attention"] = counts["blocked"] + counts["triage"] + counts["rejected"]
+            counts["attention"] = (
+                counts["blocked"] + counts["triage"] + counts["rejected"] + counts["inconclusive"]
+            )
             counts["total"] = len(cards)
             return {"cards": cards, "counts": counts}
     except sqlite3.Error:

@@ -162,6 +162,9 @@ globalThis.__fcUseQuery = opts => {
     globalThis.__fcModelsQueries.push({ key: opts.queryKey, interval: opts.refetchInterval, fn: typeof opts.queryFn })
     return queryState
   }
+  if (opts.queryKey[1] === 'metrics' && globalThis.__fcMetricsState) {
+    return globalThis.__fcMetricsState
+  }
   if (key === 'factonio/repos' && globalThis.__fcReposState) {
     return globalThis.__fcReposState
   }
@@ -1118,6 +1121,50 @@ report.oldHost = { error: oldErr, registeredIds: oldRegistered.map(r => r.id) }
 await runSidebarScenarios(report, registered, oldRegistered)
 await runReposScenarios(report)
 
+// Tri-state verification verdicts: additive `inconclusive` fields from /metrics and /cards.
+{
+  const tri = report.triState = {}
+  const TRI = 'acme-api-tri-state'
+  const TRI_METRICS = {
+    range: '30d', tenant: null,
+    totals: { cards: 6, done: 5, running: 0, blocked: 1, triage: 0, workstreams: 1 },
+    phases: { define: { count: 0, done: 0, median_seconds: null, p90_seconds: null } },
+    verification: {
+      diff: { pass: 1, reject: 0, inconclusive: 2, pass_rate: 0.333 },
+      blackbox: { pass: 1, reject: 1, inconclusive: 1, pass_rate: 0.333 }
+    },
+    rework: { avg_runs_per_implement_card: null, cards_with_rework: 0 },
+    escapes: { count: 0, verified_total: 1, escape_rate: 0 }
+  }
+  globalThis.__fcMetricsState = { data: TRI_METRICS, isLoading: false, isError: false }
+  try { tri.dashboard = snapshot(page.render).text } catch (e) { tri.dashboardError = String(e && e.stack || e) }
+  globalThis.__fcMetricsState = undefined
+  const TRI_CARDS = [
+    card({ id: 't_tri_imp', tenant: TRI, phase: 'implement', status: 'done', title: '[implement] i', created_at: 100 }),
+    card({ id: 't_tri_d', tenant: TRI, phase: 'verify-diff', status: 'done', verdict: 'pass', title: '[verify:diff] d', created_at: 200 }),
+    card({ id: 't_tri_b', tenant: TRI, phase: 'verify-blackbox', status: 'done', verdict: 'inconclusive', title: '[verify:blackbox] b', summary: 'No browser available', created_at: 200 })
+  ]
+  const TRI_COUNTS = { running: 0, blocked: 0, triage: 0, ready: 0, done: 3, todo: 0, review: 0, rejected: 0, inconclusive: 1, attention: 1, total: 3 }
+  cardsState = { data: { cards: TRI_CARDS, counts: TRI_COUNTS }, isLoading: false, isError: false }
+  try {
+    const m = mountPane({ focused: null })
+    let tree = m.render()
+    for (const sec of sectionsOf(tree)) {
+      if (sec.expanded === 'false') {
+        fire(find(find(tree, n => n.type === 'section' && n.props['data-tenant'] === sec.tenant).node, byAttr('data-action', 'toggle-ws')))
+        tree = m.render()
+      }
+    }
+    for (const sec of sectionsOf(tree)) {
+      const toggle = find(find(tree, n => n.type === 'section' && n.props['data-tenant'] === sec.tenant).node, n => n.props.className === 'fc-sb-done-toggle')
+      if (toggle && toggle.node.props['aria-expanded'] === 'false') { fire(toggle); tree = m.render() }
+    }
+    tri.sections = sectionsOf(tree).map(x => ({ tenant: x.tenant, state: x.state, cards: x.cards }))
+    tri.verdictTags = findAll(tree, n => n.props && n.props['data-verdict']).map(h => ({ verdict: h.node.props['data-verdict'], tone: h.node.props['data-tone'] ?? null, text: text(h.node).trim() }))
+  } catch (e) { tri.sidebarError = String(e && e.stack || e) }
+  cardsState = { data: undefined, isLoading: true, isError: false }
+}
+
 process.stdout.write(JSON.stringify(report))
 """
 
@@ -1138,6 +1185,22 @@ class TestDesktopPlugin(unittest.TestCase):
         if proc.returncode != 0:
             raise AssertionError(f"node smoke failed ({proc.returncode}):\n{proc.stderr}\n{proc.stdout}")
         cls.report = json.loads(proc.stdout)
+
+    def test_tri_state_inconclusive_fields_render_cleanly(self):
+        tri = self.report["triState"]
+        self.assertNotIn("dashboardError", tri)
+        self.assertNotIn("sidebarError", tri)
+        # /metrics additive `inconclusive` counts do not break the dashboard cards.
+        self.assertIn("Diff Check Pass", tri["dashboard"])
+        self.assertIn("33%", tri["dashboard"])
+        self.assertIn("1 pass · 1 reject", tri["dashboard"])
+        # /cards `verdict: "inconclusive"` renders as a neutral (never pass-toned) tag.
+        self.assertEqual(len(tri["sections"]), 1)
+        self.assertIn("t_tri_b", tri["sections"][0]["cards"])
+        tags = {t["verdict"]: t for t in tri["verdictTags"]}
+        self.assertEqual(tags["inconclusive"]["text"], "inconclusive")
+        self.assertNotEqual(tags["inconclusive"]["tone"], "pass")
+        self.assertEqual(tags["pass"]["tone"], "pass")
 
     # --- static checks -------------------------------------------------
     def test_node_check_syntax(self):

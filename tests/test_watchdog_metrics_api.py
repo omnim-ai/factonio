@@ -441,7 +441,7 @@ class TestCardsEnrichment(unittest.TestCase):
     def _assert_all_counts(self, counts: dict) -> None:
         self.assertEqual(counts, {
             "running": 1, "blocked": 1, "triage": 1, "ready": 1, "done": 3,
-            "todo": 1, "review": 1, "rejected": 2, "attention": 4, "total": 9,
+            "todo": 1, "review": 1, "rejected": 2, "inconclusive": 0, "attention": 4, "total": 9,
         })
 
     def test_thread_cards_enriched_fields_and_counts(self):
@@ -544,6 +544,113 @@ class TestCardsEnrichment(unittest.TestCase):
             self.assertAlmostEqual(card["active_duration_seconds"], 60, delta=1)
             self.assertEqual(data["counts"]["attention"], 1)
             self.assertEqual(data["counts"]["total"], 1)
+
+
+
+def _seed_tri_state_db(db_path: Path, now_ts: float) -> None:
+    """Verification cards with pass / reject / inconclusive verdicts (metadata and run outcome)."""
+    from hermes_cli.kanban_db_connect import connect_closing
+
+    rows = [
+        # (id, title, status, skill, run outcome, metadata)
+        ("t_d_pass", "[verify:diff] acme/api#1", "done", "factonio:verify-diff", "completed", {"verdict": "pass"}),
+        # Done card with an explicit inconclusive verdict must NOT fall back to pass.
+        ("t_d_inc", "[verify:diff] acme/api#2", "done", "factonio:verify-diff", "completed", {"verdict": "Inconclusive"}),
+        # No metadata verdict, run outcome inconclusive.
+        ("t_d_inc2", "[verify:diff] acme/api#3", "blocked", "factonio:verify-diff", "inconclusive", {}),
+        ("t_b_pass", "[verify:blackbox] acme/api#1", "done", "factonio:verify-blackbox", "completed", {}),
+        ("t_b_rej", "[verify:blackbox] acme/api#2", "done", "factonio:verify-blackbox", "completed", {"verdict": "reject"}),
+        ("t_b_inc", "[verify:blackbox] acme/api#3", "done", "factonio:verify-blackbox", "completed",
+         {"verdict": "inconclusive", "disclosed_limits": ["no browser"]}),
+    ]
+    with connect_closing(db_path=db_path) as conn:
+        for i, (tid, title, status, skill, outcome, meta) in enumerate(rows):
+            created = now_ts - 500 + i
+            conn.execute(
+                """
+                INSERT INTO tasks (id, title, assignee, status, tenant, session_id, skills, created_at, started_at, completed_at)
+                VALUES (?, ?, 'factonio', ?, 'ws-tri', 'sess_tri', ?, ?, ?, ?)
+                """,
+                (tid, title, status, json.dumps([skill]), created, created, created + 60 if status == "done" else None),
+            )
+            conn.execute(
+                """
+                INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, metadata)
+                VALUES (?, 'factonio', ?, ?, ?, ?, ?)
+                """,
+                (tid, outcome, created, created + 60, outcome, json.dumps(meta)),
+            )
+        conn.commit()
+
+
+class TestTriStateVerdicts(unittest.TestCase):
+    def _assert_metrics(self, m: dict) -> None:
+        self.assertEqual(m["verification"]["diff"], {"pass": 1, "reject": 0, "inconclusive": 2, "pass_rate": 0.333})
+        self.assertEqual(m["verification"]["blackbox"], {"pass": 1, "reject": 1, "inconclusive": 1, "pass_rate": 0.333})
+
+    def _assert_cards(self, data: dict) -> None:
+        verdicts = {c["id"]: c["verdict"] for c in data["cards"]}
+        self.assertEqual(verdicts, {
+            "t_d_pass": "pass", "t_d_inc": "inconclusive", "t_d_inc2": "inconclusive",
+            "t_b_pass": "pass", "t_b_rej": "reject", "t_b_inc": "inconclusive",
+        })
+        counts = data["counts"]
+        self.assertEqual(counts["inconclusive"], 3)
+        self.assertEqual(counts["rejected"], 1)
+        self.assertEqual(counts["blocked"], 1)
+        self.assertEqual(counts["attention"], 1 + 1 + 3)  # blocked + rejected + inconclusive
+        self.assertEqual(counts["total"], 6)
+
+    def test_card_verdict_never_defaults_inconclusive_to_pass(self):
+        from factonio.metrics import _card_verdict
+
+        done = [{"outcome": "completed", "metadata": json.dumps({"verdict": "INCONCLUSIVE"})}]
+        self.assertEqual(_card_verdict("verify-blackbox", "done", done), "inconclusive")
+        self.assertEqual(_card_verdict("verify-diff", "done", [{"outcome": "inconclusive", "metadata": "{}"}]), "inconclusive")
+        self.assertEqual(_card_verdict("verify-diff", "done", [{"outcome": "completed", "metadata": "{}"}]), "pass")
+        self.assertEqual(_card_verdict("verify-diff", "ready", [{"outcome": "changes_requested"}]), "reject")
+        self.assertIsNone(_card_verdict("verify-diff", "running", []))
+
+    def test_metrics_and_thread_cards_count_inconclusive(self):
+        from factonio import metrics
+
+        with isolated_hermes_home() as home:
+            empty = metrics.compute_metrics(home / "missing.db")
+            self.assertEqual(empty["verification"]["diff"]["inconclusive"], 0)
+            self.assertEqual(empty["verification"]["blackbox"]["inconclusive"], 0)
+            self.assertEqual(metrics.thread_cards(home / "missing.db")["counts"]["inconclusive"], 0)
+
+            now_ts = time.time()
+            _seed_tri_state_db(home / "kanban.db", now_ts)
+            self._assert_metrics(metrics.compute_metrics(home / "kanban.db", now=now_ts))
+            self._assert_cards(metrics.thread_cards(home / "kanban.db"))
+
+    def test_dashboard_api_passes_inconclusive_through(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        with isolated_hermes_home() as home:
+            _seed_tri_state_db(home / "kanban.db", time.time())
+            spec = importlib.util.spec_from_file_location(
+                "factonio_test_plugin_api_tri", PLUGIN_ROOT / "dashboard" / "plugin_api.py"
+            )
+            assert spec is not None and spec.loader is not None
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            app = FastAPI()
+            app.include_router(mod.router, prefix="/api/plugins/factonio")
+            client = TestClient(app)
+
+            r = client.get("/api/plugins/factonio/metrics?range=7d")
+            self.assertEqual(r.status_code, 200)
+            self._assert_metrics(r.json())
+            r = client.get("/api/plugins/factonio/cards?tenant=ws-tri")
+            self.assertEqual(r.status_code, 200)
+            self._assert_cards(r.json())
+            r = client.get("/api/plugins/factonio/status")
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()["counts"]["inconclusive"], 3)
+            self.assertEqual(r.json()["counts"]["attention"], 5)
 
 
 if __name__ == "__main__":
