@@ -9,6 +9,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import time
 from contextlib import closing
 from pathlib import Path
@@ -429,6 +430,7 @@ def remove_repo(slug_or_full: str) -> dict[str, Any]:
 _PR_GATE_QUERY = """
 query($owner: String!, $name: String!, $number: Int!, $threadsCursor: String, $contextsCursor: String) {
   repository(owner: $owner, name: $name) {
+    defaultBranchRef { name }
     pullRequest(number: $number) {
       number
       url
@@ -518,6 +520,9 @@ def _gate_graphql(full_repo: str, pr_number: int, **cursors: Optional[str]) -> d
     pr = repo_node.get("pullRequest")
     if not isinstance(pr, dict):
         raise _GateQueryError(f"Pull request #{int(pr_number)} not found in {full_repo}")
+    default_ref = repo_node.get("defaultBranchRef")
+    if isinstance(default_ref, dict) and default_ref.get("name"):
+        pr = {**pr, "_default_branch": str(default_ref["name"])}
     return pr
 
 
@@ -673,6 +678,8 @@ def inspect_pr_gate(repo_spec: str, pr_number: int) -> dict[str, Any]:
     checks_green = (
         not failed and not pending and not contexts_truncated and head_rollup_state not in _ROLLUP_FAIL
     )
+    base_branch = data.get("baseRefName")
+    default_branch = str(data.get("_default_branch") or (repo_entry or {}).get("default_branch") or "main")
     return {
         "ok": True,
         "repo": full_repo,
@@ -683,7 +690,7 @@ def inspect_pr_gate(repo_spec: str, pr_number: int) -> dict[str, Any]:
         "is_draft": is_draft,
         "head_branch": data.get("headRefName"),
         "head_sha": data.get("headRefOid"),
-        "base_branch": data.get("baseRefName"),
+        "base_branch": base_branch,
         "mergeable": data.get("mergeable"),
         "merge_state_status": data.get("mergeStateStatus"),
         "checks": {"passed": passed, "failed": failed, "pending": pending},
@@ -694,6 +701,8 @@ def inspect_pr_gate(repo_spec: str, pr_number: int) -> dict[str, Any]:
         "unresolved_threads": unresolved_threads,
         "blocker_tier": blocker_tier,
         "head_rollup_state": head_rollup_state,
+        "default_branch": default_branch,
+        "is_stacked": bool(base_branch and base_branch != default_branch),
     }
 
 
@@ -875,14 +884,18 @@ def assess_trunk_drift(
     repo_path: str | Path,
     head_ref: str = "HEAD",
     *,
+    base_branch: Optional[str] = None,
     default_branch: str = "main",
     remote: str = "origin",
     fetch: bool = False,
 ) -> dict[str, Any]:
-    """Compare files changed on `<remote>/<default_branch>` vs. the PR since their merge-base."""
+    """Compare files changed on `<remote>/<base>` vs. the PR since their merge-base.
+
+    ``base_branch`` (a stacked PR's true ``baseRefName``) takes precedence over ``default_branch``.
+    """
     try:
         cwd = Path(repo_path)
-        branch = _validate_default_branch(default_branch)
+        branch = _validate_default_branch(base_branch or default_branch)
         remote = _validate_remote(remote)
         head_ref = _validate_git_ref(head_ref, "head_ref")
         trunk_ref = f"{remote}/{branch}"
@@ -930,8 +943,12 @@ def merge_pr(
     *,
     expected_head_sha: Optional[str] = None,
     method: str = "squash",
+    delete_branch: bool = True,
 ) -> dict[str, Any]:
     """Verify PR gates, merge via `gh pr merge`, then confirm the live PR state.
+
+    Local sync targets the PR's true base branch (``baseRefName``), so a stacked PR fast-forwards
+    its parent branch rather than the default branch. ``delete_branch=False`` keeps the head branch.
 
     Refuses on stale HEAD or any gate blocker. After `gh pr merge` exits 0 the PR is read
     back: only a confirmed ``MERGED`` state reports ``merged: True`` (and fast-forwards the
@@ -959,7 +976,9 @@ def merge_pr(
         }
 
     flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}.get(method, "--squash")
-    args = ["pr", "merge", str(int(pr_number)), "--repo", str(gate["repo"]), flag, "--delete-branch"]
+    args = ["pr", "merge", str(int(pr_number)), "--repo", str(gate["repo"]), flag]
+    if delete_branch:
+        args.append("--delete-branch")
     if gate.get("head_sha"):
         args.extend(["--match-head-commit", str(gate["head_sha"])])
 
@@ -979,6 +998,9 @@ def merge_pr(
         "url": gate["url"],
         "head_sha": gate["head_sha"],
         "method": method,
+        "base_branch": gate.get("base_branch"),
+        "is_stacked": bool(gate.get("is_stacked")),
+        "delete_branch": bool(delete_branch),
     }
     readback = _run_gh([
         "pr", "view", str(int(pr_number)), "--repo", str(gate["repo"]), "--json", "state,mergedAt,baseRefName",
@@ -1018,6 +1040,7 @@ def merge_pr(
             "merged": True,
             "queued": False,
             **base_result,
+            "base_branch": str(branch),
             "state": live.get("state"),
             "merged_at": live.get("mergedAt"),
             "local_synced": local_synced,
@@ -1040,6 +1063,456 @@ def merge_pr(
         "local_synced": False,
         "local_sync_note": "skipped: PR queued or not yet merged",
     }
+
+
+# ---------------------------------------------------------------------------
+# Stacked PRs: branch seeding, true-base patch-ids, and clean-worktree restacks
+# ---------------------------------------------------------------------------
+
+
+def _verify_commit(cwd: Path, rev: str) -> Optional[str]:
+    proc = _run_git(["rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"], cwd=cwd)
+    sha = proc.stdout.strip() if proc.returncode == 0 else ""
+    return sha or None
+
+
+def _fetch_refspec(cwd: Path, remote: str, refspec: str) -> bool:
+    return _run_git(["fetch", "--no-tags", remote, refspec], cwd=cwd, timeout=120).returncode == 0
+
+
+def _fetch_branch(cwd: Path, remote: str, branch: str) -> bool:
+    return _fetch_refspec(cwd, remote, f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}")
+
+
+def _fetch_pull_head(cwd: Path, remote: str, pr_number: int) -> bool:
+    n = int(pr_number)
+    return _fetch_refspec(cwd, remote, f"+refs/pull/{n}/head:refs/factonio/pull/{n}/head")
+
+
+def _registered_checkout(repo_spec: str) -> tuple[Optional[dict[str, Any]], Optional[Path]]:
+    entry = get_repo(repo_spec)
+    if entry and entry.get("path"):
+        path = Path(str(entry["path"])).expanduser()
+        if (path / ".git").exists():
+            return entry, path
+    return entry, None
+
+
+def _validate_pr_number(value: Any, field: str = "pr_number") -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a positive integer; got {value!r}")
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} must be a positive integer; got {value!r}") from None
+    if number < 1 or (isinstance(value, float) and value != number):
+        raise ValueError(f"{field} must be a positive integer; got {value!r}")
+    return number
+
+
+def seed_stacked_branch(
+    repo_path: str | Path,
+    base_branch: str,
+    branch_name: str,
+    *,
+    remote: str = "origin",
+) -> dict[str, Any]:
+    """Create local ``branch_name`` at the tip of ``base_branch`` without touching any checkout.
+
+    Resolves ``refs/heads/<base_branch>`` then ``refs/remotes/<remote>/<base_branch>``. Hermes's
+    worktree dispatcher checks out an existing branch as-is, so a seeded branch anchors a stacked
+    card's worktree on its parent. Raises ``ValueError`` only for unsafe names; every git problem
+    (not a repo, base ref missing) returns ``{"ok": False, "seeded": False, "reason": ...}``.
+    """
+    base = _validate_default_branch(base_branch)
+    branch = _validate_default_branch(branch_name)
+    remote = _validate_remote(remote)
+    out: dict[str, Any] = {
+        "ok": False, "seeded": False, "branch_name": branch, "base_branch": base,
+        "base_commit": None, "base_ref": None,
+    }
+    cwd = Path(repo_path).expanduser()
+    try:
+        if not (cwd / ".git").exists():
+            return {**out, "reason": f"not a git repository: {cwd}"}
+        probe = _run_git(["rev-parse", "--is-inside-work-tree"], cwd=cwd)
+        if probe.returncode != 0:
+            return {**out, "reason": _git_err(probe, "rev-parse")}
+        fmt = _run_git(["check-ref-format", "--branch", branch], cwd=cwd)
+        if fmt.returncode != 0:
+            return {**out, "reason": f"invalid branch name {branch!r}"}
+        existing = _verify_commit(cwd, f"refs/heads/{branch}")
+        if existing:
+            return {**out, "ok": True, "already_exists": True, "base_commit": existing,
+                    "base_ref": f"refs/heads/{branch}", "reason": "branch already exists"}
+        for ref in (f"refs/heads/{base}", f"refs/remotes/{remote}/{base}"):
+            sha = _verify_commit(cwd, ref)
+            if sha:
+                made = _run_git(["branch", "--no-track", branch, sha], cwd=cwd)
+                if made.returncode != 0:
+                    return {**out, "reason": _git_err(made, "branch")}
+                return {**out, "ok": True, "seeded": True, "base_commit": sha, "base_ref": ref}
+        return {**out, "reason": f"base branch {base!r} not found locally (refs/heads or {remote}/)"}
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {**out, "reason": str(exc)}
+
+
+def inspect_pr_patch_id(
+    repo_spec: str,
+    pr_number: int,
+    *,
+    base_ref: Optional[str] = None,
+    remote: str = "origin",
+    fetch: bool = False,
+) -> dict[str, Any]:
+    """Stable patch-id of a live PR measured against its true base (``<remote>/<baseRefName>``)."""
+    gate = inspect_pr_gate(repo_spec, pr_number)
+    if not gate.get("ok"):
+        return {**gate, "patch_id": None}
+    out: dict[str, Any] = {
+        "ok": False,
+        "repo": gate["repo"],
+        "pr_number": gate["pr_number"],
+        "base_branch": gate.get("base_branch"),
+        "default_branch": gate.get("default_branch"),
+        "is_stacked": gate.get("is_stacked"),
+        "head_sha": gate.get("head_sha"),
+        "base_ref": None,
+        "merge_base": None,
+        "patch_id": None,
+    }
+    try:
+        remote = _validate_remote(remote)
+        _, cwd = _registered_checkout(repo_spec)
+        if cwd is None:
+            return {**out, "error": "local checkout not registered or missing"}
+        base_branch = _validate_default_branch(gate.get("base_branch") or gate.get("default_branch") or "main")
+        head = _validate_git_ref(str(gate.get("head_sha") or ""), "head_sha")
+        if fetch:
+            _fetch_branch(cwd, remote, base_branch)
+            if not _verify_commit(cwd, head):
+                if not (gate.get("head_branch") and _fetch_branch(cwd, remote, str(gate["head_branch"]))):
+                    _fetch_pull_head(cwd, remote, int(pr_number))
+        resolved_base = _validate_git_ref(base_ref, "base_ref") if base_ref else f"{remote}/{base_branch}"
+        if not _verify_commit(cwd, head):
+            return {**out, "base_ref": resolved_base, "error": f"PR head {head} is not available locally (try fetch=True)"}
+        mb = _run_git(["merge-base", resolved_base, head], cwd=cwd)
+        if mb.returncode != 0 or not mb.stdout.strip():
+            return {**out, "base_ref": resolved_base, "error": _git_err(mb, "merge-base")}
+        patch_id = compute_patch_id(cwd, head, base_ref=resolved_base)
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        return {**out, "error": str(exc)}
+    return {**out, "ok": True, "base_ref": resolved_base, "merge_base": mb.stdout.strip(), "patch_id": patch_id}
+
+
+def _gh_pr_view(full_repo: str, pr_number: int, fields: str) -> Optional[dict[str, Any]]:
+    try:
+        proc = _run_gh(["pr", "view", str(int(pr_number)), "--repo", full_repo, "--json", fields])
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout or "")
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _resolve_old_base(
+    cwd: Path,
+    full_repo: str,
+    *,
+    remote: str,
+    old_base_sha: Optional[str],
+    parent_pr: Optional[int],
+    old_base_branch: Optional[str],
+    target_base: str,
+) -> tuple[Optional[str], str]:
+    """Commit the PR's own commits were stacked on: explicit sha -> parent PR head -> old base branch."""
+    if old_base_sha:
+        ref = _validate_git_ref(old_base_sha, "old_base_sha")
+        sha = _verify_commit(cwd, ref)
+        if not sha and _fetch_refspec(cwd, remote, ref):
+            sha = _verify_commit(cwd, ref)
+        if not sha:
+            raise RuntimeError(f"old_base_sha {ref!r} is not available locally")
+        return sha, "old_base_sha"
+    if parent_pr is not None:
+        parent = _gh_pr_view(full_repo, parent_pr, "headRefOid,headRefName,baseRefName,state") or {}
+        oid = str(parent.get("headRefOid") or "")
+        if oid:
+            sha = _verify_commit(cwd, oid)
+            if not sha and _fetch_pull_head(cwd, remote, parent_pr):
+                sha = _verify_commit(cwd, oid)
+            if sha:
+                return sha, f"parent_pr #{int(parent_pr)}"
+    if old_base_branch and old_base_branch != target_base:
+        _fetch_branch(cwd, remote, old_base_branch)
+        sha = _verify_commit(cwd, f"refs/remotes/{remote}/{old_base_branch}")
+        if sha:
+            return sha, f"{remote}/{old_base_branch}"
+    return None, "none"
+
+
+def _record_restack(result: dict[str, Any], *, repo_slug: str, tenant: Optional[str],
+                    card_id: Optional[str], actor: Optional[str]) -> None:
+    from .trail import record_transition
+
+    if result.get("conflict"):
+        outcome = "conflict"
+    elif not result.get("ok"):
+        outcome = "error"
+    else:
+        outcome = "continuous" if result.get("verdict_continuous") else "reverify_required"
+    why = result.get("error") or (
+        f"PR #{result.get('pr_number')} restacked onto {result.get('target_base')}: "
+        + ("patch-id unchanged" if result.get("verdict_continuous") else "patch-id changed; re-verify")
+    )
+    keys = (
+        "pr_number", "head_branch", "old_head_sha", "new_head_sha", "old_base_branch", "target_base",
+        "old_base_commit", "old_base_source", "rebase_mode", "before_patch_id", "after_patch_id",
+        "verdict_continuous", "reverify_required", "conflict", "conflict_files", "pushed", "retargeted", "dry_run",
+    )
+    record_transition(
+        "restack_pr",
+        tenant=tenant or "",
+        repo_slug=repo_slug,
+        phase="gate",
+        card_id=card_id or "",
+        actor=actor,
+        why=str(why)[:500],
+        evidence={k: result.get(k) for k in keys},
+        result=outcome,
+    )
+
+
+def restack_pr(
+    repo_spec: str,
+    pr_number: int,
+    *,
+    new_base: Optional[str] = None,
+    old_base_sha: Optional[str] = None,
+    parent_pr: Optional[int] = None,
+    verified_head_sha: Optional[str] = None,
+    remote: str = "origin",
+    push: bool = True,
+    retarget: bool = True,
+    dry_run: bool = False,
+    tenant: Optional[str] = None,
+    card_id: Optional[str] = None,
+    actor: Optional[str] = None,
+) -> dict[str, Any]:
+    """Rebase an open PR onto ``new_base`` in a throwaway linked worktree and report verdict continuity.
+
+    The registered checkout is never checked out or modified: the rebase runs in a temporary
+    ``git worktree add --detach`` that is always removed. With a known old base commit
+    (``old_base_sha`` -> ``parent_pr`` head -> ``<remote>/<old base>``) the rebase is
+    ``--onto <remote>/<new_base> <old_base>``, which replays only the PR's own commits even when the
+    parent was squash-merged and its branch deleted. ``verdict_continuous`` is true when the stable
+    patch-id before (vs. the old base) equals the patch-id after (vs. the new base).
+    """
+    pr_number = _validate_pr_number(pr_number)
+    if parent_pr is not None:
+        parent_pr = _validate_pr_number(parent_pr, "parent_pr")
+    remote = _validate_remote(remote)
+    if new_base is not None:
+        new_base = _validate_default_branch(new_base)
+    if verified_head_sha is not None:
+        verified_head_sha = _validate_git_ref(verified_head_sha, "verified_head_sha")
+    if old_base_sha is not None:
+        old_base_sha = _validate_git_ref(old_base_sha, "old_base_sha")
+
+    gate = inspect_pr_gate(repo_spec, pr_number)
+    entry, cwd = _registered_checkout(repo_spec)
+    full_repo = str(gate.get("repo") or (entry or {}).get("repo") or normalize_repo(repo_spec)[0])
+    repo_slug = str((entry or {}).get("slug") or normalize_repo(full_repo)[1])
+    result: dict[str, Any] = {
+        "ok": False,
+        "repo": full_repo,
+        "pr_number": pr_number,
+        "head_branch": gate.get("head_branch"),
+        "old_head_sha": gate.get("head_sha"),
+        "new_head_sha": None,
+        "old_base_branch": gate.get("base_branch"),
+        "target_base": None,
+        "old_base_commit": None,
+        "old_base_source": None,
+        "rebase_mode": None,
+        "before_patch_id": None,
+        "after_patch_id": None,
+        "verdict_continuous": False,
+        "reverify_required": True,
+        "conflict": False,
+        "conflict_files": [],
+        "pushed": False,
+        "retargeted": False,
+        "dry_run": bool(dry_run),
+        "noop": False,
+    }
+
+    def finish(**updates: Any) -> dict[str, Any]:
+        result.update(updates)
+        _record_restack(result, repo_slug=repo_slug, tenant=tenant, card_id=card_id, actor=actor)
+        return result
+
+    if not gate.get("ok"):
+        return finish(error=str(gate.get("error") or "PR gate inspection failed"))
+    if str(gate.get("state") or "").upper() != "OPEN":
+        return finish(error=f"PR #{pr_number} is {gate.get('state')}; only OPEN PRs can be restacked")
+    if cwd is None:
+        return finish(error="local checkout not registered or missing")
+    try:
+        head_branch = _validate_default_branch(str(gate.get("head_branch") or ""))
+        old_head = _validate_git_ref(str(gate.get("head_sha") or ""), "head_sha")
+        target_base = _validate_default_branch(new_base or gate.get("default_branch") or "main")
+    except ValueError as exc:
+        return finish(error=str(exc))
+    old_base_branch = gate.get("base_branch")
+    result["target_base"] = target_base
+    target_ref = f"{remote}/{target_base}"
+
+    if not _fetch_branch(cwd, remote, target_base) and not _verify_commit(cwd, f"refs/remotes/{target_ref}"):
+        return finish(error=f"cannot fetch {remote} {target_base}")
+    if not _verify_commit(cwd, old_head):
+        if not _fetch_branch(cwd, remote, head_branch) or not _verify_commit(cwd, old_head):
+            _fetch_pull_head(cwd, remote, pr_number)
+    if not _verify_commit(cwd, old_head):
+        return finish(error=f"PR head {old_head} is not available locally after fetch")
+
+    try:
+        old_base_commit, source = _resolve_old_base(
+            cwd, full_repo, remote=remote, old_base_sha=old_base_sha, parent_pr=parent_pr,
+            old_base_branch=str(old_base_branch) if old_base_branch else None, target_base=target_base,
+        )
+    except (ValueError, RuntimeError) as exc:
+        return finish(error=str(exc))
+    result.update(old_base_commit=old_base_commit, old_base_source=source)
+
+    before_ref = old_base_commit or (f"{remote}/{old_base_branch}" if old_base_branch else target_ref)
+    try:
+        result["before_patch_id"] = compute_patch_id(cwd, verified_head_sha or old_head, base_ref=before_ref)
+    except (ValueError, RuntimeError) as exc:
+        result["before_patch_note"] = str(exc)
+
+    tmp_root = Path(tempfile.mkdtemp(prefix="factonio-restack-"))
+    wt = tmp_root / "wt"
+    result["temp_worktree"] = str(wt)
+    try:
+        added = _run_git(["worktree", "add", "--detach", str(wt), old_head], cwd=cwd, timeout=120)
+        if added.returncode != 0:
+            return finish(error=_git_err(added, "worktree add"))
+        rebase_args = ["-c", "rebase.updateRefs=false", "-c", "rebase.autoStash=false", "rebase", "--no-autosquash"]
+        if old_base_commit:
+            result["rebase_mode"] = "onto"
+            rebase_args += ["--onto", target_ref, old_base_commit]
+        else:
+            result["rebase_mode"] = "plain"
+            rebase_args.append(target_ref)
+        rebased = _run_git(rebase_args, cwd=wt, timeout=300)
+        if rebased.returncode != 0:
+            unmerged = _run_git(["diff", "--name-only", "--diff-filter=U"], cwd=wt)
+            files = [line for line in unmerged.stdout.splitlines() if line.strip()]
+            _run_git(["rebase", "--abort"], cwd=wt, timeout=60)
+            output = (rebased.stderr or rebased.stdout or "").strip()
+            conflict = bool(files) or "conflict" in output.lower()
+            last_line = (output.splitlines() or ["unknown"])[-1]
+            return finish(
+                conflict=conflict,
+                conflict_files=files,
+                error=("rebase conflict: " if conflict else "rebase failed: ") + last_line,
+            )
+        new_head = _verify_commit(wt, "HEAD")
+        if not new_head:
+            return finish(error="cannot resolve rebased HEAD")
+        result["new_head_sha"] = new_head
+        result["noop"] = new_head == old_head
+        try:
+            result["after_patch_id"] = compute_patch_id(wt, new_head, base_ref=target_ref)
+        except (ValueError, RuntimeError) as exc:
+            result["after_patch_note"] = str(exc)
+        continuous = bool(
+            result["before_patch_id"] and result["after_patch_id"]
+            and result["before_patch_id"] == result["after_patch_id"]
+        )
+        result.update(verdict_continuous=continuous, reverify_required=not continuous)
+
+        if not dry_run and push and not result["noop"]:
+            pushed = _run_git(
+                ["push", f"--force-with-lease=refs/heads/{head_branch}:{old_head}", remote,
+                 f"{new_head}:refs/heads/{head_branch}"],
+                cwd=wt, timeout=180,
+            )
+            if pushed.returncode != 0:
+                return finish(error=_git_err(pushed, "push --force-with-lease"))
+            result["pushed"] = True
+        if not dry_run and retarget and old_base_branch != target_base:
+            edit = _run_gh(["pr", "edit", str(pr_number), "--repo", full_repo, "--base", target_base], timeout=60)
+            if edit.returncode != 0:
+                detail = (edit.stderr or edit.stdout or f"gh exit {edit.returncode}").strip()
+                return finish(error=f"gh pr edit --base {target_base} failed: {detail}")
+            result["retargeted"] = True
+        return finish(ok=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return finish(error=str(exc))
+    finally:
+        if wt.exists():
+            _run_git(["worktree", "remove", "--force", str(wt)], cwd=cwd, timeout=120)
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        _run_git(["worktree", "prune"], cwd=cwd)
+
+
+def restack_stack(
+    repo_spec: str,
+    *,
+    parent_pr: Optional[int] = None,
+    from_branch: Optional[str] = None,
+    new_base: Optional[str] = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Restack every open PR targeting ``from_branch`` (default: the parent PR's head branch).
+
+    With ``parent_pr``, the parent's head commit becomes each child's ``old_base_sha`` and the
+    parent's base branch is the default ``new_base`` (where the parent landed).
+    """
+    if parent_pr is not None:
+        parent_pr = _validate_pr_number(parent_pr, "parent_pr")
+    if from_branch is not None:
+        from_branch = _validate_default_branch(from_branch)
+    if new_base is not None:
+        new_base = _validate_default_branch(new_base)
+    entry = get_repo(repo_spec)
+    full_repo = str(entry["repo"]) if entry else normalize_repo(repo_spec)[0]
+    out: dict[str, Any] = {
+        "ok": False, "repo": full_repo, "parent_pr": parent_pr, "from_branch": from_branch,
+        "new_base": new_base, "results": [],
+    }
+    if parent_pr is not None:
+        parent = _gh_pr_view(full_repo, parent_pr, "headRefOid,headRefName,baseRefName,state")
+        if parent is None:
+            return {**out, "error": f"cannot read parent PR #{parent_pr}"}
+        from_branch = from_branch or (str(parent.get("headRefName") or "") or None)
+        new_base = new_base or (str(parent.get("baseRefName") or "") or None)
+        if parent.get("headRefOid") and not kwargs.get("old_base_sha"):
+            kwargs["old_base_sha"] = str(parent["headRefOid"])
+        out.update(from_branch=from_branch, new_base=new_base, parent_head_sha=parent.get("headRefOid"))
+    if not from_branch:
+        raise ValueError("restack_stack needs parent_pr or from_branch")
+    proc = _run_gh([
+        "pr", "list", "--repo", full_repo, "--base", from_branch, "--state", "open",
+        "--json", "number,headRefName,headRefOid,baseRefName", "--limit", "100",
+    ])
+    if proc.returncode != 0:
+        return {**out, "error": f"gh pr list failed: {(proc.stderr or proc.stdout or '').strip()[:200]}"}
+    try:
+        children = json.loads(proc.stdout or "[]")
+    except ValueError:
+        return {**out, "error": "gh pr list returned invalid JSON"}
+    numbers = sorted(int(c["number"]) for c in children if isinstance(c, dict) and c.get("number"))
+    results = [
+        restack_pr(repo_spec, n, new_base=new_base, parent_pr=parent_pr, **kwargs) for n in numbers
+    ]
+    return {**out, "ok": all(r.get("ok") for r in results), "results": results}
 
 
 # ---------------------------------------------------------------------------

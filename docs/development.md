@@ -7,12 +7,12 @@ This guide covers repository layout, local development against Hermes Agent, run
 ```text
 __init__.py                  Plugin entrypoint: registers aux models, skills, tools, CLI, watchdog, blueprint
 plugin.yaml                  Hermes plugin manifest (v2) and config_schema
-agent_tools.py               10 agent-callable tools (`factonio_*`), including `factonio_log_decision`
-commands.py                  CLI subcommands (`hermes factonio init|add|update|remove|list|models|status|pr-gate|trail|doctor`)
+agent_tools.py               11 agent-callable tools (`factonio_*`), including `factonio_log_decision` and `factonio_restack_pr`
+commands.py                  CLI subcommands (`hermes factonio init|add|update|remove|list|models|status|pr-gate|restack|worktrees|trail|doctor`)
 config.py                    Settings, durable repos.json store (atomic writes + flock), phase model & design resolution
 orchestrator.py              Workstream lifecycle, Kanban DAG creation, holdout/ isolation, session notify+wake subscriptions
 profile_setup.py             Dedicated headless `factonio` profile initializer and `doctor` diagnostics
-repos.py                     GitHub repo registration, validation, exact-HEAD PR gate, and squash-merge helpers
+repos.py                     GitHub repo registration, validation, exact-HEAD PR gate, squash-merge, and stacked-PR restack helpers
 trail.py                     Append-only SQLite decision trail (`trail.db`: WAL, schema_meta, immutability triggers)
 metrics.py                   Read-only SQLite queries over `kanban.db` (phase timings, pass rates, rework, escapes, enriched cards)
 watchdog.py                  In-process `on_kanban_dispatch_tick` PID/side-effect liveness, phase-aware stall detection, bounded triage
@@ -37,6 +37,7 @@ tests/
   test_watchdog_metrics_api.py
   test_watchdog_liveness.py   PID/side-effect liveness, phase thresholds, bounded triage
   test_worktree_audit.py     Real-git worktree safety buckets, --prune-safe, `worktrees` CLI
+  test_stacked_prs.py        Real-git stacked spawn/seeding, true-base gate & merge, `--onto` restack continuity, `restack` CLI/tool
   test_trail.py              trail.db store, transition hooks, CLI/API/tool, retro, cross-vendor warning
   test_desktop_plugin.py     Node ESM smoke tests + Desktop SDK surface lint (59 tests)
 tools/
