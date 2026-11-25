@@ -381,6 +381,7 @@ DESKTOP_SHELL_CSS = r"""
   --ui-stroke-tertiary: rgba(148, 163, 184, 0.12);
   --ui-accent: #7c8cf8;
   --ui-success: #2cb67d;
+  --ui-yellow: #c08532;
   --dt-destructive: #e5486d;
   --ui-row-hover-background: rgba(124, 140, 248, 0.08);
   --ui-row-active-background: rgba(124, 140, 248, 0.16);
@@ -712,6 +713,82 @@ export function initialReposState() {
   };
 }
 
+// Decision Trail fixtures shaped like GET /api/plugins/factonio/trail ({decisions, summary, filters};
+// see trail.trail_payload). Timestamps are relative to "now" so the "ago" labels stay realistic.
+export const trailIso = minutesAgo => new Date(Date.now() - minutesAgo * 60000).toISOString().replace('Z', '000Z');
+export const trailDecision = o => ({
+  tenant: '', repo_slug: '', phase: '', card_id: '', actor: 'orchestrator', why: '', evidence: {}, result: '',
+  supersedes_id: null, superseded_by: [], is_superseded: false, ...o,
+});
+
+// Fill superseded_by / is_superseded from supersedes_id, sort newest first, apply ?tenant=/&repo=/&phase=.
+export function trailPayload(list, path = '') {
+  const params = new URLSearchParams(String(path).split('?')[1] || '');
+  const by = {};
+  for (const d of list) if (d.supersedes_id) (by[d.supersedes_id] = by[d.supersedes_id] || []).push(d.id);
+  let rows = list.map(d => ({ ...d, superseded_by: by[d.id] || [], is_superseded: !!by[d.id] }))
+    .sort((a, b) => b.ts.localeCompare(a.ts));
+  for (const [k, field] of [['tenant', 'tenant'], ['repo', 'repo_slug'], ['phase', 'phase'], ['card_id', 'card_id']]) {
+    const v = params.get(k);
+    if (v) rows = rows.filter(d => d[field] === v);
+  }
+  const count = key => rows.reduce((acc, d) => ({ ...acc, [d[key] || 'unknown']: (acc[d[key] || 'unknown'] || 0) + 1 }), {});
+  const superseded = rows.filter(d => d.is_superseded).length;
+  return {
+    decisions: rows.slice(0, Number(params.get('limit') || 100)),
+    summary: { total: rows.length, active: rows.length - superseded, superseded, by_phase: count('phase'), by_actor: count('actor'), by_tenant: count('tenant'), latest_ts: rows[0]?.ts || null },
+    filters: { tenant: params.get('tenant'), repo: params.get('repo'), phase: params.get('phase'), card_id: params.get('card_id'), limit: Number(params.get('limit') || 100) },
+  };
+}
+
+const W2 = 'omnim-ai-factonio-wave-2-watchdog-liveness';
+const ACME = 'acme-payments-api-rate-limit-i42';
+const d = trailDecision;
+export const DASHBOARD_TRAIL = [
+  d({ id: 'd_f012c8a47b99', ts: trailIso(12), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'merge', card_id: 't_bcf5502a', decision: 'pr_merged', why: 'Squash-merged PR #12 after the GraphQL readback confirmed all four gate tiers green on the exact head.', evidence: { pr_number: 12, head_sha: '5d178304e1', tests_passed: 114 }, result: 'merged' }),
+  d({ id: 'd_7e30f91b5c04', ts: trailIso(27), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'escape', card_id: 't_1658b10a', decision: 'escape_gap_opened', why: 'A liveness bug from #9 reached main despite a passing verify. Opened a Verification Gap Analysis to find which check should have caught it.', evidence: { escaped_from: 'omnim-ai/factonio#9', card_id: 't_1658b10a' }, result: 'recorded' }),
+  d({ id: 'd_c4f08e2a91b7', ts: trailIso(40), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'verify', card_id: 't_bcf5502a', decision: 'verify_carryover', why: 'Reused the prior verify-diff pass after git patch-id matched the unchanged hunks.', evidence: { pr_number: 12, head_sha: '5d178304e1', patch_id: '91e4f0a2c7b1', tests_passed: 114, tests_failed: 0 }, result: 'pass', supersedes_id: 'd_9a1e4c0b2f31' }),
+  d({ id: 'd_2d67a4e8f012', ts: trailIso(54), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'watchdog', card_id: 't_caf57a3b', actor: 'watchdog', decision: 'stall_detected', why: 'Worker 48219 is alive but has made no file, git or API side effect for 27 minutes. Flagged the card for operator attention.', evidence: { card_id: 't_caf57a3b', worker_pid: 48219, side_effect_age_s: 1620 }, result: 'stalled' }),
+  d({ id: 'd_9a1e4c0b2f31', ts: trailIso(71), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'verify', card_id: 't_bcf5502a', decision: 'pr_gate_wait', why: 'Held the PR gate: e2e-linux failed once on a known-flaky timeout. Waiting for a rerun before judging the diff.', evidence: { pr_number: 12, head_sha: '5d178304e1', failing_check: 'e2e-linux' }, result: 'inconclusive' }),
+  d({ id: 'd_11aa82b90c3e', ts: trailIso(110), tenant: ACME, repo_slug: 'acme-payments-api', phase: 'implement', card_id: 't_77d0e3a1', actor: 'worker', decision: 'spawn_implement', why: 'Spawned the implement worker for issue #42 (rate-limit headers) once the define card closed.', evidence: { card_id: 't_77d0e3a1' }, result: 'spawned' }),
+  d({ id: 'd_6f19b3d28e45', ts: trailIso(134), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'design', card_id: 't_8bee4979', actor: 'human', decision: 'design_approved', why: 'Approved the Decision Trail dashboard section and sidebar disclosure after checking both themes at 344px and 300px.', evidence: { card_id: 't_8bee4979', design_provider: 'claude-design' }, result: 'approved' }),
+  d({ id: 'd_4b81e2c0a119', ts: trailIso(167), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'define', card_id: 't_5a2c91e0', actor: 'worker', decision: 'attack_the_premise_pivot', why: 'Attack the Premise: a trail table inside the fenced kanban.db would tie audit writes to board locks. Pivoted to a dedicated append-only trail.db.', evidence: { card_id: 't_5a2c91e0', rejected: 'kanban.db table' }, result: 'pivot' }),
+];
+
+const SB_WS = 'omnim-ai-factonio-docked-sidebar-tab';
+const SB_META = 'omnim-ai-factonio-enrich-cards-metadata';
+export const SIDEBAR_TRAIL = [
+  d({ id: 'd_5b10c2e4a801', ts: trailIso(150), tenant: SB_WS, repo_slug: 'omnim-ai-factonio', phase: 'define', card_id: 't_4ab36a09', decision: 'start_workstream', why: 'Started the docked sidebar workstream from the chat request.', evidence: { card_id: 't_4ab36a09' }, result: 'spawned' }),
+  d({ id: 'd_5b10c2e4a802', ts: trailIso(121), tenant: SB_WS, repo_slug: 'omnim-ai-factonio', phase: 'design', card_id: 't_4ab36a0b', actor: 'human', decision: 'design_approved', why: 'Approved the docked tab previews in both themes.', evidence: { card_id: 't_4ab36a0b', design_provider: 'claude-design' }, result: 'approved' }),
+  d({ id: 'd_5b10c2e4a803', ts: trailIso(76), tenant: SB_WS, repo_slug: 'omnim-ai-factonio', phase: 'verify', card_id: 't_4ab36a0d', decision: 'spawn_verify', why: 'PR #44 opened at 7c1e9a0; spawned the isolated Diff and Black-Box checks.', evidence: { pr_number: 44, head_sha: '7c1e9a04d2' }, result: 'spawned' }),
+  d({ id: 'd_5b10c2e4a804', ts: trailIso(67), tenant: SB_WS, repo_slug: 'omnim-ai-factonio', phase: 'verify', card_id: 't_4ab36a10', decision: 'verify_diff_verdict', why: 'Diff matches spec.md; no scope creep.', evidence: { pr_number: 44, head_sha: '7c1e9a04d2', tests_passed: 61 }, result: 'pass' }),
+  d({ id: 'd_5b10c2e4a805', ts: trailIso(62), tenant: SB_WS, repo_slug: 'omnim-ai-factonio', phase: 'verify', card_id: 't_4ab36a11', decision: 'verify_blackbox_verdict', why: 'Headless browser timed out before the keyboard scenarios ran.', evidence: { pr_number: 44, head_sha: '7c1e9a04d2' }, result: 'inconclusive' }),
+  d({ id: 'd_5b10c2e4a806', ts: trailIso(55), tenant: SB_WS, repo_slug: 'omnim-ai-factonio', phase: 'verify', card_id: 't_4ab36a11', decision: 'verify_blackbox_verdict', why: 'Rerun: Tab skips the collapsed workstream header (focus order).', evidence: { pr_number: 44, head_sha: '7c1e9a04d2', tests_passed: 11, tests_failed: 1 }, result: 'reject', supersedes_id: 'd_5b10c2e4a805' }),
+  d({ id: 'd_5b10c2e4a807', ts: trailIso(53), tenant: SB_WS, repo_slug: 'omnim-ai-factonio', phase: 'implement', card_id: 't_4ab36a14', decision: 'spawn_fix_round', why: 'Fix Round 1 of 3 for the focus-order finding.', evidence: { pr_number: 44, fix_round: 1 }, result: 'spawned' }),
+  d({ id: 'd_5b10c2e4a808', ts: trailIso(38), tenant: SB_WS, repo_slug: 'omnim-ai-factonio', phase: 'watchdog', card_id: 't_4ab36a14', actor: 'watchdog', decision: 'needs_input', why: 'Worker paused on a product question; no side effects since.', evidence: { worker_pid: 48219, side_effect_age_s: 1380 }, result: 'blocked' }),
+  d({ id: 'd_7d21c0e5a901', ts: trailIso(95), tenant: SB_META, repo_slug: 'omnim-ai-factonio', phase: 'implement', card_id: 't_a1b2c3d4', actor: 'worker', decision: 'spawn_implement', why: 'Enrich /cards metadata.', evidence: { card_id: 't_a1b2c3d4' }, result: 'spawned' }),
+  d({ id: 'd_7d21c0e5a902', ts: trailIso(12), tenant: SB_META, repo_slug: 'omnim-ai-factonio', phase: 'verify', card_id: 't_a1b2c3d4', decision: 'spawn_verify', why: 'PR #42 reworked; re-verifying.', evidence: { pr_number: 42, head_sha: 'e4a1d90b7c' }, result: 'spawned' }),
+];
+
+// Workflow demo ledger: each entry appears from `step` onward (index into WORKFLOW_DEMO_HTML STEPS).
+const WF = 'acme-payments-api-rate-limit-i42';
+const wf = (step, mins, o) => ({ step, ...d({ tenant: WF, repo_slug: 'acme-payments-api', ts: trailIso(mins), ...o }) });
+const WORKFLOW_TRAIL = [
+  wf(0, 40, { id: 'd_a42e00000001', phase: 'define', card_id: 't_def42', decision: 'start_workstream', why: 'Issue #42: token-bucket rate limiting.', evidence: { card_id: 't_def42' }, result: 'spawned' }),
+  wf(1, 36, { id: 'd_a42e00000002', phase: 'design', card_id: 't_des42', decision: 'spawn_design', why: 'has_ui=true; Claude Design previews.', evidence: { design_provider: 'claude-design' }, result: 'spawned' }),
+  wf(2, 31, { id: 'd_a42e00000003', phase: 'design', card_id: 't_des42', actor: 'human', decision: 'design_approved', why: 'Quota badge states approved.', evidence: {}, result: 'approved' }),
+  wf(2, 30, { id: 'd_a42e00000004', phase: 'implement', card_id: 't_imp42a', decision: 'spawn_implement', why: 'Two parallel worktree units.', evidence: { units: 2 }, result: 'spawned' }),
+  wf(3, 24, { id: 'd_a42e00000005', phase: 'verify', card_id: 't_imp42a', decision: 'spawn_verify', why: 'PR #42 opened at 9c4e1a2.', evidence: { pr_number: 42, head_sha: '9c4e1a2f60' }, result: 'spawned' }),
+  wf(4, 20, { id: 'd_a42e00000006', phase: 'verify', card_id: 't_vd42', decision: 'verify_diff_verdict', why: 'Diff matches spec.md.', evidence: { pr_number: 42, head_sha: '9c4e1a2f60', tests_passed: 48 }, result: 'pass' }),
+  wf(4, 19, { id: 'd_a42e00000007', phase: 'verify', card_id: 't_vb42', decision: 'verify_blackbox_verdict', why: 'Concurrent burst overshoots quota by +1; Retry-After: 0.', evidence: { pr_number: 42, head_sha: '9c4e1a2f60', tests_passed: 3, tests_failed: 1 }, result: 'reject' }),
+  wf(5, 15, { id: 'd_a42e00000008', phase: 'implement', card_id: 't_imp42fix', decision: 'spawn_fix_round', why: 'Fix Round 1 of 3: atomic debit.', evidence: { pr_number: 42, fix_round: 1 }, result: 'spawned' }),
+  wf(6, 8, { id: 'd_a42e00000009', phase: 'verify', card_id: 't_vd42r2', decision: 'verify_carryover', why: 'patch-id matched unchanged hunks; reran the touched files only.', evidence: { pr_number: 42, head_sha: 'f8b30d9a11', patch_id: '3be0c1d9a4f2', tests_passed: 52 }, result: 'pass' }),
+  wf(6, 6, { id: 'd_a42e0000000a', phase: 'verify', card_id: 't_vb42r2', decision: 'verify_blackbox_verdict', why: 'All 4 holdout checks pass, including the 32-way concurrent burst.', evidence: { pr_number: 42, head_sha: 'f8b30d9a11', tests_passed: 4, tests_failed: 0 }, result: 'pass', supersedes_id: 'd_a42e00000007' }),
+  wf(6, 4, { id: 'd_a42e0000000b', phase: 'gate', card_id: 't_imp42fix', decision: 'pr_gate', why: 'All merge gate tiers clear on the exact head.', evidence: { pr_number: 42, head_sha: 'f8b30d9a11', checks_passed: 6 }, result: 'ready' }),
+  wf(6, 3, { id: 'd_a42e0000000c', phase: 'merge', card_id: 't_imp42fix', decision: 'merge_pr', why: 'PR #42 merged.', evidence: { pr_number: 42, head_sha: 'f8b30d9a11', method: 'squash' }, result: 'merged' }),
+];
+export const workflowTrail = step => WORKFLOW_TRAIL.filter(x => x.step <= step).map(({ step: _s, ...rest }) => rest);
+
 export async function bootPlugin(restHandler) {
   const mod = await import('/desktop/plugin.js');
   const plugin = mod.default;
@@ -786,7 +863,7 @@ DASHBOARD_HTML = f"""<!doctype html>
   </div>
   <script type="module">
     import {{ __mount }} from 'react';
-    import {{ MODELS_DATA, METRICS_BY_RANGE, initialReposState, bootPlugin }} from '/__harness/mock-data.js';
+    import {{ MODELS_DATA, METRICS_BY_RANGE, initialReposState, bootPlugin, trailPayload, DASHBOARD_TRAIL }} from '/__harness/mock-data.js';
 
     const reposState = initialReposState();
     window.__fcMock = {{ sessionId: 'sess_dash', visible: true, __version: 1 }};
@@ -800,6 +877,7 @@ DASHBOARD_HTML = f"""<!doctype html>
       if (path === '/models') return MODELS_DATA;
       if (path === '/repos') return reposState;
       if (path === '/status') return {{ ok: true, repos_count: 3, counts: {{ running: 2, blocked: 0, triage: 0 }} }};
+      if (path.startsWith('/trail')) return trailPayload(DASHBOARD_TRAIL, path);
       return {{}};
     }});
 
@@ -876,7 +954,7 @@ SIDEBAR_HTML = f"""<!doctype html>
   </div>
   <script type="module">
     import {{ __mount }} from 'react';
-    import {{ bootPlugin }} from '/__harness/mock-data.js';
+    import {{ bootPlugin, trailPayload, SIDEBAR_TRAIL }} from '/__harness/mock-data.js';
 
     const NOW = Math.floor(Date.now() / 1000);
     const T = s => NOW - s;
@@ -912,6 +990,7 @@ SIDEBAR_HTML = f"""<!doctype html>
     window.__fcMock = {{ sessionId: 'sess_demo', visible: true, __version: 1 }};
     const {{ regs }} = await bootPlugin((path) => {{
       if (path.startsWith('/cards')) return {{ cards: CARDS, counts: {{ running: 2, blocked: 1, triage: 0, rejected: 1, attention: 2, done: 11, total: 14 }} }};
+      if (path.startsWith('/trail')) return trailPayload(SIDEBAR_TRAIL, path);
       return {{}};
     }});
 
@@ -921,6 +1000,13 @@ SIDEBAR_HTML = f"""<!doctype html>
     const cardBtn = document.querySelector('article[data-id="t_4ab36a11"] button[data-action="toggle-card"]');
     if (cardBtn) cardBtn.click();
     await new Promise(r => setTimeout(r, 60));
+    // Scroll so the drawer's Decisions rows and the workstream's Decision Trail strip share the frame.
+    const sbBody = document.querySelector('.fc-sb-body');
+    const decisionsDt = document.querySelector('article[data-id="t_4ab36a11"] .fc-sb-trail-dt');
+    if (sbBody && decisionsDt) {{
+      decisionsDt.scrollIntoView({{ block: 'start' }});
+      sbBody.scrollTop -= 140;
+    }}
     window.__ready = true;
   </script>
 </body>
@@ -1036,7 +1122,7 @@ WORKFLOW_DEMO_HTML = f"""<!doctype html>
   </div>
   <script type="module">
     import {{ __mount, __rerender }} from 'react';
-    import {{ bootPlugin }} from '/__harness/mock-data.js';
+    import {{ bootPlugin, trailPayload, workflowTrail }} from '/__harness/mock-data.js';
 
     const NOW = Math.floor(Date.now() / 1000);
     const T = s => NOW - s;
@@ -1201,10 +1287,12 @@ WORKFLOW_DEMO_HTML = f"""<!doctype html>
     STEPS[7].cards = STEPS[6].cards;
 
     let currentCards = STEPS[0].cards;
+    let currentStep = 0;
     window.__fcMock = {{ sessionId: 'sess_demo', visible: true, __version: 1 }};
 
     const {{ regs }} = await bootPlugin((path) => {{
       if (path.startsWith('/cards')) return {{ cards: currentCards, counts: {{}} }};
+      if (path.startsWith('/trail')) return trailPayload(workflowTrail(currentStep), path);
       return {{}};
     }});
 
@@ -1222,6 +1310,7 @@ WORKFLOW_DEMO_HTML = f"""<!doctype html>
       async setStep(i) {{
         const step = STEPS[i];
         currentCards = step.cards;
+        currentStep = i;
         window.__fcMock.__version++;
         renderChatAndPill(step);
         __rerender();
@@ -1243,8 +1332,10 @@ WORKFLOW_DEMO_HTML = f"""<!doctype html>
           const toggleBtn = cardEl?.querySelector('button[data-action="toggle-card"]');
           if (toggleBtn && toggleBtn.getAttribute('aria-expanded') !== 'true') toggleBtn.click();
           await new Promise(r => setTimeout(r, 80));
+          // Pin the opened card to the top so its whole drawer (incl. Decisions) is in frame.
           const sbBody = document.querySelector('.fc-sb-body');
-          if (sbBody) sbBody.scrollTop = sbBody.scrollHeight;
+          const opened = document.querySelector(`article[data-id="${{step.openCardId}}"]`);
+          if (sbBody && opened) sbBody.scrollTop = Math.max(0, opened.offsetTop - sbBody.offsetTop - 6);
         }}
         await new Promise(r => setTimeout(r, 30));
       }}
@@ -1298,7 +1389,7 @@ REPO_EDITOR_DEMO_HTML = f"""<!doctype html>
   <div id="toast-root"></div>
   <script type="module">
     import {{ __mount, __rerender }} from 'react';
-    import {{ MODELS_DATA, METRICS_BY_RANGE, initialReposState, bootPlugin }} from '/__harness/mock-data.js';
+    import {{ MODELS_DATA, METRICS_BY_RANGE, initialReposState, bootPlugin, trailPayload, DASHBOARD_TRAIL }} from '/__harness/mock-data.js';
 
     let reposState = initialReposState();
     window.__fcMock = {{ sessionId: 'sess_ed', visible: true, __version: 1 }};
@@ -1659,11 +1750,11 @@ def capture_selected(out_dir: Path, targets: list[str], qa_dir: Path | None = No
     try:
         if "dashboard" in targets:
             dest = out_dir / "dashboard.png"
-            capture_url(chrome, f"{base}/__harness/dashboard.html", dest, 1240, 1100, scale=2)
+            capture_url(chrome, f"{base}/__harness/dashboard.html", dest, 1240, 1620, scale=2)
             print(f"Wrote {dest} ({dest.stat().st_size} bytes)")
         if "sidebar" in targets:
             dest = out_dir / "sidebar.png"
-            capture_url(chrome, f"{base}/__harness/sidebar.html", dest, 1100, 770, scale=2)
+            capture_url(chrome, f"{base}/__harness/sidebar.html", dest, 1100, 1040, scale=2)
             print(f"Wrote {dest} ({dest.stat().st_size} bytes)")
         if "settings" in targets:
             dest = out_dir / "settings.png"
@@ -1685,7 +1776,7 @@ def capture_selected(out_dir: Path, targets: list[str], qa_dir: Path | None = No
                     wf_frames: list[Path] = []
                     for i in range(8):
                         frame = wf_dir / f"frame_{i:02d}.png"
-                        capture_url(chrome, f"{base}/__harness/workflow-demo.html?step={i}", frame, 960, 660, scale=2)
+                        capture_url(chrome, f"{base}/__harness/workflow-demo.html?step={i}", frame, 960, 760, scale=2)
                         wf_frames.append(frame)
                     out_gif = out_dir / "demo-workflow.gif"
                     encode_gif(wf_frames, [2.2, 2.0, 2.0, 2.2, 3.0, 2.0, 2.5, 3.2], out_gif, width=960)
