@@ -32,6 +32,7 @@ _config = importlib.import_module(f"{_PKG_NAME}.config")
 _metrics = importlib.import_module(f"{_PKG_NAME}.metrics")
 _profile_setup = importlib.import_module(f"{_PKG_NAME}.profile_setup")
 _repos = importlib.import_module(f"{_PKG_NAME}.repos")
+_trail = importlib.import_module(f"{_PKG_NAME}.trail")
 
 router = APIRouter()
 Range = Literal["7d", "30d", "90d", "all"]
@@ -175,6 +176,19 @@ def cards(
 ):
     """Kanban cards for the focused chat session or workstream tenant."""
     return _metrics.thread_cards(_kanban_db(), session_id=session_id, tenant=tenant, limit=limit)
+
+
+@router.get("/trail")
+def trail(
+    tenant: Optional[str] = Query(None),
+    repo: Optional[str] = Query(None),
+    phase: Optional[str] = Query(None),
+    card_id: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    profile: Optional[str] = Query(None),
+):
+    """Append-only decision trail from `trail.db`: `{decisions, summary, filters}`."""
+    return _trail.trail_payload(tenant=tenant, repo=repo, phase=phase, card_id=card_id, limit=limit)
 
 
 @router.get("/doctor")

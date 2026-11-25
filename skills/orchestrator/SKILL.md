@@ -30,7 +30,7 @@ Coordinate software delivery on registered GitHub repositories across Definition
    - **Feature (`kind="feature"`):** Definition -> optional Phase 1b Design (when `has_ui: true` or requested) -> parallel Implementation -> parallel Verification -> Merge.
    - **Bug (`kind="bug"`):** Definition (diagnosis mode) -> Implementation -> parallel Verification -> Merge.
    - **Small obvious change (`kind="quick"`):** Implementation -> Verification -> Merge.
-5. If the user reports a regression in work that previously passed Verification, pass `escaped_from="<verify_card_id>"` to `factonio_start` so escape rate stays accurate.
+5. If the user reports a regression in work that previously passed Verification, pass `escaped_from="<verify_card_id>"` to `factonio_start` so escape rate stays accurate. The Definition card then requires a `Verification Gap Analysis` in `spec.md`, and an `escape` row is written to the decision trail.
 
 ### 2. Optional Phase 1b Design (UI Work)
 
@@ -75,6 +75,24 @@ Coordinate software delivery on registered GitHub repositories across Definition
    - `auto`: call `factonio_merge_pr(repo, pr_number, expected_head_sha=...)`. Only auto-merge when both verdicts are `pass`.
    - `ask`: present the PR URL, check results, and verification verdicts (including any `disclosed_limits`) and wait for the user's go-ahead.
 6. **Live merge readback:** after `factonio_merge_pr` returns, confirm the outcome from the live PR state, not from the merge command's exit code. Report `merged` only when the PR state is `MERGED` with a `mergedAt` timestamp; if the result says `queued` (merge queue or auto-merge pending) report it as queued and re-check later instead of announcing a merge. When a merge is confirmed, the local registered checkout's default branch is fast-forwarded only when safe (clean tree on that branch, or a strict fast-forward ref update when another branch is checked out); report `local_synced` / `local_sync_note` and never discard local work to sync.
+
+## Decision Trail (Show Your Work)
+
+- Factory transitions (`start`, `escape`, `spawn_design`, `spawn_implement`, `spawn_verify`, `pr_gate`, `merge_pr`) are recorded automatically in the append-only `trail.db`.
+- Log your own judgment calls with `factonio_log_decision`: forks between approaches, pivots, Attack the Premise probes, unblock decisions, and merge countersigns. Put checkable facts (PR, SHA, patch-id, test counts, command) in `evidence`.
+- Rows are immutable. To correct a decision, log a new row with `supersedes_id` set to the old id; never re-log as if the old one did not happen.
+- Read it back with `hermes factonio trail --tenant <t> --markdown` when writing summaries or handoffs.
+
+## Human Handoffs (Ketchup)
+
+Every time you stop to ask the user for a decision (design approval, `merge_policy: ask`, over-budget fix rounds, `inconclusive` verdicts, escalations), make the message decision-ready:
+
+1. **Plain language first:** one or two sentences on what happened and what you need, with no internal jargon, card ids, or tool names as the lead.
+2. **Visuals before prose:** lead with the preview, screenshot, table, or diff stat that shows the state; text explains it.
+3. **Self-contained:** the user must not need to open the board or scroll back. Restate the context they need.
+4. **One recommendation:** state the option you recommend and why, plus at most two alternatives.
+5. **Evidence and risk:** link the PR, verdicts, check results, and trail rows backing the recommendation, and state what could go wrong if they accept it.
+6. **Exact ask:** end with the specific reply you need (for example "Reply `merge` or `hold`").
 
 ## Error Handling
 

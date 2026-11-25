@@ -16,6 +16,7 @@ from .config import (
 from .orchestrator import workstream_status
 from .profile_setup import init_factonio_profile, run_doctor
 from .repos import RepoNotFoundError, add_repo, inspect_pr_gate, remove_repo, update_repo
+from .trail import render_trail_markdown, render_trail_text, trail_payload
 
 
 def _print_result(data: dict[str, Any], as_json: bool) -> None:
@@ -87,6 +88,20 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         p_pr.add_argument("repo", help="Repo slug or 'owner/repo'.")
         p_pr.add_argument("pr_number", type=int, help="Pull request number.")
 
+        p_trail = sub.add_parser("trail", help="Show the append-only Factonio decision trail (trail.db).")
+        p_trail.add_argument("--tenant", default=None, help="Filter by workstream tenant.")
+        p_trail.add_argument("--repo", default=None, help="Filter by repo slug or 'owner/repo'.")
+        p_trail.add_argument("--phase", default=None, help="Filter by phase (define, design, implement, verify, gate, merge, escape, ...).")
+        p_trail.add_argument("--card", dest="card_id", default=None, help="Filter by Kanban card id.")
+        p_trail.add_argument("--limit", type=int, default=50, help="Max decisions to show, newest first (default: 50).")
+        p_trail.add_argument("--markdown", action="store_true", help="Render a Markdown table (for PRs, retros, handoffs).")
+        p_trail.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Output the {decisions, summary, filters} JSON contract.",
+        )
+
         sub.add_parser("doctor", help="Verify git, gh auth, worker profile, Kanban config, and phase models.")
 
     def handle_cli(args: Any) -> None:
@@ -94,7 +109,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         as_json = bool(getattr(args, "json", False))
 
         if not cmd:
-            print("Usage: hermes factonio {init|add|update|remove|list|models|status|pr-gate|doctor} [--json]")
+            print("Usage: hermes factonio {init|add|update|remove|list|models|status|pr-gate|trail|doctor} [--json]")
             return
 
         if cmd == "init":
@@ -254,6 +269,27 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                 sys.exit(1)
             return
 
+        if cmd == "trail":
+            payload = trail_payload(
+                tenant=args.tenant,
+                repo=args.repo,
+                phase=args.phase,
+                card_id=args.card_id,
+                limit=args.limit,
+            )
+            if as_json:
+                print(json.dumps(payload, indent=2, default=str))
+            elif args.markdown:
+                print(render_trail_markdown(payload["decisions"]), end="")
+            else:
+                summary = payload["summary"]
+                print(
+                    f"Decision trail: total={summary['total']} active={summary['active']} "
+                    f"superseded={summary['superseded']} (showing {len(payload['decisions'])})"
+                )
+                print(render_trail_text(payload["decisions"]))
+            return
+
         if cmd == "doctor":
             res = run_doctor(plugin_dir)
             if as_json:
@@ -271,7 +307,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
 
     ctx.register_cli_command(
         "factonio",
-        help="Manage the Factonio pure-Hermes software factory (init, add, update, models, status, doctor).",
+        help="Manage the Factonio pure-Hermes software factory (init, add, update, models, status, trail, doctor).",
         setup_fn=setup_parser,
         handler_fn=handle_cli,
     )
