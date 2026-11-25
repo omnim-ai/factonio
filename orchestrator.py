@@ -519,7 +519,7 @@ def spawn_verification_pair(
         f"and executing the acceptance criteria plus every scenario under `{holdout_dir}`"
         f"{f', comparing rendered UI fidelity against `{design_dir}`' if design_dir else ''}. "
         f"NEVER run `git diff`, NEVER inspect PR diffs, and NEVER read implementation source code. "
-        f"Return structured metadata with `verdict: pass|reject`, `pr_number: {int(pr_number)}`, "
+        f"Return structured metadata with `verdict: pass|reject|inconclusive`, `pr_number: {int(pr_number)}`, "
         f"`repo: {full_repo}`, `scenarios_run`, and `findings: [...]`.\n"
     )
 

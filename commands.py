@@ -237,9 +237,17 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                 if not res.get("ok"):
                     print(f"Error: {res.get('error')}")
                     sys.exit(1)
-                verdict = "READY" if res["ready_to_merge"] else "BLOCKED"
+                if res["ready_to_merge"]:
+                    verdict = "READY"
+                else:
+                    tier = res.get("blocker_tier")
+                    verdict = f"BLOCKED (tier {tier})" if tier else "BLOCKED"
                 print(f"{verdict}: {res['repo']}#{res['pr_number']} ({res['state']}, head={str(res['head_sha'])[:10]})")
                 print(f"  Checks: passed={len(res['checks']['passed'])} failed={len(res['checks']['failed'])} pending={len(res['checks']['pending'])}")
+                print(
+                    f"  Review: decision={res.get('review_decision') or 'NONE'} "
+                    f"unresolved_threads={len(res.get('unresolved_threads') or [])}"
+                )
                 for b in res["blockers"]:
                     print(f"  Blocker: {b}")
             if not res.get("ready_to_merge"):

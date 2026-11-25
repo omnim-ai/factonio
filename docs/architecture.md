@@ -52,9 +52,21 @@ If either check returns `verdict: reject`:
 
 Before merging or reporting a PR ready:
 
-1. `factonio_pr_gate` queries GitHub live via `gh` for PR state, draft status, mergeability, required status checks, and live `head_sha`.
-2. `factonio_merge_pr` refuses to merge if CI is red/pending or if `head_sha` drifted after Verification passed.
-3. On `merge_policy: auto`, the PR is squash-merged and its branch deleted; on `merge_policy: ask`, the orchestrator presents verification results and waits for human approval.
+1. `factonio_pr_gate` queries GitHub live via `gh api graphql` for PR state, draft status, mergeability (`mergeable`, `mergeStateStatus`), `reviewDecision`, unresolved review threads, head-commit check runs / status contexts, the head `statusCheckRollup.state`, and live `head_sha`. Review threads and check contexts are cursor-paginated (100 per page, up to 20 pages), so PRs with more than 100 checks are gated correctly.
+2. Blockers are classified in strict priority tiers and reported in that order, with `blocker_tier` set to the highest-priority active tier (`None` when ready):
+   1. merge conflicts (`mergeable == CONFLICTING` or `mergeStateStatus` `DIRTY`/`CONFLICTING`);
+   2. unresolved review threads (each returned with `id`, `path`, `line`, `author`, `body` snippet, `created_at`);
+   3. failing/pending CI checks, or `mergeStateStatus == BLOCKED` with a head rollup of `ERROR`/`FAILURE`;
+   4. merge gates (PR not `OPEN`, draft, or `reviewDecision == CHANGES_REQUESTED`).
+3. `factonio_merge_pr` refuses to merge on any blocker or if `head_sha` drifted after Verification passed.
+4. On `merge_policy: auto`, the PR is squash-merged and its branch deleted; on `merge_policy: ask`, the orchestrator presents verification results and waits for human approval.
+5. After `gh pr merge` exits 0, `factonio_merge_pr` reads the PR back (`state,mergedAt,baseRefName`). Only a confirmed `MERGED` state reports `merged: true`; merge-queue / auto-merge PRs report `merged: false, queued: true`; a PR closed without merging is an error. On a confirmed merge the registered checkout's default branch is fast-forwarded when safe (`local_synced`, `local_sync_note`): a dirty working tree, a diverged branch, or a branch checked out in another worktree is never touched, and a skipped sync never fails the merge.
+
+`repos.py` also provides pure-Python git helpers for verdict continuity: `compute_patch_id` / `verify_patch_continuity` (stable `git patch-id` comparison, so a verified patch survives a mechanical rebase) and `assess_trunk_drift` (files changed on `origin/<default_branch>` vs. the PR since their merge-base).
+
+### Tri-state verification verdicts
+
+Verification cards report `verdict: pass | reject | inconclusive`. `inconclusive` (from run metadata or a run outcome) is never counted as a pass: `/metrics` reports `verification.{diff,blackbox}.inconclusive` and includes it in the `pass_rate` denominator, and `/cards` reports `counts.inconclusive`, which is included in `counts.attention`.
 
 ## Per-phase model resolution
 
