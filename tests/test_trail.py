@@ -557,6 +557,47 @@ class TestTrailCliAndApi(unittest.TestCase):
                 self.assertEqual(data["filters"]["repo"], "acme-api")
                 self.assertEqual(data["filters"]["limit"], 2)
 
+    def test_get_decision_and_single_decision_api(self):
+        from factonio import trail
+
+        with isolated_hermes_home() as home:
+            self.assertIsNone(trail.get_decision("d_000000000000"))
+            client = _api_client("factonio_test_plugin_api_trail_one")
+            self.assertEqual(client.get("/api/plugins/factonio/trail/d_000000000000").status_code, 404)
+
+            first = self._seed()
+            correction = next(d for d in trail.query_decisions(limit=10) if d["supersedes_id"] == first["id"])
+            row = trail.get_decision(first["id"])
+            self.assertEqual(row["id"], first["id"])
+            self.assertEqual(row["evidence"], {"head_sha": "abc1234", "pr_number": 42})
+            self.assertEqual(row["superseded_by"], [correction["id"]])
+            self.assertTrue(row["is_superseded"])
+            self.assertEqual(trail.get_decision(correction["id"])["supersedes_id"], first["id"])
+            self.assertFalse(trail.get_decision(correction["id"])["is_superseded"])
+            self.assertIsNone(trail.get_decision("d_missing"))
+            self.assertIsNone(trail.get_decision(""))
+            other_db = home / "other-trail.db"
+            self.assertIsNone(trail.get_decision(first["id"], db_path=other_db))
+            self.assertFalse(other_db.exists())
+
+            resp = client.get(f"/api/plugins/factonio/trail/{first['id']}")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(set(resp.json()), {"decision"})
+            api_row = resp.json()["decision"]
+            self.assertEqual(api_row, row)
+            self.assertEqual(
+                list(api_row),
+                ["id", "ts", "tenant", "repo_slug", "phase", "card_id", "actor", "decision", "why", "evidence",
+                 "result", "supersedes_id", "superseded_by", "is_superseded"],
+            )
+            missing = client.get("/api/plugins/factonio/trail/d_missing")
+            self.assertEqual(missing.status_code, 404)
+            self.assertIn("d_missing", missing.json()["detail"])
+            # The list route and its exact filters contract are untouched by the single-row route.
+            listing = client.get("/api/plugins/factonio/trail").json()
+            self.assertEqual(set(listing), {"decisions", "summary", "filters"})
+            self.assertEqual(listing["filters"], {"tenant": None, "repo": None, "phase": None, "card_id": None, "limit": 100})
+
     def test_trail_api_contract_and_metrics_summary(self):
         with isolated_hermes_home():
             client = _api_client("factonio_test_plugin_api_trail")

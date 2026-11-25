@@ -728,6 +728,14 @@ export function trailPayload(list, path = '') {
   for (const d of list) if (d.supersedes_id) (by[d.supersedes_id] = by[d.supersedes_id] || []).push(d.id);
   let rows = list.map(d => ({ ...d, superseded_by: by[d.id] || [], is_superseded: !!by[d.id] }))
     .sort((a, b) => b.ts.localeCompare(a.ts));
+  // GET /trail/{decision_id} -> {decision} or 404, like dashboard/plugin_api.py.
+  const one = /^\/trail\/([^?]+)/.exec(String(path));
+  if (one) {
+    const id = decodeURIComponent(one[1]);
+    const row = rows.find(d => d.id === id);
+    if (!row) return Promise.reject(new Error(`404: {"detail":"Decision '${id}' not found."}`));
+    return { decision: row };
+  }
   for (const [k, field] of [['tenant', 'tenant'], ['repo', 'repo_slug'], ['phase', 'phase'], ['card_id', 'card_id']]) {
     const v = params.get(k);
     if (v) rows = rows.filter(d => d[field] === v);

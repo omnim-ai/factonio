@@ -1338,10 +1338,15 @@ function TrailSection({ ctx, reposQ }) {
   // A deep link (`/factonio?tenant=…`) scopes the fetch server-side until the
   // user picks another workstream or clears the filters.
   const [scoped, setScoped] = useState(routeTenant || null)
+  // Lineage targets fetched on demand because they sit outside the loaded
+  // window or server scope; merged into the ledger so a jump lands on a row.
+  const [pinned, setPinned] = useState({})
   const headingRef = useRef(null)
   const rowEls = useRef({})
   const pendingJump = useRef(null)
   const flashTimer = useRef(null)
+  const jumpSeq = useRef(0)
+  const latest = useRef({})
   const queryClient = useQueryClient()
   const queryKey = scoped ? [...TRAIL_QUERY_KEY, 'tenant', scoped] : TRAIL_QUERY_KEY
   const query = useQuery({
@@ -1363,10 +1368,15 @@ function TrailSection({ ctx, reposQ }) {
   useEffect(() => {
     const id = pendingJump.current
     if (!id) return
+    // Clearing a server scope refetches; keep the jump pending until the row renders.
+    const el = visible.some(d => d.id === id) ? rowEls.current[id] : null
+    if (!el) {
+      if (!loading) pendingJump.current = null
+      return
+    }
     pendingJump.current = null
-    const el = rowEls.current[id]
-    el?.scrollIntoView?.({ block: 'center', behavior: prefersReducedMotion() ? 'auto' : 'smooth' })
-    el?.focus?.({ preventScroll: true })
+    el.scrollIntoView?.({ block: 'center', behavior: prefersReducedMotion() ? 'auto' : 'smooth' })
+    el.focus?.({ preventScroll: true })
     clearTimeout(flashTimer.current)
     flashTimer.current = setTimeout(() => setFlash(cur => (cur === id ? null : cur)), 1600)
   })
@@ -1375,7 +1385,10 @@ function TrailSection({ ctx, reposQ }) {
   const isError = !!query.isError
   const hasData = data != null
   const loading = !hasData && !isError
-  const all = trailDecisions(data)
+  const loaded = trailDecisions(data)
+  const loadedIds = new Set(loaded.map(d => d.id))
+  const extra = Object.values(pinned).filter(d => d && !loadedIds.has(d.id))
+  const all = extra.length ? trailDecisions({ decisions: [...loaded, ...extra] }) : loaded
   const empty = hasData && all.length === 0 && !scoped
 
   const registered = Array.isArray(reposQ?.data?.repos) ? reposQ.data.repos : []
@@ -1422,19 +1435,47 @@ function TrailSection({ ctx, reposQ }) {
       announce(repo, v, phase, hideSup)
     }
   }
-  const jump = id => {
-    if (!all.some(d => d.id === id)) {
-      setMsg(`${id} is older than the loaded trail.`)
-      return
-    }
-    if (!visible.some(d => d.id === id)) {
-      setRepo(''); setTenant(''); setPhase(''); setHideSup(false)
+  const passes = (d, f) => (!f.repo || d.repo_slug === f.repo) && (!f.tenant || d.tenant === f.tenant) && (!f.phase || d.phase === f.phase) && !(f.hideSup && d.is_superseded)
+  latest.current = { repo, tenant, phase, hideSup, scoped }
+  const land = (id, row, f) => {
+    if (!passes(row, f)) {
+      setRepo(''); setTenant(''); setPhase(''); setHideSup(false); setScoped(null)
       setMsg(`Filters cleared to show ${id}.`)
     } else {
       setMsg(`Jumped to ${id}.`)
     }
     pendingJump.current = id
     setFlash(id)
+  }
+  // Single-row lookup; older hosts without GET /trail/{id} fall back to one
+  // wide unscoped /trail page when the target may sit outside what is loaded.
+  const fetchDecision = async (id, mayBeOutside) => {
+    try {
+      const res = await ctx.rest(`/trail/${encodeURIComponent(id)}`)
+      if (res?.decision?.id === id) return res.decision
+    } catch (err) {
+      if (describeSaveError(err).status === 404) return null
+    }
+    if (!mayBeOutside) return null
+    return trailDecisions(await ctx.rest('/trail?limit=1000')).find(d => d.id === id) || null
+  }
+  const jump = async id => {
+    const seq = ++jumpSeq.current
+    const known = all.find(d => d.id === id)
+    if (known) {
+      land(id, known, { repo, tenant, phase, hideSup })
+      return
+    }
+    pendingJump.current = null
+    setMsg(`Loading ${id}…`)
+    const row = await fetchDecision(id, !!scoped || total > loaded.length).catch(() => null)
+    if (seq !== jumpSeq.current) return
+    if (!row) {
+      setMsg(`Could not load decision ${id}.`)
+      return
+    }
+    setPinned(cur => ({ ...cur, [row.id]: row }))
+    land(id, row, latest.current)
   }
 
   const select = (id, key, label, allLabel, opts, value) => jsxs('span', {

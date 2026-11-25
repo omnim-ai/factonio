@@ -22,14 +22,16 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 
 try:
     import hermes_yaml as yaml
 except ImportError:
     import yaml
 
-from tests._env import PLUGIN_ROOT
+from tests._env import PLUGIN_ROOT, isolated_hermes_home
 
 PLUGIN_JS = PLUGIN_ROOT / "desktop" / "plugin.js"
 PHASES = ["define", "design", "implement", "verify", "watchdog"]
@@ -41,6 +43,7 @@ def aux_route(phase: str) -> str:
 
 SMOKE_SCRIPT = r"""
 import { registerHooks } from 'node:module'
+import { readFileSync } from 'node:fs'
 
 const STUBS = {
   '@hermes/plugin-sdk': `
@@ -1379,6 +1382,130 @@ async function runTrailScenarios(report) {
   globalThis.__fcReposState = undefined
   globalThis.__fcQueryClient = undefined
 }
+
+// Lineage targets outside the loaded window / server scope, fed by real trail.db
+// payloads that the Python side writes to FC_LINEAGE_FIXTURE.
+async function runTrailLineageScenarios(report) {
+  const L = report.trail.lineage = {}
+  const fx = JSON.parse(readFileSync(process.env.FC_LINEAGE_FIXTURE, 'utf8'))
+  const client = { invalidateQueries: () => Promise.resolve() }
+  const notFound = id => new Error(`404: {"detail":"Decision '${id}' not found."}`)
+  const mockRest = (responses, extra = {}) => async p => {
+    if (Object.hasOwn(extra, p)) return extra[p](p)
+    if (Object.hasOwn(responses, p)) return JSON.parse(JSON.stringify(responses[p]))
+    if (p.startsWith('/trail/')) throw notFound(p.slice(7))
+    throw new Error(`500: unexpected ${p}`)
+  }
+  const mount = (state, rest) => {
+    trailState = state
+    trailQueries.length = 0
+    const m = mountRepos({ data: { repos: TRAIL_REPOS, defaults: REPO_DEFAULTS }, client })
+    m.setRest(rest)
+    return m
+  }
+  // The link's onClick returns the jump promise; awaiting it settles any lookup.
+  const clickLink = (tree, rowId, kind) => Promise.all(trailLink(tree, rowId, kind).results)
+  const snap = (m, tree) => ({
+    trail: readTrail(tree),
+    scroll: JSON.parse(JSON.stringify(scrollLog)),
+    focus: [...m.focusLog],
+    rests: m.rests.map(r => r.path),
+    query: lastTrailQuery()
+  })
+  const reset = m => { scrollLog.length = 0; m.focusLog.length = 0; m.rests.length = 0 }
+
+  // >200 rows: the original is not in /trail?limit=200; the Supersedes link loads it by id.
+  {
+    const w = fx.window
+    const m = mount({ data: w.responses['/trail?limit=200'], isLoading: false, isError: false }, mockRest(w.responses))
+    let tree = m.render()
+    const before = readTrail(tree)
+    reset(m)
+    const pending = clickLink(tree, w.correction, 'supersedes')
+    tree = m.render()
+    const loadingMsg = readTrail(tree).live
+    await pending; await tick()
+    tree = m.render()
+    L.window = { api: w.api, before: { rows: before.rows.length, hasTarget: before.rows.some(r => r.id === w.original), link: before.rows.find(r => r.id === w.correction).links }, loadingMsg, after: snap(m, tree) }
+    // A second jump to the now-pinned row needs no refetch.
+    reset(m)
+    await clickLink(tree, w.correction, 'supersedes')
+    tree = m.render()
+    L.windowAgain = snap(m, tree)
+  }
+
+  // Older host / capture mock: /trail/{id} answers with a list payload -> one wide unscoped page.
+  {
+    const w = fx.window
+    const m = mount({ data: w.responses['/trail?limit=200'], isLoading: false, isError: false },
+      mockRest(w.responses, { [`/trail/${w.original}`]: () => w.responses['/trail?limit=200'] }))
+    let tree = m.render()
+    reset(m)
+    await clickLink(tree, w.correction, 'supersedes')
+    await tick()
+    tree = m.render()
+    L.fallback = snap(m, tree)
+  }
+
+  // Server scope: /factonio?tenant=<b> deep link; the superseded original lives in another tenant.
+  {
+    const s = fx.scope
+    const state = opts => (opts.queryKey.includes('tenant')
+      ? { data: s.responses[`/trail?tenant=${encodeURIComponent(s.tenant)}&limit=200`], isLoading: false, isError: false }
+      : { data: s.responses['/trail?limit=200'], isLoading: false, isError: false })
+    globalThis.location = { hash: `#/factonio?tenant=${encodeURIComponent(s.tenant)}`, search: '' }
+    const m = mount(state, mockRest(s.responses))
+    let tree = m.render()
+    const before = { trail: readTrail(tree), query: lastTrailQuery() }
+    delete globalThis.location
+    reset(m)
+    await clickLink(tree, s.correction, 'supersedes')
+    await tick()
+    tree = m.render()
+    L.scope = { api: s.api, original: s.original, before: { rows: before.trail.rows.map(r => r.id), tenant: before.trail.bar.selects.tenant.value, query: before.query }, after: snap(m, tree) }
+  }
+
+  // Genuinely missing target (404): announced, nothing thrown, no scroll/focus, no wide refetch.
+  {
+    const rows = [dec({ id: 'd_dangling0001', ts: '2026-11-25T16:40:00.000000Z', phase: 'verify', actor: 'orchestrator', decision: 'verify_carryover', result: 'pass', supersedes_id: 'd_missing00000' })]
+    const m = mount({ data: { decisions: rows, summary: { total: 1, active: 1, superseded: 0, by_tenant: { [W2]: 1 } }, filters: {} }, isLoading: false, isError: false }, mockRest({}))
+    let tree = m.render()
+    reset(m)
+    let threw = null
+    try { await clickLink(tree, 'd_dangling0001', 'supersedes') } catch (e) { threw = String(e) }
+    await tick()
+    tree = m.render()
+    L.missing = { threw, ...snap(m, tree) }
+  }
+
+  // Race: link A is still loading when link B is followed; A's late answer is dropped.
+  {
+    const rows = [
+      dec({ id: 'd_corr_a00001', ts: '2026-11-25T16:40:00.000000Z', phase: 'verify', actor: 'orchestrator', decision: 'retry_a', result: 'pass', supersedes_id: 'd_orig_a00001' }),
+      dec({ id: 'd_corr_b00001', ts: '2026-11-25T16:30:00.000000Z', phase: 'gate', actor: 'orchestrator', decision: 'retry_b', result: 'pass', supersedes_id: 'd_orig_b00001' })
+    ]
+    const orig = (id, ts, by) => dec({ id, ts, phase: 'verify', actor: 'orchestrator', decision: 'first_try', result: 'reject', superseded_by: [by], is_superseded: true })
+    const slowA = deferred()
+    const m = mount({ data: { decisions: rows, summary: { total: 4, active: 2, superseded: 2, by_tenant: { [W2]: 4 } }, filters: {} }, isLoading: false, isError: false },
+      mockRest({ '/trail/d_orig_b00001': { decision: orig('d_orig_b00001', '2026-11-20T10:00:00.000000Z', 'd_corr_b00001') } },
+        { '/trail/d_orig_a00001': () => slowA.promise }))
+    let tree = m.render()
+    reset(m)
+    const a = clickLink(tree, 'd_corr_a00001', 'supersedes')
+    tree = m.render()
+    await clickLink(tree, 'd_corr_b00001', 'supersedes')
+    await tick()
+    tree = m.render()
+    slowA.resolve({ decision: orig('d_orig_a00001', '2026-11-21T10:00:00.000000Z', 'd_corr_a00001') })
+    await a; await tick()
+    tree = m.render()
+    L.race = snap(m, tree)
+  }
+
+  trailState = { data: undefined, isLoading: true, isError: false }
+  globalThis.__fcReposState = undefined
+  globalThis.__fcQueryClient = undefined
+}
 const mod = await import(process.env.FC_PLUGIN_URL)
 const plugin = mod.default
 const report = { id: plugin.id, name: plugin.name }
@@ -1432,6 +1559,7 @@ report.oldHost = { error: oldErr, registeredIds: oldRegistered.map(r => r.id) }
 await runSidebarScenarios(report, registered, oldRegistered)
 await runReposScenarios(report)
 await runTrailScenarios(report)
+await runTrailLineageScenarios(report)
 
 // Tri-state verification verdicts: additive `inconclusive` fields from /metrics and /cards.
 {
@@ -1481,19 +1609,74 @@ process.stdout.write(JSON.stringify(report))
 """
 
 
+
+def _lineage_fixture(tmp: Path) -> dict:
+    """Real trail.db payloads for lineage targets outside the loaded window or server scope."""
+    from factonio import trail
+
+    with isolated_hermes_home():
+        win_db = tmp / "window-trail.db"
+        def log(decision: str, **kw):
+            return trail.log_decision(decision, db_path=win_db, actor="orchestrator", **kw)
+
+        original = log("pr_gate_wait", tenant="lineage-window", repo_slug="omnim-ai-factonio", phase="verify",
+                       why="Held the gate on a flaky check.", evidence={"pr_number": 16}, result="inconclusive")
+        for i in range(200):
+            log("heartbeat_ok", tenant="lineage-window", repo_slug="omnim-ai-factonio", phase="watchdog", evidence={"n": i}, result="recorded")
+        correction = log("verify_carryover", tenant="lineage-window", repo_slug="omnim-ai-factonio", phase="verify",
+                         why="Re-ran the flaky check green.", result="pass", supersedes_id=original["id"])
+        page = trail.trail_payload(limit=200, db_path=win_db)
+        window = {
+            "original": original["id"],
+            "correction": correction["id"],
+            "api": {"total": page["summary"]["total"], "loaded": len(page["decisions"]),
+                    "target_loaded": any(d["id"] == original["id"] for d in page["decisions"])},
+            "responses": {
+                "/trail?limit=200": page,
+                "/trail?limit=1000": trail.trail_payload(limit=1000, db_path=win_db),
+                f"/trail/{original['id']}": {"decision": trail.get_decision(original["id"], db_path=win_db)},
+            },
+        }
+
+        scope_db = tmp / "scope-trail.db"
+        other = trail.log_decision("pr_gate_wait", db_path=scope_db, tenant="lineage-a", repo_slug="acme-api", phase="gate",
+                                   actor="orchestrator", result="blocked")
+        trail.log_decision("spawn_implement", db_path=scope_db, tenant="lineage-a", repo_slug="acme-api", phase="implement",
+                           actor="worker", result="spawned")
+        fix = trail.log_decision("pr_gate", db_path=scope_db, tenant="lineage-b", repo_slug="acme-api", phase="gate",
+                                 actor="human", why="Override recorded in the follow-up workstream.", result="ready",
+                                 supersedes_id=other["id"])
+        scoped = trail.trail_payload(tenant="lineage-b", limit=200, db_path=scope_db)
+        scope = {
+            "tenant": "lineage-b",
+            "original": other["id"],
+            "correction": fix["id"],
+            "api": {"scoped_ids": [d["id"] for d in scoped["decisions"]], "filters": scoped["filters"]},
+            "responses": {
+                "/trail?tenant=lineage-b&limit=200": scoped,
+                "/trail?limit=200": trail.trail_payload(limit=200, db_path=scope_db),
+                f"/trail/{other['id']}": {"decision": trail.get_decision(other["id"], db_path=scope_db)},
+            },
+        }
+    return {"window": window, "scope": scope}
+
+
 @unittest.skipUnless(shutil.which("node"), "node is required for desktop plugin checks")
 class TestDesktopPlugin(unittest.TestCase):
     report: dict
 
     @classmethod
     def setUpClass(cls) -> None:
-        proc = subprocess.run(
-            ["node", "--input-type=module", "-e", SMOKE_SCRIPT],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            env={"PATH": os.environ.get("PATH", ""), "FC_PLUGIN_URL": PLUGIN_JS.as_uri()},
-        )
+        with tempfile.TemporaryDirectory(prefix="factonio-lineage-") as tmp:
+            fixture = Path(tmp) / "lineage.json"
+            fixture.write_text(json.dumps(_lineage_fixture(Path(tmp))))
+            proc = subprocess.run(
+                ["node", "--input-type=module", "-e", SMOKE_SCRIPT],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={"PATH": os.environ.get("PATH", ""), "FC_PLUGIN_URL": PLUGIN_JS.as_uri(), "FC_LINEAGE_FIXTURE": str(fixture)},
+            )
         if proc.returncode != 0:
             raise AssertionError(f"node smoke failed ({proc.returncode}):\n{proc.stderr}\n{proc.stdout}")
         cls.report = json.loads(proc.stdout)
@@ -2121,6 +2304,77 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual({r["id"]: r["flash"] for r in v["trail"]["rows"]}["d_c4f08e2a91b7"], "true")
         self.assertEqual(v["focus"], ["trail-d_c4f08e2a91b7"])
         self.assertEqual(d["supShownAgain"][2]["pressed"], "true")
+
+    def _landed(self, snap, target):
+        rows = {r["id"]: r for r in snap["trail"]["rows"]}
+        self.assertIn(target, rows, "target row is rendered in the ledger")
+        self.assertEqual(rows[target]["flash"], "true")
+        self.assertEqual(sum(r["flash"] == "true" for r in snap["trail"]["rows"]), 1)
+        self.assertEqual(snap["scroll"], [[f"trail-{target}", {"block": "center", "behavior": "smooth"}]])
+        self.assertEqual(snap["focus"], [f"trail-{target}"])
+
+    def test_trail_lineage_jump_loads_target_beyond_loaded_window(self):
+        lin = self.report["trail"]["lineage"]
+        w = lin["window"]
+        # Real trail.db: 1 original + 200 intervening + 1 correction; /trail?limit=200 excludes the original.
+        self.assertEqual(w["api"], {"total": 202, "loaded": 200, "target_loaded": False})
+        self.assertEqual(w["before"]["rows"], 200)
+        self.assertFalse(w["before"]["hasTarget"])
+        self.assertEqual([lk["kind"] for lk in w["before"]["link"]], ["supersedes"])
+        target = w["before"]["link"][0]["jump"]
+        self.assertTrue(w["loadingMsg"].startswith(f"Loading {target}"))
+        a = w["after"]
+        self.assertEqual(a["rests"], [f"/trail/{target}"])
+        self._landed(a, target)
+        self.assertEqual(a["trail"]["live"], f"Jumped to {target}.")
+        self.assertEqual(len(a["trail"]["rows"]), 201)
+        self.assertEqual(a["trail"]["rows"][-1]["id"], target, "the older target sorts last, newest-first")
+        row = a["trail"]["rows"][-1]
+        self.assertEqual(row["superseded"], "true")
+        self.assertEqual([lk["kind"] for lk in row["links"]], ["superseded-by"])
+        self.assertEqual(a["query"]["key"], ["factonio", "trail", 200])
+        again = lin["windowAgain"]
+        self.assertEqual(again["rests"], [])
+        self._landed(again, target)
+
+    def test_trail_lineage_jump_falls_back_to_wide_page_on_older_hosts(self):
+        f = self.report["trail"]["lineage"]["fallback"]
+        target = self.report["trail"]["lineage"]["window"]["before"]["link"][0]["jump"]
+        self.assertEqual(f["rests"], [f"/trail/{target}", "/trail?limit=1000"])
+        self._landed(f, target)
+
+    def test_trail_lineage_jump_leaves_server_scope_for_other_tenant_target(self):
+        s = self.report["trail"]["lineage"]["scope"]
+        target = s["original"]
+        self.assertNotIn(target, s["api"]["scoped_ids"])
+        self.assertEqual(s["api"]["filters"]["tenant"], "lineage-b")
+        self.assertEqual(s["before"]["query"]["key"], ["factonio", "trail", 200, "tenant", "lineage-b"])
+        self.assertEqual(s["before"]["tenant"], "lineage-b")
+        self.assertNotIn(target, s["before"]["rows"])
+        a = s["after"]
+        self.assertEqual(a["rests"], [f"/trail/{target}"])
+        self.assertEqual(a["query"]["key"], ["factonio", "trail", 200], "server tenant scope dropped")
+        self.assertEqual(a["trail"]["bar"]["selects"]["tenant"]["value"], "")
+        self.assertEqual(a["trail"]["live"], f"Filters cleared to show {target}.")
+        self._landed(a, target)
+        self.assertEqual(len(a["trail"]["rows"]), 3)
+
+    def test_trail_lineage_jump_missing_target_announces_cleanly(self):
+        m = self.report["trail"]["lineage"]["missing"]
+        self.assertIsNone(m["threw"])
+        self.assertEqual(m["rests"], ["/trail/d_missing00000"])
+        self.assertEqual(m["trail"]["live"], "Could not load decision d_missing00000.")
+        self.assertEqual(m["scroll"], [])
+        self.assertEqual(m["focus"], [])
+        self.assertEqual([r["id"] for r in m["trail"]["rows"]], ["d_dangling0001"])
+        self.assertEqual(m["trail"]["rows"][0]["flash"], "false")
+
+    def test_trail_lineage_jump_drops_stale_lookup(self):
+        r = self.report["trail"]["lineage"]["race"]
+        self.assertEqual(r["rests"], ["/trail/d_orig_a00001", "/trail/d_orig_b00001"])
+        self._landed(r, "d_orig_b00001")
+        self.assertNotIn("d_orig_a00001", [x["id"] for x in r["trail"]["rows"]])
+        self.assertEqual(r["trail"]["live"], "Jumped to d_orig_b00001.")
 
     def test_trail_dashboard_empty_state(self):
         e = self.report["trail"]["dashboard"]["empty"]

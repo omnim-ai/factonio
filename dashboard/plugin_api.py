@@ -191,6 +191,15 @@ def trail(
     return _trail.trail_payload(tenant=tenant, repo=repo, phase=phase, card_id=card_id, limit=limit)
 
 
+@router.get("/trail/{decision_id}")
+def trail_decision(decision_id: str, profile: Optional[str] = Query(None)):
+    """One decision by id, `{decision}`, so lineage links can reach rows outside a `/trail` window."""
+    row = _trail.get_decision(decision_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Decision {decision_id!r} not found.")
+    return {"decision": row}
+
+
 @router.get("/doctor")
 def doctor(profile: Optional[str] = Query(None)):
     """Environment and profile readiness report."""
