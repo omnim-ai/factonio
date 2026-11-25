@@ -71,6 +71,55 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "repos": {},
 }
 
+DEFAULT_STALE_HEARTBEAT_MINUTES = 20
+
+# Per-phase stale thresholds: verification cards are short-lived, design cards legitimately idle longer.
+PHASE_STALE_HEARTBEAT_MINUTES: dict[str, int] = {
+    "verify-diff": 10,
+    "verify-blackbox": 15,
+    "define": 20,
+    "implement": 25,
+    "design": 30,
+}
+
+
+def _positive_minutes(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        return None
+    return minutes if minutes > 0 else None
+
+
+def resolve_stale_heartbeat_minutes(
+    phase: Optional[str],
+    *,
+    stale_heartbeat_minutes: Optional[int] = None,
+    phase_overrides: Optional[Mapping[str, Any]] = None,
+) -> int:
+    """Return the effective stale threshold (minutes) for a card phase.
+
+    - ``phase_overrides[phase]`` (a positive int) wins outright.
+    - Otherwise the phase default applies (``DEFAULT_STALE_HEARTBEAT_MINUTES`` for unknown phases).
+    - A global ``stale_heartbeat_minutes`` above the default acts as a floor; below the default it
+      acts as a cap; ``None`` or exactly the default leaves phase defaults untouched.
+    """
+    key = str(phase or "").strip().lower()
+    if isinstance(phase_overrides, Mapping):
+        override = _positive_minutes(phase_overrides.get(key))
+        if override is not None:
+            return override
+
+    base = PHASE_STALE_HEARTBEAT_MINUTES.get(key, DEFAULT_STALE_HEARTBEAT_MINUTES)
+    configured = _positive_minutes(stale_heartbeat_minutes)
+    if configured is None or configured == DEFAULT_STALE_HEARTBEAT_MINUTES:
+        return base
+    if configured > DEFAULT_STALE_HEARTBEAT_MINUTES:
+        return max(base, configured)
+    return min(base, configured)
+
 
 def get_hermes_home_path() -> Path:
     """Resolve the active HERMES_HOME path via Hermes core."""

@@ -15,7 +15,7 @@ profile_setup.py             Dedicated headless `factonio` profile initializer a
 repos.py                     GitHub repo registration, validation, exact-HEAD PR gate, and squash-merge helpers
 trail.py                     Append-only SQLite decision trail (`trail.db`: WAL, schema_meta, immutability triggers)
 metrics.py                   Read-only SQLite queries over `kanban.db` (phase timings, pass rates, rework, escapes, enriched cards)
-watchdog.py                  In-process `on_kanban_dispatch_tick` stall/triage detector with throttling and deduplication
+watchdog.py                  In-process `on_kanban_dispatch_tick` PID/side-effect liveness, phase-aware stall detection, bounded triage
 dashboard/
   manifest.json              Hermes Dashboard API discovery manifest
   plugin_api.py              FastAPI router mounted at `/api/plugins/factonio/*`
@@ -35,6 +35,8 @@ tests/
   test_orchestrator_and_repos.py
   test_cli_and_tools.py
   test_watchdog_metrics_api.py
+  test_watchdog_liveness.py   PID/side-effect liveness, phase thresholds, bounded triage
+  test_worktree_audit.py     Real-git worktree safety buckets, --prune-safe, `worktrees` CLI
   test_trail.py              trail.db store, transition hooks, CLI/API/tool, retro, cross-vendor warning
   test_desktop_plugin.py     Node ESM smoke tests + Desktop SDK surface lint (59 tests)
 tools/
