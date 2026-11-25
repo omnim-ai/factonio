@@ -320,6 +320,97 @@ class TestWorktreeAudit(unittest.TestCase):
             self.assertEqual(_worktree_paths(paths["main"]), before)
             self.assertTrue((paths["scratch"] / "__pycache__").is_dir())
 
+    def test_audit_does_not_rewrite_worktree_index(self):
+        with isolated_hermes_home() as home:
+            paths = _build_fixture(home)
+            wt = paths["merged"]
+            index = Path(_git(wt, "rev-parse", "--absolute-git-dir").strip()) / "index"
+            # Stat-only change to a tracked file: plain `git status` would refresh and rewrite the index.
+            tracked = wt / "merged.txt"
+            st = tracked.stat()
+            os.utime(tracked, ns=(st.st_atime_ns, st.st_mtime_ns - 3_600_000_000_000))
+            old = index.stat().st_mtime_ns - 7_200_000_000_000
+            os.utime(index, ns=(old, old))
+            before = (index.read_bytes(), index.stat().st_mtime_ns)
+            res = self._audit(paths, check_pr=False)
+            by_name = {Path(w["path"]).name: w for w in res["worktrees"]}
+            self.assertEqual(by_name["merged"]["dirty"], "clean")
+            self.assertEqual((index.read_bytes(), index.stat().st_mtime_ns), before)
+
+    def _prune_with_post_audit_hook(self, paths, hook):
+        from factonio import repos
+
+        real_audit = repos.audit_worktrees
+
+        def audit_then_hook(*args: Any, **kw: Any) -> dict[str, Any]:
+            out = real_audit(*args, **kw)
+            hook()
+            return out
+
+        with mock.patch.object(repos, "_run_gh", side_effect=_gh_ok), \
+                mock.patch.object(repos, "audit_worktrees", side_effect=audit_then_hook):
+            return repos.prune_safe_worktrees(str(paths["main"]))
+
+    def test_prune_holds_worktree_claimed_by_active_card_after_audit(self):
+        from hermes_cli.kanban_db_connect import connect_closing
+
+        with isolated_hermes_home() as home:
+            paths = _build_fixture(home)
+            db = home / "kanban.db"
+            _seed_cards(db, paths)
+            self.assertEqual(
+                {Path(w["path"]).name: w for w in self._audit(paths)["worktrees"]}["merged"]["bucket"], "safe"
+            )
+
+            def claim() -> None:
+                with connect_closing(db_path=db) as conn:
+                    conn.execute(
+                        "INSERT INTO tasks (id, title, assignee, status, workspace_path, branch_name, created_at)"
+                        " VALUES ('t_late', 't_late', 'factonio', 'running', ?, NULL, 0)",
+                        (str(paths["merged"]),),
+                    )
+                    conn.commit()
+
+            res = self._prune_with_post_audit_hook(paths, claim)
+            removed = {Path(r["path"]).name for r in res["removed"]}
+            held = {Path(h["path"]).name: h for h in res["held"]}
+            self.assertNotIn("merged", removed)
+            self.assertTrue(paths["merged"].is_dir())
+            self.assertIn(str(paths["merged"]), _worktree_paths(paths["main"]))
+            self.assertEqual(held["merged"]["bucket"], "hold-active-card")
+            self.assertIn("t_late", held["merged"]["hold_reason"])
+            # Unclaimed safe worktrees are still pruned.
+            self.assertIn("scratch", removed)
+
+    def test_prune_fails_closed_when_kanban_db_unreadable_before_removal(self):
+        with isolated_hermes_home() as home:
+            paths = _build_fixture(home)
+            db = home / "kanban.db"
+            _seed_cards(db, paths)
+
+            def corrupt() -> None:
+                for suffix in ("-wal", "-shm"):
+                    Path(f"{db}{suffix}").unlink(missing_ok=True)
+                db.write_bytes(b"this is not a sqlite database" * 64)
+
+            res = self._prune_with_post_audit_hook(paths, corrupt)
+            self.assertEqual(res["removed"], [])
+            self.assertFalse(res["ok"])
+            held = {Path(h["path"]).name: h for h in res["held"]}
+            for name in ("merged", "scratch", "closed", "donecard"):
+                self.assertTrue(paths[name].is_dir(), name)
+                self.assertEqual(held[name]["bucket"], "hold-active-card", held[name])
+                self.assertIn("could not be verified", held[name]["hold_reason"])
+
+    def test_prune_holds_worktree_whose_head_moved_after_audit(self):
+        with isolated_hermes_home() as home:
+            paths = _build_fixture(home)
+            res = self._prune_with_post_audit_hook(paths, lambda: _commit(paths["merged"], "late.txt"))
+            held = {Path(h["path"]).name: h for h in res["held"]}
+            self.assertTrue((paths["merged"] / "late.txt").is_file())
+            self.assertEqual(held["merged"]["bucket"], "review")
+            self.assertIn("changed since audit", held["merged"]["hold_reason"])
+
     def test_prune_safe_only_removes_safe(self):
         from factonio import repos
 

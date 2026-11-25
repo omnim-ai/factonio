@@ -720,6 +720,11 @@ def _run_git(
     )
 
 
+def _run_git_ro(args: list[str], *, cwd: Path, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    """Read-only git probe: never refresh/rewrite the index or take optional locks."""
+    return _run_git(["--no-optional-locks", *args], cwd=cwd, timeout=timeout)
+
+
 def _git_err(proc: subprocess.CompletedProcess[str], what: str) -> str:
     detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
     return f"git {what} failed: {detail}"
@@ -1142,9 +1147,7 @@ def _dirty_inventory(wt_path: Path) -> dict[str, Any]:
     ``wip:N`` counts tracked edits plus ignored files outside the regenerable allowlist;
     ``scratch:N`` counts untracked (non-ignored) files when nothing protected exists.
     """
-    proc = _run_git(
-        ["status", "--porcelain=v1", "-z", "--ignored=matching", "--untracked-files=all"], cwd=wt_path
-    )
+    proc = _run_git_ro(["status", "--porcelain=v1", "-z", "--ignored=matching", "--untracked-files=all"], cwd=wt_path)
     if proc.returncode != 0:
         # Unknown state must never look prunable.
         return {"dirty": "wip:?", "tracked": [], "ignored_data": [], "scratch": [], "hold_reason": "git status failed"}
@@ -1184,15 +1187,15 @@ def _dirty_inventory(wt_path: Path) -> dict[str, Any]:
 def _classify_remote(wt_path: Path, branch: Optional[str]) -> str:
     if not branch:
         return "detached"
-    upstream = _run_git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], cwd=wt_path)
+    upstream = _run_git_ro(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], cwd=wt_path)
     remote_ref = upstream.stdout.strip() if upstream.returncode == 0 else ""
     if not remote_ref:
         candidate = f"refs/remotes/origin/{branch}"
-        if _run_git(["rev-parse", "--verify", "--quiet", candidate], cwd=wt_path).returncode == 0:
+        if _run_git_ro(["rev-parse", "--verify", "--quiet", candidate], cwd=wt_path).returncode == 0:
             remote_ref = candidate
     if not remote_ref:
         return "no-remote"
-    ahead = _run_git(["rev-list", "--count", f"{remote_ref}..HEAD"], cwd=wt_path)
+    ahead = _run_git_ro(["rev-list", "--count", f"{remote_ref}..HEAD"], cwd=wt_path)
     if ahead.returncode != 0 or not ahead.stdout.strip().isdigit():
         return "no-remote"
     count = int(ahead.stdout.strip())
@@ -1201,10 +1204,10 @@ def _classify_remote(wt_path: Path, branch: Optional[str]) -> str:
 
 def _worktree_age_days(wt_path: Path, now_ts: float) -> Optional[float]:
     stamps: list[float] = []
-    ct = _run_git(["log", "-1", "--format=%ct"], cwd=wt_path)
+    ct = _run_git_ro(["log", "-1", "--format=%ct"], cwd=wt_path)
     if ct.returncode == 0 and ct.stdout.strip().isdigit():
         stamps.append(float(ct.stdout.strip()))
-    git_dir = _run_git(["rev-parse", "--absolute-git-dir"], cwd=wt_path)
+    git_dir = _run_git_ro(["rev-parse", "--absolute-git-dir"], cwd=wt_path)
     if git_dir.returncode == 0 and git_dir.stdout.strip():
         try:
             stamps.append((Path(git_dir.stdout.strip()) / "index").stat().st_mtime)
@@ -1233,29 +1236,37 @@ def _default_kanban_db_path() -> Optional[Path]:
         return None
 
 
-def _active_cards(kanban_db_path: Optional[Path]) -> list[dict[str, Any]]:
-    """Read-only list of non-terminal Kanban cards with their workspace path / branch."""
+def _resolve_kanban_db(kanban_db_path: Optional[str | Path]) -> Optional[Path]:
+    return Path(kanban_db_path) if kanban_db_path else _default_kanban_db_path()
+
+
+def _query_active_cards(kanban_db_path: Optional[Path]) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Read-only list of non-terminal Kanban cards plus an error when an existing DB cannot be verified."""
     if kanban_db_path is None or not Path(kanban_db_path).is_file():
-        return []
+        return [], None
     try:
         conn = sqlite3.connect(f"file:{Path(kanban_db_path)}?mode=ro", uri=True, timeout=3.0)
-    except sqlite3.Error:
-        return []
+    except sqlite3.Error as exc:
+        return [], f"cannot open {kanban_db_path}: {exc}"
     conn.row_factory = sqlite3.Row
     try:
         with closing(conn):
             cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
             if not {"id", "status"} <= cols:
-                return []
+                return [], f"{kanban_db_path} has no tasks(id, status) table"
             select = ", ".join(c if c in cols else f"NULL AS {c}" for c in ("id", "status", "workspace_path", "branch_name"))
             placeholders = ", ".join("?" for _ in _INACTIVE_CARD_STATUSES)
             rows = conn.execute(
                 f"SELECT {select} FROM tasks WHERE status NOT IN ({placeholders})",
                 _INACTIVE_CARD_STATUSES,
             ).fetchall()
-            return [dict(r) for r in rows]
-    except sqlite3.Error:
-        return []
+            return [dict(r) for r in rows], None
+    except sqlite3.Error as exc:
+        return [], f"cannot query {kanban_db_path}: {exc}"
+
+
+def _active_cards(kanban_db_path: Optional[Path]) -> list[dict[str, Any]]:
+    return _query_active_cards(kanban_db_path)[0]
 
 
 def _match_active_card(cards: list[dict[str, Any]], wt_path: Path, branch: Optional[str]) -> Optional[dict[str, Any]]:
@@ -1312,17 +1323,17 @@ def _list_prs_by_branch(full_repo: Optional[str]) -> tuple[dict[str, dict[str, A
 def _resolve_base_ref(main_path: Path, default_branch: str, base_ref: Optional[str]) -> Optional[str]:
     if base_ref:
         ref = _validate_git_ref(base_ref, "base_ref")
-        if _run_git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], cwd=main_path).returncode == 0:
+        if _run_git_ro(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], cwd=main_path).returncode == 0:
             return ref
         raise ValueError(f"base_ref {ref!r} does not resolve to a commit in {main_path}")
     for candidate in (f"origin/{default_branch}", default_branch):
-        if _run_git(["rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"], cwd=main_path).returncode == 0:
+        if _run_git_ro(["rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"], cwd=main_path).returncode == 0:
             return candidate
     return None
 
 
 def _origin_full_repo(main_path: Path) -> Optional[str]:
-    proc = _run_git(["remote", "get-url", "origin"], cwd=main_path)
+    proc = _run_git_ro(["remote", "get-url", "origin"], cwd=main_path)
     if proc.returncode != 0 or not proc.stdout.strip():
         return None
     try:
@@ -1386,7 +1397,7 @@ def _audit_one_repo(
     if not main_path.is_dir():
         result["error"] = f"local checkout not found: {main_path}"
         return result
-    listing = _run_git(["worktree", "list", "--porcelain"], cwd=main_path)
+    listing = _run_git_ro(["worktree", "list", "--porcelain"], cwd=main_path)
     if listing.returncode != 0:
         result["error"] = _git_err(listing, "worktree list")
         return result
@@ -1429,7 +1440,7 @@ def _audit_one_repo(
 
         merged: Optional[bool] = None
         if resolved_base and head_sha:
-            probe = _run_git(["merge-base", "--is-ancestor", head_sha, resolved_base], cwd=main_path)
+            probe = _run_git_ro(["merge-base", "--is-ancestor", head_sha, resolved_base], cwd=main_path)
             merged = True if probe.returncode == 0 else (False if probe.returncode == 1 else None)
         entry["merged"] = merged
         inventory = _dirty_inventory(wt_path) if exists else {"dirty": "clean", "hold_reason": ""}
@@ -1473,8 +1484,7 @@ def audit_worktrees(
     ``hold-wip`` > ``hold-active-card`` > ``hold-open-pr`` > ``safe`` > ``review``.
     """
     targets = _resolve_audit_targets(repo_spec)
-    db_path = Path(kanban_db_path) if kanban_db_path else _default_kanban_db_path()
-    cards = _active_cards(db_path)
+    cards = _active_cards(_resolve_kanban_db(kanban_db_path))
     now_ts = time.time()
 
     repos_out = [
@@ -1515,7 +1525,7 @@ def _is_linked_worktree_of(wt_path: Path, main_path: Path) -> bool:
     admin = Path(text[len("gitdir:"):].strip())
     if not admin.is_absolute():
         admin = (wt_path / admin)
-    common = _run_git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=main_path)
+    common = _run_git_ro(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=main_path)
     if common.returncode != 0 or not common.stdout.strip():
         return False
     worktrees_root = Path(common.stdout.strip()).resolve() / "worktrees"
@@ -1524,6 +1534,40 @@ def _is_linked_worktree_of(wt_path: Path, main_path: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _recheck_before_removal(
+    wt: dict[str, Any], wt_path: Path, main_path: Path, db_path: Optional[Path]
+) -> tuple[Optional[tuple[str, str]], list[str], Optional[str]]:
+    """Re-verify a ``safe`` candidate immediately before deletion.
+
+    Returns ``(hold, dropped_scratch, kanban_error)`` where ``hold`` is ``(bucket, reason)``
+    when the worktree must be kept. Kanban ownership fails closed.
+    """
+    listing = _run_git_ro(["worktree", "list", "--porcelain"], cwd=main_path)
+    if listing.returncode != 0:
+        return ("review", f"worktree changed since audit: {_git_err(listing, 'worktree list')}"), [], None
+    current = next((e for e in _parse_worktree_porcelain(listing.stdout) if e.get("path") == wt["path"]), None)
+    if current is None:
+        return ("review", "worktree changed since audit: no longer registered"), [], None
+    if current.get("branch") != wt["branch"] or current.get("head_sha") != wt["head_sha"]:
+        return ("review", "worktree changed since audit: branch or HEAD moved"), [], None
+
+    dropped_scratch: list[str] = []
+    if wt_path.is_dir():
+        fresh = _dirty_inventory(wt_path)
+        if str(fresh["dirty"]).startswith("wip:"):
+            return ("hold-wip", f"work appeared before removal: {fresh['hold_reason']}"), [], None
+        dropped_scratch = list(fresh["scratch"])
+
+    cards, err = _query_active_cards(db_path)
+    if err:
+        return ("hold-active-card", f"active-card ownership could not be verified (fail closed): {err}"), [], err
+    card = _match_active_card(cards, wt_path, wt["branch"])
+    if card:
+        status = card.get("status") or "active"
+        return ("hold-active-card", f"active card {card.get('id')} ({status}) claimed worktree before removal"), [], None
+    return None, dropped_scratch, None
 
 
 def prune_safe_worktrees(
@@ -1535,6 +1579,8 @@ def prune_safe_worktrees(
 ) -> dict[str, Any]:
     """Remove ONLY ``bucket == "safe"`` worktrees; every held/review worktree is left untouched."""
     audit = audit_worktrees(repo_spec, base_ref=base_ref, kanban_db_path=kanban_db_path, check_pr=check_pr)
+    db_path = _resolve_kanban_db(kanban_db_path)
+    kanban_errors: list[str] = []
     removed: list[dict[str, Any]] = []
     held: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -1550,18 +1596,16 @@ def prune_safe_worktrees(
                 })
                 continue
             wt_path = Path(wt["path"])
-            # Re-check right before deleting: work may have appeared since the audit.
-            dropped_scratch: list[str] = []
-            if wt_path.is_dir():
-                fresh = _dirty_inventory(wt_path)
-                if str(fresh["dirty"]).startswith("wip:"):
-                    held.append({
-                        "path": wt["path"], "branch": wt["branch"], "bucket": "hold-wip",
-                        "hold_reason": f"work appeared before removal: {fresh['hold_reason']}",
-                        "size_bytes": wt["size_bytes"],
-                    })
-                    continue
-                dropped_scratch = list(fresh["scratch"])
+            # Re-check right before deleting: work, HEAD moves or a card claim may have happened since the audit.
+            hold, dropped_scratch, kanban_error = _recheck_before_removal(wt, wt_path, main_path, db_path)
+            if kanban_error and kanban_error not in kanban_errors:
+                kanban_errors.append(kanban_error)
+            if hold is not None:
+                held.append({
+                    "path": wt["path"], "branch": wt["branch"], "bucket": hold[0],
+                    "hold_reason": hold[1], "size_bytes": wt["size_bytes"],
+                })
+                continue
             touched = True
             proc = _run_git(["worktree", "remove", "--force", str(wt_path)], cwd=main_path, timeout=120)
             note = "git worktree remove"
@@ -1581,10 +1625,11 @@ def prune_safe_worktrees(
 
     reclaimed = sum(int(r["size_bytes"]) for r in removed)
     return {
-        "ok": audit["ok"] and not errors,
+        "ok": audit["ok"] and not errors and not kanban_errors,
         "removed": removed,
         "held": held,
         "errors": errors,
+        "kanban_errors": kanban_errors,
         "reclaimed_bytes": reclaimed,
         "reclaimed_human": _human_size(reclaimed),
         "audit": audit["summary"],
