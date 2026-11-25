@@ -23,6 +23,8 @@ from .repos import (
     inspect_pr_gate,
     prune_safe_worktrees,
     remove_repo,
+    restack_pr,
+    restack_stack,
     update_repo,
 )
 from .trail import render_trail_markdown, render_trail_text, trail_payload
@@ -121,6 +123,27 @@ def _print_harness(action: str, res: dict[str, Any]) -> None:
         print(f"  -> {rec}")
 
 
+def _print_restack_one(r: dict[str, Any]) -> None:
+    if r.get("conflict"):
+        verdict = "CONFLICT"
+    elif not r.get("ok"):
+        verdict = "ERROR"
+    else:
+        verdict = "CONTINUOUS" if r.get("verdict_continuous") else "REVERIFY"
+    old = str(r.get("old_head_sha") or "?")[:10]
+    new = str(r.get("new_head_sha") or "-")[:10]
+    print(
+        f"{verdict}: {r.get('repo')}#{r.get('pr_number')} {r.get('old_base_branch')} -> {r.get('target_base')}"
+        f" head {old} -> {new} ({r.get('rebase_mode') or 'n/a'}, old base via {r.get('old_base_source') or 'n/a'})"
+    )
+    print(f"  patch-id before={r.get('before_patch_id')} after={r.get('after_patch_id')}")
+    print(f"  pushed={r.get('pushed')} retargeted={r.get('retargeted')} dry_run={r.get('dry_run')}")
+    if r.get("conflict_files"):
+        print(f"  Conflicting files: {', '.join(r['conflict_files'])}")
+    if r.get("error"):
+        print(f"  Error: {r['error']}")
+
+
 def register_cli(ctx: Any, plugin_dir: Path) -> None:
     """Register `hermes factonio <subcommand>`."""
 
@@ -183,6 +206,27 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         p_pr.add_argument("repo", help="Repo slug or 'owner/repo'.")
         p_pr.add_argument("pr_number", type=int, help="Pull request number.")
 
+        p_rs = sub.add_parser(
+            "restack",
+            help="Rebase a stacked PR (or every child of a parent) onto its new base with patch-id continuity.",
+        )
+        p_rs.add_argument("repo", help="Repo slug or 'owner/repo'.")
+        p_rs.add_argument("pr_number", type=int, nargs="?", default=None, help="Child PR (omit to restack all children).")
+        p_rs.add_argument("--parent-pr", type=int, default=None, help="Parent PR whose head was the old base.")
+        p_rs.add_argument("--from-branch", default=None, help="Restack all open PRs targeting this branch.")
+        p_rs.add_argument("--new-base", default=None, help="New base branch (default: parent's base or repo default).")
+        p_rs.add_argument("--old-base-sha", default=None, help="Commit the PR was stacked on (overrides --parent-pr).")
+        p_rs.add_argument("--verified-sha", default=None, help="HEAD the existing verdict was given on.")
+        p_rs.add_argument("--no-push", action="store_true", help="Do not push the rebased head.")
+        p_rs.add_argument("--no-retarget", action="store_true", help="Do not retarget the PR base via gh pr edit.")
+        p_rs.add_argument("--dry-run", action="store_true", help="Rebase and compare patch-ids only; no push/retarget.")
+        p_rs.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Output machine-readable JSON.",
+        )
+
         p_wt = sub.add_parser(
             "worktrees",
             help="Audit git worktrees into safety buckets (read-only unless --prune-safe).",
@@ -240,7 +284,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         as_json = bool(getattr(args, "json", False))
 
         if not cmd:
-            print("Usage: hermes factonio {init|add|update|remove|list|models|status|pr-gate|worktrees|harness|trail|doctor} [--json]")
+            print("Usage: hermes factonio {init|add|update|remove|list|models|status|pr-gate|restack|worktrees|harness|trail|doctor} [--json]")
             return
 
         if cmd == "init":
@@ -400,6 +444,43 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                 sys.exit(1)
             return
 
+        if cmd == "restack":
+            common = {
+                "new_base": args.new_base,
+                "old_base_sha": args.old_base_sha,
+                "verified_head_sha": args.verified_sha,
+                "push": not args.no_push,
+                "retarget": not args.no_retarget,
+                "dry_run": bool(args.dry_run),
+                "actor": "cli",
+            }
+            try:
+                if args.pr_number is not None:
+                    res = restack_pr(args.repo, args.pr_number, parent_pr=args.parent_pr, **common)
+                elif args.parent_pr is None and not args.from_branch:
+                    raise ValueError("pass a pr_number, --parent-pr, or --from-branch")
+                else:
+                    res = restack_stack(args.repo, parent_pr=args.parent_pr, from_branch=args.from_branch, **common)
+            except (RepoNotFoundError, ValueError) as exc:
+                if as_json:
+                    print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+                else:
+                    print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            if as_json:
+                print(json.dumps(res, indent=2, default=str))
+            elif "results" in res:
+                print(f"Restack children of {res.get('from_branch')} -> {res.get('new_base') or '(default)'}: {len(res['results'])} PR(s)")
+                if res.get("error"):
+                    print(f"  Error: {res['error']}")
+                for item in res["results"]:
+                    _print_restack_one(item)
+            else:
+                _print_restack_one(res)
+            if not res.get("ok"):
+                sys.exit(1)
+            return
+
         if cmd == "worktrees":
             try:
                 if getattr(args, "prune_safe", False):
@@ -486,7 +567,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
 
     ctx.register_cli_command(
         "factonio",
-        help="Manage the Factonio pure-Hermes software factory (init, add, update, models, status, worktrees, harness, trail, doctor).",
+        help="Manage the Factonio pure-Hermes software factory (init, add, update, models, status, restack, worktrees, harness, trail, doctor).",
         setup_fn=setup_parser,
         handler_fn=handle_cli,
     )

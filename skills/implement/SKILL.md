@@ -43,13 +43,21 @@ Before committing, reread your own diff (`git diff origin/<default_branch>...HEA
 - **Behavioral tests:** tests assert observable behavior (return values, state transitions, CLI exit codes, API responses), not that an internal helper was merely called.
 - **Small verifiable commits:** each commit builds and passes tests on its own and does one thing; separate mechanical moves/renames from behavior changes.
 
+### 2c. Stacked Units
+
+When the card lists `Target base branch` (and usually `Stack parent PR`), this unit stacks on a parent PR's branch instead of the default branch. Use that branch as `<base>` everywhere the steps below say `<default_branch>`:
+
+- `git fetch origin <base>` and diff/rebase against `origin/<base>...HEAD` so the PR contains only this unit's commits.
+- Open the PR with `gh pr create --base <base>`; never target the default branch for a stacked unit.
+- Do not restack after the parent merges yourself; the orchestrator runs `factonio_restack_pr`, which reports whether earlier verdicts still apply.
+
 ### 3. Publish or Update the Pull Request
 
 1. Stage and commit only intended files with a clear commit message.
 2. Push the branch: `git push -u origin HEAD`.
 3. Create a PR if none exists yet, using the PR briefing template below:
    ```bash
-   gh pr create --repo <owner/repo> --base <default_branch> --title "<concise title>" --body-file <briefing.md>
+   gh pr create --repo <owner/repo> --base <default_branch or Target base branch> --title "<concise title>" --body-file <briefing.md>
    ```
    If updating an existing PR for a fix round, push the fix commits to the same branch and leave a brief comment summarizing what changed.
 4. Capture the live PR number, URL, and `head_sha` via `factonio_pr_gate(repo, pr_number)`.

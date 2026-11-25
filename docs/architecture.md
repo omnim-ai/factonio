@@ -33,6 +33,7 @@ Every card spawned by Factonio automatically subscribes the calling chat session
 - Each independent unit from the spec DAG runs in its own isolated git worktree anchored to a Hermes Project (`<repo-slug>`).
 - Workers read `spec.md` and approved `design/` artifacts only — `holdout/` paths are stripped from Implementation card briefs.
 - Workers implement changes, run repository tests, push a branch, and open a GitHub PR with its `head_sha`.
+- **Stacked units:** `factonio_spawn_implement(base_branch=..., stack_parent_pr=...)` targets a parent PR's branch instead of the default branch. When the base resolves locally (`refs/heads/<base>` or `refs/remotes/origin/<base>`), `seed_stacked_branch` creates `<project>/stack-<id>` at that tip without touching any checkout and passes it as the card's `branch_name`, so Hermes's worktree dispatcher checks it out as-is. The card body carries `Target base branch` / `Stack parent PR` and tells the worker to diff against `origin/<base>...HEAD` and open the PR with `gh pr create --base <base>`. Unstacked cards are unchanged.
 
 ### Phase 3 — Isolated Parallel Verification (`factonio:verify-diff` + `factonio:verify-blackbox`)
 
@@ -68,7 +69,23 @@ Before merging or reporting a PR ready:
 4. On `merge_policy: auto`, the PR is squash-merged and its branch deleted; on `merge_policy: ask`, the orchestrator presents verification results and waits for human approval.
 5. After `gh pr merge` exits 0, `factonio_merge_pr` reads the PR back (`state,mergedAt,baseRefName`). Only a confirmed `MERGED` state reports `merged: true`; merge-queue / auto-merge PRs report `merged: false, queued: true`; a PR closed without merging is an error. On a confirmed merge the registered checkout's default branch is fast-forwarded when safe (`local_synced`, `local_sync_note`): a dirty working tree, a diverged branch, or a branch checked out in another worktree is never touched, and a skipped sync never fails the merge.
 
-`repos.py` also provides pure-Python git helpers for verdict continuity: `compute_patch_id` / `verify_patch_continuity` (stable `git patch-id` comparison, so a verified patch survives a mechanical rebase) and `assess_trunk_drift` (files changed on `origin/<default_branch>` vs. the PR since their merge-base).
+The gate reports the PR's true `base_branch` (`baseRefName`) alongside the repository's `default_branch` (`defaultBranchRef`) and `is_stacked`. `factonio_merge_pr` fast-forwards the PR's true base locally (so merging a child into its parent branch syncs the parent, not `main`) and accepts `delete_branch: false` to keep a parent branch alive while children still target it.
+
+#### Restacking stacked PRs
+
+When a parent PR lands, `restack_pr` / `factonio_restack_pr` / `hermes factonio restack` move each child onto the new base without touching the registered checkout:
+
+1. Read the live child PR (must be `OPEN`), fetch `<remote>/<new_base>` and the child head (falling back to `refs/pull/<n>/head`).
+2. Resolve the commit the child was stacked on: explicit `old_base_sha`, else the parent PR's `headRefOid` (`gh pr view`, fetching `refs/pull/<parent>/head` if needed), else `<remote>/<old base branch>`.
+3. Compute the before patch-id (`git diff <old_base>...<head> | git patch-id --stable`).
+4. In a throwaway `git worktree add --detach`, run `git rebase --onto <remote>/<new_base> <old_base>` (plain `git rebase` only when no old base is known). `--onto` replays only the child's own commits, so a squash-merged and deleted parent restacks cleanly. A conflict runs `git rebase --abort` and returns `conflict: true` with `conflict_files`.
+5. Compute the after patch-id against `<remote>/<new_base>`: identical ids mean `verdict_continuous: true` (earlier Diff/Black-Box verdicts carry over); otherwise `reverify_required: true`.
+6. Unless `dry_run`, push with `--force-with-lease=refs/heads/<head>:<old_head>` (refusing if someone else pushed) and retarget with `gh pr edit --base <new_base>`.
+7. Log `restack_pr` (`continuous` / `reverify_required` / `conflict` / `error`) to `trail.db`; the temporary worktree is removed and pruned in every case.
+
+`restack_stack(parent_pr=...)` lists open PRs whose base is the parent's head branch and restacks each onto the parent's base. `inspect_pr_patch_id` reports a live PR's patch-id against its true base.
+
+`repos.py` also provides pure-Python git helpers for verdict continuity: `compute_patch_id` / `verify_patch_continuity` (stable `git patch-id` comparison, so a verified patch survives a mechanical rebase) and `assess_trunk_drift` (files changed on `origin/<base_branch or default_branch>` vs. the PR since their merge-base).
 
 ### Tri-state verification verdicts
 

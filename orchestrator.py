@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -459,10 +460,24 @@ def spawn_implementation_card(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     idempotency_key: Optional[str] = None,
+    base_branch: Optional[str] = None,
+    stack_parent_pr: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Create one scoped Implementation worktree card (never exposes holdout/)."""
+    """Create one scoped Implementation worktree card (never exposes holdout/).
+
+    ``base_branch`` (default: the repo's default branch) and ``stack_parent_pr`` make it a stacked
+    card: a local branch is pre-seeded at the base tip when resolvable so the dispatcher's worktree
+    starts on the parent, and the body instructs the worker to open the PR with ``--base``.
+    """
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
+
+    from .repos import _validate_default_branch, _validate_pr_number, seed_stacked_branch
+
+    if base_branch is not None:
+        base_branch = _validate_default_branch(base_branch)
+    if stack_parent_pr is not None:
+        stack_parent_pr = _validate_pr_number(stack_parent_pr, "stack_parent_pr")
 
     repo = get_repo(repo_spec)
     if repo is None:
@@ -478,6 +493,23 @@ def spawn_implementation_card(
     contract = _completion_contract_for_repo(repo)
     design_line = f"- Approved Design directory: `{design_dir}` (treat `DESIGN.md` and previews as binding UI acceptance)\n" if design_dir else ""
     design_barrier_note = f" and `{design_dir}`" if design_dir else ""
+    default_branch = str(repo.get("default_branch") or "main")
+    target_base = base_branch or default_branch
+    is_stacked = bool(stack_parent_pr is not None or target_base != default_branch)
+
+    stack_lines = ""
+    stack_section = ""
+    if is_stacked:
+        stack_lines = f"- Target base branch: `{target_base}`\n"
+        if stack_parent_pr is not None:
+            stack_lines += f"- Stack parent PR: `{full_repo}#{stack_parent_pr}`\n"
+        stack_section = (
+            f"\n## Stacked PR\n"
+            f"This unit stacks on `{target_base}`, not `{default_branch}`. Run `git fetch origin {target_base}`, "
+            f"rebase onto and diff against `origin/{target_base}...HEAD`, and open the PR with "
+            f"`gh pr create --base {target_base}`. After the parent lands, the orchestrator restacks this PR "
+            f"with `factonio_restack_pr`.\n"
+        )
 
     body = (
         f"## Factonio Implementation Card\n"
@@ -486,11 +518,22 @@ def spawn_implementation_card(
         f"- Spec: `{spec_path}`\n"
         f"{design_line}"
         f"- Default branch: `{repo.get('default_branch', 'main')}`\n"
+        f"{stack_lines}"
         f"- Max fix rounds: `{repo.get('max_fix_rounds', 3)}`\n\n"
-        f"## Work Unit\n{unit_body.strip()}\n\n"
+        f"## Work Unit\n{unit_body.strip()}\n"
+        f"{stack_section}\n"
         f"## Information Barrier\n"
         f"Read only the repository, `{spec_path}`{design_barrier_note}. Do not search for or read any `holdout/` files.\n"
     )
+
+    seed: Optional[dict[str, Any]] = None
+    branch_kwargs: dict[str, Any] = {}
+    if is_stacked and target_base != default_branch:
+        candidate = f"{project_slug}/stack-{uuid.uuid4().hex[:8]}"
+        seed = seed_stacked_branch(repo_path, target_base, candidate)
+        if seed.get("ok"):
+            branch_kwargs["branch_name"] = candidate
+    branch_seeded = bool(branch_kwargs)
 
     effective_session_id = _resolve_calling_session_id(session_id)
     with connect_closing(board=board) as conn:
@@ -513,6 +556,7 @@ def spawn_implementation_card(
             session_id=effective_session_id,
             board=board,
             completion_contract=contract,
+            **branch_kwargs,
         )
         subscribed = _auto_subscribe_task(conn, task_id, session_id=effective_session_id)
 
@@ -523,7 +567,17 @@ def spawn_implementation_card(
         phase="implement",
         card_id=task_id,
         why=unit_title.strip(),
-        evidence={"parents": list(parents or []), "design_linked": bool(design_dir), "completion_contract": contract},
+        evidence={
+            "parents": list(parents or []),
+            "design_linked": bool(design_dir),
+            "completion_contract": contract,
+            "base_branch": target_base,
+            "is_stacked": is_stacked,
+            "stack_parent_pr": stack_parent_pr,
+            "branch_seeded": branch_seeded,
+            "branch_name": branch_kwargs.get("branch_name"),
+            "seed_reason": (seed or {}).get("reason"),
+        },
         result="spawned",
     )
 
@@ -536,6 +590,11 @@ def spawn_implementation_card(
         "model": model_info["resolved"],
         "completion_contract": contract,
         "subscribed": subscribed,
+        "base_branch": target_base,
+        "is_stacked": is_stacked,
+        "stack_parent_pr": stack_parent_pr,
+        "branch_seeded": branch_seeded,
+        "branch_name": branch_kwargs.get("branch_name"),
     }
 
 
