@@ -95,7 +95,7 @@ Writes acquire an in-process re-entrant thread lock plus an exclusive POSIX `fcn
 ## Watchdog, metrics, and Dashboard API
 
 - **Tick Watchdog (`watchdog.py`):** Hooks `on_kanban_dispatch_tick` (throttled by `watchdog_interval_minutes`, default `5`). Flags running cards silent beyond `stale_heartbeat_minutes` (default `20`), `needs_input` cards blocked beyond `blocked_reminder_minutes` (default `45`), and `triage` cards, deduplicating alerts via plugin state.
-- **Metrics (`metrics.py`):** Queries `kanban.db` read-only (`?mode=ro`) to compute workstream totals, per-phase median/P90 durations, Diff vs Black-Box pass rates, rework rate (`avg_runs_per_implement_card`), and post-merge escape rate (`escaped_from` cards).
+- **Metrics (`metrics.py`):** Queries `kanban.db` read-only (`?mode=ro`) to compute workstream totals, per-phase median/P90 durations, Diff vs Black-Box pass rates, rework rate (`avg_runs_per_implement_card`), and post-merge escape rate (`escaped_from` cards), plus trail decision counts from `trail.db`.
 - **Dashboard API (`dashboard/plugin_api.py`):** Mounted at `/api/plugins/factonio/`:
   - `GET /status` — active/blocked counts, repo count, phase models, cross-model warning
   - `GET /repos` — registered repositories with explicit overrides, effective inherited settings, and global defaults
@@ -103,4 +103,14 @@ Writes acquire an in-process re-entrant thread lock plus an exclusive POSIX `fcn
   - `GET /models` — resolved per-phase provider/model matrix
   - `GET /metrics?range=7d|30d|90d|all` — factory KPIs and phase timing percentiles
   - `GET /cards?session_id=...&tenant=...` — enriched Kanban cards for the right-sidebar Factonio tab
+  - `GET /trail?tenant=&repo=&phase=&card_id=&limit=100` — append-only decision trail as `{decisions, summary, filters}`; each decision carries parsed `evidence`, `superseded_by`, and `is_superseded`
   - `GET /doctor` — environment and worker profile readiness checks
+
+## Decision trail (`trail.db`)
+
+`trail.py` owns `<root HERMES_HOME>/plugin-data/factonio/trail.db`, Factonio's own SQLite store (`journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`). `schema_meta` records `schema_version = "1"` so future metrics tables can live here without writing to Hermes's fenced `kanban.db`.
+
+- **Append-only:** the `decisions` table (`id`, `ts`, `tenant`, `repo_slug`, `phase`, `card_id`, `actor`, `decision`, `why`, `evidence_json`, `result`, `supersedes_id`) has `trg_decisions_no_update` / `trg_decisions_no_delete` triggers that abort any `UPDATE` or `DELETE`. A correction is a new row whose `supersedes_id` must reference an existing row (validated in `log_decision` and by a foreign key).
+- **Automatic transitions:** `start_workstream` (plus an `escape` row when `escaped_from` is set), `spawn_design_card`, `spawn_implementation_card`, `spawn_verification_pair`, and the `factonio_pr_gate` / `factonio_merge_pr` tools record rows best-effort; a trail write failure is logged and never blocks card creation or merging.
+- **Surfaces:** `factonio_log_decision` (agent tool), `hermes factonio trail` (CLI), `GET /trail` (API), and an additive `trail` block in `GET /metrics` (`decision_count`, `active_count`, `superseded_count`, `by_tenant`, `by_phase`).
+- **Escaped regressions:** `escaped_from` adds a required `Verification Gap Analysis` section to the Definition card; the retro blueprint mines `trail.db` plus Kanban metrics for mistake classes seen at least twice and applies the `/correct` enforcement ladder.

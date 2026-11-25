@@ -17,6 +17,7 @@ from .config import (
     resolve_phase_model,
 )
 from .metrics import thread_cards
+from .trail import record_transition
 
 _SLUG_RE = re.compile(r"[^a-z0-9-]+")
 
@@ -135,6 +136,21 @@ def _auto_subscribe_task(conn: Any, task_id: str, *, session_id: Optional[str] =
         return False
 
 
+def verification_gap_section(escaped_from: str) -> str:
+    """Required Definition-card section for regressions that escaped a passed Verification."""
+    return (
+        f"## Verification Gap Analysis (required)\n"
+        f"This regression escaped Verification card `{escaped_from}`. Before the task DAG, `spec.md` MUST include a "
+        f"`## Verification Gap Analysis` section that:\n"
+        f"1. Names the gate that should have caught it (CI, Diff Check, Black-Box Check, or a hidden scenario) and the "
+        f"concrete reason it did not (missing scenario, untested path, wrong premise, environment gap).\n"
+        f"2. Proposes the cheapest durable fix using the enforcement ladder "
+        f"Architecture -> Types -> Lint/CI check naming the fix -> Behavioral test -> Skill text last.\n"
+        f"3. Proves the proposed check fails against the original escaped failure before adopting it, and adds a new "
+        f"hidden black-box scenario reproducing the escape (never referenced from `spec.md`).\n"
+    )
+
+
 def _completion_contract_for_repo(repo: dict[str, Any]) -> str:
     """Use native GitHub PR contract when branch protection defines required checks."""
     ci_mode = str(repo.get("ci_contract") or "auto").lower()
@@ -226,6 +242,8 @@ def start_workstream(
             f"write `{spec_path}` (goals, acceptance criteria, technical approach, and parallel task DAG), "
             f"and write hidden black-box verification scenarios under `{holdout_dir}` (never referenced inside `spec.md`).\n"
         )
+        if escaped_from:
+            card_body += "\n" + verification_gap_section(str(escaped_from))
         skill_name = "factonio:define"
         goal_mode = True
         workspace_kind = "dir"
@@ -253,6 +271,35 @@ def start_workstream(
             completion_contract=contract,
         )
         subscribed = _auto_subscribe_task(conn, task_id, session_id=effective_session_id)
+
+    record_transition(
+        "start_workstream",
+        tenant=tenant,
+        repo_slug=slug,
+        phase=phase,
+        card_id=task_id,
+        why=short_title,
+        evidence={
+            "kind": canon_kind,
+            "skill": skill_name,
+            "issue_number": issue_number,
+            "skip_define": bool(go_direct),
+            "escaped_from": escaped_from,
+            "completion_contract": contract,
+        },
+        result="spawned",
+    )
+    if escaped_from:
+        record_transition(
+            "escaped_regression",
+            tenant=tenant,
+            repo_slug=slug,
+            phase="escape",
+            card_id=task_id,
+            why=f"Regression escaped verification card {escaped_from}",
+            evidence={"escaped_from": str(escaped_from), "fix_card_id": task_id},
+            result="recorded",
+        )
 
     return {
         "ok": True,
@@ -298,6 +345,15 @@ def spawn_design_card(
     design_info = resolve_design_provider(repo_slug=slug, override=provider)
 
     if design_info["effective"] == "off":
+        record_transition(
+            "skip_design",
+            tenant=tenant,
+            repo_slug=slug,
+            phase="design",
+            why=str(design_info["reason"]),
+            evidence={"design_provider": design_info["configured"]},
+            result="skipped",
+        )
         return {
             "ok": False,
             "skipped": True,
@@ -358,6 +414,21 @@ def spawn_design_card(
             completion_contract="local-only",
         )
         subscribed = _auto_subscribe_task(conn, task_id, session_id=effective_session_id)
+
+    record_transition(
+        "spawn_design",
+        tenant=tenant,
+        repo_slug=slug,
+        phase="design",
+        card_id=task_id,
+        why=short_title,
+        evidence={
+            "design_provider": design_info["effective"],
+            "approval": design_info["approval"],
+            "parents": list(parents or []),
+        },
+        result="spawned",
+    )
 
     return {
         "ok": True,
@@ -439,6 +510,17 @@ def spawn_implementation_card(
             completion_contract=contract,
         )
         subscribed = _auto_subscribe_task(conn, task_id, session_id=effective_session_id)
+
+    record_transition(
+        "spawn_implement",
+        tenant=tenant,
+        repo_slug=slug,
+        phase="implement",
+        card_id=task_id,
+        why=unit_title.strip(),
+        evidence={"parents": list(parents or []), "design_linked": bool(design_dir), "completion_contract": contract},
+        result="spawned",
+    )
 
     return {
         "ok": True,
@@ -563,6 +645,22 @@ def spawn_verification_pair(
         )
         diff_sub = _auto_subscribe_task(conn, diff_id, session_id=effective_session_id)
         bb_sub = _auto_subscribe_task(conn, bb_id, session_id=effective_session_id)
+
+    record_transition(
+        "spawn_verify",
+        tenant=tenant,
+        repo_slug=slug,
+        phase="verify",
+        card_id=impl_card_id or "",
+        why=f"PR #{int(pr_number)} opened" + (f" at {head_sha[:12]}" if head_sha else ""),
+        evidence={
+            "pr_number": int(pr_number),
+            "head_sha": head_sha,
+            "verify_diff_task_id": diff_id,
+            "verify_blackbox_task_id": bb_id,
+        },
+        result="spawned",
+    )
 
     return {
         "ok": True,

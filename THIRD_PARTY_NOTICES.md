@@ -8,6 +8,12 @@ Factonio adapts engineering patterns and instruction text from the third-party p
 - Author: Lauren Tan ([@poteto](https://x.com/poteto))
 - License: MIT
 - Used in: `profile_setup.py` (worker execution contract) and the bundled phase skills under `skills/` (`define`, `implement`, `verify-diff`, `verify-blackbox`, `orchestrator`).
+- Wave 2 adapted patterns:
+  - `show-me-your-work`: the append-only decision trail (`trail.py`, `factonio_log_decision`, `hermes factonio trail`).
+  - `ketchup`: decision-ready human handoff rules (`skills/orchestrator/SKILL.md`).
+  - `/correct`: recurring-mistake mining, the enforcement ladder, and the prove-it-fails rule in the retro blueprint (`__init__.py`) and Verification Gap Analysis (`orchestrator.py`, `skills/define/SKILL.md`).
+  - `worktree-audit.sh`: safety-bucketed worktree audit and opt-in pruning (`repos.py`, `hermes factonio worktrees`).
+  - side-effect liveness: watchdog progress detection beyond heartbeats (`watchdog.py`).
 
 ```text
 MIT License

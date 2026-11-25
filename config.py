@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import os
+import re
 import tempfile
 import threading
 from pathlib import Path
@@ -509,16 +510,162 @@ def resolve_design_provider(
     }
 
 
+def _model_label(info: Mapping[str, Any]) -> str:
+    return f"{info['provider']}/{info['model']}" if info.get("provider") else str(info["model"])
+
+
+def _bare_model_name(model: str) -> str:
+    """`openrouter`-style `vendor/model` and Bedrock-style `vendor.model` reduce to the bare model id."""
+    tail = model.strip().lower().rsplit("/", 1)[-1]
+    head, sep, rest = tail.partition(".")
+    if sep and head in _VENDOR_ALIASES:
+        tail = rest
+    return tail
+
+
 def check_cross_model_warning(*, repo_slug: Optional[str] = None) -> Optional[str]:
-    """Return a non-blocking warning if Verification resolves to the same model as Implementation."""
+    """Return a non-blocking warning when Verification is not independent of Implementation.
+
+    Warns on the exact same model (including the same model reached through a router such
+    as ``openrouter``), and on different models from the same vendor/model family, since
+    same-family reviewers share blind spots.
+    """
     impl = resolve_phase_model("implement", repo_slug=repo_slug)
     verify = resolve_phase_model("verify", repo_slug=repo_slug)
     if not impl.get("model") or not verify.get("model"):
         return None
-    if (impl.get("provider") or "", impl["model"]) == (verify.get("provider") or "", verify["model"]):
-        label = f"{impl['provider']}/{impl['model']}" if impl.get("provider") else impl["model"]
+    same_exact = (impl.get("provider") or "", impl["model"]) == (verify.get("provider") or "", verify["model"])
+    if same_exact or _bare_model_name(str(impl["model"])) == _bare_model_name(str(verify["model"])):
+        label = _model_label(impl) if same_exact else f"{_model_label(impl)} vs {_model_label(verify)}"
         return (
             f"Verification uses the same model as Implementation ({label}). "
             "Configure `factonio_verify` in `hermes model` (Auxiliary Models) for cross-model independence."
         )
+    impl_vendor = infer_model_vendor(impl.get("provider"), impl.get("model"))
+    verify_vendor = infer_model_vendor(verify.get("provider"), verify.get("model"))
+    if impl_vendor and impl_vendor == verify_vendor:
+        return (
+            f"Verification ({_model_label(verify)}) and Implementation ({_model_label(impl)}) use the same "
+            f"vendor/model family ({impl_vendor}). Configure `factonio_verify` in `hermes model` (Auxiliary Models) "
+            "with a model from a different vendor for cross-model independence."
+        )
     return None
+
+
+# Vendor families keyed by canonical vendor; values are model-name / provider prefixes.
+_VENDOR_ALIASES: dict[str, str] = {
+    "anthropic": "anthropic",
+    "claude": "anthropic",
+    "openai": "openai",
+    "gpt": "openai",
+    "chatgpt": "openai",
+    "codex": "openai",
+    "o1": "openai",
+    "o3": "openai",
+    "o4": "openai",
+    "azure": "openai",
+    "google": "google",
+    "gemini": "google",
+    "gemma": "google",
+    "palm": "google",
+    "meta": "meta",
+    "llama": "meta",
+    "mistral": "mistral",
+    "mistralai": "mistral",
+    "mixtral": "mistral",
+    "codestral": "mistral",
+    "devstral": "mistral",
+    "magistral": "mistral",
+    "ministral": "mistral",
+    "pixtral": "mistral",
+    "xai": "xai",
+    "x-ai": "xai",
+    "grok": "xai",
+    "deepseek": "deepseek",
+    "qwen": "qwen",
+    "qwq": "qwen",
+    "alibaba": "qwen",
+    "dashscope": "qwen",
+    "moonshot": "moonshot",
+    "moonshotai": "moonshot",
+    "kimi": "moonshot",
+    "zai": "zhipu",
+    "z-ai": "zhipu",
+    "zhipu": "zhipu",
+    "glm": "zhipu",
+    "cohere": "cohere",
+    "command": "cohere",
+    "amazon": "amazon",
+    "nova": "amazon",
+    "nous": "nous",
+    "nousresearch": "nous",
+    "hermes": "nous",
+    "minimax": "minimax",
+    "microsoft": "microsoft",
+    "phi": "microsoft",
+}
+
+# Providers that front many vendors; the model id (not the provider) identifies the family.
+_ROUTER_PROVIDERS: frozenset[str] = frozenset(
+    {
+        "openrouter",
+        "vertex",
+        "vertex-ai",
+        "vertexai",
+        "google-vertex",
+        "bedrock",
+        "aws-bedrock",
+        "together",
+        "fireworks",
+        "groq",
+        "deepinfra",
+        "huggingface",
+        "nebius",
+        "nvidia",
+        "ollama",
+        "lmstudio",
+        "litellm",
+        "requesty",
+        "copilot",
+        "github-copilot",
+        "ai-gateway",
+        "vercel",
+        "custom",
+    }
+)
+
+_TOKEN_SPLIT = re.compile(r"[/.:@\s]+")
+
+
+def _vendor_from_token(token: str) -> Optional[str]:
+    token = token.strip().lower()
+    if not token:
+        return None
+    if token in _VENDOR_ALIASES:
+        return _VENDOR_ALIASES[token]
+    stem = re.split(r"[-_]", token, maxsplit=1)[0]
+    if stem in _VENDOR_ALIASES:
+        return _VENDOR_ALIASES[stem]
+    for alias in sorted(_VENDOR_ALIASES, key=len, reverse=True):
+        if len(alias) >= 4 and token.startswith(alias):
+            return _VENDOR_ALIASES[alias]
+    return None
+
+
+def infer_model_vendor(provider: Optional[str], model: Optional[str]) -> Optional[str]:
+    """Infer the vendor/model family (e.g. ``anthropic``, ``openai``, ``google``) of a model.
+
+    The model id is inspected first so multi-vendor routers (``openrouter``, ``vertex``,
+    ``bedrock``, ...) resolve to the underlying family (``anthropic/claude-...``,
+    ``us.anthropic.claude-...``, ``gemini-2.5-pro``). The provider is used only when the
+    model id is not recognizable and the provider is a first-party vendor. Returns ``None``
+    when the family cannot be determined.
+    """
+    for token in _TOKEN_SPLIT.split(str(model or "")):
+        vendor = _vendor_from_token(token)
+        if vendor:
+            return vendor
+    prov = str(provider or "").strip().lower()
+    if not prov or prov == "auto" or prov in _ROUTER_PROVIDERS:
+        return None
+    return _vendor_from_token(prov)
