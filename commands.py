@@ -12,9 +12,11 @@ from .config import (
     check_cross_model_warning,
     list_repos,
     resolve_all_phase_models,
+    resolve_rigor,
+    resolve_verify_panel,
 )
 from .harness import audit_harness, bootstrap_verify_harness, check_harness, show_harness
-from .orchestrator import workstream_status
+from .orchestrator import evaluate_verification_panel, workstream_status
 from .profile_setup import init_factonio_profile, run_doctor
 from .repos import (
     RepoNotFoundError,
@@ -123,6 +125,33 @@ def _print_harness(action: str, res: dict[str, Any]) -> None:
         print(f"  -> {rec}")
 
 
+def _print_panel(res: dict[str, Any]) -> None:
+    pr = res.get("pr") or {}
+    pr_label = f" {pr.get('repo')}#{pr.get('number')}" if pr else ""
+    merge = "merge allowed" if res.get("merge_allowed") else "merge blocked"
+    print(f"{str(res['consensus']).upper()}: panel {res['panel_id']}{pr_label} ({merge})")
+    print(f"  Vendors: {', '.join(res.get('vendors') or []) or '-'} | {res.get('reason')}")
+    for lane in res.get("lanes") or []:
+        verdict = lane.get("verdict") or "-"
+        print(f"  {lane.get('task_id')} | {lane.get('status'):<8} | {lane.get('phase'):<15} | {lane.get('vendor')} ({lane.get('model')}) -> {verdict}")
+    if res.get("disagreement_summary"):
+        print(f"  Disagreement: {res['disagreement_summary']}")
+    for finding in (res.get("findings") or [])[:20]:
+        print(f"  Finding [{finding['lane']}]: {finding['item']}")
+    if res.get("recorded"):
+        print(f"  Recorded verify_panel_consensus {res.get('decision_id')} in trail.db")
+
+
+def _print_verify_panel(panel: dict[str, Any], rigor: Any) -> None:
+    print(f"\n  default rigor -> {rigor or '(invalid)'}")
+    if panel["entries"]:
+        rendered = ", ".join(f"{e['label']} [{e.get('vendor') or 'unknown'}]" for e in panel["entries"])
+        state = "valid" if panel["valid"] else "INVALID"
+        print(f"  verify panel  -> {rendered} ({panel['source']}, {state})")
+    else:
+        print("  verify panel  -> (unset)")
+
+
 def _print_restack_one(r: dict[str, Any]) -> None:
     if r.get("conflict"):
         verdict = "CONFLICT"
@@ -185,6 +214,12 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             help="Design approval override ('inherit' clears it to use the global default).",
         )
         p_upd.add_argument(
+            "--default-rigor",
+            choices=["standard", "high", "inherit"],
+            default=None,
+            help="Verification rigor override; 'high' runs a multi-vendor verify panel ('inherit' clears it).",
+        )
+        p_upd.add_argument(
             "--json",
             action="store_true",
             default=argparse.SUPPRESS,
@@ -198,6 +233,25 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
 
         p_models = sub.add_parser("models", help="Show resolved provider/model per Factonio phase.")
         p_models.add_argument("--repo", default=None, help="Optional repo slug to include per-repo overrides.")
+
+        p_panel = sub.add_parser(
+            "panel",
+            help="Evaluate a high-rigor verification panel's fail-closed consensus (read-only Kanban).",
+        )
+        p_panel.add_argument("panel_id", nargs="?", default=None, help="Panel id (vp_...); default: latest match.")
+        p_panel.add_argument("--tenant", default=None, help="Workstream tenant (latest panel when panel_id is omitted).")
+        p_panel.add_argument("--pr", dest="pr_number", type=int, default=None, help="PR number filter.")
+        p_panel.add_argument(
+            "--record",
+            action="store_true",
+            help="Record a terminal consensus as verify_panel_consensus in trail.db.",
+        )
+        p_panel.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Output machine-readable JSON.",
+        )
 
         p_status = sub.add_parser("status", help="Show active Factonio Kanban workstreams and cards.")
         p_status.add_argument("--tenant", default=None, help="Filter by workstream tenant.")
@@ -284,7 +338,10 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         as_json = bool(getattr(args, "json", False))
 
         if not cmd:
-            print("Usage: hermes factonio {init|add|update|remove|list|models|status|pr-gate|restack|worktrees|harness|trail|doctor} [--json]")
+            print(
+                "Usage: hermes factonio {init|add|update|remove|list|models|status|panel|pr-gate|restack|worktrees"
+                "|harness|trail|doctor} [--json]"
+            )
             return
 
         if cmd == "init":
@@ -336,6 +393,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                 "default_branch": getattr(args, "default_branch", None),
                 "design_provider": getattr(args, "design_provider", None),
                 "design_approval": getattr(args, "design_approval", None),
+                "default_rigor": getattr(args, "default_rigor", None),
             }
             kwargs = {k: v for k, v in flag_map.items() if v is not None}
             try:
@@ -358,6 +416,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             print(
                 f"  Design provider: {r.get('design_provider') or 'inherit'}"
                 f" | Design approval: {r.get('design_approval') or 'inherit'}"
+                f" | Default rigor: {r.get('default_rigor') or 'inherit'}"
             )
             return
 
@@ -389,6 +448,8 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                     tags.append(f"design={r['design_provider']}")
                 if r.get("design_approval"):
                     tags.append(f"design_approval={r['design_approval']}")
+                if r.get("default_rigor"):
+                    tags.append(f"rigor={r['default_rigor']}")
                 print(f"- {slug}: {r.get('repo')} ({r.get('path')}) [{' '.join(tags)}]")
             print("\nEdit settings with: hermes factonio update <repo> --merge-policy ... (see --help)")
             return
@@ -396,15 +457,47 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         if cmd == "models":
             models = resolve_all_phase_models(repo_slug=args.repo)
             warn = check_cross_model_warning(repo_slug=args.repo)
+            panel = resolve_verify_panel(repo_slug=args.repo)
+            try:
+                rigor: Any = resolve_rigor(repo_slug=args.repo)
+            except ValueError:
+                rigor = None
             if as_json:
-                print(json.dumps({"models": models, "warning": warn}, indent=2, default=str))
+                print(json.dumps(
+                    {"models": models, "warning": warn, "verify_panel": panel, "default_rigor": rigor},
+                    indent=2,
+                    default=str,
+                ))
                 return
             for phase, info in models.items():
                 label = f"{info['provider']}/{info['model']}" if info.get("provider") else (info.get("model") or "(unset)")
                 print(f"  {phase:<10} -> {label:<36} ({info['source']})")
+            _print_verify_panel(panel, rigor)
+            if rigor == "high" and not panel["valid"]:
+                print(f"\nWarning: {panel['warning']}")
             if warn:
                 print(f"\nWarning: {warn}")
             print("\nConfigure per-phase models in `hermes model` -> Auxiliary Models (factonio_*).")
+            return
+
+        if cmd == "panel":
+            try:
+                res = evaluate_verification_panel(
+                    panel_id=args.panel_id,
+                    tenant=args.tenant,
+                    pr_number=args.pr_number,
+                    record_trail=bool(args.record),
+                )
+            except ValueError as exc:
+                res = {"ok": False, "error": str(exc)}
+            if as_json:
+                print(json.dumps(res, indent=2, default=str))
+            elif not res.get("ok"):
+                print(f"Error: {res.get('error')}", file=sys.stderr)
+            else:
+                _print_panel(res)
+            if not res.get("ok"):
+                sys.exit(1)
             return
 
         if cmd == "status":
@@ -417,6 +510,11 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             for card in res["cards"][:20]:
                 pr = f" [{card['pr']['repo']}#{card['pr']['number']}]" if card.get("pr") else ""
                 print(f"  {card['id']} | {card['status']:<7} | {card['phase']:<15} | {card['title']}{pr}")
+            for panel_summary in res.get("panels") or []:
+                print(
+                    f"  Panel {panel_summary['panel_id']}: {panel_summary['consensus']}"
+                    f" ({panel_summary['completed_count']}/{panel_summary['lane_count']} lanes done)"
+                )
             return
 
         if cmd == "pr-gate":
@@ -567,7 +665,10 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
 
     ctx.register_cli_command(
         "factonio",
-        help="Manage the Factonio pure-Hermes software factory (init, add, update, models, status, restack, worktrees, harness, trail, doctor).",
+        help=(
+            "Manage the Factonio pure-Hermes software factory "
+            "(init, add, update, models, status, panel, restack, worktrees, harness, trail, doctor)."
+        ),
         setup_fn=setup_parser,
         handler_fn=handle_cli,
     )

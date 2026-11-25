@@ -16,10 +16,13 @@ from .config import (
     load_settings,
     resolve_design_provider,
     resolve_phase_model,
+    resolve_rigor,
+    resolve_verify_panel,
 )
 from .harness import HARNESS_DIR_NAME, HOOK_KINDS, REQUIRED_SECTIONS, VERIFY_MD_NAME, discover_harness
-from .metrics import thread_cards
-from .trail import record_transition
+from .metrics import aggregate_panel_verdicts as aggregate_panel_verdicts  # public re-export
+from .metrics import load_panel_lanes, summarize_panel, thread_cards
+from .trail import query_decisions, record_transition
 
 _SLUG_RE = re.compile(r"[^a-z0-9-]+")
 
@@ -632,68 +635,61 @@ def _format_harness_section(repo_path: str | Path) -> str:
     return "\n".join(lines) + "\n"
 
 
-def spawn_verification_pair(
-    repo_spec: str,
-    tenant: str,
-    pr_number: int,
+def _diff_card_body(
     *,
-    impl_card_id: Optional[str] = None,
-    head_sha: Optional[str] = None,
-    run_hint: Optional[str] = None,
-    session_id: Optional[str] = None,
-    board: Optional[str] = None,
-) -> dict[str, Any]:
-    """Spawn two isolated parallel Verification cards (Diff Check and Black-Box Check)."""
-    from hermes_cli import kanban_db as kb
-    from hermes_cli.kanban_db_connect import connect_closing
-
-    repo = get_repo(repo_spec)
-    if repo is None:
-        raise ValueError(f"Repository {repo_spec!r} is not registered with Factonio.")
-
-    slug = str(repo["slug"])
-    full_repo = str(repo["repo"])
-    repo_path = str(repo["path"])
-    spec_path = spec_file_path(tenant)
-    holdout_dir = holdout_dir_path(tenant)
-    design_dir = _has_design_artifacts(tenant)
-    parents = [impl_card_id] if impl_card_id else []
-    sha_line = f"- Expected HEAD SHA: `{head_sha}`\n" if head_sha else ""
-    design_line = f"- Approved Design directory: `{design_dir}`\n" if design_dir else ""
-    pr_ref = f"{full_repo}#{int(pr_number)}"
-
-    diff_model = _phase_model_kwargs("verify", slug, subphase="verify_diff")
-    bb_model = _phase_model_kwargs("verify", slug, subphase="verify_blackbox")
-
+    full_repo: str,
+    repo_path: str,
+    pr_ref: str,
+    pr_number: int,
+    sha_line: str,
+    tenant: str,
+    spec_path: Path,
+    design_dir: Optional[Path],
+    panel_line: str = "",
+) -> str:
     # Diff Check: sees spec + approved design (if any) + PR diff; NEVER given holdout_dir.
-    diff_body = (
+    design_line = f"- Approved Design directory: `{design_dir}`\n" if design_dir else ""
+    return (
         f"## Factonio Diff Verification Card\n"
         f"- Repository: `{full_repo}` (`{repo_path}`)\n"
         f"- Pull Request: `{pr_ref}`\n"
         f"{sha_line}"
         f"- Workstream tenant: `{tenant}`\n"
+        f"{panel_line}"
         f"- Spec: `{spec_path}`\n"
         f"{design_line}\n"
         f"## Information Barrier\n"
-        f"Audit the PR diff (`gh pr diff {int(pr_number)} --repo {full_repo}`) against `{spec_path}`"
+        f"Audit the PR diff (`gh pr diff {pr_number} --repo {full_repo}`) against `{spec_path}`"
         f"{f' and `{design_dir}`' if design_dir else ''}. "
         f"Do not inspect any `holdout/` directory. Return structured metadata with `verdict: pass|reject`, "
-        f"`pr_number: {int(pr_number)}`, `repo: {full_repo}`, and `findings: [...]`.\n"
+        f"`pr_number: {pr_number}`, `repo: {full_repo}`, and `findings: [...]`.\n"
     )
 
+
+def _blackbox_card_body(
+    *,
+    full_repo: str,
+    repo_path: str,
+    pr_ref: str,
+    pr_number: int,
+    sha_line: str,
+    tenant: str,
+    spec_path: Path,
+    design_dir: Optional[Path],
+    holdout_dir: Path,
+    hint_section: str,
+    panel_line: str = "",
+) -> str:
     # Black-Box Check: sees acceptance criteria + approved design previews (if any) + holdout + built app;
     # FORBIDDEN from reading git diff or source files.
-    hint_section = f"\n## Run / Target Hint\n{run_hint.strip()}\n" if run_hint else ""
-    harness_section = _format_harness_section(repo_path)
-    harness_path = str(Path(repo_path) / HARNESS_DIR_NAME / VERIFY_MD_NAME) if harness_section else None
-    if harness_section:
-        hint_section += f"\n{harness_section}"
-    bb_body = (
+    design_line = f"- Approved Design directory: `{design_dir}`\n" if design_dir else ""
+    return (
         f"## Factonio Black-Box Verification Card\n"
         f"- Repository: `{full_repo}` (`{repo_path}`)\n"
         f"- Pull Request: `{pr_ref}`\n"
         f"{sha_line}"
         f"- Workstream tenant: `{tenant}`\n"
+        f"{panel_line}"
         f"- Acceptance spec: `{spec_path}` (read ONLY the Goals & Acceptance Criteria sections)\n"
         f"{design_line}"
         f"- Hidden holdout directory: `{holdout_dir}`\n"
@@ -703,50 +699,206 @@ def spawn_verification_pair(
         f"and executing the acceptance criteria plus every scenario under `{holdout_dir}`"
         f"{f', comparing rendered UI fidelity against `{design_dir}`' if design_dir else ''}. "
         f"NEVER run `git diff`, NEVER inspect PR diffs, and NEVER read implementation source code. "
-        f"Return structured metadata with `verdict: pass|reject|inconclusive`, `pr_number: {int(pr_number)}`, "
+        f"Return structured metadata with `verdict: pass|reject|inconclusive`, `pr_number: {pr_number}`, "
         f"`repo: {full_repo}`, `scenarios_run`, and `findings: [...]`.\n"
     )
 
+
+_PANEL_LANE_NOTE = (
+    "\n## Verification Panel Lane\n"
+    "You are one independent lane of a high-rigor multi-vendor panel. Do not read, wait for, or coordinate with "
+    "other panel lanes; give your own verdict. The orchestrator aggregates lanes fail-closed with "
+    "`factonio_evaluate_panel`: any reject or inconclusive lane blocks the merge.\n"
+)
+
+
+def _panel_card_line(panel_id: str, entry: dict[str, Any]) -> str:
+    vendor = entry.get("vendor") or "unknown"
+    return f"- Verification panel: `{panel_id}` (rigor=`high`, vendor=`{vendor}`, model=`{entry['label']}`)\n"
+
+
+def spawn_verification_pair(
+    repo_spec: str,
+    tenant: str,
+    pr_number: int,
+    *,
+    impl_card_id: Optional[str] = None,
+    head_sha: Optional[str] = None,
+    run_hint: Optional[str] = None,
+    rigor: Optional[str] = None,
+    panel_models: Optional[list[Any]] = None,
+    session_id: Optional[str] = None,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
+    """Spawn isolated parallel Verification cards (Diff Check and Black-Box Check).
+
+    ``rigor`` (default: the repo's / global ``default_rigor``) of ``"standard"`` spawns one pair.
+    ``"high"`` resolves a multi-vendor ``verify_panel`` and spawns one Diff + Black-Box pair per
+    panel member, tagged with a shared ``panel_id``; it raises ``ValueError`` (fail closed) when the
+    panel has fewer than 2 members or fewer than 2 distinct known vendor families.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+
+    repo = get_repo(repo_spec)
+    if repo is None:
+        raise ValueError(f"Repository {repo_spec!r} is not registered with Factonio.")
+
+    slug = str(repo["slug"])
+    effective_rigor = resolve_rigor(repo_slug=slug, override=rigor)
+    panel: Optional[dict[str, Any]] = None
+    if effective_rigor == "high":
+        panel = resolve_verify_panel(repo_slug=slug, override=panel_models)
+        if not panel["valid"]:
+            raise ValueError(panel["warning"])
+
+    full_repo = str(repo["repo"])
+    repo_path = str(repo["path"])
+    spec_path = spec_file_path(tenant)
+    holdout_dir = holdout_dir_path(tenant)
+    design_dir = _has_design_artifacts(tenant)
+    parents = [impl_card_id] if impl_card_id else []
+    sha_line = f"- Expected HEAD SHA: `{head_sha}`\n" if head_sha else ""
+    pr_ref = f"{full_repo}#{int(pr_number)}"
+    common = {
+        "full_repo": full_repo,
+        "repo_path": repo_path,
+        "pr_ref": pr_ref,
+        "pr_number": int(pr_number),
+        "sha_line": sha_line,
+        "tenant": tenant,
+        "spec_path": spec_path,
+        "design_dir": design_dir,
+    }
+
+    hint_section = f"\n## Run / Target Hint\n{run_hint.strip()}\n" if run_hint else ""
+    harness_section = _format_harness_section(repo_path)
+    harness_path = str(Path(repo_path) / HARNESS_DIR_NAME / VERIFY_MD_NAME) if harness_section else None
+    if harness_section:
+        hint_section += f"\n{harness_section}"
+
     effective_session_id = _resolve_calling_session_id(session_id)
+
+    def _create(conn: Any, *, title: str, body: str, skill: str, model: dict[str, Any]) -> str:
+        return kb.create_task(
+            conn,
+            title=title,
+            body=body,
+            assignee=WORKER_PROFILE,
+            created_by=PLUGIN_ID,
+            workspace_kind="scratch",
+            project_id="",
+            tenant=tenant,
+            parents=parents,
+            skills=[skill],
+            model_override=model["model_override"],
+            provider_override=model["provider_override"],
+            goal_mode=False,
+            session_id=effective_session_id,
+            board=board,
+            completion_contract="local-only",
+        )
+
+    if panel is None:
+        diff_model = _phase_model_kwargs("verify", slug, subphase="verify_diff")
+        bb_model = _phase_model_kwargs("verify", slug, subphase="verify_blackbox")
+        diff_body = _diff_card_body(**common)
+        bb_body = _blackbox_card_body(**common, holdout_dir=holdout_dir, hint_section=hint_section)
+        with connect_closing(board=board) as conn:
+            diff_id = _create(
+                conn, title=f"[verify:diff] {pr_ref}", body=diff_body, skill="factonio:verify-diff", model=diff_model
+            )
+            bb_id = _create(
+                conn,
+                title=f"[verify:blackbox] {pr_ref}",
+                body=bb_body,
+                skill="factonio:verify-blackbox",
+                model=bb_model,
+            )
+            diff_sub = _auto_subscribe_task(conn, diff_id, session_id=effective_session_id)
+            bb_sub = _auto_subscribe_task(conn, bb_id, session_id=effective_session_id)
+
+        record_transition(
+            "spawn_verify",
+            tenant=tenant,
+            repo_slug=slug,
+            phase="verify",
+            card_id=impl_card_id or "",
+            why=f"PR #{int(pr_number)} opened" + (f" at {head_sha[:12]}" if head_sha else ""),
+            evidence={
+                "pr_number": int(pr_number),
+                "head_sha": head_sha,
+                "verify_diff_task_id": diff_id,
+                "verify_blackbox_task_id": bb_id,
+                "harness_present": bool(harness_section),
+                "rigor": "standard",
+            },
+            result="spawned",
+        )
+
+        return {
+            "ok": True,
+            "tenant": tenant,
+            "repo": full_repo,
+            "pr_number": int(pr_number),
+            "verify_diff_task_id": diff_id,
+            "verify_blackbox_task_id": bb_id,
+            "diff_model": diff_model["resolved"],
+            "blackbox_model": bb_model["resolved"],
+            "subscribed": bool(diff_sub and bb_sub),
+            "harness_present": bool(harness_section),
+            "harness_path": harness_path,
+            "rigor": "standard",
+            "panel": None,
+        }
+
+    panel_id = f"vp_{uuid.uuid4().hex[:10]}"
+    lanes: list[dict[str, Any]] = []
+    all_subscribed = True
     with connect_closing(board=board) as conn:
-        diff_id = kb.create_task(
-            conn,
-            title=f"[verify:diff] {pr_ref}",
-            body=diff_body,
-            assignee=WORKER_PROFILE,
-            created_by=PLUGIN_ID,
-            workspace_kind="scratch",
-            project_id="",
-            tenant=tenant,
-            parents=parents,
-            skills=["factonio:verify-diff"],
-            model_override=diff_model["model_override"],
-            provider_override=diff_model["provider_override"],
-            goal_mode=False,
-            session_id=effective_session_id,
-            board=board,
-            completion_contract="local-only",
-        )
-        bb_id = kb.create_task(
-            conn,
-            title=f"[verify:blackbox] {pr_ref}",
-            body=bb_body,
-            assignee=WORKER_PROFILE,
-            created_by=PLUGIN_ID,
-            workspace_kind="scratch",
-            project_id="",
-            tenant=tenant,
-            parents=parents,
-            skills=["factonio:verify-blackbox"],
-            model_override=bb_model["model_override"],
-            provider_override=bb_model["provider_override"],
-            goal_mode=False,
-            session_id=effective_session_id,
-            board=board,
-            completion_contract="local-only",
-        )
-        diff_sub = _auto_subscribe_task(conn, diff_id, session_id=effective_session_id)
-        bb_sub = _auto_subscribe_task(conn, bb_id, session_id=effective_session_id)
+        for entry in panel["entries"]:
+            vendor = entry.get("vendor") or "unknown"
+            model = {
+                "model_override": entry["model"],
+                "provider_override": entry.get("provider") or None,
+                "resolved": {
+                    "phase": "verify",
+                    "provider": entry.get("provider") or None,
+                    "model": entry["model"],
+                    "source": panel["source"],
+                },
+            }
+            panel_line = _panel_card_line(panel_id, entry)
+            diff_body = _diff_card_body(**common, panel_line=panel_line) + _PANEL_LANE_NOTE
+            bb_body = (
+                _blackbox_card_body(**common, holdout_dir=holdout_dir, hint_section=hint_section, panel_line=panel_line)
+                + _PANEL_LANE_NOTE
+            )
+            diff_id = _create(
+                conn,
+                title=f"[verify:diff] {pr_ref} [panel:{vendor}]",
+                body=diff_body,
+                skill="factonio:verify-diff",
+                model=model,
+            )
+            bb_id = _create(
+                conn,
+                title=f"[verify:blackbox] {pr_ref} [panel:{vendor}]",
+                body=bb_body,
+                skill="factonio:verify-blackbox",
+                model=model,
+            )
+            all_subscribed = _auto_subscribe_task(conn, diff_id, session_id=effective_session_id) and all_subscribed
+            all_subscribed = _auto_subscribe_task(conn, bb_id, session_id=effective_session_id) and all_subscribed
+            lanes.append({
+                "vendor": entry.get("vendor"),
+                "provider": entry.get("provider"),
+                "model": entry["model"],
+                "label": entry["label"],
+                "verify_diff_task_id": diff_id,
+                "verify_blackbox_task_id": bb_id,
+                "model_resolved": model["resolved"],
+            })
 
     record_transition(
         "spawn_verify",
@@ -754,13 +906,22 @@ def spawn_verification_pair(
         repo_slug=slug,
         phase="verify",
         card_id=impl_card_id or "",
-        why=f"PR #{int(pr_number)} opened" + (f" at {head_sha[:12]}" if head_sha else ""),
+        why=f"PR #{int(pr_number)} opened" + (f" at {head_sha[:12]}" if head_sha else "")
+        + f"; high-rigor panel {panel_id} ({', '.join(panel['vendors'])})",
         evidence={
             "pr_number": int(pr_number),
             "head_sha": head_sha,
-            "verify_diff_task_id": diff_id,
-            "verify_blackbox_task_id": bb_id,
+            "verify_diff_task_id": lanes[0]["verify_diff_task_id"],
+            "verify_blackbox_task_id": lanes[0]["verify_blackbox_task_id"],
             "harness_present": bool(harness_section),
+            "rigor": "high",
+            "panel_id": panel_id,
+            "vendors": list(panel["vendors"]),
+            "panel_source": panel["source"],
+            "panel_lanes": [
+                {k: lane[k] for k in ("vendor", "label", "verify_diff_task_id", "verify_blackbox_task_id")}
+                for lane in lanes
+            ],
         },
         result="spawned",
     )
@@ -770,13 +931,133 @@ def spawn_verification_pair(
         "tenant": tenant,
         "repo": full_repo,
         "pr_number": int(pr_number),
-        "verify_diff_task_id": diff_id,
-        "verify_blackbox_task_id": bb_id,
-        "diff_model": diff_model["resolved"],
-        "blackbox_model": bb_model["resolved"],
-        "subscribed": bool(diff_sub and bb_sub),
+        "verify_diff_task_id": lanes[0]["verify_diff_task_id"],
+        "verify_blackbox_task_id": lanes[0]["verify_blackbox_task_id"],
+        "diff_model": lanes[0]["model_resolved"],
+        "blackbox_model": lanes[0]["model_resolved"],
+        "subscribed": bool(all_subscribed),
         "harness_present": bool(harness_section),
         "harness_path": harness_path,
+        "rigor": "high",
+        "panel": {
+            "panel_id": panel_id,
+            "vendors": list(panel["vendors"]),
+            "source": panel["source"],
+            "advisories": list(panel.get("advisories") or []),
+            "lanes": lanes,
+        },
+    }
+
+
+def _kanban_db_file(board: Optional[str] = None) -> Path:
+    try:
+        from hermes_cli.kanban_db import kanban_db_path
+
+        return Path(kanban_db_path(board=board))
+    except Exception:
+        return get_root_hermes_home_path() / "kanban.db"
+
+
+_TERMINAL_CONSENSUS = frozenset({"pass", "reject", "inconclusive"})
+
+
+def _lane_fingerprint(lanes: list[dict[str, Any]]) -> list[list[Any]]:
+    return sorted([str(lane.get("task_id") or ""), lane.get("verdict")] for lane in lanes)
+
+
+def _already_recorded(panel_id: str, tenant: Optional[str], consensus: str, fingerprint: list[list[Any]]) -> Optional[str]:
+    """Id of an active identical `verify_panel_consensus` row, so repeated evaluations do not spam trail.db."""
+    try:
+        rows = query_decisions(tenant=tenant or None, phase="verify", limit=500)
+    except Exception:
+        return None
+    for row in rows:
+        if row.get("decision") != "verify_panel_consensus" or row.get("is_superseded"):
+            continue
+        ev = row.get("evidence") or {}
+        if ev.get("panel_id") != panel_id:
+            continue
+        if row.get("result") == consensus and ev.get("lane_fingerprint") == fingerprint:
+            return str(row.get("id"))
+        return None
+    return None
+
+
+def evaluate_verification_panel(
+    *,
+    panel_id: Optional[str] = None,
+    tenant: Optional[str] = None,
+    pr_number: Optional[int] = None,
+    board: Optional[str] = None,
+    record_trail: bool = True,
+) -> dict[str, Any]:
+    """Aggregate a high-rigor panel's lanes from `kanban.db` (read-only) into a fail-closed consensus.
+
+    Selects the panel by ``panel_id`` or, failing that, the most recent panel matching ``tenant``
+    and/or ``pr_number``. When ``record_trail`` and the consensus is terminal (pass, reject,
+    inconclusive), logs ``verify_panel_consensus`` to `trail.db` (once per identical outcome).
+    """
+    pid = str(panel_id or "").strip() or None
+    if pid is None and not tenant and pr_number is None:
+        raise ValueError("Pass panel_id, or tenant and/or pr_number, to select a verification panel.")
+    grouped = load_panel_lanes(
+        _kanban_db_file(board),
+        panel_ids=[pid] if pid else None,
+        tenant=tenant or None,
+        pr_number=int(pr_number) if pr_number is not None else None,
+    )
+    if not grouped:
+        target = pid or ", ".join(
+            x for x in (f"tenant={tenant}" if tenant else "", f"pr={pr_number}" if pr_number is not None else "") if x
+        )
+        return {"ok": False, "error": f"No verification panel found for {target}.", "panel_id": pid}
+
+    candidates = sorted(
+        (summarize_panel(key, lanes) for key, lanes in grouped.items()),
+        key=lambda p: (p.get("created_at") or 0, p.get("seq") or 0),
+    )
+    summary = next((p for p in candidates if p["panel_id"] == pid), None) if pid else candidates[-1]
+    if summary is None:
+        return {"ok": False, "error": f"No verification panel found for {pid}.", "panel_id": pid}
+
+    recorded = False
+    decision_id: Optional[str] = None
+    if record_trail and summary["consensus"] in _TERMINAL_CONSENSUS:
+        fingerprint = _lane_fingerprint(summary["lanes"])
+        decision_id = _already_recorded(summary["panel_id"], summary.get("tenant"), summary["consensus"], fingerprint)
+        if decision_id is None:
+            pr = summary.get("pr") or {}
+            row = record_transition(
+                "verify_panel_consensus",
+                tenant=summary.get("tenant") or tenant or "",
+                repo_slug=str(pr.get("repo") or ""),
+                phase="verify",
+                why=(summary.get("disagreement_summary") or summary["reason"])[:500],
+                evidence={
+                    "panel_id": summary["panel_id"],
+                    "pr_number": pr.get("number"),
+                    "vendors": summary["vendors"],
+                    "lanes": [
+                        {k: lane.get(k) for k in ("task_id", "phase", "vendor", "model", "status", "verdict")}
+                        for lane in summary["lanes"]
+                    ],
+                    "lane_fingerprint": fingerprint,
+                    "merge_allowed": summary["merge_allowed"],
+                    "has_disagreement": summary["has_disagreement"],
+                    "disagreement_summary": summary["disagreement_summary"],
+                },
+                result=summary["consensus"],
+            )
+            if row is not None:
+                recorded = True
+                decision_id = str(row.get("id"))
+
+    return {
+        "ok": True,
+        **summary,
+        "other_panel_ids": [p["panel_id"] for p in candidates if p["panel_id"] != summary["panel_id"]],
+        "recorded": recorded,
+        "decision_id": decision_id,
     }
 
 
@@ -786,18 +1067,22 @@ def workstream_status(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Return current Kanban cards and phase counts for a Factonio workstream."""
-    try:
-        from hermes_cli.kanban_db import kanban_db_path
-
-        db_path = Path(kanban_db_path(board=board))
-    except Exception:
-        db_path = get_root_hermes_home_path() / "kanban.db"
-
+    """Return current Kanban cards, phase counts, and live high-rigor panel consensus for a workstream."""
+    db_path = _kanban_db_file(board)
     data = thread_cards(db_path, session_id=session_id, tenant=tenant)
+    panel_ids = sorted({str(c["panel_id"]) for c in data.get("cards", []) if c.get("panel_id")})
+    panels: list[dict[str, Any]] = []
+    if panel_ids:
+        grouped = load_panel_lanes(db_path, panel_ids=panel_ids)
+        panels = sorted(
+            (summarize_panel(pid, lanes) for pid, lanes in grouped.items()),
+            key=lambda p: (p.get("created_at") or 0, p.get("seq") or 0),
+            reverse=True,
+        )
     return {
         "ok": True,
         "tenant": tenant,
         "settings_merge_policy": load_settings(use_root=True).get("default_merge_policy", "auto"),
         **data,
+        "panels": panels,
     }

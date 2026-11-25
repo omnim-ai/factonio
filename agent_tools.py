@@ -21,6 +21,7 @@ from .harness import (
     show_harness,
 )
 from .orchestrator import (
+    evaluate_verification_panel,
     spawn_design_card,
     spawn_implementation_card,
     spawn_verification_pair,
@@ -174,8 +175,9 @@ def register_tools(ctx: Any) -> None:
             "name": "factonio_update_repo",
             "description": (
                 "Update settings of an already-registered Factonio repository. Only fields you pass are changed: "
-                "merge_policy, max_fix_rounds, default_branch, design_provider, design_approval. Pass 'inherit' "
-                "(or null) for design_provider/design_approval to clear the per-repo override and use the global default."
+                "merge_policy, max_fix_rounds, default_branch, design_provider, design_approval, default_rigor. Pass "
+                "'inherit' (or null) for design_provider/design_approval/default_rigor to clear the per-repo override "
+                "and use the global default."
             ),
             "parameters": {
                 "type": "object",
@@ -193,6 +195,13 @@ def register_tools(ctx: Any) -> None:
                         "type": "string",
                         "enum": ["ask", "auto", "inherit"],
                         "description": "Design approval override; 'inherit' clears it.",
+                    },
+                    "default_rigor": {
+                        "type": "string",
+                        "enum": ["standard", "high", "inherit"],
+                        "description": (
+                            "Verification rigor override: 'high' runs a multi-vendor verify panel; 'inherit' clears it."
+                        ),
                     },
                 },
                 "required": ["repo"],
@@ -352,6 +361,8 @@ def register_tools(ctx: Any) -> None:
                 impl_card_id=args.get("impl_card_id"),
                 head_sha=args.get("head_sha"),
                 run_hint=args.get("run_hint"),
+                rigor=args.get("rigor") or None,
+                panel_models=args.get("panel_models") or None,
                 session_id=kwargs.get("session_id"),
             )
             return _json_ok(res)
@@ -365,7 +376,10 @@ def register_tools(ctx: Any) -> None:
             "name": "factonio_spawn_verify",
             "description": (
                 "Spawn Factonio's two isolated parallel Verification cards for a PR: Diff Check (spec + git diff, "
-                "no holdout) and Black-Box Check (built artifact + holdout, no diff), both using the Verification model."
+                "no holdout) and Black-Box Check (built artifact + holdout, no diff), both using the Verification model. "
+                "rigor='high' (or the repo's default_rigor) instead fans out one Diff + Black-Box pair per member of a "
+                "multi-vendor verify panel under a shared panel_id, failing closed unless the panel spans >= 2 vendor "
+                "families; aggregate the lanes with factonio_evaluate_panel."
             ),
             "parameters": {
                 "type": "object",
@@ -376,11 +390,75 @@ def register_tools(ctx: Any) -> None:
                     "impl_card_id": {"type": "string", "description": "Optional parent Implementation card id."},
                     "head_sha": {"type": "string", "description": "Expected PR HEAD commit SHA."},
                     "run_hint": {"type": "string", "description": "Optional build/run/preview command hint for Black-Box Check."},
+                    "rigor": {
+                        "type": "string",
+                        "enum": ["standard", "high"],
+                        "description": "Verification rigor (default: repo default_rigor, then global, then 'standard').",
+                    },
+                    "panel_models": {
+                        "type": "array",
+                        "items": {
+                            "anyOf": [
+                                {"type": "string", "description": "'provider/model' or 'model'."},
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "provider": {"type": "string"},
+                                        "model": {"type": "string"},
+                                        "label": {"type": "string"},
+                                    },
+                                    "required": ["model"],
+                                },
+                            ]
+                        },
+                        "description": "rigor=high: explicit panel members overriding the configured verify_panel.",
+                    },
                 },
                 "required": ["repo", "tenant", "pr_number"],
             },
         },
         handler=handle_spawn_verify,
+    )
+
+    def handle_evaluate_panel(args: dict[str, Any], **kwargs: Any) -> str:
+        try:
+            pr_number = args.get("pr_number")
+            res = evaluate_verification_panel(
+                panel_id=args.get("panel_id") or None,
+                tenant=args.get("tenant") or None,
+                pr_number=int(pr_number) if pr_number is not None else None,
+                record_trail=bool(args.get("record", True)),
+            )
+            return _json_ok(res)
+        except Exception as exc:
+            return _json_err(exc)
+
+    ctx.register_tool(
+        name="factonio_evaluate_panel",
+        toolset=PLUGIN_ID,
+        schema={
+            "name": "factonio_evaluate_panel",
+            "description": (
+                "Aggregate a rigor='high' verification panel's lanes (read-only from Kanban) into a fail-closed "
+                "consensus: any reject -> reject, any inconclusive -> inconclusive, unfinished lanes -> pending, pass "
+                "only when every lane passed across >= 2 vendor families. Returns merge_allowed, per-verdict lanes, "
+                "disagreement_summary and aggregated findings, and records terminal consensus in trail.db."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "panel_id": {"type": "string", "description": "Panel id (vp_...) from factonio_spawn_verify."},
+                    "tenant": {"type": "string", "description": "Workstream tenant (latest panel when panel_id is omitted)."},
+                    "pr_number": {"type": "integer", "description": "PR number (latest panel when panel_id is omitted)."},
+                    "record": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Record a terminal consensus as verify_panel_consensus in trail.db.",
+                    },
+                },
+            },
+        },
+        handler=handle_evaluate_panel,
     )
 
     def handle_status(args: dict[str, Any], **kwargs: Any) -> str:

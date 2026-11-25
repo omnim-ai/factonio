@@ -31,6 +31,10 @@ _REJECT_VERDICTS = frozenset({"reject", "fail", "block", "changes_requested"})
 # Tri-state verification: `inconclusive` is never a pass and always needs attention.
 _INCONCLUSIVE_VERDICTS = frozenset({"inconclusive"})
 _VERIFY_PHASES = frozenset({"verify-diff", "verify-blackbox"})
+_PANEL_TAG_RE = re.compile(
+    r"Verification panel: `(vp_[a-z0-9]+)` \(rigor=`([^`]+)`, vendor=`([^`]+)`, model=`([^`]+)`\)"
+)
+_PASS_VERDICTS = frozenset({"pass"})
 # Run outcomes that are not failures: a clean latest run clears any stale error.
 _CLEAN_OUTCOMES = frozenset({"completed", "review_requested", "changes_requested", "scheduled", "approved"})
 
@@ -154,6 +158,217 @@ def _parse_json_dict(raw: Any) -> dict[str, Any]:
     return {}
 
 
+def parse_panel_tag(body: Any) -> Optional[dict[str, str]]:
+    """Parse the ``- Verification panel: `vp_...` (rigor=..., vendor=..., model=...)`` card stamp."""
+    m = _PANEL_TAG_RE.search(str(body or ""))
+    if not m:
+        return None
+    return {"panel_id": m.group(1), "rigor": m.group(2), "vendor": m.group(3), "model": m.group(4)}
+
+
+def _known_vendor(vendor: Any) -> Optional[str]:
+    text = str(vendor or "").strip().lower()
+    return text if text and text not in ("unknown", "none") else None
+
+
+def _verdict_bucket(verdict: Optional[str]) -> Optional[str]:
+    """Bucket a lane verdict; any unrecognized completed verdict is `inconclusive` (never a pass)."""
+    if verdict is None:
+        return None
+    norm = str(verdict).strip().lower()
+    if not norm:
+        return None
+    if norm in _REJECT_VERDICTS:
+        return "reject"
+    if norm in _PASS_VERDICTS:
+        return "pass"
+    return "inconclusive"
+
+
+def _lane_label(lane: dict[str, Any]) -> str:
+    phase = str(lane.get("phase") or "lane")
+    vendor = lane.get("vendor") or "unknown"
+    task_id = lane.get("task_id")
+    return f"{phase}/{vendor}" + (f" ({task_id})" if task_id else "")
+
+
+def aggregate_panel_verdicts(lanes: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fail-closed consensus over high-rigor verification panel lanes.
+
+    Each lane is a dict with ``status``, ``verdict`` and ``vendor`` (plus optional ``task_id``,
+    ``phase``, ``model``, ``findings``, ``disclosed_limits``). Rules, in order: any reject-family
+    verdict -> ``reject``; any inconclusive -> ``inconclusive``; any lane not done or without a
+    verdict -> ``pending``; >= 2 lanes over >= 2 distinct known vendors -> ``pass``; otherwise
+    ``inconclusive`` (degenerate single-vendor panel). Only ``pass`` sets ``merge_allowed``.
+    """
+    norm_lanes: list[dict[str, Any]] = []
+    buckets: dict[str, list[str]] = {"pass": [], "reject": [], "inconclusive": [], "pending": []}
+    findings: list[dict[str, Any]] = []
+    limits: list[dict[str, Any]] = []
+    vendors: list[str] = []
+    for raw in lanes or []:
+        lane = dict(raw or {})
+        verdict = lane.get("verdict")
+        verdict = str(verdict).strip().lower() if verdict is not None and str(verdict).strip() else None
+        bucket = _verdict_bucket(verdict)
+        status = str(lane.get("status") or "").strip().lower()
+        complete = status == "done" and verdict is not None
+        label = _lane_label(lane)
+        lane.update({"verdict": verdict, "bucket": bucket, "complete": complete, "label": label})
+        norm_lanes.append(lane)
+        vendor = _known_vendor(lane.get("vendor"))
+        if vendor and vendor not in vendors:
+            vendors.append(vendor)
+        if bucket is not None and (complete or bucket != "pass"):
+            buckets[bucket].append(label)
+        else:
+            buckets["pending"].append(label)
+        for key, sink in (("findings", findings), ("disclosed_limits", limits)):
+            items = lane.get(key)
+            if isinstance(items, (list, tuple)):
+                for item in items:
+                    sink.append({"lane": label, "vendor": lane.get("vendor"), "phase": lane.get("phase"), "item": item})
+            elif items:
+                sink.append({"lane": label, "vendor": lane.get("vendor"), "phase": lane.get("phase"), "item": items})
+
+    if buckets["reject"]:
+        consensus, reason = "reject", f"{len(buckets['reject'])} lane(s) rejected"
+    elif buckets["inconclusive"]:
+        consensus, reason = "inconclusive", f"{len(buckets['inconclusive'])} lane(s) inconclusive"
+    elif any(not lane["complete"] for lane in norm_lanes):
+        consensus, reason = "pending", f"{len(buckets['pending'])} lane(s) still pending"
+    elif len(norm_lanes) >= 2 and len(vendors) >= 2:
+        consensus, reason = "pass", f"all {len(norm_lanes)} lanes passed across {len(vendors)} vendor families"
+    else:
+        consensus = "inconclusive"
+        reason = (
+            f"degenerate panel: {len(norm_lanes)} lane(s) across {len(vendors)} known vendor famil"
+            f"{'y' if len(vendors) == 1 else 'ies'}; a pass needs >= 2 lanes and >= 2 vendors"
+        )
+
+    decided = [b for b in ("pass", "reject", "inconclusive") if buckets[b]]
+    has_disagreement = len(decided) > 1
+    disagreement_summary: Optional[str] = None
+    if has_disagreement:
+        parts = [f"{b}: {', '.join(buckets[b])}" for b in decided]
+        disagreement_summary = "Panel lanes disagree -- " + "; ".join(parts)
+        if findings:
+            disagreement_summary += f". {len(findings)} finding(s) to review before escalation"
+        if buckets["pending"]:
+            disagreement_summary += f" ({len(buckets['pending'])} lane(s) still pending)"
+        disagreement_summary += "."
+
+    return {
+        "consensus": consensus,
+        "merge_allowed": consensus == "pass",
+        "reason": reason,
+        "lane_count": len(norm_lanes),
+        "completed_count": sum(1 for lane in norm_lanes if lane["complete"]),
+        "vendors": sorted(vendors),
+        "distinct_vendor_count": len(vendors),
+        "verdicts": buckets,
+        "has_disagreement": has_disagreement,
+        "disagreement_summary": disagreement_summary,
+        "findings": findings,
+        "disclosed_limits": limits,
+        "lanes": norm_lanes,
+    }
+
+
+def _panel_lane(task: dict[str, Any], runs: list[dict[str, Any]], tag: dict[str, str]) -> dict[str, Any]:
+    phase = classify_phase(task)
+    status = str(task.get("status") or "")
+    meta = _parse_json_dict(runs[-1].get("metadata")) if runs else {}
+    return {
+        "task_id": task.get("id"),
+        "title": task.get("title"),
+        "phase": phase,
+        "status": status,
+        "verdict": _card_verdict(phase, status, runs) if phase in _VERIFY_PHASES else None,
+        "vendor": tag["vendor"],
+        "model": tag["model"],
+        "tenant": task.get("tenant"),
+        "pr": _extract_pr_ref(task, runs),
+        "findings": meta.get("findings") if isinstance(meta.get("findings"), list) else [],
+        "disclosed_limits": meta.get("disclosed_limits") if isinstance(meta.get("disclosed_limits"), list) else [],
+        "created_at": task.get("created_at"),
+        "seq": task.get("seq"),
+    }
+
+
+def summarize_panel(panel_id: str, lanes: list[dict[str, Any]]) -> dict[str, Any]:
+    """`aggregate_panel_verdicts` plus panel identity (tenant, PR) derived from its lanes."""
+    agg = aggregate_panel_verdicts(lanes)
+    first = lanes[0] if lanes else {}
+    return {
+        "panel_id": panel_id,
+        "tenant": first.get("tenant"),
+        "pr": next((lane.get("pr") for lane in lanes if lane.get("pr")), None),
+        "created_at": min((lane.get("created_at") or 0 for lane in lanes), default=None),
+        "seq": max((lane.get("seq") or 0 for lane in lanes), default=0),
+        **agg,
+    }
+
+
+def load_panel_lanes(
+    db_path: Path,
+    *,
+    panel_ids: Optional[list[str]] = None,
+    tenant: Optional[str] = None,
+    pr_number: Optional[int] = None,
+    assignee: str = WORKER_PROFILE,
+) -> dict[str, list[dict[str, Any]]]:
+    """Read panel verification cards from `kanban.db` (read-only), grouped by ``panel_id``."""
+    conn = _open_ro(db_path)
+    if conn is None:
+        return {}
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    try:
+        with closing(conn):
+            where = ["assignee = ?", "body LIKE ?"]
+            params: list[Any] = [assignee, "%Verification panel: `vp_%"]
+            if tenant:
+                where.append("tenant = ?")
+                params.append(tenant)
+            if panel_ids:
+                where.append("(" + " OR ".join("body LIKE ?" for _ in panel_ids) + ")")
+                params.extend(f"%`{pid}`%" for pid in panel_ids)
+            tasks = [
+                dict(r)
+                for r in conn.execute(
+                    f"SELECT rowid AS seq, id, title, status, tenant, skills, created_at, result, body FROM tasks "
+                    f"WHERE {' AND '.join(where)} ORDER BY created_at ASC, rowid ASC",
+                    params,
+                ).fetchall()
+            ]
+            if not tasks:
+                return {}
+            ids = [t["id"] for t in tasks]
+            ph = ",".join("?" for _ in ids)
+            run_cols = _table_columns(conn, "task_runs")
+            run_extra = "".join(f", {c}" for c in ("summary", "error") if c in run_cols)
+            runs_by_task: dict[str, list[dict[str, Any]]] = {}
+            for r in conn.execute(
+                f"SELECT id, task_id, started_at, ended_at, outcome, metadata{run_extra} FROM task_runs "
+                f"WHERE task_id IN ({ph}) ORDER BY id ASC",
+                ids,
+            ).fetchall():
+                runs_by_task.setdefault(r["task_id"], []).append(dict(r))
+    except sqlite3.Error:
+        return {}
+
+    wanted = set(panel_ids or [])
+    for task in tasks:
+        tag = parse_panel_tag(task.get("body"))
+        if tag is None or (wanted and tag["panel_id"] not in wanted):
+            continue
+        lane = _panel_lane(task, runs_by_task.get(task["id"], []), tag)
+        if pr_number is not None and int((lane.get("pr") or {}).get("number") or -1) != int(pr_number):
+            continue
+        grouped.setdefault(tag["panel_id"], []).append(lane)
+    return grouped
+
+
 def classify_phase(task: dict[str, Any]) -> str:
     """Classify a Factonio Kanban card into its pipeline phase."""
     skills = _parse_json_list(task.get("skills"))
@@ -258,6 +473,10 @@ def compute_metrics(
     return result
 
 
+def _empty_panel_counts() -> dict[str, int]:
+    return {"total": 0, "pass": 0, "reject": 0, "inconclusive": 0, "pending": 0, "disagreements": 0}
+
+
 def _compute_kanban_metrics(
     db_path: Path,
     *,
@@ -287,6 +506,7 @@ def _compute_kanban_metrics(
         },
         "rework": {"avg_runs_per_implement_card": None, "cards_with_rework": 0},
         "escapes": {"count": 0, "verified_total": 0, "escape_rate": None},
+        "verification_panels": _empty_panel_counts(),
     }
 
     conn = _open_ro(db_path)
@@ -343,6 +563,7 @@ def _compute_kanban_metrics(
             impl_run_counts: list[int] = []
             impl_rework_cards = 0
             escape_count = 0
+            panel_lanes: dict[str, list[dict[str, Any]]] = {}
 
             for t in tasks:
                 if t.get("tenant"):
@@ -380,6 +601,9 @@ def _compute_kanban_metrics(
                         impl_rework_cards += 1
 
                 if phase in _VERIFY_PHASES:
+                    tag = parse_panel_tag(t.get("body"))
+                    if tag is not None:
+                        panel_lanes.setdefault(tag["panel_id"], []).append(_panel_lane(t, runs, tag))
                     verdict = _card_verdict(phase, status, runs)
                     if phase == "verify-diff":
                         if verdict == "pass":
@@ -435,6 +659,14 @@ def _compute_kanban_metrics(
                 "verified_total": verified_total,
                 "escape_rate": round(escape_count / verified_total, 3) if verified_total else None,
             }
+            panel_counts = _empty_panel_counts()
+            for lanes in panel_lanes.values():
+                agg = aggregate_panel_verdicts(lanes)
+                panel_counts["total"] += 1
+                panel_counts[agg["consensus"]] += 1
+                if agg["has_disagreement"]:
+                    panel_counts["disagreements"] += 1
+            empty["verification_panels"] = panel_counts
             return empty
     except sqlite3.Error:
         return empty
@@ -556,6 +788,7 @@ def thread_cards(
                     elapsed = max(0, int(end - float(created)))
                 phase = classify_phase(r)
                 verdict = _card_verdict(phase, st, runs)
+                panel_tag = parse_panel_tag(r.get("body")) if phase in _VERIFY_PHASES else None
                 if verdict in _REJECT_VERDICTS:
                     counts["rejected"] += 1
                 elif verdict in _INCONCLUSIVE_VERDICTS:
@@ -583,6 +816,8 @@ def thread_cards(
                     "summary": _card_summary(r, st, runs),
                     "last_outcome": runs[-1].get("outcome") if runs else None,
                     "last_error": _card_last_error(r, st, runs),
+                    "panel_id": (panel_tag or {}).get("panel_id"),
+                    "panel_vendor": (panel_tag or {}).get("vendor"),
                 })
             counts["attention"] = (
                 counts["blocked"] + counts["triage"] + counts["rejected"] + counts["inconclusive"]

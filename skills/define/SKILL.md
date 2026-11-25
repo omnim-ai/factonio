@@ -83,6 +83,8 @@ Keep independent units parallel (`depends on: none`). Never mention or leak `hol
 3. **Shared mutable state:** Where do units touch the same file, schema, config, or global? Separate that state behind an explicit interface (or extract it into its own blocking unit) before deciding to serialize.
 4. **Smallest safe decomposition:** Is each unit the smallest independently verifiable, mergeable PR? Merge units that cannot be verified alone; split units that mix unrelated concerns.
 
+**Verification rigor:** when a unit touches security, authentication, data migrations, money movement, or a public API contract, say so in its DAG line (for example `rigor: high recommended`) so the orchestrator can opt that PR into the multi-vendor `rigor: high` verification panel. Leave all other units on the default `standard` rigor.
+
 ### 3. Author Hidden Holdout Checks
 
 Write 2 to 5 concrete black-box verification scenarios under the `holdout/` directory (for example `holdout/01-happy-path.md`, `holdout/02-edge-case.md`). Each file must contain:

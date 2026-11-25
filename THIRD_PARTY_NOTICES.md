@@ -18,6 +18,7 @@ Factonio adapts engineering patterns and instruction text from the third-party p
   - `create-verification-skill`: the repo-local verification harness with `Launch` / `Doctor` / `Drive` / `Evidence` / `Cleanup` sections and a feature map (`harness.py`, `.factonio/verify.md` + `.factonio/harness.json`, `factonio_bootstrap_verify`, `hermes factonio harness init`), fed to Black-Box Verification (`orchestrator.py`, `skills/verify-blackbox/SKILL.md`).
   - `maintain-verification-skill`: scheduled read-only feature-map drift audits that report `clean` / `stale` / `missing` and never edit product code (`audit_harness`, `hermes factonio harness audit`, the `harness-audit` blueprint in `__init__.py`).
   - stacked PR landing: `base_branch` / `stack_parent_pr` implementation cards, true-base PR gate/merge, and clean-worktree `git rebase --onto` restacks with `git patch-id` verdict continuity (`repos.py`, `orchestrator.py`, `factonio_restack_pr`, `hermes factonio restack`).
+  - multi-model review panel: opt-in `rigor="high"` verification that fans independent reviewers out across distinct vendor families and only passes on unanimous agreement, surfacing disagreements for escalation (`config.py` `resolve_verify_panel`, `orchestrator.py` `aggregate_panel_verdicts` / `evaluate_verification_panel`, `factonio_evaluate_panel`, `hermes factonio panel`).
 
 ```text
 MIT License
