@@ -78,6 +78,47 @@ jobs:
       - name: Manifest, skills, and documentation link integrity
         run: uv run --with pyyaml python tools/check_repo_integrity.py
 
+  media:
+    name: README media freshness
+    # Enforces that PRs modifying Desktop UI (`desktop/plugin.js`) or the capture harness also
+    # refresh `docs/images/` (using `.agents/skills/update-readme-media/SKILL.md`), unless the
+    # PR carries the `no-visual-change` label for non-visual refactors.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+      - name: Verify docs/images updated or no-visual-change label set
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          PR: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          changed=$(git diff --name-only "$BASE...HEAD")
+          if ! printf '%s\n' "$changed" | grep -qE '^(desktop/plugin\.js|tools/capture_readme_media\.py)$'; then
+            echo "No Desktop UI or media harness changes: skipped"
+            exit 0
+          fi
+          if gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels -q '.labels[].name' | grep -qx no-visual-change; then
+            echo "no-visual-change label present: skipped"
+            exit 0
+          fi
+          if printf '%s\n' "$changed" | grep -qE '^docs/images/'; then
+            echo "docs/images/ updated alongside UI change:"
+            printf '%s\n' "$changed" | grep -E '^docs/images/'
+            exit 0
+          fi
+          echo "::error file=desktop/plugin.js::Desktop UI or capture harness changed without updating docs/images/. Follow .agents/skills/update-readme-media/SKILL.md (run 'python3 tools/capture_readme_media.py --capture --qa-dir /tmp/factonio-media-qa' and visually verify), or add the 'no-visual-change' label if the change has no visual impact."
+          exit 1
+
   tests:
     name: Test suite on Hermes (pinned)
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
@@ -116,7 +157,7 @@ jobs:
     name: CI passed
     # Single required check for branch protection: passes when every job above succeeded or was cleanly skipped.
     if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
-    needs: [changelog, lint, tests]
+    needs: [changelog, lint, media, tests]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

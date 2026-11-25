@@ -85,6 +85,23 @@ class TestPluginRegistration(unittest.TestCase):
             self.assertTrue(any(cb for cb in mgr._hooks.get("on_kanban_dispatch_tick", [])))
             self.assertIn("factonio:retro", mgr._automation_blueprints)
 
+            # 5. Contributor-only project skills (.agents/skills/) stay out of runtime plugin skills
+            self.assertNotIn("factonio:update-readme-media", mgr._plugin_skills)
+
+    def test_contributor_project_skill_discoverable_and_not_quarantined(self):
+        from agent.skill_utils import is_quarantined_project_skill, iter_skill_index_files
+
+        skill_dir = PLUGIN_ROOT / ".agents" / "skills"
+        self.assertTrue(skill_dir.is_dir())
+        discovered = {p.parent.name: p for p in iter_skill_index_files(skill_dir, "SKILL.md")}
+        self.assertIn("update-readme-media", discovered)
+        skill_md = discovered["update-readme-media"]
+        with isolated_hermes_home():
+            self.assertFalse(
+                is_quarantined_project_skill(skill_md),
+                "Contributor skill .agents/skills/update-readme-media/SKILL.md was quarantined by Hermes scanner",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

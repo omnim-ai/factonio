@@ -182,6 +182,7 @@ git clone git@github.com:omnim-ai/factonio.git
 cd factonio
 ln -sfn "$PWD" "${HERMES_HOME:-$HOME/.hermes}/plugins/factonio"
 hermes plugins enable factonio
+hermes skills trust   # auto-loads contributor skills in .agents/skills/ (e.g. update-readme-media)
 ```
 
 ### Run tests and checks
@@ -199,7 +200,7 @@ node --check desktop/plugin.js
 python3 tools/check_repo_integrity.py
 ```
 
-Read **[CONTRIBUTING.md](CONTRIBUTING.md)** for PR expectations, core invariants, and the change-to-checks guide, and **[docs/development.md](docs/development.md)** for setting up a pinned Hermes checkout, understanding the zero-build Node ESM Desktop test harness, and regenerating README screenshots and animations.
+Read **[CONTRIBUTING.md](CONTRIBUTING.md)** for PR expectations, core invariants, and the change-to-checks guide, and **[docs/development.md](docs/development.md)** for setting up a pinned Hermes checkout, understanding the zero-build Node ESM Desktop test harness, and keeping README screenshots/GIFs up to date via the [`.agents/skills/update-readme-media/SKILL.md`](.agents/skills/update-readme-media/SKILL.md) contributor skill (enforced on UI PRs in CI).
 
 Report security vulnerabilities privately through **[SECURITY.md](SECURITY.md)**. See **[CHANGELOG.md](CHANGELOG.md)** for release history.
 
