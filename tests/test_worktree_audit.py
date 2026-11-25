@@ -402,6 +402,108 @@ class TestWorktreeAudit(unittest.TestCase):
                 self.assertEqual(held[name]["bucket"], "hold-active-card", held[name])
                 self.assertIn("could not be verified", held[name]["hold_reason"])
 
+    def _assert_nothing_removed(self, res, paths, names=("merged", "scratch", "closed", "donecard")):
+        self.assertFalse(res["ok"], res)
+        self.assertEqual(res["removed"], [])
+        self.assertTrue(res["kanban_errors"], res)
+        held = {Path(h["path"]).name: h for h in res["held"]}
+        for name in names:
+            self.assertTrue(paths[name].is_dir(), name)
+            self.assertIn(str(paths[name]), _worktree_paths(paths["main"]))
+            self.assertEqual(held[name]["bucket"], "hold-active-card", held[name])
+            self.assertIn("could not be verified", held[name]["hold_reason"])
+        self.assertEqual((paths["merged"] / "merged.txt").read_text(encoding="utf-8"), "m" * 4096)
+
+    def test_prune_fails_closed_when_kanban_db_disappears_after_audit(self):
+        with isolated_hermes_home() as home:
+            paths = _build_fixture(home)
+            db = home / "kanban.db"
+            _seed_cards(db, paths)
+
+            def vanish() -> None:
+                for suffix in ("-wal", "-shm"):
+                    Path(f"{db}{suffix}").unlink(missing_ok=True)
+                db.rename(home / "kanban.db.moved")
+
+            res = self._prune_with_post_audit_hook(paths, vanish)
+            self._assert_nothing_removed(res, paths)
+
+    def test_prune_fails_closed_when_explicit_kanban_db_path_unavailable(self):
+        from factonio import repos
+
+        with isolated_hermes_home() as home:
+            paths = _build_fixture(home)
+            (home / "a-directory.db").mkdir()
+            for bad in (home / "no-such.db", home / "a-directory.db"):
+                with mock.patch.object(repos, "_run_gh", side_effect=_gh_ok):
+                    res = repos.prune_safe_worktrees(str(paths["main"]), kanban_db_path=bad)
+                self._assert_nothing_removed(res, paths)
+
+    def test_prune_holds_worktree_locked_after_audit(self):
+        with isolated_hermes_home() as home:
+            paths = _build_fixture(home)
+            _seed_cards(home / "kanban.db", paths)
+            def hook() -> None:
+                _git(paths["main"], "worktree", "lock", "--reason", "operator hold", str(paths["merged"]))
+
+            res = self._prune_with_post_audit_hook(paths, hook)
+            removed = {Path(r["path"]).name for r in res["removed"]}
+            held = {Path(h["path"]).name: h for h in res["held"]}
+            self.assertNotIn("merged", removed)
+            self.assertEqual(held["merged"]["bucket"], "review")
+            self.assertIn("locked", held["merged"]["hold_reason"])
+            self.assertEqual((paths["merged"] / "merged.txt").read_text(encoding="utf-8"), "m" * 4096)
+            self.assertIn(str(paths["merged"]), _worktree_paths(paths["main"]))
+            self.assertIn("scratch", removed)
+
+    def test_prune_never_rmtrees_worktree_locked_during_git_remove(self):
+        from factonio import repos
+
+        with isolated_hermes_home() as home:
+            paths = _build_fixture(home)
+            real_run_git = repos._run_git
+
+            def lock_then_remove(args: list[str], **kw: Any):
+                if args[:2] == ["worktree", "remove"] and Path(args[-1]) == paths["merged"]:
+                    _git(paths["main"], "worktree", "lock", "--reason", "operator hold", str(paths["merged"]))
+                return real_run_git(args, **kw)
+
+            with mock.patch.object(repos, "_run_gh", side_effect=_gh_ok), \
+                    mock.patch.object(repos, "_run_git", side_effect=lock_then_remove):
+                res = repos.prune_safe_worktrees(str(paths["main"]))
+            removed = {Path(r["path"]).name for r in res["removed"]}
+            held = {Path(h["path"]).name: h for h in res["held"]}
+            self.assertNotIn("merged", removed)
+            self.assertEqual(held["merged"]["bucket"], "review")
+            self.assertIn("locked", held["merged"]["hold_reason"])
+            self.assertEqual((paths["merged"] / "merged.txt").read_text(encoding="utf-8"), "m" * 4096)
+            self.assertIn(str(paths["merged"]), _worktree_paths(paths["main"]))
+
+    def test_prune_rmtree_fallback_only_for_deregistered_leftovers(self):
+        from factonio import repos
+
+        with isolated_hermes_home() as home:
+            paths = _build_fixture(home)
+            real_run_git = repos._run_git
+            target = paths["scratch"]
+
+            def remove_leaving_artifacts(args: list[str], **kw: Any):
+                proc = real_run_git(args, **kw)
+                if args[:2] == ["worktree", "remove"] and Path(args[-1]) == target:
+                    # git de-registered the worktree but could not delete a leftover directory.
+                    (target / "build" / "stuck").mkdir(parents=True)
+                    (target / ".git").write_text(f"gitdir: {paths['main']}/.git/worktrees/scratch\n", encoding="utf-8")
+                    return subprocess.CompletedProcess(proc.args, 1, "", "error: failed to delete: Directory not empty")
+                return proc
+
+            with mock.patch.object(repos, "_run_gh", side_effect=_gh_ok), \
+                    mock.patch.object(repos, "_run_git", side_effect=remove_leaving_artifacts):
+                res = repos.prune_safe_worktrees(str(paths["main"]))
+            removed = {Path(r["path"]).name: r for r in res["removed"]}
+            self.assertEqual(removed["scratch"]["method"], "fallback rmtree")
+            self.assertFalse(target.exists())
+            self.assertTrue(res["ok"], res)
+
     def test_prune_holds_worktree_whose_head_moved_after_audit(self):
         with isolated_hermes_home() as home:
             paths = _build_fixture(home)

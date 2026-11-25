@@ -1240,9 +1240,19 @@ def _resolve_kanban_db(kanban_db_path: Optional[str | Path]) -> Optional[Path]:
     return Path(kanban_db_path) if kanban_db_path else _default_kanban_db_path()
 
 
-def _query_active_cards(kanban_db_path: Optional[Path]) -> tuple[list[dict[str, Any]], Optional[str]]:
-    """Read-only list of non-terminal Kanban cards plus an error when an existing DB cannot be verified."""
-    if kanban_db_path is None or not Path(kanban_db_path).is_file():
+def _query_active_cards(
+    kanban_db_path: Optional[Path], *, required: bool = False
+) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Read-only list of non-terminal Kanban cards plus an error when ownership cannot be verified.
+
+    A missing DB only means "no cards" when ``required`` is false; destructive callers pass
+    ``required=True`` whenever the DB is expected to exist, so a vanished/unreadable DB fails closed.
+    """
+    if kanban_db_path is None:
+        return [], ("cannot resolve kanban.db path" if required else None)
+    if not Path(kanban_db_path).is_file():
+        if required:
+            return [], f"{kanban_db_path} is missing or not a regular file"
         return [], None
     try:
         conn = sqlite3.connect(f"file:{Path(kanban_db_path)}?mode=ro", uri=True, timeout=3.0)
@@ -1353,6 +1363,8 @@ def _bucket_for(entry: dict[str, Any]) -> tuple[str, str]:
         return "hold-open-pr", f"open PR {entry['pr'].split('/')[0]}"
     if entry.get("locked"):
         return "review", "worktree is locked"
+    if entry.get("prunable") or entry.get("exists") is False:
+        return "review", "worktree directory is missing or prunable"
     if dirty == "clean" or dirty.startswith("scratch:"):
         if entry.get("merged") is True:
             return "safe", ""
@@ -1421,54 +1433,84 @@ def _audit_one_repo(
         wt_path = Path(raw["path"])
         if wt_path.exists() and wt_path.resolve() == main_resolved:
             continue
-        branch = raw.get("branch")
-        exists = wt_path.is_dir()
-        head_sha = raw.get("head_sha")
-        entry: dict[str, Any] = {
-            "path": str(wt_path),
-            "repo": full_repo,
-            "slug": target.get("slug"),
-            "branch": branch,
-            "head_sha": head_sha,
-            "exists": exists,
-            "locked": bool(raw.get("locked")),
-        }
+        entry = _inspect_worktree(
+            raw, main_path=main_path, full_repo=full_repo, slug=target.get("slug"),
+            resolved_base=resolved_base, prs=prs, cards=cards, now_ts=now_ts,
+        )
+        entry.pop("scratch_paths", None)
+        result["worktrees"].append(entry)
+    return result
+
+
+def _inspect_worktree(
+    raw: dict[str, Any],
+    *,
+    main_path: Path,
+    full_repo: Optional[str],
+    slug: Optional[str],
+    resolved_base: Optional[str],
+    prs: dict[str, dict[str, Any]],
+    cards: list[dict[str, Any]],
+    now_ts: float,
+    measure: bool = True,
+) -> dict[str, Any]:
+    """Classify one ``git worktree list --porcelain`` entry.
+
+    The single source of truth for bucket safety, shared by the audit and the pre-removal
+    recheck so the two can never drift. ``measure=False`` skips size/age/remote (informational only).
+    """
+    wt_path = Path(raw["path"])
+    branch = raw.get("branch")
+    exists = wt_path.is_dir()
+    head_sha = raw.get("head_sha")
+    entry: dict[str, Any] = {
+        "path": str(wt_path),
+        "repo": full_repo,
+        "slug": slug,
+        "branch": branch,
+        "head_sha": head_sha,
+        "exists": exists,
+        "locked": bool(raw.get("locked")),
+        "prunable": bool(raw.get("prunable")),
+    }
+    if measure:
         size = _dir_size_bytes(wt_path) if exists else 0
         entry["size_bytes"] = size
         entry["size_human"] = _human_size(size)
         entry["age_days"] = _worktree_age_days(wt_path, now_ts) if exists else None
 
-        merged: Optional[bool] = None
-        if resolved_base and head_sha:
-            probe = _run_git_ro(["merge-base", "--is-ancestor", head_sha, resolved_base], cwd=main_path)
-            merged = True if probe.returncode == 0 else (False if probe.returncode == 1 else None)
-        entry["merged"] = merged
-        inventory = _dirty_inventory(wt_path) if exists else {"dirty": "clean", "hold_reason": ""}
-        entry["dirty"] = inventory["dirty"]
-        if inventory.get("hold_reason"):
-            entry["dirty_reason"] = inventory["hold_reason"]
+    merged: Optional[bool] = None
+    if resolved_base and head_sha:
+        probe = _run_git_ro(["merge-base", "--is-ancestor", head_sha, resolved_base], cwd=main_path)
+        merged = True if probe.returncode == 0 else (False if probe.returncode == 1 else None)
+    entry["merged"] = merged
+    inventory = _dirty_inventory(wt_path) if exists else {"dirty": "clean", "scratch": [], "hold_reason": ""}
+    entry["dirty"] = inventory["dirty"]
+    entry["scratch_paths"] = list(inventory.get("scratch") or [])
+    if inventory.get("hold_reason"):
+        entry["dirty_reason"] = inventory["hold_reason"]
+    if measure:
         entry["remote"] = _classify_remote(wt_path, branch) if exists else ("detached" if not branch else "no-remote")
 
-        pr = prs.get(branch) if branch else None
-        if pr:
-            state = str(pr.get("state") or "").upper()
-            if state == "OPEN" and pr.get("isDraft"):
-                state = "DRAFT"
-            entry["pr"] = f"#{pr.get('number')}/{state.lower()}"
-            entry["pr_state"] = state
-            entry["pr_url"] = pr.get("url")
-        else:
-            entry["pr"] = "-"
-            entry["pr_state"] = None
-            entry["pr_url"] = None
+    pr = prs.get(branch) if branch else None
+    if pr:
+        state = str(pr.get("state") or "").upper()
+        if state == "OPEN" and pr.get("isDraft"):
+            state = "DRAFT"
+        entry["pr"] = f"#{pr.get('number')}/{state.lower()}"
+        entry["pr_state"] = state
+        entry["pr_url"] = pr.get("url")
+    else:
+        entry["pr"] = "-"
+        entry["pr_state"] = None
+        entry["pr_url"] = None
 
-        card = _match_active_card(cards, wt_path, branch)
-        entry["active_card"] = card.get("id") if card else None
-        entry["active_card_status"] = card.get("status") if card else None
+    card = _match_active_card(cards, wt_path, branch)
+    entry["active_card"] = card.get("id") if card else None
+    entry["active_card_status"] = card.get("status") if card else None
 
-        entry["bucket"], entry["hold_reason"] = _bucket_for(entry)
-        result["worktrees"].append(entry)
-    return result
+    entry["bucket"], entry["hold_reason"] = _bucket_for(entry)
+    return entry
 
 
 def audit_worktrees(
@@ -1511,63 +1553,84 @@ def audit_worktrees(
     }
 
 
-def _is_linked_worktree_of(wt_path: Path, main_path: Path) -> bool:
-    """True only if ``wt_path`` is a linked worktree whose admin dir lives under ``main_path``'s git dir."""
+def _linked_worktree_admin_dir(wt_path: Path, main_path: Path) -> Optional[Path]:
+    """Admin dir named by ``wt_path/.git`` if it lies under ``main_path``'s ``worktrees/``; else ``None``."""
     marker = wt_path / ".git"
     if not marker.is_file():
-        return False
+        return None
     try:
         text = marker.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
-        return False
+        return None
     if not text.startswith("gitdir:"):
-        return False
+        return None
     admin = Path(text[len("gitdir:"):].strip())
     if not admin.is_absolute():
         admin = (wt_path / admin)
     common = _run_git_ro(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=main_path)
     if common.returncode != 0 or not common.stdout.strip():
-        return False
+        return None
     worktrees_root = Path(common.stdout.strip()).resolve() / "worktrees"
     try:
         admin.resolve().relative_to(worktrees_root)
     except ValueError:
-        return False
-    return True
+        return None
+    return admin
+
+
+def _live_worktree_entry(main_path: Path, wt_path_str: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Current porcelain entry for ``wt_path_str`` (``None`` if unregistered) or an error string."""
+    listing = _run_git_ro(["worktree", "list", "--porcelain"], cwd=main_path)
+    if listing.returncode != 0:
+        return None, _git_err(listing, "worktree list")
+    return next((e for e in _parse_worktree_porcelain(listing.stdout) if e.get("path") == wt_path_str), None), None
 
 
 def _recheck_before_removal(
-    wt: dict[str, Any], wt_path: Path, main_path: Path, db_path: Optional[Path]
+    wt: dict[str, Any],
+    main_path: Path,
+    *,
+    repo_out: dict[str, Any],
+    prs: dict[str, dict[str, Any]],
+    db_path: Optional[Path],
+    db_required: bool,
 ) -> tuple[Optional[tuple[str, str]], list[str], Optional[str]]:
     """Re-verify a ``safe`` candidate immediately before deletion.
 
-    Returns ``(hold, dropped_scratch, kanban_error)`` where ``hold`` is ``(bucket, reason)``
-    when the worktree must be kept. Kanban ownership fails closed.
+    Re-runs the exact audit classifier (``_inspect_worktree`` -> ``_bucket_for``) on the live
+    porcelain entry, so lock/prunable/HEAD/merge/dirty/PR/card invariants cannot drift from the
+    audit. Returns ``(hold, dropped_scratch, kanban_error)``; ``hold`` is ``(bucket, reason)``.
+    Kanban ownership fails closed.
     """
-    listing = _run_git_ro(["worktree", "list", "--porcelain"], cwd=main_path)
-    if listing.returncode != 0:
-        return ("review", f"worktree changed since audit: {_git_err(listing, 'worktree list')}"), [], None
-    current = next((e for e in _parse_worktree_porcelain(listing.stdout) if e.get("path") == wt["path"]), None)
+    current, err = _live_worktree_entry(main_path, wt["path"])
+    if err:
+        return ("review", f"worktree changed since audit: {err}"), [], None
     if current is None:
         return ("review", "worktree changed since audit: no longer registered"), [], None
     if current.get("branch") != wt["branch"] or current.get("head_sha") != wt["head_sha"]:
         return ("review", "worktree changed since audit: branch or HEAD moved"), [], None
+    if current.get("locked"):
+        return ("review", "worktree is locked"), [], None
 
-    dropped_scratch: list[str] = []
-    if wt_path.is_dir():
-        fresh = _dirty_inventory(wt_path)
-        if str(fresh["dirty"]).startswith("wip:"):
-            return ("hold-wip", f"work appeared before removal: {fresh['hold_reason']}"), [], None
-        dropped_scratch = list(fresh["scratch"])
+    cards, kanban_err = _query_active_cards(db_path, required=db_required)
+    if kanban_err:
+        return (
+            ("hold-active-card", f"active-card ownership could not be verified (fail closed): {kanban_err}"),
+            [],
+            kanban_err,
+        )
+    fresh = _inspect_worktree(
+        current, main_path=main_path, full_repo=repo_out.get("repo"), slug=repo_out.get("slug"),
+        resolved_base=repo_out.get("base_ref"), prs=prs, cards=cards, now_ts=time.time(), measure=False,
+    )
+    if fresh["bucket"] != "safe":
+        return (fresh["bucket"], f"changed since audit: {fresh['hold_reason']}"), [], None
+    return None, list(fresh["scratch_paths"]), None
 
-    cards, err = _query_active_cards(db_path)
-    if err:
-        return ("hold-active-card", f"active-card ownership could not be verified (fail closed): {err}"), [], err
-    card = _match_active_card(cards, wt_path, wt["branch"])
-    if card:
-        status = card.get("status") or "active"
-        return ("hold-active-card", f"active card {card.get('id')} ({status}) claimed worktree before removal"), [], None
-    return None, dropped_scratch, None
+
+def _is_lock_refusal(proc: subprocess.CompletedProcess[str]) -> bool:
+    text = f"{proc.stderr or ''}\n{proc.stdout or ''}".lower()
+    return "locked" in text or "lock reason" in text
 
 
 def prune_safe_worktrees(
@@ -1577,48 +1640,92 @@ def prune_safe_worktrees(
     kanban_db_path: Optional[str | Path] = None,
     check_pr: bool = True,
 ) -> dict[str, Any]:
-    """Remove ONLY ``bucket == "safe"`` worktrees; every held/review worktree is left untouched."""
-    audit = audit_worktrees(repo_spec, base_ref=base_ref, kanban_db_path=kanban_db_path, check_pr=check_pr)
+    """Remove ONLY worktrees that are ``safe`` both in the audit and on a live re-check.
+
+    Fail-closed rules:
+    - Kanban ownership is *required* when ``kanban_db_path`` is explicit, when the default DB path
+      cannot be resolved, or once the default DB has been seen to exist (before the audit or at any
+      later candidate). A required DB that is missing/non-file/unreadable holds every candidate.
+    - ``shutil.rmtree`` never overrides a ``git worktree remove`` refusal: it only runs when git has
+      already de-registered the worktree (so no lock can remain), its admin dir is gone, the output
+      carries no lock refusal, and Kanban ownership re-verifies.
+    """
     db_path = _resolve_kanban_db(kanban_db_path)
+    db_required = bool(kanban_db_path) or db_path is None or db_path.exists()
+    audit = audit_worktrees(repo_spec, base_ref=base_ref, kanban_db_path=kanban_db_path, check_pr=check_pr)
     kanban_errors: list[str] = []
     removed: list[dict[str, Any]] = []
     held: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
+    def hold(wt: dict[str, Any], bucket: str, reason: str) -> None:
+        held.append({
+            "path": wt["path"], "branch": wt["branch"], "bucket": bucket,
+            "hold_reason": reason, "size_bytes": wt["size_bytes"],
+        })
+
+    def note_kanban_error(err: Optional[str]) -> None:
+        if err and err not in kanban_errors:
+            kanban_errors.append(err)
+
     for repo_out in audit["repos"]:
         main_path = Path(repo_out["path"])
-        touched = False
+        candidates = [wt for wt in repo_out["worktrees"] if wt["bucket"] == "safe"]
         for wt in repo_out["worktrees"]:
             if wt["bucket"] != "safe":
-                held.append({
-                    "path": wt["path"], "branch": wt["branch"], "bucket": wt["bucket"],
-                    "hold_reason": wt["hold_reason"], "size_bytes": wt["size_bytes"],
-                })
-                continue
+                hold(wt, wt["bucket"], wt["hold_reason"])
+        if not candidates:
+            continue
+        # PR state is re-read too; a lookup failure only demotes closed-PR candidates to review.
+        prs = _list_prs_by_branch(repo_out.get("repo"))[0] if check_pr else {}
+        touched = False
+        for wt in candidates:
             wt_path = Path(wt["path"])
-            # Re-check right before deleting: work, HEAD moves or a card claim may have happened since the audit.
-            hold, dropped_scratch, kanban_error = _recheck_before_removal(wt, wt_path, main_path, db_path)
-            if kanban_error and kanban_error not in kanban_errors:
-                kanban_errors.append(kanban_error)
-            if hold is not None:
-                held.append({
-                    "path": wt["path"], "branch": wt["branch"], "bucket": hold[0],
-                    "hold_reason": hold[1], "size_bytes": wt["size_bytes"],
-                })
+            if db_path is not None and db_path.exists():
+                db_required = True
+            recheck = dict(repo_out=repo_out, prs=prs, db_path=db_path, db_required=db_required)
+            held_as, dropped_scratch, kanban_error = _recheck_before_removal(wt, main_path, **recheck)
+            note_kanban_error(kanban_error)
+            if held_as is not None:
+                hold(wt, *held_as)
                 continue
+
             touched = True
             proc = _run_git(["worktree", "remove", "--force", str(wt_path)], cwd=main_path, timeout=120)
-            note = "git worktree remove"
-            if wt_path.exists():
-                if wt_path.resolve() != main_path.resolve() and _is_linked_worktree_of(wt_path, main_path):
-                    shutil.rmtree(wt_path, ignore_errors=True)
-                    note = "fallback rmtree"
-                if wt_path.exists():
-                    errors.append({"path": wt["path"], "error": _git_err(proc, "worktree remove")})
+            method = "git worktree remove"
+            if proc.returncode != 0 or wt_path.exists():
+                if _is_lock_refusal(proc):
+                    hold(wt, "review", "worktree is locked (git refused removal)")
                     continue
+                current, list_err = _live_worktree_entry(main_path, wt["path"])
+                if list_err or current is not None:
+                    # Still registered: git refused. Report why, never override it.
+                    held_as, _, kanban_error = (
+                        (None, [], None) if list_err else _recheck_before_removal(wt, main_path, **recheck)
+                    )
+                    note_kanban_error(kanban_error)
+                    if held_as is not None:
+                        hold(wt, *held_as)
+                    else:
+                        errors.append({"path": wt["path"], "error": list_err or _git_err(proc, "worktree remove")})
+                    continue
+                if wt_path.exists():
+                    refusal = _fallback_refusal(wt_path, main_path, wt["branch"], db_path, db_required)
+                    if refusal is not None:
+                        note_kanban_error(refusal[2])
+                        if refusal[0] is not None:
+                            hold(wt, *refusal[0])
+                        else:
+                            errors.append({"path": wt["path"], "error": f"{_git_err(proc, 'worktree remove')}; {refusal[1]}"})
+                        continue
+                    shutil.rmtree(wt_path, ignore_errors=True)
+                    method = "fallback rmtree"
+                    if wt_path.exists():
+                        errors.append({"path": wt["path"], "error": _git_err(proc, "worktree remove")})
+                        continue
             removed.append({
                 "path": wt["path"], "branch": wt["branch"], "size_bytes": wt["size_bytes"],
-                "size_human": wt["size_human"], "method": note, "dropped_scratch": dropped_scratch,
+                "size_human": wt["size_human"], "method": method, "dropped_scratch": dropped_scratch,
             })
         if touched:
             _run_git(["worktree", "prune"], cwd=main_path)
@@ -1634,3 +1741,31 @@ def prune_safe_worktrees(
         "reclaimed_human": _human_size(reclaimed),
         "audit": audit["summary"],
     }
+
+
+def _fallback_refusal(
+    wt_path: Path, main_path: Path, branch: Optional[str], db_path: Optional[Path], db_required: bool
+) -> Optional[tuple[Optional[tuple[str, str]], str, Optional[str]]]:
+    """Why leftover files of a git-de-registered worktree must NOT be rmtree'd, or ``None`` if allowed.
+
+    Returns ``(hold, error_text, kanban_error)``.
+    """
+    wt_resolved, main_resolved = wt_path.resolve(), main_path.resolve()
+    if wt_resolved == main_resolved or main_resolved.is_relative_to(wt_resolved):
+        return None, "refusing rmtree: path is or contains the main checkout", None
+    admin = _linked_worktree_admin_dir(wt_path, main_path)
+    if admin is None:
+        return None, "refusing rmtree: not a linked worktree of this repository", None
+    if admin.exists():
+        # Admin dir (and any lock file in it) still present: git did not release this worktree.
+        return None, f"refusing rmtree: worktree admin dir still exists ({admin})", None
+    cards, kanban_err = _query_active_cards(db_path, required=db_required)
+    if kanban_err:
+        return (
+            ("hold-active-card", f"active-card ownership could not be verified (fail closed): {kanban_err}"),
+            "", kanban_err,
+        )
+    card = _match_active_card(cards, wt_path, branch)
+    if card:
+        return (("hold-active-card", f"active card {card.get('id')} claimed leftover directory"), "", None)
+    return None
