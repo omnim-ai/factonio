@@ -78,27 +78,44 @@ def _active_duration_seconds(runs: list[dict[str, Any]], now_ts: float) -> Optio
     return int(total) if seen else None
 
 
-def _card_verdict(phase: str, status: str, runs: list[dict[str, Any]]) -> Optional[str]:
-    """Resolve a card's verdict: explicit `metadata.verdict` first, then verify-phase fallbacks.
-
-    `inconclusive` (from metadata or run outcome) is returned as-is and never defaults to `pass`;
-    `pass` is only inferred for a done verify card that recorded no verdict at all.
-    """
+def _metadata_verdict(runs: list[dict[str, Any]]) -> Optional[str]:
     last = runs[-1] if runs else {}
     verdict = str(_parse_json_dict(last.get("metadata")).get("verdict") or "").strip().lower()
     if verdict in _INCONCLUSIVE_VERDICTS:
         return "inconclusive"
+    return verdict or None
+
+
+def _explicit_verify_verdict(runs: list[dict[str, Any]]) -> Optional[str]:
+    """Explicit verify verdict: `metadata.verdict`, else a fail-closed run outcome, else `None`.
+
+    Never infers `pass`; high-rigor panel lanes use this directly so a done card without a
+    recorded verdict stays pending and cannot unlock a merge.
+    """
+    verdict = _metadata_verdict(runs)
     if verdict:
         return verdict
-    if phase in _VERIFY_PHASES:
-        outcome = str(last.get("outcome") or "").strip().lower()
-        if outcome == "changes_requested":
-            return "reject"
-        if outcome in _INCONCLUSIVE_VERDICTS:
-            return "inconclusive"
-        if status == "done":
-            return "pass"
+    outcome = str((runs[-1] if runs else {}).get("outcome") or "").strip().lower()
+    if outcome == "changes_requested":
+        return "reject"
+    if outcome in _INCONCLUSIVE_VERDICTS:
+        return "inconclusive"
     return None
+
+
+def _card_verdict(phase: str, status: str, runs: list[dict[str, Any]]) -> Optional[str]:
+    """Resolve a card's verdict: explicit `metadata.verdict` first, then verify-phase fallbacks.
+
+    `inconclusive` (from metadata or run outcome) is returned as-is and never defaults to `pass`;
+    `pass` is only inferred for a done verify card that recorded no verdict at all (legacy
+    display/metrics behavior; panel consensus uses `_explicit_verify_verdict` instead).
+    """
+    if phase not in _VERIFY_PHASES:
+        return _metadata_verdict(runs)
+    verdict = _explicit_verify_verdict(runs)
+    if verdict:
+        return verdict
+    return "pass" if status == "done" else None
 
 
 def _card_summary(task: dict[str, Any], status: str, runs: list[dict[str, Any]]) -> Optional[str]:
@@ -192,6 +209,48 @@ def _lane_label(lane: dict[str, Any]) -> str:
     return f"{phase}/{vendor}" + (f" ({task_id})" if task_id else "")
 
 
+_EVIDENCE_TEXT_KEYS = ("issue", "title", "message", "summary", "description", "repro")
+_EVIDENCE_MAX_ITEMS = 4
+_EVIDENCE_MAX_CHARS = 160
+
+
+def _evidence_text(item: Any) -> Optional[str]:
+    """One-line human-readable excerpt of a finding / disclosed limit (dict or string)."""
+    if isinstance(item, dict):
+        text = next((str(item[k]) for k in _EVIDENCE_TEXT_KEYS if _text_or_none(item.get(k))), None)
+        if text is None:
+            text = json.dumps(item, sort_keys=True, default=str) if item else None
+    else:
+        text = str(item) if item is not None else None
+    text = " ".join((text or "").split())
+    if not text:
+        return None
+    return text if len(text) <= _EVIDENCE_MAX_CHARS else text[: _EVIDENCE_MAX_CHARS - 3].rstrip() + "..."
+
+
+def _lane_items(lane: dict[str, Any], key: str) -> list[Any]:
+    items = lane.get(key)
+    if isinstance(items, (list, tuple)):
+        return list(items)
+    return [items] if items else []
+
+
+def _dissent_evidence(lanes: list[dict[str, Any]]) -> str:
+    """Bounded excerpts of findings / disclosed limits from non-pass (reject, inconclusive) lanes."""
+    excerpts: list[str] = []
+    for lane in lanes:
+        if lane.get("bucket") not in ("reject", "inconclusive"):
+            continue
+        for key, kind in (("findings", "finding"), ("disclosed_limits", "limit")):
+            for item in _lane_items(lane, key):
+                text = _evidence_text(item)
+                if text:
+                    excerpts.append(f"[{lane['label']}] {kind}: {text}")
+    shown = excerpts[:_EVIDENCE_MAX_ITEMS]
+    extra = len(excerpts) - len(shown)
+    return "; ".join(shown) + (f" (+{extra} more)" if extra > 0 else "")
+
+
 def aggregate_panel_verdicts(lanes: list[dict[str, Any]]) -> dict[str, Any]:
     """Fail-closed consensus over high-rigor verification panel lanes.
 
@@ -252,8 +311,9 @@ def aggregate_panel_verdicts(lanes: list[dict[str, Any]]) -> dict[str, Any]:
     if has_disagreement:
         parts = [f"{b}: {', '.join(buckets[b])}" for b in decided]
         disagreement_summary = "Panel lanes disagree -- " + "; ".join(parts)
-        if findings:
-            disagreement_summary += f". {len(findings)} finding(s) to review before escalation"
+        evidence = _dissent_evidence(norm_lanes)
+        if evidence:
+            disagreement_summary += ". Dissenting evidence: " + evidence
         if buckets["pending"]:
             disagreement_summary += f" ({len(buckets['pending'])} lane(s) still pending)"
         disagreement_summary += "."
@@ -284,7 +344,7 @@ def _panel_lane(task: dict[str, Any], runs: list[dict[str, Any]], tag: dict[str,
         "title": task.get("title"),
         "phase": phase,
         "status": status,
-        "verdict": _card_verdict(phase, status, runs) if phase in _VERIFY_PHASES else None,
+        "verdict": _explicit_verify_verdict(runs) if phase in _VERIFY_PHASES else None,
         "vendor": tag["vendor"],
         "model": tag["model"],
         "tenant": task.get("tenant"),

@@ -106,12 +106,14 @@ def _get_task(task_id: str):
     return task
 
 
-def _complete(task_id: str, verdict: str, **meta: Any) -> None:
+def _complete(task_id: str, verdict: Optional[str], **meta: Any) -> None:
+    """Complete a card; ``verdict=None`` omits ``metadata.verdict`` entirely."""
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
 
+    metadata = dict(meta) if verdict is None else {"verdict": verdict, **meta}
     with connect_closing() as conn:
-        ok = kb.complete_task(conn, task_id, summary=f"verdict {verdict}", metadata={"verdict": verdict, **meta})
+        ok = kb.complete_task(conn, task_id, summary=f"verdict {verdict}", metadata=metadata)
     assert ok, task_id
 
 
@@ -575,6 +577,46 @@ class TestAggregatePanelVerdicts(unittest.TestCase):
         unknown = self.agg([_lane("done", "pass", "anthropic"), _lane("done", "looks fine", "openai")])
         self.assertEqual(unknown["consensus"], "inconclusive")
 
+    def test_disagreement_summary_quotes_dissenting_evidence(self):
+        res = self.agg([
+            _lane("done", "pass", "anthropic", task_id="t_a"),
+            _lane("done", "reject", "openai", task_id="t_o", findings=[
+                {"severity": "blocking", "issue": "Missing auth check on DELETE /items"},
+                "Token logged in plaintext",
+            ]),
+        ])
+        summary = res["disagreement_summary"]
+        self.assertIn("pass: verify-diff/anthropic (t_a)", summary)
+        self.assertIn("reject: verify-diff/openai (t_o)", summary)
+        self.assertIn("Missing auth check on DELETE /items", summary)
+        self.assertIn("Token logged in plaintext", summary)
+
+        res = self.agg([
+            _lane("done", "pass", "anthropic", task_id="t_a"),
+            _lane("done", "inconclusive", "openai", "verify-blackbox", task_id="t_b",
+                  disclosed_limits=["Could not start the browser sandbox"]),
+        ])
+        summary = res["disagreement_summary"]
+        self.assertIn("inconclusive: verify-blackbox/openai (t_b)", summary)
+        self.assertIn("Could not start the browser sandbox", summary)
+
+        titled = self.agg([
+            _lane("done", "pass", "anthropic"),
+            _lane("done", "reject", "openai", findings=[{"title": "Race in retry loop"}, {"message": "m1"}]),
+        ])
+        self.assertIn("Race in retry loop", titled["disagreement_summary"])
+        self.assertIn("m1", titled["disagreement_summary"])
+
+    def test_disagreement_summary_bounds_many_findings(self):
+        many = [f"finding number {i} " + "x" * 400 for i in range(12)]
+        res = self.agg([_lane("done", "pass", "anthropic"), _lane("done", "reject", "openai", findings=many)])
+        summary = res["disagreement_summary"]
+        self.assertIn("finding number 0", summary)
+        self.assertNotIn("finding number 11", summary)
+        self.assertIn("more", summary)
+        self.assertLess(len(summary), 1500)
+        self.assertEqual(len(res["findings"]), 12)
+
     def test_reject_wins_over_inconclusive_and_pending(self):
         res = self.agg([
             _lane("done", "inconclusive", "anthropic"), _lane("blocked", "reject", "openai"), _lane("running", None, "google"),
@@ -679,6 +721,67 @@ class TestEvaluatePanel(unittest.TestCase):
             self.assertIn("No verification panel", missing["error"])
             with self.assertRaises(ValueError):
                 evaluate_verification_panel()
+
+    def test_completed_lanes_without_verdict_fail_closed(self):
+        from factonio.metrics import compute_metrics
+        from factonio.orchestrator import evaluate_verification_panel, workstream_status
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            res = self._spawn(home, "t-nv", 31)
+            pid = res["panel"]["panel_id"]
+            for lane in res["panel"]["lanes"]:
+                _complete(lane["verify_diff_task_id"], None)
+                _complete(lane["verify_blackbox_task_id"], None)
+                self.assertEqual(_get_task(lane["verify_diff_task_id"]).status, "done")
+
+            ev = evaluate_verification_panel(panel_id=pid, record_trail=True)
+            self.assertTrue(ev["ok"], ev)
+            self.assertEqual((ev["consensus"], ev["merge_allowed"], ev["recorded"]), ("pending", False, False))
+            self.assertEqual(ev["lane_count"], 4)
+            self.assertEqual(ev["completed_count"], 0)
+            self.assertEqual(_trail_rows("verify_panel_consensus"), [])
+
+            panels = workstream_status(tenant="t-nv")["panels"]
+            self.assertEqual([(p["panel_id"], p["consensus"], p["merge_allowed"]) for p in panels], [(pid, "pending", False)])
+            m = compute_metrics(home / "kanban.db", range_key="all", tenant="t-nv")
+            self.assertEqual(m["verification_panels"]["pass"], 0)
+            self.assertEqual(m["verification_panels"]["pending"], 1)
+
+    def test_disagreement_summary_carries_dissenting_evidence(self):
+        from factonio.orchestrator import evaluate_verification_panel
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            rej = self._spawn(home, "t-ds", 41)
+            lanes = rej["panel"]["lanes"]
+            _complete(lanes[0]["verify_diff_task_id"], "pass")
+            _complete(lanes[0]["verify_blackbox_task_id"], "pass")
+            _complete(lanes[1]["verify_diff_task_id"], "reject", findings=[
+                {"severity": "blocking", "issue": "Unvalidated redirect in /login"}, "Secret echoed to logs",
+            ])
+            _complete(lanes[1]["verify_blackbox_task_id"], "pass")
+            ev = evaluate_verification_panel(panel_id=rej["panel"]["panel_id"], record_trail=False)
+            summary = ev["disagreement_summary"]
+            self.assertEqual(ev["consensus"], "reject")
+            self.assertIn("pass: verify-diff/anthropic", summary)
+            self.assertIn("reject: verify-diff/openai", summary)
+            self.assertIn("Unvalidated redirect in /login", summary)
+            self.assertIn("Secret echoed to logs", summary)
+
+            inc = self._spawn(home, "t-ds", 42)
+            lanes = inc["panel"]["lanes"]
+            for lane in lanes:
+                _complete(lane["verify_diff_task_id"], "pass")
+            _complete(lanes[0]["verify_blackbox_task_id"], "pass")
+            _complete(lanes[1]["verify_blackbox_task_id"], "inconclusive",
+                      disclosed_limits=["Headless browser unavailable in sandbox"])
+            ev = evaluate_verification_panel(panel_id=inc["panel"]["panel_id"], record_trail=False)
+            summary = ev["disagreement_summary"]
+            self.assertEqual(ev["consensus"], "inconclusive")
+            self.assertIn("pass: verify-diff/anthropic", summary)
+            self.assertIn("inconclusive: verify-blackbox/openai", summary)
+            self.assertIn("Headless browser unavailable in sandbox", summary)
 
     def test_tool_and_cli(self):
         import hermes_yaml as yaml
