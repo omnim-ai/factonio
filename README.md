@@ -59,9 +59,9 @@ Factonio ships a zero-build Hermes Desktop UI (`desktop/plugin.js`) using only p
 
 ### Metrics Dashboard (`/factonio`)
 
-Track workstream throughput, Diff vs Black-Box pass rates, rework rate, post-merge escape rate, per-phase median/P90 durations, phase model assignments, and registered repositories in one place:
+Track workstream throughput, Diff vs Black-Box pass rates, rework rate, post-merge escape rate, per-phase median/P90 durations, the append-only Decision Trail (filterable by repository, workstream and phase, with evidence pills and superseded ↔ superseding links), phase model assignments, and registered repositories in one place:
 
-![Factonio Dashboard showing KPI cards, Phase Durations, Phase Model Configuration, and Registered Repositories](docs/images/dashboard.png)
+![Factonio Dashboard showing KPI cards, Phase Durations, the Decision Trail ledger with evidence pills and supersede lineage, and Phase Model Configuration](docs/images/dashboard.png)
 
 ### Inline Repository Settings Editor
 
@@ -75,7 +75,7 @@ Monitor active workstreams beside your chat transcript in the hideable **Factoni
 
 | Docked Factonio Sidebar Tab | Settings → Plugins → Factonio |
 |:---:|:---:|
-| ![Factonio Right Sidebar tab beside Files with workstream pipeline and open card detail drawer](docs/images/sidebar.png) | ![Settings Plugins Factonio landing page showing Phase Models and Agent settings](docs/images/settings.png) |
+| ![Factonio Right Sidebar tab beside Files with workstream pipeline, an open card drawer listing its decisions, and per-workstream decision counts](docs/images/sidebar.png) | ![Settings Plugins Factonio landing page showing Phase Models and Agent settings](docs/images/settings.png) |
 
 ## Quick start
 
@@ -177,7 +177,7 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 - `factonio_merge_pr` — verify exact HEAD SHA and squash-merge a verified PR
 - `factonio_log_decision` — append a decision (fork, pivot, Attack the Premise probe, gate countersign) to the append-only `trail.db`; correct one by logging a new row with `supersedes_id`
 
-Factory transitions (start, escape, design/implement/verify spawns, PR gate and merge outcomes) are recorded in `<HERMES_HOME>/plugin-data/factonio/trail.db` automatically and served at `GET /api/plugins/factonio/trail?tenant=&repo=&phase=&card_id=&limit=`.
+Factory transitions (start, escape, design/implement/verify spawns, PR gate and merge outcomes) are recorded in `<HERMES_HOME>/plugin-data/factonio/trail.db` automatically and served at `GET /api/plugins/factonio/trail?tenant=&repo=&phase=&card_id=&limit=` (single rows at `GET /api/plugins/factonio/trail/{decision_id}`).
 
 </details>
 

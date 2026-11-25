@@ -105,6 +105,7 @@ Writes acquire an in-process re-entrant thread lock plus an exclusive POSIX `fcn
   - `GET /metrics?range=7d|30d|90d|all` — factory KPIs and phase timing percentiles
   - `GET /cards?session_id=...&tenant=...` — enriched Kanban cards for the right-sidebar Factonio tab
   - `GET /trail?tenant=&repo=&phase=&card_id=&limit=100` — append-only decision trail as `{decisions, summary, filters}`; each decision carries parsed `evidence`, `superseded_by`, and `is_superseded`
+  - `GET /trail/{decision_id}` — one decision as `{decision}` (same enriched shape) or `404`, used to resolve lineage targets outside a `/trail` window
   - `GET /doctor` — environment and worker profile readiness checks
 
 ## Decision trail (`trail.db`)
@@ -113,5 +114,6 @@ Writes acquire an in-process re-entrant thread lock plus an exclusive POSIX `fcn
 
 - **Append-only:** the `decisions` table (`id`, `ts`, `tenant`, `repo_slug`, `phase`, `card_id`, `actor`, `decision`, `why`, `evidence_json`, `result`, `supersedes_id`) has `trg_decisions_no_update` / `trg_decisions_no_delete` triggers that abort any `UPDATE` or `DELETE`. A correction is a new row whose `supersedes_id` must reference an existing row (validated in `log_decision` and by a foreign key).
 - **Automatic transitions:** `start_workstream` (plus an `escape` row when `escaped_from` is set), `spawn_design_card`, `spawn_implementation_card`, `spawn_verification_pair`, and the `factonio_pr_gate` / `factonio_merge_pr` tools record rows best-effort; a trail write failure is logged and never blocks card creation or merging.
-- **Surfaces:** `factonio_log_decision` (agent tool), `hermes factonio trail` (CLI), `GET /trail` (API), and an additive `trail` block in `GET /metrics` (`decision_count`, `active_count`, `superseded_count`, `by_tenant`, `by_phase`).
+- **Surfaces:** `factonio_log_decision` (agent tool), `hermes factonio trail` (CLI), `GET /trail` and `GET /trail/{decision_id}` (API), and an additive `trail` block in `GET /metrics` (`decision_count`, `active_count`, `superseded_count`, `by_tenant`, `by_phase`).
+- **Desktop:** `desktop/plugin.js` reads `GET /trail?limit=200` through one shared query key and filters client-side: the `/factonio` **Decision Trail** section (repo/workstream/phase filters, evidence pills, lineage jumps; a `/factonio?tenant=` deep link scopes the fetch server-side; a jump to a target outside the loaded window or scope loads it via `GET /trail/{decision_id}`, pins it into the ledger and clears obstructing filters/scope before scrolling, focusing and flashing it) and, in the sidebar tab, per-workstream decision strips plus per-card decisions in the card drawer (polled only while the pane is visible).
 - **Escaped regressions:** `escaped_from` adds a required `Verification Gap Analysis` section to the Definition card (why both Diff Check and Black-Box Check missed the bug, plus ladder-ranked prevention proven to fail on the original bug); the retro blueprint mines `trail.db` plus Kanban metrics for mistake classes seen at least twice and applies the `/correct` enforcement ladder.

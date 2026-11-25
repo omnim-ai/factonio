@@ -370,6 +370,17 @@ def query_decisions(
         return _enrich(conn, rows)
 
 
+def get_decision(decision_id: str, *, db_path: Optional[Path] = None) -> Optional[dict[str, Any]]:
+    """One decision by id (enriched like `query_decisions`), or ``None`` when absent."""
+    key = str(decision_id or "").strip()
+    path = Path(db_path) if db_path is not None else trail_db_path()
+    if not key or not path.is_file():
+        return None
+    with closing(_connect(path)) as conn:
+        row = conn.execute("SELECT * FROM decisions WHERE id = ?", (key,)).fetchone()
+        return _enrich(conn, [row])[0] if row is not None else None
+
+
 def _empty_summary() -> dict[str, Any]:
     return {
         "total": 0,
