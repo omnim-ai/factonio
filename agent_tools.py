@@ -20,7 +20,15 @@ from .orchestrator import (
     start_workstream,
     workstream_status,
 )
-from .repos import EDITABLE_REPO_FIELDS, add_repo, inspect_pr_gate, merge_pr, update_repo
+from .repos import (
+    EDITABLE_REPO_FIELDS,
+    add_repo,
+    inspect_pr_gate,
+    merge_pr,
+    restack_pr,
+    restack_stack,
+    update_repo,
+)
 from .trail import log_decision, record_transition
 
 
@@ -286,6 +294,8 @@ def register_tools(ctx: Any) -> None:
                 parents=args.get("parents"),
                 session_id=kwargs.get("session_id"),
                 idempotency_key=args.get("idempotency_key"),
+                base_branch=args.get("base_branch") or None,
+                stack_parent_pr=args.get("stack_parent_pr"),
             )
             return _json_ok(res)
         except Exception as exc:
@@ -298,7 +308,8 @@ def register_tools(ctx: Any) -> None:
             "name": "factonio_spawn_implement",
             "description": (
                 "Create one scoped Implementation worktree card in an existing Factonio workstream, "
-                "linked to `spec.md` without exposing `holdout/`, using the configured Implementation model."
+                "linked to `spec.md` without exposing `holdout/`, using the configured Implementation model. "
+                "Pass `base_branch` (and `stack_parent_pr`) to stack the unit on a parent PR's branch."
             ),
             "parameters": {
                 "type": "object",
@@ -309,6 +320,15 @@ def register_tools(ctx: Any) -> None:
                     "body": {"type": "string", "description": "Scoped work unit instructions and acceptance criteria."},
                     "parents": {"type": "array", "items": {"type": "string"}, "description": "Parent card ids."},
                     "idempotency_key": {"type": "string", "description": "Optional retry-safe key."},
+                    "base_branch": {
+                        "type": "string",
+                        "description": "Stacked PR base branch (default: the repo's default branch).",
+                    },
+                    "stack_parent_pr": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Parent PR number this unit stacks on.",
+                    },
                 },
                 "required": ["repo", "tenant", "title", "body"],
             },
@@ -429,6 +449,7 @@ def register_tools(ctx: Any) -> None:
                 int(args["pr_number"]),
                 expected_head_sha=args.get("expected_head_sha"),
                 method=str(args.get("method") or "squash"),
+                delete_branch=bool(args.get("delete_branch", True)),
             )
         except Exception as exc:
             return _json_err(exc)
@@ -450,6 +471,11 @@ def register_tools(ctx: Any) -> None:
                     "pr_number": {"type": "integer", "description": "GitHub pull request number."},
                     "expected_head_sha": {"type": "string", "description": "Exact HEAD commit SHA verified by Diff and Black-Box checks."},
                     "method": {"type": "string", "enum": ["squash", "merge", "rebase"], "default": "squash"},
+                    "delete_branch": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Delete the head branch after merging (keep it while child PRs still target it).",
+                    },
                     "tenant": {"type": "string", "description": "Workstream tenant for the decision trail (defaults to the worker's tenant)."},
                     "card_id": {"type": "string", "description": "Kanban card id for the decision trail (defaults to the worker's card)."},
                 },
@@ -457,6 +483,67 @@ def register_tools(ctx: Any) -> None:
             },
         },
         handler=handle_merge_pr,
+    )
+
+    def handle_restack(args: dict[str, Any], **kwargs: Any) -> str:
+        try:
+            trail = _trail_context(args)
+            common = {
+                "new_base": args.get("new_base") or None,
+                "old_base_sha": args.get("old_base_sha") or None,
+                "verified_head_sha": args.get("verified_head_sha") or None,
+                "push": bool(args.get("push", True)),
+                "retarget": bool(args.get("retarget", True)),
+                "dry_run": bool(args.get("dry_run", False)),
+                "tenant": trail["tenant"],
+                "card_id": trail["card_id"],
+                "actor": trail["actor"],
+            }
+            if args.get("pr_number") is not None:
+                res = restack_pr(
+                    str(args["repo"]), int(args["pr_number"]), parent_pr=args.get("parent_pr"), **common
+                )
+            else:
+                res = restack_stack(
+                    str(args["repo"]),
+                    parent_pr=args.get("parent_pr"),
+                    from_branch=args.get("from_branch") or None,
+                    **common,
+                )
+            return _json_ok(res)
+        except Exception as exc:
+            return _json_err(exc)
+
+    ctx.register_tool(
+        name="factonio_restack_pr",
+        toolset=PLUGIN_ID,
+        schema={
+            "name": "factonio_restack_pr",
+            "description": (
+                "Restack a stacked PR (or every open child of a parent PR) onto its new base after the parent lands: "
+                "rebases in a throwaway worktree with `git rebase --onto`, pushes with --force-with-lease, retargets via "
+                "`gh pr edit --base`, and reports `verdict_continuous` by comparing `git patch-id --stable` before/after."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Registered repo slug or 'owner/repo'."},
+                    "pr_number": {"type": "integer", "description": "Child PR to restack (omit to restack all children)."},
+                    "parent_pr": {"type": "integer", "description": "Parent PR whose head was the old base."},
+                    "from_branch": {"type": "string", "description": "Restack all open PRs targeting this branch."},
+                    "new_base": {"type": "string", "description": "New base branch (default: parent's base or repo default)."},
+                    "old_base_sha": {"type": "string", "description": "Commit the PR was stacked on (overrides parent_pr)."},
+                    "verified_head_sha": {"type": "string", "description": "HEAD the existing verdict was given on."},
+                    "push": {"type": "boolean", "default": True, "description": "Force-with-lease push the rebased head."},
+                    "retarget": {"type": "boolean", "default": True, "description": "Retarget the PR base via gh pr edit."},
+                    "dry_run": {"type": "boolean", "default": False, "description": "Rebase and compare only; no push/retarget."},
+                    "tenant": {"type": "string", "description": "Workstream tenant for the decision trail."},
+                    "card_id": {"type": "string", "description": "Kanban card id for the decision trail."},
+                },
+                "required": ["repo"],
+            },
+        },
+        handler=handle_restack,
     )
 
     def handle_log_decision(args: dict[str, Any], **kwargs: Any) -> str:
