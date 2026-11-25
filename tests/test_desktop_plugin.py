@@ -1,6 +1,7 @@
 """Clean-room tests for the Factonio Desktop plugin (desktop/plugin.js).
 
 Covers the Settings → Plugins → Factonio landing page registration, the
+editable Registered Repositories table on /factonio (GET/PATCH /repos), the
 Auxiliary Models deep-links on both the settings page and the /factonio
 dashboard, the hideable right-sidebar Factonio tab docked beside Files
 (registration, reveal, visibility-aware polling, scope/status/phase filters, workstream pipeline,
@@ -49,11 +50,14 @@ const STUBS = {
     export function EmptyState(props) { return { type: 'div', props: { children: [props.title, props.description] } } }
     export const host = globalThis.__fcHost
     export function useQuery(opts) { return globalThis.__fcUseQuery(opts) }
+    export function useQueryClient() { return globalThis.__fcQueryClient }
     export function useValue(v) { return v && typeof v === 'object' && typeof v.get === 'function' ? v.get() : v }
   `,
   'react': `
     export function useState(init) { return globalThis.__fcHooks.useState(init) }
-    export default { useState }
+    export function useRef(init) { return globalThis.__fcHooks.useRef(init) }
+    export function useEffect(fn, deps) { return globalThis.__fcHooks.useEffect(fn, deps) }
+    export default { useState, useRef, useEffect }
   `,
   'react/jsx-runtime': `
     export function jsx(type, props, key) { return { type, props: props || {}, key } }
@@ -96,16 +100,38 @@ Object.defineProperty(globalThis, 'navigator', { value: { clipboard: { writeText
 // across re-renders of the same renderer (mirrors React state identity).
 function makeHooks() {
   const store = new Map()
+  const visited = new Set()
+  let pending = []
   let path = 'root'
   let idx = 0
   return {
     store,
+    visited,
     useState(init) {
       const k = path + '#' + (idx++)
       if (!store.has(k)) store.set(k, typeof init === 'function' ? init() : init)
       return [store.get(k), v => store.set(k, typeof v === 'function' ? v(store.get(k)) : v)]
     },
-    enter(p) { const prev = [path, idx]; path = p; idx = 0; return prev },
+    useRef(init) {
+      const k = path + '#' + (idx++)
+      if (!store.has(k)) store.set(k, { current: init })
+      return store.get(k)
+    },
+    useEffect(fn, deps) {
+      const k = path + '#' + (idx++)
+      const prev = store.get(k)
+      const changed = !prev || !deps || !prev.deps || deps.length !== prev.deps.length || deps.some((d, i) => !Object.is(d, prev.deps[i]))
+      store.set(k, { deps })
+      if (changed) pending.push(fn)
+    },
+    // Run queued effects (after refs are attached), like React's commit phase.
+    flush() { const q = pending; pending = []; q.forEach(fn => fn()) },
+    // Drop hook state of components not rendered this pass (React unmount semantics).
+    gc() {
+      for (const k of [...store.keys()]) if (!visited.has(k.slice(0, k.lastIndexOf('#')))) store.delete(k)
+      visited.clear()
+    },
+    enter(p) { const prev = [path, idx]; path = p; idx = 0; visited.add(p); return prev },
     leave(prev) { [path, idx] = prev }
   }
 }
@@ -133,6 +159,9 @@ globalThis.__fcUseQuery = opts => {
   if (key === 'factonio/models') {
     globalThis.__fcModelsQueries.push({ key: opts.queryKey, interval: opts.refetchInterval, fn: typeof opts.queryFn })
     return queryState
+  }
+  if (key === 'factonio/repos' && globalThis.__fcReposState) {
+    return globalThis.__fcReposState
   }
   if (opts.queryKey[1] === 'cards') {
     cardsQueries.push({ key: opts.queryKey, enabled: opts.enabled !== false, interval: opts.refetchInterval, fn: opts.queryFn })
@@ -642,6 +671,398 @@ async function runSidebarScenarios(report, registered, oldRegistered) {
     return [h.node.props['data-id'], { text: text(d).trim(), title: d.props.title }]
   }))
 }
+
+// ---------------------------------------------------------------------------
+// Registered Repositories editor harness (/factonio page, GET/PATCH /repos)
+// ---------------------------------------------------------------------------
+const REPO_DEFAULTS = { merge_policy: 'auto', max_fix_rounds: 3, design_provider: 'auto', design_approval: 'ask' }
+const REPOS = [
+  { slug: 'tozes-factonio', repo: 'tozes/factonio', url: 'https://github.com/tozes/factonio', path: '/home/tozes/dev/factonio', default_branch: 'main', merge_policy: 'auto', max_fix_rounds: 3, design_provider: null, design_approval: null, effective_design_provider: 'auto', effective_design_approval: 'ask', resolved_design_provider: 'claude-design', has_required_checks: false, models: {} },
+  { slug: 'acme-web-dashboard', repo: 'acme/web-dashboard', url: 'https://github.com/acme/web-dashboard', path: '/home/tozes/workspace/projects/acme-web-dashboard', default_branch: 'develop', merge_policy: 'ask', max_fix_rounds: 5, design_provider: 'hermes', design_approval: 'auto', effective_design_provider: 'hermes', effective_design_approval: 'auto', resolved_design_provider: 'hermes', has_required_checks: true, models: {} },
+  { slug: 'acme-cli-tools', repo: 'acme/cli-tools', url: 'https://github.com/acme/cli-tools', path: '/home/tozes/workspace/acme-cli-tools', default_branch: 'release/v2', merge_policy: 'auto', max_fix_rounds: 2, design_provider: 'off', design_approval: null, effective_design_provider: 'off', effective_design_approval: 'ask', resolved_design_provider: 'off', has_required_checks: false, models: {} }
+]
+function deferred() {
+  let resolve, reject
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej })
+  return { promise, resolve, reject }
+}
+function attachRefs(tree, focusLog) {
+  walk(tree, n => {
+    const ref = n.props.ref
+    if (!ref) return
+    const name = n.props.id || n.props['aria-label'] || text(n).trim()
+    const el = { tag: n.type, name, focus: () => focusLog.push(name) }
+    if (typeof ref === 'function') ref(el)
+    else ref.current = el
+  })
+}
+function mountRepos({ data, client }) {
+  const regs = []
+  const rests = []
+  let restImpl = async () => ({ ok: true })
+  const ctx = {
+    rest: (p, opts) => { rests.push({ path: p, opts: opts ? JSON.parse(JSON.stringify(opts)) : null }); return restImpl(p, opts) },
+    onDispose: () => {},
+    registerMany: items => regs.push(...items)
+  }
+  plugin.register(ctx)
+  const page = regs.find(r => r.id === 'page')
+  const hooks = makeHooks()
+  const focusLog = []
+  const refetches = []
+  const render = () => {
+    globalThis.__fcHooks = hooks
+    globalThis.__fcQueryClient = client
+    globalThis.__fcReposState = { data, isLoading: false, isError: false, refetch: () => refetches.push(1) }
+    const tree = expand(page.render())
+    hooks.gc()
+    attachRefs(tree, focusLog)
+    hooks.flush()
+    return tree
+  }
+  return { rests, render, focusLog, refetches, setRest: fn => { restImpl = fn }, setData: next => { data = next } }
+}
+const reposSec = tree => find(tree, n => n.type === 'table' && String(n.props.className).includes('fc-repos'))
+function readRepos(tree) {
+  const tbl = reposSec(tree)
+  if (!tbl) return null
+  const rows = findAll(tbl.node, n => n.type === 'tr' && n.props['data-slug'] && n.props.className !== 'fc-repo-ed').map(h => {
+    const tr = h.node
+    const tds = tr.props.children.filter(Boolean)
+    const tag = td => { const t = find(td, n => String(n.props.className || '').startsWith('fc-tag fc-tag--')); return t ? { cls: t.node.props.className, text: text(t.node).replace(/\s+/g, ' ').trim(), title: t.node.props.title } : null }
+    const btn = find(tr, n => n.type === 'button').node
+    return {
+      slug: tr.props['data-slug'],
+      editing: tr.props['data-editing'] || null,
+      repo: text(find(tds[0], n => n.props.className === 'fc-trunc fc-repo-name').node).trim(),
+      path: find(tds[0], n => n.props.className === 'fc-trunc fc-repo-path').node.props.title,
+      branch: text(tds[1]).trim(),
+      branchTitle: find(tds[1], n => n.type === 'span').node.props.title,
+      merge: text(tds[2]).trim(),
+      rounds: text(tds[3]).trim(),
+      roundsClass: tds[3].props.className,
+      provider: tag(tds[4]),
+      approval: tag(tds[5]),
+      edit: { label: text(btn).trim(), ariaLabel: btn.props['aria-label'], expanded: btn.props['aria-expanded'], controls: btn.props['aria-controls'], active: btn.props['data-active'] || null, disabled: !!btn.props.disabled }
+    }
+  })
+  const order = findAll(find(tbl.node, n => n.type === 'tbody').node, n => n.type === 'tr').map(h => (h.node.props.className === 'fc-repo-ed' ? 'editor:' : 'row:') + h.node.props['data-slug'])
+  return {
+    tableClass: tbl.node.props.className,
+    cols: findAll(tbl.node, n => n.type === 'col').map(h => h.node.props.className),
+    headers: findAll(find(tbl.node, n => n.type === 'thead').node, n => n.type === 'th').map(h => ({ text: text(h.node).replace(/\s+/g, ' ').trim(), className: h.node.props.className || null })),
+    rows,
+    order
+  }
+}
+function readEditor(tree) {
+  const tr = find(tree, n => n.type === 'tr' && n.props.className === 'fc-repo-ed')
+  if (!tr) return null
+  const td = tr.node.props.children
+  const form = find(tr.node, n => n.type === 'form').node
+  const fs = find(form, n => n.type === 'fieldset').node
+  const fields = {}
+  for (const h of findAll(fs, n => n.props.className === 'fc-field')) {
+    const f = h.node
+    const ctl = find(f, n => n.type === 'input' || n.type === 'select').node
+    const err = find(f, n => n.props.className === 'fc-field-err')
+    const hint = find(f, n => n.props.className === 'fc-field-hint')
+    fields[f.props['data-field']] = {
+      label: text(find(f, n => n.type === 'label').node).trim(),
+      labelFor: find(f, n => n.type === 'label').node.props.htmlFor,
+      id: ctl.props.id,
+      tag: ctl.type,
+      type: ctl.props.type || null,
+      value: ctl.props.value,
+      invalid: ctl.props['aria-invalid'] || null,
+      describedBy: ctl.props['aria-describedby'],
+      err: err ? { id: err.node.props.id, text: text(err.node).trim() } : null,
+      hint: hint ? { id: hint.node.props.id, text: text(hint.node).replace(/\s+/g, ' ').trim() } : null,
+      options: ctl.type === 'select' ? findAll(ctl, n => n.type === 'option').map(o => [o.node.props.value, text(o.node).trim()]) : null
+    }
+  }
+  const msg = find(form, n => n.props['aria-live'] === 'polite').node
+  const alert = find(form, n => n.props.role === 'alert')
+  const btn = a => find(form, n => n.type === 'button' && n.props['data-action'] === a).node
+  return {
+    slug: tr.node.props['data-slug'],
+    editing: tr.node.props['data-editing'],
+    colSpan: td.props.colSpan,
+    formId: form.props.id,
+    formLabel: form.props['aria-label'],
+    busy: form.props['aria-busy'] || null,
+    noValidate: form.props.noValidate,
+    identity: text(find(form, n => n.props.className === 'fc-ed-id').node).replace(/\s+/g, ' ').trim(),
+    fieldsetClass: fs.props.className,
+    fieldsetDisabled: !!fs.props.disabled,
+    fieldOrder: findAll(fs, n => n.props.className === 'fc-field').map(h => h.node.props['data-field']),
+    fields,
+    msg: { text: text(msg).replace(/\s+/g, ' ').trim(), className: msg.props.className },
+    alert: alert ? text(alert.node).replace(/\s+/g, ' ').trim() : null,
+    cancel: { disabled: !!btn('cancel-edit').props.disabled, type: btn('cancel-edit').props.type },
+    save: { label: text(btn('save-repo')).trim(), disabled: !!btn('save-repo').props.disabled, type: btn('save-repo').props.type, spin: !!find(btn('save-repo'), n => n.props.className === 'fc-spin') }
+  }
+}
+const editBtnHit = (tree, slug) => find(tree, n => n.type === 'button' && n.props['data-action'] === 'edit-repo' && n.props['aria-label'] === `Edit ${REPOS.find(r => r.slug === slug).repo}`)
+const formOf = tree => find(tree, n => n.type === 'form').node
+function change(tree, field, value) {
+  const ctl = find(tree, n => (n.type === 'input' || n.type === 'select') && n.props.name === field).node
+  ctl.props.onChange({ target: { value } })
+}
+const submitForm = tree => formOf(tree).props.onSubmit({ preventDefault() {} })
+const keyDown = (tree, key) => formOf(tree).props.onKeyDown({ key, preventDefault() {}, stopPropagation() {} })
+
+async function runReposScenarios(report) {
+  const r = report.repos = {}
+  const validate = mod.validateRepoDraft
+  r.exportsValidator = typeof validate
+  const v = (default_branch, max_fix_rounds) => Object.keys(validate({ default_branch, max_fix_rounds }))
+  const msgs = (default_branch, max_fix_rounds) => validate({ default_branch, max_fix_rounds })
+  r.validate = {
+    valid: [['main', '3'], ['  feature/x  ', ' 2 '], ['release/v2', 1], ['a.b', '10'], ['x', 99]].map(([b, n]) => v(b, n)),
+    branch: Object.fromEntries([['empty', ''], ['blank', '   '], ['null', null], ['space', 'feat x'], ['tab', 'feat\tx'], ['dots', 'feature..bad'], ['dash', '-main'], ['ctrl', 'ma\u0001in'], ['del', 'ma\u007fin']].map(([k, b]) => [k, msgs(b, '3').default_branch || null])),
+    rounds: Object.fromEntries([['zero', '0'], ['neg', '-1'], ['float', '1.5'], ['floatNum', 2.5], ['zeroNum', 0], ['text', 'abc'], ['empty', ''], ['null', null], ['bool', true], ['plus', '+3'], ['exp', '1e2'], ['infNum', Infinity], ['nanNum', NaN], ['zeros', '000']].map(([k, n]) => [k, msgs('main', n).max_fix_rounds || null])),
+    unsafe: Object.fromEntries([['pow53', '9007199254740992'], ['pow53plus1', '9007199254740993'], ['overflow309', '9'.repeat(309)], ['pow53Num', 9007199254740992], ['bigNum', 1e300]].map(([k, n]) => [k, msgs('main', n).max_fix_rounds || null])),
+    safeMax: [['9007199254740991'], [Number.MAX_SAFE_INTEGER], ['0009007199254740991'], ['007']].map(([n]) => v('main', n))
+  }
+  const refreshedRepo0 = { ...REPOS[0], merge_policy: 'ask', design_provider: 'hermes' }
+  r.changesEdits = {
+    onlyEdited: mod.repoDraftChanges({ default_branch: 'user-feature' }, refreshedRepo0),
+    explicitOriginal: mod.repoDraftChanges({ merge_policy: 'auto', design_provider: '' }, refreshedRepo0),
+    equalLive: mod.repoDraftChanges({ merge_policy: 'ask', design_provider: 'hermes', default_branch: ' main ', max_fix_rounds: '003' }, refreshedRepo0),
+    none: mod.repoDraftChanges({}, refreshedRepo0)
+  }
+  r.changes = mod.repoDraftChanges({ default_branch: ' main ', merge_policy: 'ask', max_fix_rounds: '7', design_provider: '', design_approval: 'auto' }, REPOS[1])
+  r.describe = {
+    ipc422: mod.describeSaveError(new Error("Error invoking remote method 'hermes:api': Error: 422: {\"detail\":\"max_fix_rounds must be >= 1\"}")),
+    plain404: mod.describeSaveError(new Error('404: {"detail":"Repository \'x\' is not registered."}')),
+    pydantic: mod.describeSaveError(new Error('422: {"detail":[{"msg":"field required"},{"msg":"bad"}]}')),
+    noBody: mod.describeSaveError(Object.assign(new Error('boom'), { statusCode: 500 })),
+    network: mod.describeSaveError(new Error('fetch failed: connect ECONNREFUSED 127.0.0.1:9119'))
+  }
+
+  // Empty state
+  let m = mountRepos({ data: { repos: [], defaults: REPO_DEFAULTS } })
+  let tree = m.render()
+  r.empty = { text: text(tree).replace(/\s+/g, ' '), table: !!reposSec(tree), legend: !!find(tree, n => n.props.className === 'fc-legend'), sub: !!find(tree, n => n.props.className === 'fc-sec-sub') }
+
+  // Populated read state
+  const notified = () => [...notifications]
+  const invalidations = []
+  const client = { invalidateQueries: q => { invalidations.push(JSON.parse(JSON.stringify(q))); return Promise.resolve() } }
+  m = mountRepos({ data: { repos: REPOS, defaults: REPO_DEFAULTS }, client })
+  tree = m.render()
+  const head = find(tree, n => n.props.className === 'fc-sec fc-repos-sec')
+  r.read = {
+    ...readRepos(tree),
+    sectionClass: head ? head.node.props.className : null,
+    title: text(find(head.node, n => n.type === 'h2').node).trim(),
+    sub: text(find(head.node, n => n.props.className === 'fc-sec-sub').node).replace(/\s+/g, ' ').trim(),
+    legend: text(find(head.node, n => n.props.className === 'fc-legend').node).replace(/\s+/g, ' ').trim(),
+    legendTags: findAll(find(head.node, n => n.props.className === 'fc-legend').node, n => String(n.props.className || '').startsWith('fc-tag ')).map(h => h.node.props.className),
+    buttons: allButtonLabels(head.node),
+    editor: readEditor(tree)
+  }
+
+  // Lifecycle on tozes/factonio
+  notifications.length = 0
+  const L = r.lifecycle = {}
+  fire(editBtnHit(tree, 'tozes-factonio'))
+  tree = m.render()
+  L.opened = { table: readRepos(tree), editor: readEditor(tree), focus: [...m.focusLog] }
+  change(tree, 'design_provider', 'hermes'); tree = m.render()
+  L.providerHermes = readEditor(tree)
+  change(tree, 'design_provider', 'off'); tree = m.render()
+  L.providerOff = readEditor(tree).fields.design_provider.hint
+  change(tree, 'design_provider', 'auto'); tree = m.render()
+  L.providerAuto = readEditor(tree).fields.design_provider.hint
+  change(tree, 'design_provider', ''); tree = m.render()
+  L.providerInherit = { hint: readEditor(tree).fields.design_provider.hint, msg: readEditor(tree).msg, save: readEditor(tree).save }
+  change(tree, 'default_branch', 'feature..bad'); change(tree, 'max_fix_rounds', '0')
+  tree = m.render()
+  L.dirtyInvalid = readEditor(tree)
+  m.focusLog.length = 0
+  await submitForm(tree)
+  tree = m.render()
+  L.invalidSubmit = { editor: readEditor(tree), rests: [...m.rests], focus: [...m.focusLog] }
+  change(tree, 'default_branch', ' develop '); tree = m.render()
+  L.liveFixBranch = readEditor(tree)
+  change(tree, 'max_fix_rounds', '4'); change(tree, 'design_provider', 'hermes'); tree = m.render()
+  L.allFixed = readEditor(tree)
+
+  // Saving state (PATCH in flight), then API error
+  let d = deferred()
+  m.setRest(() => d.promise)
+  const p1 = submitForm(tree)
+  tree = m.render()
+  L.saving = { editor: readEditor(tree), table: readRepos(tree), rests: [...m.rests] }
+  keyDown(tree, 'Escape'); tree = m.render()
+  L.escapeWhileSaving = !!readEditor(tree)
+  d.reject(new Error("Error invoking remote method 'hermes:api': Error: 422: {\"detail\":\"Invalid default_branch 'develop'.\"}"))
+  await p1; tree = m.render()
+  L.apiError = { editor: readEditor(tree), table: readRepos(tree), notifications: notified(), invalidations: [...invalidations] }
+  // Network error on retry
+  m.setRest(async () => { throw new Error('fetch failed') })
+  await submitForm(tree); tree = m.render()
+  L.networkError = readEditor(tree)
+  // Successful retry
+  notifications.length = 0
+  m.focusLog.length = 0
+  d = deferred()
+  m.setRest(() => d.promise)
+  const p2 = submitForm(tree)
+  d.resolve({ ok: true, repo: { ...REPOS[0], default_branch: 'develop' } })
+  await p2; tree = m.render()
+  L.saved = { editor: readEditor(tree), table: readRepos(tree), notifications: notified(), invalidations: [...invalidations], rests: [...m.rests], focus: [...m.focusLog], refetches: m.refetches.length }
+
+  // Clearing explicit overrides -> null, refetch fallback without invalidateQueries
+  const C = r.clear = {}
+  m = mountRepos({ data: { repos: REPOS, defaults: REPO_DEFAULTS }, client: {} })
+  tree = m.render()
+  fire(editBtnHit(tree, 'acme-web-dashboard')); tree = m.render()
+  C.opened = readEditor(tree)
+  change(tree, 'design_provider', ''); change(tree, 'design_approval', ''); tree = m.render()
+  C.dirty = readEditor(tree)
+  notifications.length = 0
+  await submitForm(tree); tree = m.render()
+  C.after = { rests: [...m.rests], refetches: m.refetches.length, editor: readEditor(tree), notifications: notified() }
+
+  // Cancel / Escape discard unsaved edits; one editor at a time; Edit toggles closed
+  const X = r.cancel = {}
+  m = mountRepos({ data: { repos: REPOS, defaults: REPO_DEFAULTS }, client })
+  tree = m.render()
+  fire(editBtnHit(tree, 'acme-cli-tools')); tree = m.render()
+  X.openedProvider = readEditor(tree).fields.design_provider
+  change(tree, 'default_branch', 'scratch'); change(tree, 'merge_policy', 'ask'); tree = m.render()
+  X.dirtyMsg = readEditor(tree).msg.text
+  m.focusLog.length = 0
+  fire(find(formOf(tree), n => n.type === 'button' && n.props['data-action'] === 'cancel-edit')); tree = m.render()
+  X.afterCancel = { editor: readEditor(tree), focus: [...m.focusLog], expanded: readRepos(tree).rows[2].edit.expanded }
+  fire(editBtnHit(tree, 'acme-cli-tools')); tree = m.render()
+  X.reopened = { branch: readEditor(tree).fields.default_branch.value, merge: readEditor(tree).fields.merge_policy.value, msg: readEditor(tree).msg.text, save: readEditor(tree).save }
+  change(tree, 'max_fix_rounds', '9'); tree = m.render()
+  m.focusLog.length = 0
+  keyDown(tree, 'Enter'); tree = m.render()
+  X.enterKeepsOpen = !!readEditor(tree)
+  keyDown(tree, 'Escape'); tree = m.render()
+  X.afterEscape = { editor: readEditor(tree), focus: [...m.focusLog] }
+  fire(editBtnHit(tree, 'acme-cli-tools')); tree = m.render()
+  X.reopenedAfterEscape = readEditor(tree).fields.max_fix_rounds.value
+  change(tree, 'default_branch', 'other'); tree = m.render()
+  fire(editBtnHit(tree, 'tozes-factonio')); tree = m.render()
+  X.switched = { slug: readEditor(tree).slug, editors: findAll(tree, n => n.type === 'tr' && n.props.className === 'fc-repo-ed').length, order: readRepos(tree).order }
+  fire(editBtnHit(tree, 'acme-cli-tools')); tree = m.render()
+  X.switchedBackPristine = readEditor(tree).fields.default_branch.value
+  fire(editBtnHit(tree, 'acme-cli-tools')); tree = m.render()
+  X.toggleClosed = readEditor(tree)
+  X.rests = [...m.rests]
+
+  // Background refresh while editing: only user-edited fields are dirty / PATCHed;
+  // untouched fields reconcile to refreshed values and are never reverted.
+  const B = r.refresh = {}
+  m = mountRepos({ data: { repos: REPOS, defaults: REPO_DEFAULTS }, client })
+  tree = m.render()
+  fire(editBtnHit(tree, 'tozes-factonio')); tree = m.render()
+  change(tree, 'default_branch', 'user-feature'); tree = m.render()
+  B.before = readEditor(tree)
+  const refreshed = { ...REPOS[0], merge_policy: 'ask', design_provider: 'hermes', effective_design_provider: 'hermes', resolved_design_provider: 'hermes' }
+  m.setData({ repos: [refreshed, REPOS[1], REPOS[2]], defaults: REPO_DEFAULTS })
+  tree = m.render()
+  B.after = readEditor(tree)
+  m.setRest(async () => ({ ok: true }))
+  await submitForm(tree); tree = m.render()
+  B.rests = [...m.rests]
+  B.closed = readEditor(tree) === null
+  // Editing a field, then refresh changes that same field: the user's edit wins.
+  m = mountRepos({ data: { repos: REPOS, defaults: REPO_DEFAULTS }, client })
+  tree = m.render()
+  fire(editBtnHit(tree, 'tozes-factonio')); tree = m.render()
+  change(tree, 'merge_policy', 'ask'); tree = m.render()
+  m.setData({ repos: [{ ...REPOS[0], merge_policy: 'auto', max_fix_rounds: 6 }, REPOS[1], REPOS[2]], defaults: REPO_DEFAULTS })
+  tree = m.render()
+  B.keepEdit = readEditor(tree)
+  await submitForm(tree)
+  B.keepEditRests = [...m.rests]
+
+  // Post-refresh: explicitly choosing the edit-start value again is a real edit.
+  const E = r.editBack = {}
+  const openTozes = data => {
+    m = mountRepos({ data: { repos: [data || REPOS[0], REPOS[1], REPOS[2]], defaults: REPO_DEFAULTS }, client })
+    tree = m.render()
+    fire(editBtnHit(tree, 'tozes-factonio')); tree = m.render()
+  }
+  const refreshTo = patch => {
+    m.setData({ repos: [{ ...REPOS[0], ...patch }, REPOS[1], REPOS[2]], defaults: REPO_DEFAULTS })
+    tree = m.render()
+  }
+  const saveOk = async () => {
+    m.setRest(async () => ({ ok: true }))
+    await submitForm(tree); tree = m.render()
+    return [...m.rests]
+  }
+  // 1. merge_policy auto -> refresh ask -> choose auto
+  openTozes(); refreshTo({ merge_policy: 'ask' })
+  E.merge = { refreshed: readEditor(tree) }
+  change(tree, 'merge_policy', 'auto'); tree = m.render()
+  E.merge.chosen = readEditor(tree)
+  E.merge.rests = await saveOk()
+  // 2. design_provider inherited -> refresh hermes -> choose Inherit global
+  openTozes(); refreshTo({ design_provider: 'hermes', effective_design_provider: 'hermes', resolved_design_provider: 'hermes' })
+  E.provider = { refreshed: readEditor(tree) }
+  change(tree, 'design_provider', ''); tree = m.render()
+  E.provider.chosen = readEditor(tree)
+  E.provider.rests = await saveOk()
+  // 3. branch/rounds main/3 -> refresh develop/5 -> type main/3
+  openTozes(); refreshTo({ default_branch: 'develop', max_fix_rounds: 5 })
+  E.text = { refreshed: readEditor(tree) }
+  change(tree, 'default_branch', 'main'); change(tree, 'max_fix_rounds', '3'); tree = m.render()
+  E.text.chosen = readEditor(tree)
+  E.text.rests = await saveOk()
+  // 4. edit only branch, refresh others, then explicitly choose original values
+  openTozes()
+  change(tree, 'default_branch', 'user-feature'); tree = m.render()
+  refreshTo({ merge_policy: 'ask', design_provider: 'hermes', effective_design_provider: 'hermes', resolved_design_provider: 'hermes' })
+  E.mixed = { refreshed: readEditor(tree) }
+  m.setRest(async () => ({ ok: true }))
+  await submitForm(tree); tree = m.render()
+  E.mixed.firstRests = [...m.rests]
+  openTozes({ ...REPOS[0] })
+  change(tree, 'default_branch', 'user-feature'); tree = m.render()
+  refreshTo({ merge_policy: 'ask', design_provider: 'hermes', effective_design_provider: 'hermes', resolved_design_provider: 'hermes' })
+  change(tree, 'merge_policy', 'auto'); change(tree, 'design_provider', ''); tree = m.render()
+  E.mixed.chosen = readEditor(tree)
+  E.mixed.allRests = await saveOk()
+  // Reverting an edit to the live value drops it; the field then follows later refreshes.
+  openTozes()
+  change(tree, 'merge_policy', 'ask'); tree = m.render()
+  change(tree, 'merge_policy', 'auto'); tree = m.render()
+  E.revert = { msg: readEditor(tree).msg.text, save: readEditor(tree).save }
+  refreshTo({ merge_policy: 'ask' })
+  E.revert.after = readEditor(tree)
+
+  // Unsafe max_fix_rounds are rejected in the editor: no PATCH, draft preserved.
+  const U = r.unsafe = {}
+  for (const [k, n] of [['pow53', '9007199254740992'], ['pow53plus1', '9007199254740993'], ['overflow309', '9'.repeat(309)]]) {
+    m = mountRepos({ data: { repos: REPOS, defaults: REPO_DEFAULTS }, client })
+    tree = m.render()
+    fire(editBtnHit(tree, 'tozes-factonio')); tree = m.render()
+    change(tree, 'max_fix_rounds', n); tree = m.render()
+    m.focusLog.length = 0
+    await submitForm(tree); tree = m.render()
+    const ed = readEditor(tree)
+    U[k] = { rests: [...m.rests], value: ed.fields.max_fix_rounds.value, expected: n, invalid: ed.fields.max_fix_rounds.invalid, err: ed.fields.max_fix_rounds.err && ed.fields.max_fix_rounds.err.text, focus: [...m.focusLog], roundsId: ed.fields.max_fix_rounds.id }
+  }
+  // Numeric unsafe value (e.g. a programmatic draft) is equally rejected.
+  m = mountRepos({ data: { repos: REPOS, defaults: REPO_DEFAULTS }, client })
+  tree = m.render()
+  fire(editBtnHit(tree, 'tozes-factonio')); tree = m.render()
+  change(tree, 'max_fix_rounds', 9007199254740992); tree = m.render()
+  await submitForm(tree); tree = m.render()
+  { const ed = readEditor(tree); U.pow53Num = { rests: [...m.rests], value: ed.fields.max_fix_rounds.value, expected: 9007199254740992, invalid: ed.fields.max_fix_rounds.invalid, err: ed.fields.max_fix_rounds.err && ed.fields.max_fix_rounds.err.text } }
+
+  globalThis.__fcReposState = undefined
+  globalThis.__fcQueryClient = undefined
+}
 const mod = await import(process.env.FC_PLUGIN_URL)
 const plugin = mod.default
 const report = { id: plugin.id, name: plugin.name }
@@ -693,6 +1114,7 @@ try {
 report.oldHost = { error: oldErr, registeredIds: oldRegistered.map(r => r.id) }
 
 await runSidebarScenarios(report, registered, oldRegistered)
+await runReposScenarios(report)
 
 process.stdout.write(JSON.stringify(report))
 """
@@ -1176,6 +1598,355 @@ class TestDesktopPlugin(unittest.TestCase):
         for imp in re.findall(r"^import .* from '([^']+)'", source, re.M):
             self.assertIn(imp, ("@hermes/plugin-sdk", "react", "react/jsx-runtime"))
 
+
+    # --- Registered Repositories editor ----------------------------------------
+    def _ed_vals(self, editor):
+        return {f: v["value"] for f, v in editor["fields"].items()}
+
+    def test_repos_empty_state_keeps_heading_and_empty_state_only(self):
+        e = self.report["repos"]["empty"]
+        self.assertIn("Registered Repositories", e["text"])
+        self.assertIn("No repositories registered", e["text"])
+        self.assertIn("hermes factonio add owner/repo", e["text"])
+        self.assertFalse(e["table"])
+        self.assertFalse(e["legend"])
+        self.assertFalse(e["sub"])
+        self.assertNotIn("Global defaults", e["text"])
+
+    def test_repos_table_layout_headers_and_legend(self):
+        r = self.report["repos"]["read"]
+        self.assertEqual(r["sectionClass"], "fc-sec fc-repos-sec")
+        self.assertEqual(r["title"], "Registered Repositories")
+        self.assertEqual(r["sub"], "Global defaults: design provider auto · design approval ask")
+        self.assertEqual(r["legend"], "value · global inherited value override")
+        self.assertEqual(r["legendTags"], ["fc-tag fc-tag--inherit", "fc-tag fc-tag--set"])
+        self.assertEqual(r["tableClass"], "fc-table fc-repos")
+        self.assertEqual(
+            r["cols"],
+            ["fc-col-repo", "fc-col-branch", "fc-col-merge", "fc-col-rounds", "fc-col-prov", "fc-col-appr", "fc-col-act"],
+        )
+        self.assertEqual(
+            [h["text"] for h in r["headers"]],
+            ["Repository Local path", "Branch", "Merge policy", "Max fix rounds", "Design provider", "Design approval", "Actions"],
+        )
+        self.assertEqual(r["headers"][3]["className"], "fc-num")
+        self.assertEqual(r["headers"][6]["className"], "fc-act")
+        self.assertEqual(r["order"], ["row:tozes-factonio", "row:acme-web-dashboard", "row:acme-cli-tools"])
+        self.assertIsNone(r["editor"])
+        # No Add / Remove repository controls: only one Edit button per row.
+        self.assertEqual(r["buttons"], ["Edit", "Edit", "Edit"])
+
+    def test_repos_rows_show_all_parameters_and_inherited_vs_override(self):
+        rows = {row["slug"]: row for row in self.report["repos"]["read"]["rows"]}
+        a = rows["tozes-factonio"]
+        self.assertEqual((a["repo"], a["path"], a["branch"], a["merge"], a["rounds"]), ("tozes/factonio", "/home/tozes/dev/factonio", "main", "auto", "3"))
+        self.assertEqual(a["roundsClass"], "fc-num")
+        self.assertEqual(a["branchTitle"], "main")
+        self.assertEqual(a["provider"], {"cls": "fc-tag fc-tag--inherit", "text": "auto · global", "title": "Inherited from global default; resolves to claude-design"})
+        self.assertEqual(a["approval"], {"cls": "fc-tag fc-tag--inherit", "text": "ask · global", "title": "Inherited from global default"})
+        b = rows["acme-web-dashboard"]
+        self.assertEqual(b["provider"], {"cls": "fc-tag fc-tag--set", "text": "hermes", "title": "Repository override"})
+        self.assertEqual(b["approval"], {"cls": "fc-tag fc-tag--set", "text": "auto", "title": "Repository override"})
+        c = rows["acme-cli-tools"]
+        self.assertEqual(c["provider"]["cls"], "fc-tag fc-tag--set")
+        self.assertEqual(c["provider"]["text"], "off")
+        self.assertEqual(c["approval"]["cls"], "fc-tag fc-tag--inherit")
+        for slug, row in rows.items():
+            with self.subTest(slug=slug):
+                self.assertEqual(row["edit"]["label"], "Edit")
+                self.assertEqual(row["edit"]["ariaLabel"], f"Edit {row['repo']}")
+                self.assertEqual(row["edit"]["expanded"], "false")
+                self.assertIsNone(row["edit"].get("controls"))
+                self.assertIsNone(row["edit"].get("active"))
+                self.assertFalse(row["edit"]["disabled"])
+                self.assertIsNone(row["editing"])
+
+    def test_validate_repo_draft(self):
+        v = self.report["repos"]["validate"]
+        self.assertEqual(self.report["repos"]["exportsValidator"], "function")
+        self.assertEqual(v["valid"], [[], [], [], [], []])
+        self.assertEqual(
+            v["branch"],
+            {
+                "empty": "Branch is required.",
+                "blank": "Branch is required.",
+                "null": "Branch is required.",
+                "space": "Branch can’t contain spaces.",
+                "tab": "Branch can’t contain spaces.",
+                "dots": "Branch can’t contain “..”.",
+                "dash": "Branch can’t start with “-”.",
+                "ctrl": "Branch has invalid characters.",
+                "del": "Branch has invalid characters.",
+            },
+        )
+        for case, msg in v["rounds"].items():
+            with self.subTest(case=case):
+                self.assertEqual(msg, "Must be a whole number, 1 or more.")
+
+    def test_validate_repo_draft_rejects_unsafe_max_fix_rounds(self):
+        v = self.report["repos"]["validate"]
+        rng = "Must be 9007199254740991 or less."
+        self.assertEqual(v["unsafe"], {"pow53": rng, "pow53plus1": rng, "overflow309": rng, "pow53Num": rng, "bigNum": rng})
+        self.assertEqual(v["safeMax"], [[], [], [], []])
+
+    def test_repo_editor_rejects_unsafe_max_fix_rounds(self):
+        for case, u in self.report["repos"]["unsafe"].items():
+            with self.subTest(case=case):
+                self.assertEqual(u["rests"], [])
+                self.assertEqual(u["value"], u["expected"])  # draft preserved
+                self.assertEqual(u["invalid"], "true")
+                self.assertEqual(u["err"], "Must be 9007199254740991 or less.")
+                if "focus" in u:
+                    self.assertEqual(u["focus"], [u["roundsId"]])
+
+    def test_repo_draft_changes_only_explicit_edits_against_live_repo(self):
+        c = self.report["repos"]["changesEdits"]
+        self.assertEqual(c["onlyEdited"], {"default_branch": "user-feature"})
+        self.assertEqual(c["explicitOriginal"], {"merge_policy": "auto", "design_provider": None})
+        self.assertEqual(c["equalLive"], {})
+        self.assertEqual(c["none"], {})
+
+    def _patch(self, body):
+        return [{"path": "/repos/tozes-factonio", "opts": {"method": "PATCH", "body": body}}]
+
+    def test_refresh_then_explicit_original_merge_policy_is_kept_and_sent(self):
+        e = self.report["repos"]["editBack"]["merge"]
+        self.assertEqual(self._ed_vals(e["refreshed"])["merge_policy"], "ask")
+        self.assertTrue(e["refreshed"]["save"]["disabled"])
+        self.assertEqual(self._ed_vals(e["chosen"])["merge_policy"], "auto")
+        self.assertEqual(e["chosen"]["msg"]["text"], "1 unsaved change")
+        self.assertFalse(e["chosen"]["save"]["disabled"])
+        self.assertEqual(e["rests"], self._patch({"merge_policy": "auto"}))
+
+    def test_refresh_then_explicit_inherit_global_provider_is_kept_and_sent(self):
+        e = self.report["repos"]["editBack"]["provider"]
+        self.assertEqual(self._ed_vals(e["refreshed"])["design_provider"], "hermes")
+        self.assertEqual(self._ed_vals(e["chosen"])["design_provider"], "")
+        self.assertEqual(e["chosen"]["msg"]["text"], "1 unsaved change")
+        self.assertFalse(e["chosen"]["save"]["disabled"])
+        self.assertEqual(e["rests"], self._patch({"design_provider": None}))
+
+    def test_refresh_then_explicit_original_branch_and_rounds_are_kept_and_sent(self):
+        e = self.report["repos"]["editBack"]["text"]
+        self.assertEqual(self._ed_vals(e["refreshed"])["default_branch"], "develop")
+        self.assertEqual(self._ed_vals(e["refreshed"])["max_fix_rounds"], "5")
+        self.assertEqual(self._ed_vals(e["chosen"])["default_branch"], "main")
+        self.assertEqual(self._ed_vals(e["chosen"])["max_fix_rounds"], "3")
+        self.assertEqual(e["chosen"]["msg"]["text"], "2 unsaved changes")
+        self.assertFalse(e["chosen"]["save"]["disabled"])
+        self.assertEqual(e["rests"], self._patch({"default_branch": "main", "max_fix_rounds": 3}))
+
+    def test_refresh_untouched_fields_follow_live_then_explicit_originals_are_sent(self):
+        e = self.report["repos"]["editBack"]["mixed"]
+        vals = self._ed_vals(e["refreshed"])
+        self.assertEqual((vals["default_branch"], vals["merge_policy"], vals["design_provider"]), ("user-feature", "ask", "hermes"))
+        self.assertEqual(e["refreshed"]["msg"]["text"], "1 unsaved change")
+        self.assertEqual(e["firstRests"], self._patch({"default_branch": "user-feature"}))
+        vals = self._ed_vals(e["chosen"])
+        self.assertEqual((vals["default_branch"], vals["merge_policy"], vals["design_provider"]), ("user-feature", "auto", ""))
+        self.assertEqual(e["chosen"]["msg"]["text"], "3 unsaved changes")
+        self.assertEqual(
+            e["allRests"],
+            self._patch({"default_branch": "user-feature", "merge_policy": "auto", "design_provider": None}),
+        )
+
+    def test_reverting_edit_to_live_value_drops_it_and_follows_refresh(self):
+        e = self.report["repos"]["editBack"]["revert"]
+        self.assertTrue(e["save"]["disabled"])
+        self.assertEqual(self._ed_vals(e["after"])["merge_policy"], "ask")
+        self.assertTrue(e["after"]["save"]["disabled"])
+
+    def test_repo_editor_background_refresh_does_not_revert_untouched_fields(self):
+        b = self.report["repos"]["refresh"]
+        self.assertEqual(b["before"]["msg"]["text"], "1 unsaved change")
+        self.assertEqual(b["after"]["msg"]["text"], "1 unsaved change")
+        # Untouched fields reconcile to refreshed values; the user's edit is preserved.
+        self.assertEqual(
+            self._ed_vals(b["after"]),
+            {"default_branch": "user-feature", "merge_policy": "ask", "max_fix_rounds": "3", "design_provider": "hermes", "design_approval": ""},
+        )
+        self.assertEqual(
+            b["rests"],
+            [{"path": "/repos/tozes-factonio", "opts": {"method": "PATCH", "body": {"default_branch": "user-feature"}}}],
+        )
+        self.assertTrue(b["closed"])
+        k = b["keepEdit"]
+        self.assertEqual(k["msg"]["text"], "1 unsaved change")
+        self.assertEqual(self._ed_vals(k)["merge_policy"], "ask")
+        self.assertEqual(self._ed_vals(k)["max_fix_rounds"], "6")
+        self.assertEqual(
+            b["keepEditRests"],
+            [{"path": "/repos/tozes-factonio", "opts": {"method": "PATCH", "body": {"merge_policy": "ask"}}}],
+        )
+
+    def test_patch_body_only_changed_fields_and_error_parsing(self):
+        rep = self.report["repos"]
+        # Trimmed branch equal to the original is not a change; "" -> null; rounds -> Number.
+        self.assertEqual(rep["changes"], {"default_branch": "main", "max_fix_rounds": 7, "design_provider": None})
+        d = rep["describe"]
+        self.assertEqual(d["ipc422"], {"status": 422, "detail": "max_fix_rounds must be >= 1"})
+        self.assertEqual(d["plain404"], {"status": 404, "detail": "Repository 'x' is not registered."})
+        self.assertEqual(d["pydantic"], {"status": 422, "detail": "field required; bad"})
+        self.assertEqual(d["noBody"], {"status": 500, "detail": "HTTP 500"})
+        self.assertEqual(d["network"]["status"], None)
+
+    def test_repo_editor_opens_beneath_row_with_focus_and_fields(self):
+        o = self.report["repos"]["lifecycle"]["opened"]
+        ed = o["editor"]
+        self.assertEqual(o["table"]["order"], ["row:tozes-factonio", "editor:tozes-factonio", "row:acme-web-dashboard", "row:acme-cli-tools"])
+        row = o["table"]["rows"][0]
+        self.assertEqual(row["editing"], "true")
+        self.assertEqual(row["edit"]["expanded"], "true")
+        self.assertEqual(row["edit"]["active"], "true")
+        self.assertEqual(row["edit"]["controls"], ed["formId"])
+        self.assertEqual(ed["editing"], "true")
+        self.assertEqual(ed["colSpan"], 7)
+        self.assertEqual(ed["formLabel"], "Edit settings for tozes/factonio")
+        self.assertTrue(ed["noValidate"])
+        self.assertEqual(ed["identity"], "Editing tozes-factonio Path /home/tozes/dev/factonio")
+        self.assertEqual(ed["fieldsetClass"], "fc-ed-grid")
+        self.assertEqual(ed["fieldOrder"], ["default_branch", "merge_policy", "max_fix_rounds", "design_provider", "design_approval"])
+        self.assertEqual(self._ed_vals(ed), {"default_branch": "main", "merge_policy": "auto", "max_fix_rounds": "3", "design_provider": "", "design_approval": ""})
+        for name, f in ed["fields"].items():
+            with self.subTest(field=name):
+                self.assertEqual(f["labelFor"], f["id"])
+                self.assertEqual(f["describedBy"], f["hint"]["id"])
+                self.assertIsNone(f["invalid"])
+        self.assertEqual(ed["fields"]["max_fix_rounds"]["type"], "number")
+        self.assertEqual(ed["fields"]["design_provider"]["options"][0], ["", "Inherit global (auto)"])
+        self.assertEqual(ed["fields"]["design_approval"]["options"], [["", "Inherit global (ask)"], ["ask", "ask"], ["auto", "auto"]])
+        self.assertEqual(ed["fields"]["design_provider"]["hint"]["text"], "Currently resolves to claude-design .")
+        # Focus moves to the Default branch input; Save disabled until dirty.
+        self.assertEqual(o["focus"], [ed["fields"]["default_branch"]["id"]])
+        self.assertEqual(ed["save"], {"label": "Save changes", "disabled": True, "type": "submit", "spin": False})
+        self.assertEqual(ed["cancel"], {"disabled": False, "type": "button"})
+        self.assertEqual(ed["msg"], {"text": "", "className": "fc-ed-msg"})
+
+    def test_repo_editor_dirty_tracking_and_provider_hints(self):
+        L = self.report["repos"]["lifecycle"]
+        h = L["providerHermes"]
+        self.assertEqual(h["msg"]["text"], "1 unsaved change")
+        self.assertFalse(h["save"]["disabled"])
+        self.assertEqual(h["fields"]["design_provider"]["hint"]["text"], "Resolves to hermes (overrides global auto ).")
+        self.assertEqual(L["providerOff"]["text"], "Design phase is skipped.")
+        self.assertEqual(L["providerAuto"]["text"], "Currently resolves to claude-design .")
+        # Reverting to the original value clears the dirty state.
+        self.assertEqual(L["providerInherit"]["msg"]["text"], "")
+        self.assertTrue(L["providerInherit"]["save"]["disabled"])
+        self.assertEqual(L["dirtyInvalid"]["msg"]["text"], "2 unsaved changes")
+        self.assertEqual(L["allFixed"]["msg"]["text"], "3 unsaved changes")
+
+    def test_repo_editor_validation_blocks_patch(self):
+        L = self.report["repos"]["lifecycle"]
+        inv = L["invalidSubmit"]
+        self.assertEqual(inv["rests"], [])
+        ed = inv["editor"]
+        b, n = ed["fields"]["default_branch"], ed["fields"]["max_fix_rounds"]
+        self.assertEqual(b["invalid"], "true")
+        self.assertEqual(b["describedBy"], b["err"]["id"])
+        self.assertEqual(b["err"]["text"], "Branch can’t contain “..”.")
+        self.assertIsNone(b["hint"])
+        self.assertEqual(n["invalid"], "true")
+        self.assertEqual(n["err"]["text"], "Must be a whole number, 1 or more.")
+        self.assertEqual(ed["msg"], {"text": "Fix 2 fields to save.", "className": "fc-ed-msg fc-ed-msg--err"})
+        self.assertEqual(inv["focus"], [b["id"]])  # first invalid field
+        self.assertEqual(self._ed_vals(ed)["default_branch"], "feature..bad")  # draft untouched
+        # Live re-validation of already-flagged fields.
+        live = L["liveFixBranch"]
+        self.assertIsNone(live["fields"]["default_branch"]["invalid"])
+        self.assertEqual(live["fields"]["max_fix_rounds"]["invalid"], "true")
+        self.assertEqual(live["msg"]["text"], "Fix 1 field to save.")
+        self.assertIsNone(L["allFixed"]["fields"]["max_fix_rounds"]["invalid"])
+
+    def test_repo_editor_saving_state_and_patch_body(self):
+        sv = self.report["repos"]["lifecycle"]["saving"]
+        self.assertEqual(
+            sv["rests"],
+            [{"path": "/repos/tozes-factonio", "opts": {"method": "PATCH", "body": {"default_branch": "develop", "max_fix_rounds": 4, "design_provider": "hermes"}}}],
+        )
+        ed = sv["editor"]
+        self.assertEqual(ed["busy"], "true")
+        self.assertTrue(ed["fieldsetDisabled"])
+        self.assertTrue(ed["cancel"]["disabled"])
+        self.assertEqual(ed["save"], {"label": "Saving…", "disabled": True, "type": "submit", "spin": True})
+        self.assertEqual(ed["msg"]["text"], "Saving 3 changes…")
+        self.assertEqual([r["edit"]["disabled"] for r in sv["table"]["rows"]], [True, True, True])
+        self.assertTrue(self.report["repos"]["lifecycle"]["escapeWhileSaving"])  # Escape ignored while saving
+
+    def test_repo_editor_api_and_network_errors_preserve_draft(self):
+        L = self.report["repos"]["lifecycle"]
+        ae = L["apiError"]
+        ed = ae["editor"]
+        self.assertIsNotNone(ed)
+        self.assertEqual(ed["alert"], "Couldn’t save (422). Invalid default_branch 'develop'. Your changes are still here.")
+        self.assertEqual(ed["save"]["label"], "Retry save")
+        self.assertFalse(ed["save"]["disabled"])
+        self.assertIsNone(ed["busy"])
+        self.assertFalse(ed["fieldsetDisabled"])
+        self.assertEqual(self._ed_vals(ed), {"default_branch": " develop ", "merge_policy": "auto", "max_fix_rounds": "4", "design_provider": "hermes", "design_approval": ""})
+        self.assertEqual(ae["notifications"], [])
+        self.assertEqual(ae["invalidations"], [])
+        self.assertFalse(ae["table"]["rows"][0]["edit"]["disabled"])
+        ne = L["networkError"]
+        self.assertEqual(ne["alert"], "Couldn’t save. Network error. Your changes are still here.")
+        self.assertEqual(ne["save"]["label"], "Retry save")
+        self.assertEqual(self._ed_vals(ne)["max_fix_rounds"], "4")
+
+    def test_repo_editor_successful_save(self):
+        s = self.report["repos"]["lifecycle"]["saved"]
+        self.assertIsNone(s["editor"])
+        self.assertEqual(s["invalidations"], [{"queryKey": ["factonio", "repos"]}])
+        self.assertEqual(s["refetches"], 0)
+        self.assertEqual(s["notifications"], [{"kind": "info", "message": "Saved settings for tozes/factonio"}])
+        self.assertEqual(s["focus"], ["Edit tozes/factonio"])
+        self.assertEqual(s["table"]["rows"][0]["edit"]["expanded"], "false")
+        self.assertEqual(len(s["rests"]), 3)  # 422, network error, success
+        c = self.report["repos"]["clear"]
+        self.assertEqual(self._ed_vals(c["opened"])["design_provider"], "hermes")
+        self.assertEqual(c["dirty"]["msg"]["text"], "2 unsaved changes")
+        self.assertEqual(c["dirty"]["fields"]["design_provider"]["hint"]["text"], "Currently resolves to claude-design .")
+        self.assertEqual(
+            c["after"]["rests"],
+            [{"path": "/repos/acme-web-dashboard", "opts": {"method": "PATCH", "body": {"design_provider": None, "design_approval": None}}}],
+        )
+        self.assertEqual(c["after"]["refetches"], 1)  # refetch fallback without invalidateQueries
+        self.assertIsNone(c["after"]["editor"])
+        self.assertEqual(c["after"]["notifications"], [{"kind": "info", "message": "Saved settings for acme/web-dashboard"}])
+
+    def test_repo_editor_cancel_escape_and_single_editor(self):
+        x = self.report["repos"]["cancel"]
+        self.assertEqual(x["openedProvider"]["value"], "off")
+        self.assertEqual(x["openedProvider"]["hint"]["text"], "Design phase is skipped.")
+        self.assertEqual(x["dirtyMsg"], "2 unsaved changes")
+        self.assertIsNone(x["afterCancel"]["editor"])
+        self.assertEqual(x["afterCancel"]["focus"], ["Edit acme/cli-tools"])
+        self.assertEqual(x["afterCancel"]["expanded"], "false")
+        self.assertEqual(x["reopened"]["branch"], "release/v2")
+        self.assertEqual(x["reopened"]["merge"], "auto")
+        self.assertEqual(x["reopened"]["msg"], "")
+        self.assertTrue(x["reopened"]["save"]["disabled"])
+        self.assertTrue(x["enterKeepsOpen"])
+        self.assertIsNone(x["afterEscape"]["editor"])
+        self.assertEqual(x["afterEscape"]["focus"], ["Edit acme/cli-tools"])
+        self.assertEqual(x["reopenedAfterEscape"], "2")
+        self.assertEqual(x["switched"]["slug"], "tozes-factonio")
+        self.assertEqual(x["switched"]["editors"], 1)
+        self.assertEqual(x["switched"]["order"][:2], ["row:tozes-factonio", "editor:tozes-factonio"])
+        self.assertEqual(x["switchedBackPristine"], "release/v2")
+        self.assertIsNone(x["toggleClosed"])
+        self.assertEqual(x["rests"], [])
+
+    def test_repos_editor_styles_use_theme_tokens_only(self):
+        source = PLUGIN_JS.read_text(encoding="utf-8")
+        start = source.index("const STYLES = `")
+        styles = source[start : source.index("`", start + len("const STYLES = `"))]
+        prefixes = (".fc-repos", ".fc-repo-", ".fc-tag", ".fc-ed", ".fc-field", ".fc-input", "select.fc-input", ".fc-alert", ".fc-spin", ".fc-legend", ".fc-sec-sub", ".fc-btn", ".fc-col-", ".fc-th-sub", ".fc-trunc", ".fc-num", ".fc-sr")
+        rules = [line for line in styles.splitlines() if line.strip().startswith(prefixes) or line.strip().startswith("@container")]
+        self.assertGreater(len(rules), 30)
+        for line in rules:
+            self.assertNotRegex(line, r"#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(", line)
+        for needed in (".fc-tag--inherit", ".fc-tag--set", "border: 1px dashed", ".fc-ed-grid", "@container (max-width: 640px)", '.fc-input[aria-invalid="true"]', ".fc-spin", ".fc-alert"):
+            self.assertIn(needed, styles)
 
 if __name__ == "__main__":
     unittest.main()

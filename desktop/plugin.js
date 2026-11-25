@@ -19,10 +19,11 @@ import {
   EmptyState,
   host,
   useQuery,
+  useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 const ROUTE_PATH = '/factonio'
 // Contribution-scoped pane id (`<pluginId>:<paneId>`) used by host.revealPane / host.paneVisibility.
@@ -81,6 +82,57 @@ const STYLES = `
 .fc-settings { padding: 4px 0 24px; color: var(--ui-text-primary); font-size: 13px; line-height: 1.45; }
 .fc-settings-note { border: 1px solid var(--ui-stroke-secondary); border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; font-size: 12px; color: var(--ui-text-secondary); }
 .fc-settings-err { color: var(--ui-text-secondary); font-size: 12px; margin-bottom: 10px; }
+/* Registered Repositories editor (.fc-repos*, .fc-tag*, .fc-ed*): host theme tokens, transparent, currentColor and color-mix only. */
+.fc-repos-sec { container-type: inline-size; }
+.fc-sec-sub { margin: 2px 0 0; font-size: 11.5px; color: var(--ui-text-secondary); }
+.fc-legend { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--ui-text-secondary); }
+.fc-btn:hover:not(:disabled) { background: var(--ui-row-hover-background); }
+.fc-btn:disabled { opacity: 0.5; cursor: default; }
+.fc-btn:focus-visible, .fc-input:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 1px; }
+.fc-btn--primary { border-color: color-mix(in srgb, var(--ui-accent) 55%, transparent); background: color-mix(in srgb, var(--ui-accent) 14%, transparent); font-weight: 600; }
+.fc-btn--primary:hover:not(:disabled) { background: color-mix(in srgb, var(--ui-accent) 22%, transparent); }
+.fc-repos { table-layout: fixed; }
+.fc-repos th { white-space: normal; line-height: 1.25; vertical-align: bottom; }
+.fc-repos td { vertical-align: middle; }
+.fc-repos tbody tr:not(.fc-repo-ed):hover > td { background: var(--ui-row-hover-background); }
+.fc-col-repo { width: 27%; } .fc-col-branch { width: 12%; } .fc-col-merge { width: 11%; } .fc-col-rounds { width: 12%; }
+.fc-col-prov { width: 15%; } .fc-col-appr { width: 14%; } .fc-col-act { width: 9%; }
+.fc-th-sub { display: block; font-weight: 400; font-size: 10.5px; color: var(--ui-text-secondary); }
+.fc-num, .fc-act { text-align: right !important; }
+.fc-trunc { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fc-repo-name { font-family: var(--dt-font-mono, ui-monospace, monospace); font-size: 11.5px; color: var(--ui-text-primary); }
+.fc-repo-path { font-family: var(--dt-font-mono, ui-monospace, monospace); font-size: 10.5px; color: var(--ui-text-secondary); margin-top: 1px; }
+.fc-tag { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; height: 20px; box-sizing: border-box; padding: 0 7px; border-radius: 999px; border: 1px solid transparent; font-family: var(--dt-font-mono, ui-monospace, monospace); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
+.fc-tag--inherit { border: 1px dashed color-mix(in srgb, var(--ui-text-secondary) 48%, transparent); background: color-mix(in srgb, var(--ui-chat-surface-background) 65%, transparent); color: var(--ui-text-secondary); }
+.fc-tag--inherit .fc-tag-src { font-family: inherit; color: var(--ui-text-secondary); opacity: 0.85; }
+.fc-tag--set { border-color: color-mix(in srgb, var(--ui-accent) 55%, transparent); background: color-mix(in srgb, var(--ui-accent) 15%, transparent); color: var(--ui-text-primary); font-weight: 600; }
+.fc-repos tr[data-editing="true"] > td { background: var(--ui-row-active-background); border-bottom-color: transparent; }
+.fc-repos tr[data-editing="true"] > td:first-child { box-shadow: inset 2px 0 0 var(--ui-accent); }
+.fc-repos tr[data-editing="true"] .fc-tag--inherit { background: var(--ui-chat-surface-background); }
+.fc-repo-ed > td { padding: 0; }
+.fc-ed { display: flex; flex-direction: column; gap: 12px; margin: 0; padding: 2px 14px 14px 16px; border: 0; min-width: 0; }
+.fc-ed-id { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 11px; color: var(--ui-text-secondary); }
+.fc-ed-id .fc-mono { color: var(--ui-text-primary); }
+.fc-ed-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 16px; border: 0; margin: 0; padding: 0; min-width: 0; }
+@container (max-width: 640px) { .fc-ed-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.fc-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.fc-field label { font-size: 11.5px; font-weight: 500; color: var(--ui-text-primary); }
+.fc-input { height: 28px; box-sizing: border-box; width: 100%; padding: 0 8px; border: 1px solid color-mix(in srgb, var(--ui-text-secondary) 32%, var(--ui-stroke-secondary)); border-radius: 6px; background: var(--ui-chat-surface-background); color: var(--ui-text-primary); font: inherit; font-size: 12px; }
+select.fc-input { padding: 0 22px 0 8px; }
+.fc-input.fc-mono { font-family: var(--dt-font-mono, ui-monospace, monospace); font-size: 11.5px; }
+.fc-input:focus-visible { border-color: var(--ui-accent); }
+.fc-input:disabled { opacity: 0.68; cursor: default; }
+.fc-input[aria-invalid="true"] { border-color: var(--dt-destructive); box-shadow: 0 0 0 1px color-mix(in srgb, var(--dt-destructive) 35%, transparent); }
+.fc-field-hint { font-size: 11px; color: var(--ui-text-secondary); }
+.fc-field-err, .fc-ed-msg--err { font-size: 11px; color: color-mix(in srgb, var(--dt-destructive) 80%, var(--ui-text-primary)); }
+.fc-ed-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; padding-top: 12px; border-top: 1px solid var(--ui-stroke-tertiary); }
+.fc-ed-msg { flex: 1 1 280px; min-width: 0; font-size: 11.5px; color: var(--ui-text-secondary); }
+.fc-alert { display: flex; align-items: flex-start; gap: 7px; padding: 7px 10px; border-radius: 6px; font-size: 12px; border: 1px solid color-mix(in srgb, var(--dt-destructive) 45%, transparent); background: color-mix(in srgb, var(--dt-destructive) 11%, transparent); color: color-mix(in srgb, var(--dt-destructive) 82%, var(--ui-text-primary)); }
+.fc-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.fc-alert svg { flex: none; margin-top: 2px; }
+.fc-spin { display: inline-block; width: 10px; height: 10px; margin-right: 6px; border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 999px; vertical-align: -1px; animation: fc-spin .8s linear infinite; }
+@keyframes fc-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .fc-spin { animation: none; border-right-color: currentColor; opacity: .6; } }
 /* Factonio sidebar tab (.fc-sb-*): host theme tokens + translucent color-mix tints only. */
 .fc-sb {
   --fc-sb-warn: #f59e0b;
@@ -352,6 +404,559 @@ function FactonioSettingsPage({ ctx }) {
   })
 }
 
+// ---------------------------------------------------------------------------
+// Registered Repositories editor (approved Phase 1b design: design/DESIGN.md).
+// GET /repos feeds the table; PATCH /repos/{slug} saves only changed fields.
+// ---------------------------------------------------------------------------
+
+const MERGE_POLICY_OPTIONS = ['auto', 'ask']
+const DESIGN_PROVIDER_OPTIONS = ['auto', 'claude-design', 'hermes', 'off']
+const DESIGN_APPROVAL_OPTIONS = ['ask', 'auto']
+const REPO_FIELD_ORDER = ['default_branch', 'merge_policy', 'max_fix_rounds', 'design_provider', 'design_approval']
+const REPOS_QUERY_KEY = ['factonio', 'repos']
+
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`
+const controlChars = s => [...s].some(ch => ch.charCodeAt(0) < 32 || ch.charCodeAt(0) === 127)
+
+// Pure client-side validator (mirrors repos.py `_validate_default_branch` /
+// `_validate_max_fix_rounds`). Returns `{ field: message }`; empty when valid.
+function validateRepoDraft(draft) {
+  const d = draft || {}
+  const errors = {}
+  const branch = String(d.default_branch ?? '').trim()
+  if (!branch) errors.default_branch = 'Branch is required.'
+  else if (/\s/.test(branch)) errors.default_branch = 'Branch can’t contain spaces.'
+  else if (branch.includes('..')) errors.default_branch = 'Branch can’t contain “..”.'
+  else if (branch.startsWith('-')) errors.default_branch = 'Branch can’t start with “-”.'
+  else if (controlChars(branch)) errors.default_branch = 'Branch has invalid characters.'
+
+  const roundsErr = validateRounds(d.max_fix_rounds)
+  if (roundsErr) errors.max_fix_rounds = roundsErr
+  return errors
+}
+
+// Max fix rounds must be a canonical base-10 integer in [1, Number.MAX_SAFE_INTEGER]
+// so `Number(...)` in the PATCH body is exact (no silent rounding / Infinity -> null).
+const ROUNDS_WHOLE_MSG = 'Must be a whole number, 1 or more.'
+const ROUNDS_RANGE_MSG = `Must be ${Number.MAX_SAFE_INTEGER} or less.`
+function validateRounds(rounds) {
+  let big
+  if (typeof rounds === 'number') {
+    if (!Number.isInteger(rounds) || rounds < 1) return ROUNDS_WHOLE_MSG
+    if (!Number.isSafeInteger(rounds)) return ROUNDS_RANGE_MSG
+    return null
+  }
+  if (typeof rounds !== 'string') return ROUNDS_WHOLE_MSG
+  const t = rounds.trim()
+  if (!/^[0-9]+$/.test(t)) return ROUNDS_WHOLE_MSG
+  try { big = BigInt(t) } catch { return ROUNDS_WHOLE_MSG }
+  if (big < 1n) return ROUNDS_WHOLE_MSG
+  if (big > BigInt(Number.MAX_SAFE_INTEGER)) return ROUNDS_RANGE_MSG
+  return null
+}
+
+function seedRepoDraft(repo) {
+  return {
+    default_branch: String(repo.default_branch ?? ''),
+    merge_policy: String(repo.merge_policy ?? 'auto'),
+    max_fix_rounds: repo.max_fix_rounds == null ? '' : String(repo.max_fix_rounds),
+    design_provider: repo.design_provider ? String(repo.design_provider) : '',
+    design_approval: repo.design_approval ? String(repo.design_approval) : ''
+  }
+}
+
+// Normalized draft values used for change detection (trimmed text, '' overrides -> null,
+// safe-integer rounds compared numerically so '007' equals 7).
+function normalizeRepoDraft(d) {
+  const rounds = String(d.max_fix_rounds ?? '').trim()
+  const n = /^[0-9]+$/.test(rounds) ? Number(rounds) : NaN
+  return {
+    default_branch: String(d.default_branch ?? '').trim(),
+    merge_policy: String(d.merge_policy ?? ''),
+    max_fix_rounds: Number.isSafeInteger(n) ? String(n) : rounds,
+    design_provider: d.design_provider || null,
+    design_approval: d.design_approval || null
+  }
+}
+
+// The PATCH body: only fields present in `edits` (the fields the user explicitly
+// changed) whose normalized value differs from the current live `repo`. Fields the
+// user never touched are never sent, so background refreshes are not reverted; an
+// explicit choice equal to an older value is still sent once `repo` has moved on.
+function repoDraftChanges(edits, repo) {
+  const own = edits || {}
+  const next = normalizeRepoDraft({ ...seedRepoDraft(repo || {}), ...own })
+  const base = normalizeRepoDraft(seedRepoDraft(repo || {}))
+  const body = {}
+  for (const k of REPO_FIELD_ORDER) {
+    if (!Object.prototype.hasOwnProperty.call(own, k) || next[k] === base[k]) continue
+    body[k] = k === 'max_fix_rounds' ? Number(next[k]) : next[k]
+  }
+  return body
+}
+
+// ctx.rest rejects with an Error whose message carries "<status>: <body>" (possibly
+// behind an IPC prefix). Returns { status, detail } or { status: null } for network errors.
+function describeSaveError(err) {
+  const e = err && typeof err === 'object' ? err : {}
+  let status = Number(e.statusCode ?? e.status ?? e.response?.status)
+  let body = e.body ?? e.data ?? e.response?.data
+  const msg = String(e.message ?? err ?? '')
+  const m = /(?:^|[^0-9])([1-5][0-9]{2}):\s?([\s\S]*)$/.exec(msg)
+  if (!(status >= 100) && m) status = Number(m[1])
+  if (body == null && m) body = m[2]
+  if (!(status >= 100)) return { status: null, detail: '' }
+  let detail = body
+  if (typeof detail === 'string') {
+    const t = detail.trim()
+    try { detail = JSON.parse(t) } catch { detail = t }
+  }
+  if (detail && typeof detail === 'object' && !Array.isArray(detail)) detail = detail.detail ?? detail.error ?? detail.message ?? ''
+  if (Array.isArray(detail)) detail = detail.map(x => (x && typeof x === 'object' ? x.msg || JSON.stringify(x) : String(x))).join('; ')
+  detail = String(detail ?? '').trim()
+  return { status, detail: detail || `HTTP ${status}` }
+}
+
+function providerHint(draft, repo, defaults, autoResolved) {
+  const globalProvider = defaults?.design_provider || 'auto'
+  const target = draft.design_provider || globalProvider
+  const mono = v => jsx('span', { className: 'fc-mono', children: v })
+  if (target === 'off') return 'Design phase is skipped.'
+  if (draft.design_provider && draft.design_provider !== 'auto') {
+    return ['Resolves to ', mono(draft.design_provider), ' (overrides global ', mono(globalProvider), ').']
+  }
+  if (target === 'auto') {
+    const resolved = repo.effective_design_provider === 'auto' && repo.resolved_design_provider
+      ? repo.resolved_design_provider
+      : autoResolved
+    if (resolved) return ['Currently resolves to ', mono(resolved), '.']
+    return 'Picks a provider automatically at run time.'
+  }
+  return ['Currently resolves to ', mono(target), '.']
+}
+
+function DesignTag({ value, effective, resolved }) {
+  if (value) {
+    return jsx('span', { className: 'fc-tag fc-tag--set', title: 'Repository override', children: String(value) })
+  }
+  return jsxs('span', {
+    className: 'fc-tag fc-tag--inherit',
+    title: resolved ? `Inherited from global default; resolves to ${resolved}` : 'Inherited from global default',
+    children: [String(effective ?? '—'), ' ', jsx('span', { className: 'fc-tag-src', children: '· global' })]
+  })
+}
+
+function RepoRow({ repo: r, defaults, editing, busy, editorId, onEdit, buttonRef }) {
+  return jsxs('tr', {
+    'data-slug': r.slug,
+    'data-editing': editing ? 'true' : undefined,
+    children: [
+      jsxs('td', {
+        children: [
+          jsx('span', { className: 'fc-trunc fc-repo-name', title: r.repo || r.slug, children: r.repo || r.slug }),
+          jsx('span', { className: 'fc-trunc fc-repo-path', title: r.path || '', children: r.path || '—' })
+        ]
+      }),
+      jsx('td', { children: jsx('span', { className: 'fc-trunc fc-mono', title: r.default_branch || '', children: r.default_branch || '—' }) }),
+      jsx('td', { children: r.merge_policy ?? '—' }),
+      jsx('td', { className: 'fc-num', children: r.max_fix_rounds ?? '—' }),
+      jsx('td', {
+        'data-field': 'design_provider',
+        children: jsx(DesignTag, {
+          value: r.design_provider,
+          effective: r.effective_design_provider ?? defaults?.design_provider,
+          resolved: r.resolved_design_provider
+        })
+      }),
+      jsx('td', {
+        'data-field': 'design_approval',
+        children: jsx(DesignTag, { value: r.design_approval, effective: r.effective_design_approval ?? defaults?.design_approval })
+      }),
+      jsx('td', {
+        className: 'fc-act',
+        children: jsx('button', {
+          type: 'button',
+          className: 'fc-btn',
+          ref: buttonRef,
+          'data-action': 'edit-repo',
+          'data-active': editing ? 'true' : undefined,
+          'aria-expanded': String(!!editing),
+          'aria-controls': editing ? editorId : undefined,
+          'aria-label': `Edit ${r.repo || r.slug}`,
+          disabled: busy,
+          onClick: onEdit,
+          children: 'Edit'
+        })
+      })
+    ]
+  })
+}
+
+function AlertIcon() {
+  return jsxs('svg', {
+    width: 13,
+    height: 13,
+    viewBox: '0 0 16 16',
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 1.6,
+    'aria-hidden': 'true',
+    focusable: 'false',
+    children: [
+      jsx('circle', { cx: 8, cy: 8, r: 6.5 }),
+      jsx('path', { d: 'M8 4.5v4M8 11v.01', strokeLinecap: 'round' })
+    ]
+  })
+}
+
+function RepoEditor({ ctx, repo, defaults, autoResolved, reposQ, editorId, saving, setSaving, onClose, onSaved }) {
+  const queryClient = useQueryClient()
+  // Explicit per-field edits: { [field]: userValue } only for fields the user changed.
+  // Untouched fields always show the live (possibly refreshed) repo value and are never
+  // PATCHed; edited fields keep the user's value across background refreshes.
+  const [edits, setEdits] = useState({})
+  const live = seedRepoDraft(repo)
+  const draft = { ...live, ...edits }
+  const [errors, setErrors] = useState({})
+  const [apiError, setApiError] = useState(null)
+  const branchRef = useRef(null)
+  const roundsRef = useRef(null)
+
+  // Focus moves to the Default branch input when the editor opens.
+  useEffect(() => {
+    branchRef.current?.focus?.()
+  }, [])
+
+  const changes = repoDraftChanges(edits, repo)
+  const count = Object.keys(changes).length
+  const errorCount = Object.keys(errors).length
+  const fid = name => `${editorId}-${name}`
+
+  const setField = (name, value) => {
+    setEdits(prev => {
+      const next = { ...prev }
+      // Choosing the current live value drops the edit (field tracks live again).
+      if (value === live[name]) delete next[name]
+      else next[name] = value
+      return next
+    })
+    // Live re-validation only for fields already flagged (each rule is per-field).
+    setErrors(prev => {
+      if (!prev[name]) return prev
+      const fresh = validateRepoDraft({ default_branch: 'main', max_fix_rounds: 1, [name]: value })[name]
+      const next = { ...prev }
+      if (fresh) next[name] = fresh
+      else delete next[name]
+      return next
+    })
+  }
+
+  const cancel = () => {
+    if (saving) return
+    onClose()
+  }
+
+  const submit = async e => {
+    e?.preventDefault?.()
+    if (saving) return
+    const found = validateRepoDraft(draft)
+    if (Object.keys(found).length) {
+      setErrors(found)
+      setApiError(null)
+      if (found.default_branch) branchRef.current?.focus?.()
+      else if (found.max_fix_rounds) roundsRef.current?.focus?.()
+      return
+    }
+    setErrors({})
+    if (!count) return
+    setApiError(null)
+    setSaving(true)
+    try {
+      await ctx.rest('/repos/' + encodeURIComponent(repo.slug), { method: 'PATCH', body: changes })
+    } catch (err) {
+      setApiError(describeSaveError(err))
+      setSaving(false)
+      return
+    }
+    try {
+      if (typeof queryClient?.invalidateQueries === 'function') queryClient.invalidateQueries({ queryKey: REPOS_QUERY_KEY })
+      else reposQ?.refetch?.()
+    } catch { /* refresh is best-effort; the 30s poll catches up */ }
+    host.notify({ kind: 'info', message: 'Saved settings for ' + (repo.repo || repo.slug) })
+    onSaved()
+  }
+
+  const field = ({ name, label, hint, control }) => {
+    const err = errors[name]
+    const describedBy = err ? fid(`${name}-e`) : fid(`${name}-h`)
+    return jsxs('div', {
+      key: name,
+      className: 'fc-field',
+      'data-field': name,
+      children: [
+        jsx('label', { htmlFor: fid(name), children: label }),
+        control({
+          id: fid(name),
+          name,
+          'aria-invalid': err ? 'true' : undefined,
+          'aria-describedby': describedBy,
+          value: draft[name],
+          onChange: ev => setField(name, ev?.target?.value ?? '')
+        }),
+        err
+          ? jsx('span', { className: 'fc-field-err', id: fid(`${name}-e`), children: err })
+          : (Array.isArray(hint) ? jsxs : jsx)('span', { className: 'fc-field-hint', id: fid(`${name}-h`), children: hint })
+      ]
+    })
+  }
+  const select = (options, inheritLabel) => props => jsx('select', {
+    ...props,
+    className: 'fc-input',
+    children: [
+      inheritLabel ? jsx('option', { key: '__inherit', value: '', children: inheritLabel }) : null,
+      ...[...new Set([...options, ...(props.value && !options.includes(props.value) ? [props.value] : [])])]
+        .map(o => jsx('option', { key: o, value: o, children: o }))
+    ]
+  })
+
+  let msg = ''
+  let msgClass = 'fc-ed-msg'
+  if (saving) msg = `Saving ${plural(count, 'change', 'changes')}…`
+  else if (apiError) {
+    msg = jsxs('div', {
+      className: 'fc-alert',
+      role: 'alert',
+      children: [
+        jsx(AlertIcon, {}),
+        apiError.status
+          ? jsxs('span', { children: [jsx('b', { children: `Couldn’t save (${apiError.status}).` }), ` ${apiError.detail} Your changes are still here.`] })
+          : jsxs('span', { children: [jsx('b', { children: 'Couldn’t save.' }), ' Network error. Your changes are still here.'] })
+      ]
+    })
+  } else if (errorCount) {
+    msg = `Fix ${plural(errorCount, 'field', 'fields')} to save.`
+    msgClass = 'fc-ed-msg fc-ed-msg--err'
+  } else if (count) msg = `${plural(count, 'unsaved change', 'unsaved changes')}`
+
+  const label = repo.repo || repo.slug
+  return jsx('tr', {
+    className: 'fc-repo-ed',
+    'data-editing': 'true',
+    'data-slug': repo.slug,
+    children: jsx('td', {
+      colSpan: 7,
+      children: jsxs('form', {
+        className: 'fc-ed',
+        id: editorId,
+        'aria-label': `Edit settings for ${label}`,
+        'aria-busy': saving ? 'true' : undefined,
+        noValidate: true,
+        onSubmit: submit,
+        onKeyDown: e => {
+          if (e?.key === 'Escape' && !saving) {
+            e.preventDefault?.()
+            e.stopPropagation?.()
+            cancel()
+          }
+        },
+        children: [
+          jsxs('div', {
+            className: 'fc-ed-id',
+            children: [
+              jsxs('span', { children: ['Editing ', jsx('span', { className: 'fc-mono', children: repo.slug })] }),
+              jsxs('span', { children: ['Path ', jsx('span', { className: 'fc-mono', children: repo.path || '—' })] })
+            ]
+          }),
+          jsxs('fieldset', {
+            className: 'fc-ed-grid',
+            disabled: saving,
+            children: [
+              field({
+                name: 'default_branch',
+                label: 'Default branch',
+                hint: 'No spaces, “..”, or leading “-”.',
+                control: props => jsx('input', { ...props, ref: branchRef, className: 'fc-input fc-mono', type: 'text', spellCheck: false, autoComplete: 'off' })
+              }),
+              field({
+                name: 'merge_policy',
+                label: 'Merge policy',
+                hint: 'auto merges when checks pass; ask waits for you.',
+                control: select(MERGE_POLICY_OPTIONS)
+              }),
+              field({
+                name: 'max_fix_rounds',
+                label: 'Max fix rounds',
+                hint: 'Whole number, 1 or more.',
+                control: props => jsx('input', { ...props, ref: roundsRef, className: 'fc-input', type: 'number', min: 1, step: 1, inputMode: 'numeric' })
+              }),
+              field({
+                name: 'design_provider',
+                label: 'Design provider',
+                hint: providerHint(draft, repo, defaults, autoResolved),
+                control: select(DESIGN_PROVIDER_OPTIONS, `Inherit global (${defaults?.design_provider || 'auto'})`)
+              }),
+              field({
+                name: 'design_approval',
+                label: 'Design approval',
+                hint: 'ask pauses for your approval before build.',
+                control: select(DESIGN_APPROVAL_OPTIONS, `Inherit global (${defaults?.design_approval || 'ask'})`)
+              })
+            ]
+          }),
+          jsxs('div', {
+            className: 'fc-ed-foot',
+            children: [
+              jsx('div', { className: msgClass, 'aria-live': 'polite', children: msg }),
+              jsx('button', { type: 'button', className: 'fc-btn', 'data-action': 'cancel-edit', disabled: saving, onClick: cancel, children: 'Cancel' }),
+              jsxs('button', {
+                type: 'submit',
+                className: 'fc-btn fc-btn--primary',
+                'data-action': 'save-repo',
+                disabled: saving || count === 0,
+                children: saving
+                  ? [jsx('span', { key: 'spin', className: 'fc-spin', 'aria-hidden': 'true' }), 'Saving…']
+                  : [apiError ? 'Retry save' : 'Save changes']
+              })
+            ]
+          })
+        ]
+      })
+    })
+  })
+}
+
+function ReposSection({ ctx, reposQ }) {
+  const repos = Array.isArray(reposQ?.data?.repos) ? reposQ.data.repos : []
+  const defaults = reposQ?.data?.defaults || {}
+  const [editing, setEditing] = useState(null)
+  const [saving, setSaving] = useState(false)
+  const editButtons = useRef({})
+  const focusAfterClose = useRef(null)
+
+  // Cancel / save returns focus to the row's Edit button once it is re-enabled.
+  useEffect(() => {
+    const slug = focusAfterClose.current
+    if (!slug) return
+    focusAfterClose.current = null
+    editButtons.current[slug]?.focus?.()
+  })
+
+  if (repos.length === 0) {
+    return jsxs('div', {
+      className: 'fc-sec',
+      children: [
+        jsx('h2', { children: 'Registered Repositories' }),
+        jsx(EmptyState, {
+          title: 'No repositories registered',
+          description: 'Run `hermes factonio add owner/repo` or ask in chat to register a GitHub repo.'
+        })
+      ]
+    })
+  }
+
+  const close = slug => {
+    focusAfterClose.current = slug
+    setSaving(false)
+    setEditing(null)
+  }
+  const editorIdFor = slug => `fc-repo-ed-${domSafe(slug)}`
+  const editingSlug = repos.some(r => r.slug === editing) ? editing : null
+  // `auto` resolves the same for every repo (a host capability probe), so any
+  // repo currently on `auto` tells us what inheriting/choosing `auto` resolves to.
+  const autoResolved = repos.find(r => r.effective_design_provider === 'auto' && r.resolved_design_provider)?.resolved_design_provider || null
+
+  const rows = []
+  for (const r of repos) {
+    const open = editingSlug === r.slug
+    rows.push(jsx(RepoRow, {
+      key: `row:${r.slug}`,
+      repo: r,
+      defaults,
+      editing: open,
+      busy: saving,
+      editorId: editorIdFor(r.slug),
+      buttonRef: el => { editButtons.current[r.slug] = el },
+      onEdit: () => {
+        if (saving) return
+        if (open) close(r.slug)
+        else setEditing(r.slug)
+      }
+    }))
+    if (open) {
+      rows.push(jsx(RepoEditor, {
+        key: `ed:${r.slug}`,
+        ctx,
+        repo: r,
+        defaults,
+        autoResolved,
+        reposQ,
+        editorId: editorIdFor(r.slug),
+        saving,
+        setSaving,
+        onClose: () => close(r.slug),
+        onSaved: () => close(r.slug)
+      }))
+    }
+  }
+
+  const col = c => jsx('col', { key: c, className: c })
+  return jsxs('div', {
+    className: 'fc-sec fc-repos-sec',
+    children: [
+      jsxs('div', {
+        className: 'fc-sec-head',
+        children: [
+          jsxs('div', {
+            children: [
+              jsx('h2', { children: 'Registered Repositories' }),
+              jsxs('p', {
+                className: 'fc-sec-sub',
+                children: [
+                  'Global defaults: design provider ',
+                  jsx('span', { className: 'fc-mono', children: defaults.design_provider || 'auto' }),
+                  ' · design approval ',
+                  jsx('span', { className: 'fc-mono', children: defaults.design_approval || 'ask' })
+                ]
+              })
+            ]
+          }),
+          jsxs('span', {
+            className: 'fc-legend',
+            children: [
+              jsxs('span', { className: 'fc-tag fc-tag--inherit', children: ['value ', jsx('span', { className: 'fc-tag-src', children: '· global' })] }),
+              ' inherited ',
+              jsx('span', { className: 'fc-tag fc-tag--set', children: 'value' }),
+              ' override'
+            ]
+          })
+        ]
+      }),
+      jsxs('table', {
+        className: 'fc-table fc-repos',
+        children: [
+          jsxs('colgroup', {
+            children: ['fc-col-repo', 'fc-col-branch', 'fc-col-merge', 'fc-col-rounds', 'fc-col-prov', 'fc-col-appr', 'fc-col-act'].map(col)
+          }),
+          jsx('thead', {
+            children: jsxs('tr', {
+              children: [
+                jsxs('th', { scope: 'col', children: ['Repository', jsx('span', { className: 'fc-th-sub', children: 'Local path' })] }),
+                jsx('th', { scope: 'col', children: 'Branch' }),
+                jsx('th', { scope: 'col', children: 'Merge policy' }),
+                jsx('th', { scope: 'col', className: 'fc-num', children: 'Max fix rounds' }),
+                jsx('th', { scope: 'col', children: 'Design provider' }),
+                jsx('th', { scope: 'col', children: 'Design approval' }),
+                jsx('th', { scope: 'col', className: 'fc-act', children: jsx('span', { className: 'fc-sr', children: 'Actions' }) })
+              ]
+            })
+          }),
+          jsx('tbody', { children: rows })
+        ]
+      })
+    ]
+  })
+}
+
 function FactonioPage({ ctx }) {
   const [range, setRange] = useState('30d')
   const metricsQ = useQuery({
@@ -371,7 +976,6 @@ function FactonioPage({ ctx }) {
   })
 
   const m = metricsQ.data
-  const repos = reposQ.data?.repos || []
   const models = modelsQ.data?.models || {}
   const warn = modelsQ.data?.cross_model_warning
 
@@ -523,47 +1127,7 @@ function FactonioPage({ ctx }) {
               jsx(PhaseModelsTable, { models })
             ]
           }),
-          jsxs('div', {
-            className: 'fc-sec',
-            children: [
-              jsx('h2', { children: 'Registered Repositories' }),
-              repos.length === 0
-                ? jsx(EmptyState, {
-                    title: 'No repositories registered',
-                    description: 'Run `hermes factonio add owner/repo` or ask in chat to register a GitHub repo.'
-                  })
-                : jsxs('table', {
-                    className: 'fc-table',
-                    children: [
-                      jsx('thead', {
-                        children: jsxs('tr', {
-                          children: [
-                            jsx('th', { children: 'Repository' }),
-                            jsx('th', { children: 'Local Path' }),
-                            jsx('th', { children: 'Branch' }),
-                            jsx('th', { children: 'Merge Policy' }),
-                            jsx('th', { children: 'Max Fix Rounds' })
-                          ]
-                        })
-                      }),
-                      jsx('tbody', {
-                        children: repos.map(r =>
-                          jsxs('tr', {
-                            key: r.slug,
-                            children: [
-                              jsx('td', { className: 'fc-mono', children: r.repo }),
-                              jsx('td', { className: 'fc-mono', children: r.path }),
-                              jsx('td', { className: 'fc-mono', children: r.default_branch }),
-                              jsx('td', { children: r.merge_policy }),
-                              jsx('td', { children: r.max_fix_rounds })
-                            ]
-                          })
-                        )
-                      })
-                    ]
-                  })
-            ]
-          })
+          jsx(ReposSection, { ctx, reposQ })
         ]
       })
     ]
@@ -1459,6 +2023,9 @@ function YourTurnCard({ attrs, sessionId }) {
     ]
   })
 }
+
+// Pure helpers exposed for clean-room tests; the host only consumes the default export.
+export { validateRepoDraft, repoDraftChanges, seedRepoDraft, describeSaveError }
 
 export default {
   id: 'factonio',
