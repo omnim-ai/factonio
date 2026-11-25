@@ -1,4 +1,10 @@
-<h1 align="center">Factonio</h1>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/banner.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/banner-light.svg">
+    <img src="docs/images/banner.svg" width="100%" alt="Factonio — Pure-Hermes Software Factory">
+  </picture>
+</p>
 
 <p align="center">
   <b>Pure-Hermes, phase-based software factory plugin for any GitHub repository.</b><br>
