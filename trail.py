@@ -96,16 +96,20 @@ def _connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
     path = Path(db_path) if db_path is not None else trail_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=5.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript(_SCHEMA_SQL)
-    conn.execute(
-        "INSERT OR IGNORE INTO schema_meta(key, value, updated_at) VALUES ('schema_version', ?, ?)",
-        (SCHEMA_VERSION, _now_iso()),
-    )
-    conn.commit()
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.executescript(_SCHEMA_SQL)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_meta(key, value, updated_at) VALUES ('schema_version', ?, ?)",
+            (SCHEMA_VERSION, _now_iso()),
+        )
+        conn.commit()
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 

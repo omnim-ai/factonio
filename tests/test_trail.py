@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import importlib.util
 import io
 import json
@@ -13,6 +14,7 @@ import os
 import sqlite3
 import sys
 import unittest
+import warnings
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -228,6 +230,12 @@ class TestAutomaticTransitions(unittest.TestCase):
             self.assertIn("## Verification Gap Analysis (required)", body)
             self.assertIn("`t_verify9`", body)
             self.assertIn("Architecture -> Types -> Lint/CI check naming the fix -> Behavioral test -> Skill text last", body)
+            self.assertIn("analyzes BOTH independent verification lanes", body)
+            self.assertIn("naming a single gate, or CI alone, is not sufficient", body)
+            self.assertIn("1. Why Diff Check missed the bug", body)
+            self.assertIn("2. Why Black-Box Check missed the bug", body)
+            self.assertIn("fails against the original escaped failure before the fix", body)
+            self.assertNotIn("Names the gate that should have caught it", body)
             tenant = started["tenant"]
 
             design = spawn_design_card("acme/sample", tenant, provider="hermes", parents=[started["task_id"]])
@@ -480,7 +488,12 @@ class TestTrailCliAndApi(unittest.TestCase):
             path = trail.trail_db_path()
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"this is not a sqlite database" * 64)
-            metrics = compute_metrics(home / "kanban.db")
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                metrics = compute_metrics(home / "kanban.db")
+                gc.collect()
+            leaked = [w for w in caught if issubclass(w.category, ResourceWarning)]
+            self.assertEqual(leaked, [], [str(w.message) for w in leaked])
             self.assertEqual(metrics["trail"]["decision_count"], 0)
             self.assertIn("totals", metrics)
 
@@ -505,6 +518,10 @@ class TestRetroAndSkills(unittest.TestCase):
         define = (PLUGIN_ROOT / "skills" / "define" / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("### 3b. Verification Gap Analysis", define)
         self.assertIn("`## Verification Gap Analysis`", define)
+        self.assertIn("analyzes **both** independent verification lanes", define)
+        self.assertIn("**Why Diff Check missed the bug:**", define)
+        self.assertIn("**Why Black-Box Check missed the bug:**", define)
+        self.assertNotIn("Names the gate that should have caught the regression", define)
         orch = (PLUGIN_ROOT / "skills" / "orchestrator" / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("## Human Handoffs (Ketchup)", orch)
         for phrase in ("Plain language first", "Visuals before prose", "Self-contained", "Evidence and risk"):

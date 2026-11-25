@@ -141,13 +141,17 @@ def verification_gap_section(escaped_from: str) -> str:
     return (
         f"## Verification Gap Analysis (required)\n"
         f"This regression escaped Verification card `{escaped_from}`. Before the task DAG, `spec.md` MUST include a "
-        f"`## Verification Gap Analysis` section that:\n"
-        f"1. Names the gate that should have caught it (CI, Diff Check, Black-Box Check, or a hidden scenario) and the "
-        f"concrete reason it did not (missing scenario, untested path, wrong premise, environment gap).\n"
-        f"2. Proposes the cheapest durable fix using the enforcement ladder "
+        f"`## Verification Gap Analysis` section that analyzes BOTH independent verification lanes "
+        f"(naming a single gate, or CI alone, is not sufficient):\n"
+        f"1. Why Diff Check missed the bug: the code-level check, edge case, or blast-radius invariant that "
+        f"failed to catch it.\n"
+        f"2. Why Black-Box Check missed the bug: the observable behavior, acceptance criterion, or hidden scenario "
+        f"gap that failed to catch it.\n"
+        f"3. Proposes the cheapest durable structural prevention using the `/correct` enforcement ladder "
         f"Architecture -> Types -> Lint/CI check naming the fix -> Behavioral test -> Skill text last.\n"
-        f"3. Proves the proposed check fails against the original escaped failure before adopting it, and adds a new "
-        f"hidden black-box scenario reproducing the escape (never referenced from `spec.md`).\n"
+        f"4. Proves the proposed check fails against the original escaped failure before the fix (and passes after), "
+        f"recording the exact command, and adds a new hidden black-box scenario reproducing the escape "
+        f"(never referenced from `spec.md`).\n"
     )
 
 

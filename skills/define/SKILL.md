@@ -95,12 +95,13 @@ Focus holdout scenarios on edge cases, failure modes, and integration seams that
 
 ### 3b. Verification Gap Analysis (Escaped Regressions)
 
-When the card body says the work escaped a previously passed Verification card (`Escaped from: <card>` with a `## Verification Gap Analysis (required)` section), `spec.md` MUST contain a `## Verification Gap Analysis` section before the Task DAG that:
+When the card body says the work escaped a previously passed Verification card (`Escaped from: <card>` with a `## Verification Gap Analysis (required)` section), `spec.md` MUST contain a `## Verification Gap Analysis` section before the Task DAG that analyzes **both** independent verification lanes (naming a single gate, or CI alone, is not sufficient). Read the escaped card's verdict and `hermes factonio trail --card <card> --markdown` for evidence.
 
-1. Names the gate that should have caught the regression (CI, Diff Check, Black-Box Check, or a hidden scenario) and the concrete reason it did not (missing scenario, untested path, wrong premise, environment gap). Read the escaped card's verdict and `hermes factonio trail --card <card> --markdown` for evidence.
-2. Proposes the cheapest durable enforcement using the `/correct` ladder: **Architecture -> Types -> Lint/CI check naming the fix -> Behavioral test -> Skill text last**. Pick the highest rung that works and say why higher rungs do not.
-3. Proves the proposed check fails on the original escaped failure (replay the bad input or commit) and passes on the fix, recording the exact command.
-4. Adds at least one new hidden holdout scenario that reproduces the escaped behavior. Never mention `holdout/` paths or scenario contents in `spec.md`.
+1. **Why Diff Check missed the bug:** the code-level check, edge case, or blast-radius invariant that failed to catch it.
+2. **Why Black-Box Check missed the bug:** the observable behavior, acceptance criterion, or hidden scenario gap that failed to catch it.
+3. Proposes the cheapest durable structural prevention using the `/correct` ladder: **Architecture -> Types -> Lint/CI check naming the fix -> Behavioral test -> Skill text last**. Pick the highest rung that works and say why higher rungs do not.
+4. Proves the proposed check fails on the original escaped failure before the fix (replay the bad input or commit) and passes on the fix, recording the exact command.
+5. Adds at least one new hidden holdout scenario that reproduces the escaped behavior. Never mention `holdout/` paths or scenario contents in `spec.md`.
 
 Log the gap verdict with `factonio_log_decision` (phase `escape`, evidence = gate, reason, proof command).
 
