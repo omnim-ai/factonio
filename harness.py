@@ -154,6 +154,25 @@ def _slug_id(value: str) -> str:
     return _ID_RE.sub("-", value.lower()).strip("-") or "root"
 
 
+def _unique_id(base: str, taken: set[str]) -> str:
+    fid, n = base, 2
+    while fid in taken:
+        fid, n = f"{base}-{n}", n + 1
+    taken.add(fid)
+    return fid
+
+
+def _is_str_list(value: Any, *, non_empty_items: bool = False) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(v, str) and (v.strip() or not non_empty_items) for v in value
+    )
+
+
+def _str_list(value: Any) -> list[str]:
+    """The string items of ``value`` when it is a list; ``[]`` for any other type."""
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
 def _harness_paths(repo_path: Path) -> tuple[Path, Path, Path]:
     hdir = repo_path / HARNESS_DIR_NAME
     return hdir, hdir / VERIFY_MD_NAME, hdir / HARNESS_JSON_NAME
@@ -551,13 +570,15 @@ def _build_feature_map(profile: dict[str, Any]) -> list[dict[str, Any]]:
         top = rel.split("/", 1)[0] if "/" in rel else ""
         groups.setdefault(top, []).append(rel)
     features: list[dict[str, Any]] = []
+    # Root files claim "root" first; normalized directory-slug collisions get deterministic -2, -3 suffixes.
+    taken: set[str] = set()
     for top in sorted(groups):
         members = groups[top]
         if top:
-            fid = _slug_id(top)
+            fid = _unique_id(_slug_id(top), taken)
             paths = [f"{top}/**"]
         else:
-            fid = "root"
+            fid = _unique_id("root", taken)
             exts = sorted({Path(m).suffix for m in members})
             paths = [f"*{ext}" for ext in exts]
         feat_routes = [r for r, src in profile["route_sources"].items() if src in members]
@@ -843,14 +864,19 @@ def discover_harness(repo_path: str | Path) -> dict[str, Any]:
                 manifest_error = "harness.json must contain a JSON object"
         except ValueError as exc:
             manifest_error = f"harness.json is not valid JSON: {exc}"
+    # Malformed manifest fields are reported by check_harness; discovery only exposes well-typed values.
     hooks: list[dict[str, Any]] = []
-    if manifest is not None and isinstance(manifest.get("hooks"), list):
-        hooks = [h for h in manifest["hooks"] if isinstance(h, dict)]
+    if manifest is not None and manifest.get("hooks") is not None:
+        raw_hooks = manifest["hooks"]
+        hooks = [h for h in raw_hooks if isinstance(h, dict)] if isinstance(raw_hooks, list) else []
     elif has_md and "Hooks" in sections_map:
         hooks = _parse_md_hooks(sections_map["Hooks"])
     phases: dict[str, list[str]] = {}
     if manifest is not None and isinstance(manifest.get("phases"), dict):
-        phases = {k: [str(c) for c in (manifest["phases"].get(k) or [])] for k in PHASE_KEYS}
+        raw_phases = manifest["phases"]
+        phases = {k: list(raw_phases[k]) if _is_str_list(raw_phases.get(k)) else [] for k in PHASE_KEYS}
+    elif manifest is not None and manifest.get("phases") is not None:
+        phases = {k: [] for k in PHASE_KEYS}
     elif has_md:
         phases = {s.lower(): _section_commands(sections_map.get(s, "")) for s in REQUIRED_SECTIONS}
     return {
@@ -974,23 +1000,41 @@ def _validate_manifest(manifest: dict[str, Any]) -> list[str]:
         errors.append("harness.json `phases` must be an object with launch/doctor/drive/evidence/cleanup")
     else:
         for key in PHASE_KEYS:
-            if not isinstance(phases.get(key), list):
-                errors.append(f"harness.json `phases.{key}` must be a list")
+            if not _is_str_list(phases.get(key)):
+                errors.append(f"harness.json `phases.{key}` must be a list of strings; got {phases.get(key)!r}")
     fmap = manifest.get("feature_map")
     if not isinstance(fmap, list):
-        errors.append("harness.json `feature_map` must be a list")
+        errors.append(f"harness.json `feature_map` must be a list; got {type(fmap).__name__}")
     else:
         ids: set[str] = set()
         for idx, feat in enumerate(fmap):
-            if not isinstance(feat, dict) or not str(feat.get("id") or "").strip():
-                errors.append(f"feature_map[{idx}] must be an object with a non-empty `id`")
+            fid = feat.get("id") if isinstance(feat, dict) else None
+            if not isinstance(fid, str) or not fid.strip():
+                errors.append(f"feature_map[{idx}] must be an object with a non-empty string `id`; got {fid!r}")
                 continue
-            if feat["id"] in ids:
-                errors.append(f"feature_map has duplicate id {feat['id']!r}")
-            ids.add(feat["id"])
-            paths = feat.get("paths")
-            if not isinstance(paths, list) or not paths or not all(isinstance(p, str) and p.strip() for p in paths):
-                errors.append(f"feature_map[{idx}] ({feat['id']}) `paths` must be a non-empty list of globs")
+            if fid in ids:
+                errors.append(f"feature_map has duplicate id {fid!r}")
+            ids.add(fid)
+            if not _is_str_list(feat.get("paths"), non_empty_items=True) or not feat.get("paths"):
+                errors.append(f"feature_map[{idx}] ({fid}) `paths` must be a non-empty list of glob strings")
+            for key in ("commands", "scenarios"):
+                if key in feat and not _is_str_list(feat[key]):
+                    errors.append(f"feature_map[{idx}] ({fid}) `{key}` must be a list of strings")
+            if "surface" in feat and not isinstance(feat["surface"], str):
+                errors.append(f"feature_map[{idx}] ({fid}) `surface` must be a string")
+    surfaces = manifest.get("discovered_surfaces")
+    if surfaces is not None:
+        if not isinstance(surfaces, dict):
+            errors.append("harness.json `discovered_surfaces` must be an object")
+        else:
+            for key in ("routes", "cli_commands", "entrypoints"):
+                if key in surfaces and not _is_str_list(surfaces[key]):
+                    errors.append(f"harness.json `discovered_surfaces.{key}` must be a list of strings")
+    base_commit = manifest.get("base_commit")
+    if base_commit is not None and not isinstance(base_commit, str):
+        errors.append("harness.json `base_commit` must be a string or null")
+    if "stack" in manifest and not _is_str_list(manifest["stack"]):
+        errors.append("harness.json `stack` must be a list of strings")
     try:
         validate_hooks(manifest.get("hooks", []))
     except ValueError as exc:
@@ -1005,8 +1049,8 @@ def _dead_globs(manifest: Optional[dict[str, Any]], files: list[str]) -> list[di
     for feat in manifest["feature_map"]:
         if not isinstance(feat, dict):
             continue
-        for pattern in feat.get("paths") or []:
-            if isinstance(pattern, str) and not any(glob_matches(pattern, f) for f in files):
+        for pattern in _str_list(feat.get("paths")):
+            if pattern.strip() and not any(glob_matches(pattern, f) for f in files):
                 dead.append({"feature": str(feat.get("id")), "glob": pattern})
     return dead
 
@@ -1027,10 +1071,12 @@ def check_harness(repo_spec: str, *, run_doctor: bool = False, run_hooks: bool =
         for section in EXTRA_SECTIONS:
             if section not in info["sections"]:
                 warnings.append(f"verify.md has no `## {section}` section")
+    manifest_errors: list[str] = []
     if info["manifest_error"]:
         errors.append(info["manifest_error"])
     elif info["manifest"] is not None:
-        errors.extend(_validate_manifest(info["manifest"]))
+        manifest_errors = _validate_manifest(info["manifest"])
+        errors.extend(manifest_errors)
         files, _ = _list_repo_files(root)
         dead = _dead_globs(info["manifest"], files)
         for d in dead:
@@ -1045,6 +1091,10 @@ def check_harness(repo_spec: str, *, run_doctor: bool = False, run_hooks: bool =
                 errors.append(f"verify.md hooks invalid: {exc}")
 
     doctor = None
+    hooks_res = None
+    if manifest_errors and (run_doctor or run_hooks):
+        warnings.append("Skipped Doctor commands and hooks: harness.json is malformed")
+        run_doctor = run_hooks = False
     if run_doctor:
         cmds = info["phases"].get("doctor") or []
         doctor = _run_doctor(root, cmds)
@@ -1053,7 +1103,6 @@ def check_harness(repo_spec: str, *, run_doctor: bool = False, run_hooks: bool =
         for r in doctor["results"]:
             if not r["ok"]:
                 errors.append(f"Doctor command failed: `{_fmt_cmd(r['command'])}` (exit {r['exit_code']})")
-    hooks_res = None
     if run_hooks:
         try:
             hooks_res = run_harness_hooks(root, hooks=info["hooks"])
@@ -1063,8 +1112,10 @@ def check_harness(repo_spec: str, *, run_doctor: bool = False, run_hooks: bool =
         except ValueError as exc:
             errors.append(str(exc))
 
+    valid = bool(info["present"]) and not errors
     return {
-        "ok": bool(info["present"]) and not errors,
+        "ok": valid,
+        "valid": valid,
         "repo": target["repo"],
         "repo_path": str(root),
         "present": info["present"],
@@ -1163,6 +1214,8 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
     manifest = info["manifest"] if not info["manifest_error"] else None
     if info["manifest_error"]:
         result["warnings"].append(info["manifest_error"])
+    elif manifest is not None:
+        result["warnings"].extend(_validate_manifest(manifest))
     is_git = _is_git_repo(root)
     if not is_git:
         result["warnings"].append("Not a git repository: change-based drift checks skipped")
@@ -1179,13 +1232,14 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
 
     changed = _changed_files(root, base_sha) if is_git else []
     result["changed_files"] = changed
-    features = [f for f in (manifest or {}).get("feature_map") or [] if isinstance(f, dict)]
-    all_globs = [p for f in features for p in (f.get("paths") or []) if isinstance(p, str)]
+    raw_features = (manifest or {}).get("feature_map")
+    features = [f for f in raw_features if isinstance(f, dict)] if isinstance(raw_features, list) else []
+    all_globs = [p for f in features for p in _str_list(f.get("paths"))]
     source_changed = [p for p in changed if Path(p).suffix.lower() in SOURCE_EXTS]
     result["uncovered_changed_files"] = [p for p in source_changed if not _any_match(all_globs, p)]
 
     for feat in features:
-        hits = [p for p in changed if _any_match([g for g in feat.get("paths") or [] if isinstance(g, str)], p)]
+        hits = [p for p in changed if _any_match(_str_list(feat.get("paths")), p)]
         if hits:
             result["stale_features"].append(str(feat.get("id")))
             result["stale_feature_details"].append(
@@ -1197,11 +1251,15 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
     result["orphaned_glob_details"] = dead
     result["orphaned_globs"] = sorted({d["glob"] for d in dead})
 
-    if manifest is not None and isinstance(manifest.get("discovered_surfaces"), dict):
-        surfaces = manifest["discovered_surfaces"]
+    surfaces = (manifest or {}).get("discovered_surfaces")
+    if (
+        isinstance(surfaces, dict)
+        and _is_str_list(surfaces.get("routes") or [])
+        and _is_str_list(surfaces.get("cli_commands") or [])
+    ):
         profile = detect_repo_profile(root)
-        old_routes = {str(r) for r in surfaces.get("routes") or []}
-        old_cli = {str(c) for c in surfaces.get("cli_commands") or []}
+        old_routes = set(_str_list(surfaces.get("routes")))
+        old_cli = set(_str_list(surfaces.get("cli_commands")))
         live_routes, live_cli = set(profile["routes"]), set(profile["cli_commands"])
         result["new_routes"] = sorted(live_routes - old_routes)
         result["removed_routes"] = sorted(old_routes - live_routes)

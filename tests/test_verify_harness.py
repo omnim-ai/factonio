@@ -528,6 +528,117 @@ class TestSurfaces(unittest.TestCase):
             self.assertTrue(100 < len(factonio.ORCHESTRATOR_PROMPT_SECTION) < 3000)
 
 
+
+class TestFixRound1Regressions(unittest.TestCase):
+    """Bootstrap ID uniqueness, type-safe manifest validation, and the `valid` response contract."""
+
+    MALFORMED: list[tuple[str, Any]] = [
+        ("phases.doctor=17", lambda m: m["phases"].__setitem__("doctor", 17)),
+        ("feature_map[0].id=['bad']", lambda m: m["feature_map"][0].__setitem__("id", ["bad"])),
+        ("feature_map[0].paths=17", lambda m: m["feature_map"][0].__setitem__("paths", 17)),
+        ("phases non-dict", lambda m: m.__setitem__("phases", ["launch"])),
+        ("feature_map non-list", lambda m: m.__setitem__("feature_map", {"id": "x"})),
+        ("hooks non-list", lambda m: m.__setitem__("hooks", {"name": "x"})),
+        ("discovered_surfaces non-dict", lambda m: m.__setitem__("discovered_surfaces", 17)),
+        ("discovered_surfaces.routes=17", lambda m: m["discovered_surfaces"].__setitem__("routes", 17)),
+        ("phases.drive non-string item", lambda m: m["phases"].__setitem__("drive", ["true", 5])),
+        ("feature_map[0].commands=17", lambda m: m["feature_map"][0].__setitem__("commands", 17)),
+    ]
+
+    def _bootstrap_check(self, files: dict[str, str]) -> tuple[list[str], dict[str, Any]]:
+        from factonio.harness import bootstrap_verify_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo = home / "collide"
+            repo.mkdir()
+            _git(repo, "init", "-q")
+            for rel, text in files.items():
+                _write(repo, rel, text)
+            _commit_all(repo, "initial")
+            res = bootstrap_verify_harness(str(repo))
+            ids = [f["id"] for f in res["manifest"]["feature_map"]]
+            return ids, check_harness(str(repo))
+
+    def test_bootstrap_root_files_and_root_dir_get_unique_ids(self):
+        ids, chk = self._bootstrap_check({"root.py": "a = 1\n", "root/x.py": "b = 2\n"})
+        self.assertEqual(ids, ["root", "root-2"])
+        self.assertEqual((chk["ok"], chk["valid"]), (True, True), chk["errors"])
+
+    def test_bootstrap_colliding_directory_slugs_get_unique_ids(self):
+        ids, chk = self._bootstrap_check({"api-v1/a.py": "a = 1\n", "api_v1/b.py": "b = 2\n", "main.py": "m = 0\n"})
+        self.assertEqual(ids, ["root", "api-v1", "api-v1-2"])
+        self.assertEqual(len(set(ids)), len(ids))
+        self.assertEqual((chk["ok"], chk["valid"]), (True, True), chk["errors"])
+
+    def test_malformed_manifest_types_return_structured_errors(self):
+        from factonio.harness import audit_harness, bootstrap_verify_harness, check_harness, show_harness
+
+        run = TestSurfaces._cli(self)
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            bootstrap_verify_harness(str(repo), hooks=[{"name": "ok", "kind": "invariant", "command": "true"}])
+            _commit_all(repo, "harness")
+            hj = repo / ".factonio" / "harness.json"
+            pristine = json.loads(hj.read_text(encoding="utf-8"))
+            for label, mutate in self.MALFORMED:
+                with self.subTest(label):
+                    manifest = json.loads(json.dumps(pristine))
+                    mutate(manifest)
+                    hj.write_text(json.dumps(manifest), encoding="utf-8")
+
+                    chk = check_harness(str(repo), run_doctor=True, run_hooks=True)
+                    self.assertEqual((chk["ok"], chk["valid"]), (False, False))
+                    self.assertTrue(chk["errors"])
+                    self.assertTrue(all(isinstance(e, str) and e for e in chk["errors"]))
+
+                    code, out, err = run("harness", "check", str(repo), "--run-doctor", "--run-hooks", "--json")
+                    self.assertNotEqual(code, 0)
+                    self.assertNotIn("Traceback", out + err)
+                    payload = json.loads(out)
+                    self.assertEqual((payload["ok"], payload["valid"]), (False, False))
+                    self.assertTrue(payload["errors"])
+
+                    self.assertTrue(show_harness(str(repo))["present"])
+                    self.assertIn(audit_harness(str(repo))["severity"], ("clean", "stale"))
+                    for action in ("show", "audit"):
+                        _, out, err = run("harness", action, str(repo), "--json")
+                        self.assertNotIn("Traceback", out + err)
+                        json.loads(out)
+
+    def test_check_response_contract_includes_valid(self):
+        from factonio.agent_tools import register_tools
+        from factonio.harness import bootstrap_verify_harness, check_harness
+
+        run = TestSurfaces._cli(self)
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            ctx = _FakeCtx()
+            register_tools(ctx)
+            handler = ctx.tools["factonio_bootstrap_verify"]["handler"]
+
+            missing = check_harness(str(repo))
+            self.assertEqual((missing["ok"], missing["valid"]), (False, False))
+            code, out, _ = run("harness", "check", str(repo), "--json")
+            self.assertEqual((code, json.loads(out)["ok"], json.loads(out)["valid"]), (1, False, False))
+
+            bootstrap_verify_harness(str(repo))
+            chk = check_harness(str(repo), run_doctor=True)
+            self.assertEqual((chk["ok"], chk["valid"]), (True, True), chk["errors"])
+            code, out, _ = run("harness", "check", str(repo), "--run-doctor", "--run-hooks", "--json")
+            self.assertEqual((code, json.loads(out)["ok"], json.loads(out)["valid"]), (0, True, True))
+            tool = json.loads(handler({"action": "check", "repo": str(repo)}))
+            self.assertEqual((tool["ok"], tool["valid"]), (True, True))
+
+            hj = repo / ".factonio" / "harness.json"
+            manifest = json.loads(hj.read_text(encoding="utf-8"))
+            manifest["schema_version"] = 99
+            hj.write_text(json.dumps(manifest), encoding="utf-8")
+            chk = check_harness(str(repo))
+            self.assertEqual((chk["ok"], chk["valid"]), (False, False))
+            code, out, _ = run("harness", "check", str(repo), "--json")
+            self.assertEqual((code, json.loads(out)["ok"], json.loads(out)["valid"]), (1, False, False))
+
+
 class TestVerificationHarnessInjection(unittest.TestCase):
     def test_harness_only_reaches_blackbox_card(self):
         from hermes_cli import kanban_db as kb
