@@ -14,6 +14,8 @@ Factonio adapts engineering patterns and instruction text from the third-party p
   - `/correct`: recurring-mistake mining, the enforcement ladder, and the prove-it-fails rule in the retro blueprint (`__init__.py`) and Verification Gap Analysis (`orchestrator.py`, `skills/define/SKILL.md`).
   - `worktree-audit.sh`: safety-bucketed worktree audit and opt-in pruning (`repos.py`, `hermes factonio worktrees`).
   - side-effect liveness: watchdog progress detection beyond heartbeats (`watchdog.py`).
+- Wave 3 adapted patterns:
+  - stacked PR landing: `base_branch` / `stack_parent_pr` implementation cards, true-base PR gate/merge, and clean-worktree `git rebase --onto` restacks with `git patch-id` verdict continuity (`repos.py`, `orchestrator.py`, `factonio_restack_pr`, `hermes factonio restack`).
 
 ```text
 MIT License

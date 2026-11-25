@@ -159,6 +159,7 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 | `hermes factonio models [--repo SLUG] [--json]` | Show resolved provider/model per phase and cross-model warning |
 | `hermes factonio status [--tenant T] [--json]` | Show active Factonio Kanban workstreams and cards |
 | `hermes factonio pr-gate <repo> <pr_number> [--json]` | Inspect live PR HEAD SHA, mergeability, and CI check status |
+| `hermes factonio restack <repo> [pr_number] [--parent-pr N] [--from-branch B] [--new-base B] [--old-base-sha SHA] [--verified-sha SHA] [--no-push] [--no-retarget] [--dry-run] [--json]` | Rebase a stacked PR (or every open child of a parent) onto its new base in a throwaway worktree and report `git patch-id` verdict continuity |
 | `hermes factonio trail [--tenant T] [--repo R] [--phase P] [--card ID] [--limit N] [--markdown] [--json]` | Show the append-only decision trail (`trail.db`) as text, a Markdown table, or the `{decisions, summary, filters}` JSON contract |
 
 </details>
@@ -170,11 +171,12 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 - `factonio_update_repo` — update per-repository settings (`merge_policy`, `max_fix_rounds`, `default_branch`, `design_provider`, `design_approval`)
 - `factonio_start` — start a workstream (`feature`, `bug`, `quick`, or `escaped_from` for post-merge regressions)
 - `factonio_spawn_design` — spawn a Phase 1b UI/UX Design card
-- `factonio_spawn_implement` — spawn a scoped git-worktree Implementation card
+- `factonio_spawn_implement` — spawn a scoped git-worktree Implementation card (optionally stacked on a parent PR via `base_branch` / `stack_parent_pr`)
 - `factonio_spawn_verify` — spawn mutually isolated Diff Check and Black-Box Check cards in parallel
 - `factonio_status` — inspect active workstream cards, registered repos, and resolved phase models
 - `factonio_pr_gate` — verify live PR HEAD SHA and CI status checks via `gh`
 - `factonio_merge_pr` — verify exact HEAD SHA and squash-merge a verified PR
+- `factonio_restack_pr` — after a parent PR lands, rebase its child PR(s) onto the new base, push with `--force-with-lease`, retarget, and report whether verification verdicts carry over (`verdict_continuous`)
 - `factonio_log_decision` — append a decision (fork, pivot, Attack the Premise probe, gate countersign) to the append-only `trail.db`; correct one by logging a new row with `supersedes_id`
 
 Factory transitions (start, escape, design/implement/verify spawns, PR gate and merge outcomes) are recorded in `<HERMES_HOME>/plugin-data/factonio/trail.db` automatically and served at `GET /api/plugins/factonio/trail?tenant=&repo=&phase=&card_id=&limit=` (single rows at `GET /api/plugins/factonio/trail/{decision_id}`).
@@ -223,6 +225,7 @@ Special thanks to **Lauren Tan ([@poteto](https://x.com/poteto))** and **[pstack
 - **Implementation discipline:** the Attack the Premise circuit breaker, skeptical review-thread triage with prompt-injection hygiene, comment hygiene, and a short PR briefing template.
 - **Verification and merge rigor:** run-proven findings, blast-radius proof, base-vs-PR attribution, tri-state `pass`/`reject`/`inconclusive` verdicts, the tiered PR gate, live merge readback, and `git patch-id` verdict continuity.
 - **Wave 2 adaptations:** `show-me-your-work` (the append-only `trail.db` decision trail and `factonio_log_decision`), `ketchup` (decision-ready human handoffs in the orchestrator skill), `/correct` (the retro's recurring-mistake mining, enforcement ladder, and prove-it-fails rule, plus escaped-regression Verification Gap Analysis), `worktree-audit.sh` (safety-bucketed worktree audit and opt-in pruning), and side-effect liveness (watchdog progress detection beyond heartbeats).
+- **Wave 3 adaptations:** stacked PR landing (`base_branch` / `stack_parent_pr` implementation cards and `--onto` restacks in a throwaway worktree with `git patch-id` verdict continuity via `factonio_restack_pr`).
 
 pstack's copyright and permission notice is reproduced in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
