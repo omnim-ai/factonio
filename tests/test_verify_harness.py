@@ -6,8 +6,11 @@ import argparse
 import contextlib
 import io
 import json
+import os
+import shlex
 import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -637,6 +640,68 @@ class TestFixRound1Regressions(unittest.TestCase):
             self.assertEqual((chk["ok"], chk["valid"]), (False, False))
             code, out, _ = run("harness", "check", str(repo), "--json")
             self.assertEqual((code, json.loads(out)["ok"], json.loads(out)["valid"]), (1, False, False))
+
+
+@unittest.skipUnless(os.name == "posix", "process-group cleanup is POSIX-only")
+class TestTimeoutKillsDescendants(unittest.TestCase):
+    """A timed-out compound shell command must not leave descendants that write after return."""
+
+    def _compound(self, work: Path) -> tuple[str, Path, Path]:
+        pidfile, marker = work / "child.pid", work / "late.txt"
+        script = (
+            "import os, pathlib, time; "
+            f"pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid())); "
+            "time.sleep(2); "
+            f"pathlib.Path({str(marker)!r}).write_text('late side effect')"
+        )
+        return f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}; :", pidfile, marker
+
+    def _assert_group_dead(self, res: dict[str, Any], elapsed: float, pidfile: Path, marker: Path) -> None:
+        self.assertTrue(res["timed_out"])
+        self.assertFalse(res["ok"])
+        self.assertIsNone(res["exit_code"])
+        self.assertLess(elapsed, 4.0)
+        self.assertFalse(marker.exists(), "marker written before return")
+        child_pid = int(pidfile.read_text())
+        time.sleep(2.5)
+        self.assertFalse(marker.exists(), "descendant wrote a late side effect after timeout")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child_pid, 0)
+
+    def test_hook_timeout_kills_shell_descendants(self):
+        from factonio.harness import run_harness_hooks
+
+        with isolated_hermes_home() as home:
+            command, pidfile, marker = self._compound(home)
+            started = time.monotonic()
+            res = run_harness_hooks(home, hooks=[{"name": "slow", "kind": "custom", "command": command}], timeout=1)
+            elapsed = time.monotonic() - started
+            self.assertFalse(res["ok"])
+            self._assert_group_dead(res["results"][0], elapsed, pidfile, marker)
+
+    def test_doctor_timeout_kills_shell_descendants(self):
+        from factonio import harness
+
+        with isolated_hermes_home() as home:
+            command, pidfile, marker = self._compound(home)
+            started = time.monotonic()
+            doc = harness._run_doctor(home, [command], timeout=1)
+            elapsed = time.monotonic() - started
+            self.assertFalse(doc["ok"])
+            self._assert_group_dead(doc["results"][0], elapsed, pidfile, marker)
+
+    def test_argv_timeout_and_normal_output_still_work(self):
+        from factonio.harness import _run_command
+
+        with isolated_hermes_home() as home:
+            res = _run_command([sys.executable, "-c", "import time; time.sleep(5)"], home, 1)
+            self.assertTrue(res["timed_out"])
+            self.assertIn("Timed out after 1s", res["stderr"])
+            ok = _run_command("echo hi; echo err >&2; exit 3", home, 10)
+            self.assertEqual((ok["exit_code"], ok["stdout"].strip(), ok["stderr"].strip(), ok["timed_out"]),
+                             (3, "hi", "err", False))
+            missing = _run_command(["/nonexistent/factonio-binary"], home, 5)
+            self.assertEqual((missing["exit_code"], missing["ok"]), (127, False))
 
 
 class TestVerificationHarnessInjection(unittest.TestCase):

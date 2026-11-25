@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import tempfile
 import time
@@ -914,22 +915,62 @@ def show_harness(repo_spec: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """SIGKILL the command's whole process group (POSIX) so shell descendants cannot outlive a timeout."""
+    if os.name != "posix":
+        proc.kill()
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        return
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        proc.poll()  # reap the leader so its zombie does not keep the group alive
+        try:
+            os.killpg(proc.pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return
+        time.sleep(0.02)
+
+
 def _run_command(command: Any, cwd: Path, timeout: int) -> dict[str, Any]:
     started = time.monotonic()
     shell = isinstance(command, str)
+    # A dedicated session/process group lets a timeout kill every descendant, not just `/bin/sh`.
+    isolation: dict[str, Any] = (
+        {"start_new_session": True} if os.name == "posix"
+        else {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    )
+    code: Optional[int] = None
+    out, err, timed_out = "", "", False
     try:
-        proc = subprocess.run(
-            command, cwd=str(cwd), shell=shell, capture_output=True, text=True, timeout=timeout, check=False
+        proc = subprocess.Popen(
+            command, cwd=str(cwd), shell=shell, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, errors="replace", **isolation,
         )
-        code: Optional[int] = proc.returncode
-        out, err, timed_out = proc.stdout, proc.stderr, False
-    except subprocess.TimeoutExpired as exc:
-        code, timed_out = None, True
-        out = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        err = (exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or ""))
-        err = (err + f"\nTimed out after {timeout}s").strip()
     except OSError as exc:
-        code, out, err, timed_out = 127, "", str(exc), False
+        code, err = 127, str(exc)
+    else:
+        try:
+            try:
+                out, err = proc.communicate(timeout=timeout)
+                code = proc.returncode
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _kill_process_tree(proc)
+                try:
+                    out, err = proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:  # a descendant escaped the group and holds the pipes
+                    out, err = "", ""
+                err = ((err or "") + f"\nTimed out after {timeout}s").strip()
+        finally:
+            if proc.poll() is None:
+                _kill_process_tree(proc)
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe is not None:
+                    pipe.close()
+            proc.wait()
     return {
         "command": command,
         "exit_code": code,
