@@ -315,7 +315,7 @@ class TestAutomaticTransitions(unittest.TestCase):
 
 class TestLogDecisionTool(unittest.TestCase):
     def test_registered_and_declared_in_manifest(self):
-        import yaml
+        import hermes_yaml as yaml
 
         tools = _tools()
         self.assertIn("factonio_log_decision", tools)
