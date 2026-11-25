@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # Draft PRs stay lightweight; CI runs automatically once marked ready for review.
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned NousResearch/hermes-agent commit that Factonio's full test suite is verified against.
+  # To bump it, run the "Hermes Upstream" workflow with `hermes_ref: main` and update this SHA once green.
+  HERMES_REF: 8fc0374447313e276f6b9a2764bfc750190c966a
+
+jobs:
+  changelog:
+    name: Changelog entry
+    # Every non-draft PR adds a bullet under `## Unreleased` in CHANGELOG.md, or carries the
+    # `no-changelog` label (internal refactors, CI, or test-only changes).
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+      - name: Verify CHANGELOG.md or no-changelog label
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          PR: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels -q '.labels[].name' | grep -qx no-changelog; then
+            echo "no-changelog label present: skipped"
+            exit 0
+          fi
+          if git diff --name-only "$BASE...HEAD" | grep -qx CHANGELOG.md; then
+            echo "CHANGELOG.md updated"
+            exit 0
+          fi
+          echo "::error file=CHANGELOG.md::Add a bullet under '## Unreleased' in CHANGELOG.md, or add the 'no-changelog' label to this PR."
+          exit 1
+
+  lint:
+    name: Lint & manifest
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+      - name: Python bytecode compile check
+        run: python -W error -m compileall -q .
+      - name: Ruff static checks (syntax & pyflakes)
+        run: uvx ruff check --select E9,F .
+      - name: Desktop plugin JS syntax check
+        run: node --check desktop/plugin.js
+      - name: Manifest, skills, and documentation link integrity
+        run: uv run --with pyyaml python tools/check_repo_integrity.py
+
+  tests:
+    name: Test suite on Hermes (pinned)
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          path: factonio
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ env.HERMES_REF }}
+          path: hermes-agent
+      - name: Show pinned Hermes Agent commit
+        working-directory: hermes-agent
+        run: git log -1 --format='Hermes Agent %H (%cs) %s'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: hermes-agent/uv.lock
+      - name: Sync Hermes Agent runtime
+        working-directory: hermes-agent
+        run: uv sync --locked --python 3.14 --group dev
+      - name: Run Factonio test suite (isolated HERMES_HOME)
+        working-directory: factonio
+        env:
+          PYTHONPATH: ${{ github.workspace }}/hermes-agent
+        run: ../hermes-agent/.venv/bin/python -m unittest discover -s tests -v
+
+  result:
+    name: CI passed
+    # Single required check for branch protection: passes when every job above succeeded or was cleanly skipped.
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    needs: [changelog, lint, tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Job outcomes: $RESULTS"
+          for r in $RESULTS; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::A CI job ended with status: $r"; exit 1 ;;
+            esac
+          done

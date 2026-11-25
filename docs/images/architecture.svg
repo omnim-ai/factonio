@@ -1,0 +1,183 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 530" width="1080" height="530" role="img" aria-labelledby="title desc">
+  <title id="title">Factonio Architecture and Verification Information Barrier</title>
+  <desc id="desc">Four-phase software factory pipeline: Define, optional Phase 1b Design, parallel worktree Implementation, and isolated parallel Verification (Diff Check and Black-Box Check separated by an information barrier), followed by exact-HEAD PR gate and merge.</desc>
+  <defs>
+    <style>
+      .bg { fill: #0f1117; }
+      .panel { fill: #161923; stroke: #2a2f3e; stroke-width: 1.25; }
+      .card { fill: #1c2030; stroke: #31384c; stroke-width: 1.25; }
+      .card-accent { fill: #1b2238; stroke: #5b7cfa; stroke-width: 1.5; }
+      .card-green { fill: #142521; stroke: #2cb67d; stroke-width: 1.5; }
+      .card-purple { fill: #211b33; stroke: #a78bfa; stroke-width: 1.5; }
+      .barrier-box { fill: #24141b; stroke: #f43f5e; stroke-width: 1.6; stroke-dasharray: 6 4; }
+      .t-title { font: 700 18px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: #f3f5fa; }
+      .t-sub { font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: #9aa7bf; }
+      .t-head { font: 700 13.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: #f1f5f9; }
+      .t-body { font: 400 11.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: #b8c3d8; }
+      .t-mono { font: 600 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #cbd5e1; }
+      .t-tag-blue { font: 600 10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #93b4ff; }
+      .t-tag-purple { font: 600 10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #c4b5fd; }
+      .t-tag-amber { font: 600 10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #fcd34d; }
+      .t-tag-green { font: 600 10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #6ee7b7; }
+      .t-tag-red { font: 700 10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #fda4af; }
+      .pill-blue { fill: #1d2d52; stroke: #4768d6; stroke-width: 1; }
+      .pill-purple { fill: #2b2147; stroke: #7c5fd9; stroke-width: 1; }
+      .pill-amber { fill: #382a13; stroke: #c4841d; stroke-width: 1; }
+      .pill-green { fill: #133329; stroke: #239666; stroke-width: 1; }
+      .pill-red { fill: #3b1724; stroke: #e11d48; stroke-width: 1; }
+      .arrow { stroke: #64748b; stroke-width: 1.75; fill: none; }
+      .arrow-accent { stroke: #5b7cfa; stroke-width: 1.75; fill: none; }
+      .arrow-green { stroke: #2cb67d; stroke-width: 1.75; fill: none; }
+      .arrow-amber { stroke: #f59e0b; stroke-width: 1.6; stroke-dasharray: 5 3; fill: none; }
+    </style>
+    <marker id="arr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#64748b" />
+    </marker>
+    <marker id="arr-accent" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#5b7cfa" />
+    </marker>
+    <marker id="arr-green" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#2cb67d" />
+    </marker>
+    <marker id="arr-amber" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#f59e0b" />
+    </marker>
+  </defs>
+
+  <!-- Outer frame -->
+  <rect x="2" y="2" width="1076" height="526" rx="14" class="bg" stroke="#252a38" stroke-width="1.5"/>
+
+  <!-- Header -->
+  <text x="28" y="36" class="t-title">Factonio Software Factory Pipeline</text>
+  <text x="28" y="55" class="t-sub">Pure-Hermes software factory on a headless worker profile (git + gh + Kanban)</text>
+
+  <!-- Cross-model legend badge (generously sized & centered) -->
+  <rect x="706" y="19" width="346" height="32" rx="8" class="pill-purple"/>
+  <text x="879" y="39" text-anchor="middle" class="t-tag-purple">Cross-Model: factonio_verify ≠ factonio_implement</text>
+
+  <!-- Phase 1: Define -->
+  <g transform="translate(28, 86)">
+    <rect width="204" height="162" rx="10" class="card-accent"/>
+    <rect x="12" y="12" width="72" height="20" rx="10" class="pill-blue"/>
+    <text x="48" y="25.5" text-anchor="middle" class="t-tag-blue">PHASE 1</text>
+    <text x="12" y="52" class="t-head">Definition</text>
+    <text x="12" y="69" class="t-mono">factonio:define</text>
+    <text x="12" y="92" class="t-body">• Explores repo &amp; issue</text>
+    <text x="12" y="109" class="t-body">• Writes spec.md + task DAG</text>
+    <text x="12" y="126" class="t-body">• Authors hidden checks:</text>
+    <rect x="12" y="133" width="180" height="20" rx="5" class="pill-red"/>
+    <text x="102" y="146.5" text-anchor="middle" class="t-tag-red">holdout/ (strictly private)</text>
+  </g>
+
+  <!-- Phase 1b: Design (Optional) -->
+  <g transform="translate(28, 276)">
+    <rect width="204" height="126" rx="10" class="card-purple"/>
+    <rect x="12" y="12" width="150" height="20" rx="10" class="pill-purple"/>
+    <text x="87" y="25.5" text-anchor="middle" class="t-tag-purple">PHASE 1b · OPTIONAL</text>
+    <text x="12" y="50" class="t-head">UI / UX Design</text>
+    <text x="12" y="67" class="t-mono">factonio:design</text>
+    <text x="12" y="89" class="t-body">• Claude Design /design or</text>
+    <text x="21" y="106" class="t-body">pure-Hermes HTML previews</text>
+  </g>
+
+  <!-- Arrow Define -> Design -->
+  <path d="M 130 248 L 130 271" class="arrow" marker-end="url(#arr)"/>
+  <text x="140" y="264" class="t-sub">if has_ui</text>
+
+  <!-- Phase 2: Implementation -->
+  <g transform="translate(274, 86)">
+    <rect width="218" height="214" rx="10" class="card"/>
+    <rect x="12" y="12" width="72" height="20" rx="10" class="pill-blue"/>
+    <text x="48" y="25.5" text-anchor="middle" class="t-tag-blue">PHASE 2</text>
+    <text x="12" y="52" class="t-head">Parallel Implementation</text>
+    <text x="12" y="69" class="t-mono">factonio:implement</text>
+    <text x="12" y="92" class="t-body">• Isolated git worktrees per unit</text>
+    <text x="12" y="109" class="t-body">• Reads spec.md + design/ only</text>
+    <text x="12" y="126" class="t-body">• Runs repo tests &amp; opens PR</text>
+
+    <!-- Worktree mini-pills -->
+    <rect x="12" y="142" width="93" height="24" rx="6" class="panel"/>
+    <text x="58.5" y="158" text-anchor="middle" class="t-mono">worktree A</text>
+    <rect x="113" y="142" width="93" height="24" rx="6" class="panel"/>
+    <text x="159.5" y="158" text-anchor="middle" class="t-mono">worktree B</text>
+
+    <rect x="12" y="176" width="194" height="24" rx="6" class="pill-red"/>
+    <text x="109" y="191.5" text-anchor="middle" class="t-tag-red">NO ACCESS TO holdout/</text>
+  </g>
+
+  <!-- Arrows Define & Design -> Implement -->
+  <path d="M 232 152 L 269 152" class="arrow-accent" marker-end="url(#arr-accent)"/>
+  <path d="M 232 339 L 253 339 L 253 224 L 269 224" class="arrow" marker-end="url(#arr)"/>
+
+  <!-- Phase 3: Isolated Parallel Verification container -->
+  <g transform="translate(534, 76)">
+    <rect width="342" height="326" rx="12" class="panel"/>
+    <rect x="14" y="12" width="248" height="20" rx="10" class="pill-amber"/>
+    <text x="138" y="25.5" text-anchor="middle" class="t-tag-amber">PHASE 3 · ISOLATED PARALLEL VERIFY</text>
+
+    <!-- Diff Check card -->
+    <g transform="translate(14, 44)">
+      <rect width="314" height="108" rx="9" class="card"/>
+      <text x="12" y="24" class="t-head">Diff Check</text>
+      <text x="302" y="24" text-anchor="end" class="t-mono">factonio:verify-diff</text>
+      <text x="12" y="46" class="t-body">✓ Inspects spec.md + git diff</text>
+      <text x="12" y="63" class="t-body">✓ Checks correctness, security, scope</text>
+      <rect x="12" y="75" width="290" height="22" rx="5" class="pill-red"/>
+      <text x="157" y="89.5" text-anchor="middle" class="t-tag-red">✗ Blind to holdout/ (no test overfitting)</text>
+    </g>
+
+    <!-- INFORMATION BARRIER -->
+    <g transform="translate(14, 164)">
+      <rect width="314" height="28" rx="6" class="barrier-box"/>
+      <text x="157" y="18" text-anchor="middle" class="t-tag-red">— INFORMATION BARRIER (MUTUALLY ISOLATED) —</text>
+    </g>
+
+    <!-- Black-Box Check card -->
+    <g transform="translate(14, 204)">
+      <rect width="314" height="108" rx="9" class="card"/>
+      <text x="12" y="24" class="t-head">Black-Box Check</text>
+      <text x="302" y="24" text-anchor="end" class="t-mono">factonio:verify-blackbox</text>
+      <text x="12" y="46" class="t-body">✓ Runs built artifact + hidden holdout/</text>
+      <text x="12" y="63" class="t-body">✓ Verifies observable behavior end-to-end</text>
+      <rect x="12" y="75" width="290" height="22" rx="5" class="pill-red"/>
+      <text x="157" y="89.5" text-anchor="middle" class="t-tag-red">✗ Blind to git diff &amp; source (no bias)</text>
+    </g>
+  </g>
+
+  <!-- Arrows Implement -> Verify Diff & Verify Blackbox (aligned to inner card centers) -->
+  <path d="M 492 174 L 543 174" class="arrow-accent" marker-end="url(#arr-accent)"/>
+  <path d="M 492 206 L 513 206 L 513 334 L 543 334" class="arrow-accent" marker-end="url(#arr-accent)"/>
+
+  <!-- Bounded Fix Loop arrow (from Phase 3 left edge -> pill -> up into Phase 2) -->
+  <path d="M 534 374 L 496 374" class="arrow-amber" marker-end="url(#arr-amber)"/>
+  <path d="M 383 352 L 383 303" class="arrow-amber" marker-end="url(#arr-amber)"/>
+  <rect x="274" y="352" width="218" height="44" rx="7" class="pill-amber"/>
+  <text x="383" y="370" text-anchor="middle" class="t-tag-amber">On reject: bounded fix loop</text>
+  <text x="383" y="385" text-anchor="middle" class="t-tag-amber">(≤ max_fix_rounds)</text>
+
+  <!-- Merge Gate -->
+  <g transform="translate(910, 134)">
+    <rect width="142" height="206" rx="10" class="card-green"/>
+    <rect x="12" y="12" width="88" height="20" rx="10" class="pill-green"/>
+    <text x="56" y="25.5" text-anchor="middle" class="t-tag-green">MERGE GATE</text>
+    <text x="12" y="52" class="t-head">Exact-HEAD</text>
+    <text x="12" y="69" class="t-head">PR Merge</text>
+    <text x="12" y="94" class="t-body">• Both verify PASS</text>
+    <text x="12" y="111" class="t-body">• Live CI green</text>
+    <text x="12" y="128" class="t-body">• HEAD SHA match</text>
+    <text x="12" y="145" class="t-body">• Squash merge</text>
+    <text x="21" y="162" class="t-body">(auto or ask)</text>
+    <text x="12" y="190" class="t-mono">factonio_merge_pr</text>
+  </g>
+
+  <!-- Arrow Verify -> Merge Gate -->
+  <path d="M 876 238 L 905 238" class="arrow-green" marker-end="url(#arr-green)"/>
+
+  <!-- Bottom Observability & Control Strip -->
+  <g transform="translate(28, 430)">
+    <rect width="1024" height="72" rx="10" class="panel"/>
+    <text x="18" y="27" class="t-head">Observability, Governance &amp; Desktop UI</text>
+    <text x="18" y="47" class="t-body">• Tick Watchdog flags stale heartbeats &amp; blocked cards    • /factonio Dashboard tracks pass rates, rework, escape rate &amp; inline repo settings</text>
+    <text x="18" y="63" class="t-body">• Docked Right-Sidebar Tab shows live workstream pipelines &amp; card drawers    • Escaped bug tracking feeds directly back into metrics</text>
+  </g>
+</svg>

@@ -9,6 +9,13 @@ description: >
   configurable per-phase model selection, tick watchdog, and Desktop metrics UI.
 author: tozes
 license: MIT
+homepage: https://github.com/omnim-ai/factonio
+tags:
+  - software-factory
+  - github
+  - kanban
+  - verification
+  - automation
 requires_hermes: ">=0.1.0"
 provides_tools:
   - factonio_add_repo

@@ -1,0 +1,48 @@
+name: Bug report
+description: Something in the Factonio plugin, CLI, worker skills, watchdog, or Desktop UI doesn't work as expected.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please report security vulnerabilities privately through the [security advisory form](https://github.com/omnim-ai/factonio/security/advisories/new) instead of a public issue.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what happened instead, and what you expected.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area affected
+      options:
+        - Orchestrator & workstream lifecycle (factonio_start / spawn / merge)
+        - Worker skills (define / design / implement / verify-diff / verify-blackbox)
+        - CLI & repo management (hermes factonio ...)
+        - Desktop UI (/factonio dashboard, sidebar tab, settings, status pill)
+        - Dashboard API & metrics (/api/plugins/factonio/*)
+        - Watchdog & Kanban dispatch ticks
+        - Profile setup & phase model resolution
+        - Documentation / Install
+    validations:
+      required: true
+  - type: input
+    id: hermes_version
+    attributes:
+      label: Hermes Agent version
+      description: Output of `hermes --version`.
+      placeholder: "v0.23.4"
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `hermes factonio doctor --json`
+      description: Helps diagnose profile links, git/gh auth, Kanban settings, and phase model resolution. Redact any private paths if needed.
+      render: json
+  - type: textarea
+    id: logs
+    attributes:
+      label: Reproduction steps or logs
+      description: Exact commands, card IDs/outcomes, or error tracebacks.
+      render: text
