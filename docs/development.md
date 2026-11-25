@@ -44,7 +44,7 @@ tools/
 docs/
   architecture.md            Deep dive on phases, information barrier, storage, and APIs
   development.md             This file
-  images/                    Screenshots, architecture SVG, and animated GIFs for README.md
+  images/                    Brand logos/banners, 2:1 marketplace/social cover, screenshots, architecture SVG, and GIFs
 ```
 
 ## Local setup

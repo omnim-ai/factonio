@@ -5,6 +5,7 @@ Every user-facing pull request adds an entry under `## Unreleased`.
 
 ## Unreleased
 
+- Added Concept A ("Machined Winged Cogwheel") Factorio × Hermes brand assets under `docs/images/` (dark/light README banners, dark/light/monochrome logo variants, PNG exports, and 1280×640 2:1 social/marketplace cover), wired the light/dark `<picture>` hero banner into `README.md`, and extended `tools/check_repo_integrity.py` to verify HTML `srcset` paths.
 - Moved canonical repository to `omnim-ai/factonio` and updated `plugin.yaml` metadata (`homepage`, `tags`).
 - Added GitHub Actions CI pipeline (lint, manifest/link integrity, full 90-test suite against pinned Hermes Agent, and changelog gate) plus daily upstream Hermes compatibility checks and Dependabot config.
 - Added open-source contributor documentation: `CONTRIBUTING.md`, `SECURITY.md`, `AGENTS.md`, `docs/development.md`, `docs/architecture.md`, PR/issue templates, and visual `README.md` with Desktop UI screenshots, architecture diagram, and animated feature demos.
