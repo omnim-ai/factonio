@@ -28,6 +28,7 @@ provides_tools:
   - factonio_pr_gate
   - factonio_merge_pr
   - factonio_log_decision
+  - factonio_bootstrap_verify
 provides_hooks:
   - on_kanban_dispatch_tick
 config_schema:

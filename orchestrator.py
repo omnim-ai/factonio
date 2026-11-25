@@ -16,6 +16,7 @@ from .config import (
     resolve_design_provider,
     resolve_phase_model,
 )
+from .harness import HARNESS_DIR_NAME, HOOK_KINDS, REQUIRED_SECTIONS, VERIFY_MD_NAME, discover_harness
 from .metrics import thread_cards
 from .trail import record_transition
 
@@ -538,6 +539,40 @@ def spawn_implementation_card(
     }
 
 
+def _format_harness_section(repo_path: str | Path) -> str:
+    """Black-Box-only card section pointing at the repo's `.factonio/` harness ("" when absent)."""
+    try:
+        info = discover_harness(repo_path)
+    except Exception:
+        return ""
+    if not info.get("present"):
+        return ""
+    stages = " -> ".join(REQUIRED_SECTIONS)
+    lines = [
+        "## Repo Verification Harness",
+        f"- Playbook: `{info['verify_md']}` (`.factonio/verify.md`)",
+    ]
+    if info.get("harness_json"):
+        lines.append(f"- Manifest: `{info['harness_json']}` (`.factonio/harness.json`)")
+    hooks = [h for h in info.get("hooks") or [] if isinstance(h, dict) and h.get("name")]
+    if hooks:
+        rendered = ", ".join(
+            f"`{h['name']}` ({h.get('kind', 'custom')}, {'optional' if h.get('optional') else 'required'})"
+            for h in hooks
+        )
+        lines.append(f"- Declared hooks: {rendered}")
+    lines += [
+        "",
+        f"Read `.factonio/verify.md` (and `.factonio/harness.json` when present) from your fresh checkout of the PR head "
+        f"(fall back to the paths above if the PR does not carry them). Execute its stages in order: {stages}. "
+        f"Run every declared hook ({', '.join(HOOK_KINDS)}) or `hermes factonio harness check <repo> --run-doctor "
+        f"--run-hooks --json` from the checkout: a failing required hook is a `reject`, a failing optional hook is a "
+        f"`disclosed_limits` entry. The harness is a black-box playbook, not implementation source: it does not lift "
+        f"the ban on `git diff` or reading source files.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def spawn_verification_pair(
     repo_spec: str,
     tenant: str,
@@ -590,6 +625,10 @@ def spawn_verification_pair(
     # Black-Box Check: sees acceptance criteria + approved design previews (if any) + holdout + built app;
     # FORBIDDEN from reading git diff or source files.
     hint_section = f"\n## Run / Target Hint\n{run_hint.strip()}\n" if run_hint else ""
+    harness_section = _format_harness_section(repo_path)
+    harness_path = str(Path(repo_path) / HARNESS_DIR_NAME / VERIFY_MD_NAME) if harness_section else None
+    if harness_section:
+        hint_section += f"\n{harness_section}"
     bb_body = (
         f"## Factonio Black-Box Verification Card\n"
         f"- Repository: `{full_repo}` (`{repo_path}`)\n"
@@ -662,6 +701,7 @@ def spawn_verification_pair(
             "head_sha": head_sha,
             "verify_diff_task_id": diff_id,
             "verify_blackbox_task_id": bb_id,
+            "harness_present": bool(harness_section),
         },
         result="spawned",
     )
@@ -676,6 +716,8 @@ def spawn_verification_pair(
         "diff_model": diff_model["resolved"],
         "blackbox_model": bb_model["resolved"],
         "subscribed": bool(diff_sub and bb_sub),
+        "harness_present": bool(harness_section),
+        "harness_path": harness_path,
     }
 
 

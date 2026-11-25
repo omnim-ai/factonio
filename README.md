@@ -159,6 +159,7 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 | `hermes factonio models [--repo SLUG] [--json]` | Show resolved provider/model per phase and cross-model warning |
 | `hermes factonio status [--tenant T] [--json]` | Show active Factonio Kanban workstreams and cards |
 | `hermes factonio pr-gate <repo> <pr_number> [--json]` | Inspect live PR HEAD SHA, mergeability, and CI check status |
+| `hermes factonio harness init\|check\|show\|audit <repo> [--force] [--dry-run] [--base REF] [--run-doctor] [--run-hooks] [--json]` | Bootstrap, validate, show, or read-only drift-audit the repo's `.factonio/verify.md` + `harness.json` black-box verification harness (`audit` exits non-zero when `stale` or `missing`) |
 | `hermes factonio trail [--tenant T] [--repo R] [--phase P] [--card ID] [--limit N] [--markdown] [--json]` | Show the append-only decision trail (`trail.db`) as text, a Markdown table, or the `{decisions, summary, filters}` JSON contract |
 
 </details>
@@ -175,6 +176,7 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 - `factonio_status` — inspect active workstream cards, registered repos, and resolved phase models
 - `factonio_pr_gate` — verify live PR HEAD SHA and CI status checks via `gh`
 - `factonio_merge_pr` — verify exact HEAD SHA and squash-merge a verified PR
+- `factonio_bootstrap_verify` — `init` / `check` / `show` / `audit` a repo's `.factonio/` verification harness (Launch / Doctor / Drive / Evidence / Cleanup playbook, feature map, optional `visual_diff` / `invariant` / `custom` hooks); Black-Box Verification cards receive it automatically
 - `factonio_log_decision` — append a decision (fork, pivot, Attack the Premise probe, gate countersign) to the append-only `trail.db`; correct one by logging a new row with `supersedes_id`
 
 Factory transitions (start, escape, design/implement/verify spawns, PR gate and merge outcomes) are recorded in `<HERMES_HOME>/plugin-data/factonio/trail.db` automatically and served at `GET /api/plugins/factonio/trail?tenant=&repo=&phase=&card_id=&limit=` (single rows at `GET /api/plugins/factonio/trail/{decision_id}`).
