@@ -1,4 +1,10 @@
-<h1 align="center">Factonio</h1>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/banner.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/banner-light.svg">
+    <img src="docs/images/banner.svg" width="100%" alt="Factonio — Pure-Hermes Software Factory">
+  </picture>
+</p>
 
 <p align="center">
   <b>Pure-Hermes, phase-based software factory plugin for any GitHub repository.</b><br>
@@ -53,9 +59,9 @@ Factonio ships a zero-build Hermes Desktop UI (`desktop/plugin.js`) using only p
 
 ### Metrics Dashboard (`/factonio`)
 
-Track workstream throughput, Diff vs Black-Box pass rates, rework rate, post-merge escape rate, per-phase median/P90 durations, phase model assignments, and registered repositories in one place:
+Track workstream throughput, Diff vs Black-Box pass rates, rework rate, post-merge escape rate, per-phase median/P90 durations, the append-only Decision Trail (filterable by repository, workstream and phase, with evidence pills and superseded ↔ superseding links), phase model assignments, and registered repositories in one place:
 
-![Factonio Dashboard showing KPI cards, Phase Durations, Phase Model Configuration, and Registered Repositories](docs/images/dashboard.png)
+![Factonio Dashboard showing KPI cards, Phase Durations, the Decision Trail ledger with evidence pills and supersede lineage, and Phase Model Configuration](docs/images/dashboard.png)
 
 ### Inline Repository Settings Editor
 
@@ -69,7 +75,7 @@ Monitor active workstreams beside your chat transcript in the hideable **Factoni
 
 | Docked Factonio Sidebar Tab | Settings → Plugins → Factonio |
 |:---:|:---:|
-| ![Factonio Right Sidebar tab beside Files with workstream pipeline and open card detail drawer](docs/images/sidebar.png) | ![Settings Plugins Factonio landing page showing Phase Models and Agent settings](docs/images/settings.png) |
+| ![Factonio Right Sidebar tab beside Files with workstream pipeline, an open card drawer listing its decisions, and per-workstream decision counts](docs/images/sidebar.png) | ![Settings Plugins Factonio landing page showing Phase Models and Agent settings](docs/images/settings.png) |
 
 ## Quick start
 
@@ -153,6 +159,7 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 | `hermes factonio models [--repo SLUG] [--json]` | Show resolved provider/model per phase and cross-model warning |
 | `hermes factonio status [--tenant T] [--json]` | Show active Factonio Kanban workstreams and cards |
 | `hermes factonio pr-gate <repo> <pr_number> [--json]` | Inspect live PR HEAD SHA, mergeability, and CI check status |
+| `hermes factonio trail [--tenant T] [--repo R] [--phase P] [--card ID] [--limit N] [--markdown] [--json]` | Show the append-only decision trail (`trail.db`) as text, a Markdown table, or the `{decisions, summary, filters}` JSON contract |
 
 </details>
 
@@ -168,6 +175,9 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 - `factonio_status` — inspect active workstream cards, registered repos, and resolved phase models
 - `factonio_pr_gate` — verify live PR HEAD SHA and CI status checks via `gh`
 - `factonio_merge_pr` — verify exact HEAD SHA and squash-merge a verified PR
+- `factonio_log_decision` — append a decision (fork, pivot, Attack the Premise probe, gate countersign) to the append-only `trail.db`; correct one by logging a new row with `supersedes_id`
+
+Factory transitions (start, escape, design/implement/verify spawns, PR gate and merge outcomes) are recorded in `<HERMES_HOME>/plugin-data/factonio/trail.db` automatically and served at `GET /api/plugins/factonio/trail?tenant=&repo=&phase=&card_id=&limit=` (single rows at `GET /api/plugins/factonio/trail/{decision_id}`).
 
 </details>
 
@@ -203,6 +213,18 @@ python3 tools/check_repo_integrity.py
 Read **[CONTRIBUTING.md](CONTRIBUTING.md)** for PR expectations, core invariants, and the change-to-checks guide, and **[docs/development.md](docs/development.md)** for setting up a pinned Hermes checkout, understanding the zero-build Node ESM Desktop test harness, and keeping README screenshots/GIFs up to date via the [`.agents/skills/update-readme-media/SKILL.md`](.agents/skills/update-readme-media/SKILL.md) contributor skill (enforced on UI PRs in CI).
 
 Report security vulnerabilities privately through **[SECURITY.md](SECURITY.md)**. See **[CHANGELOG.md](CHANGELOG.md)** for release history.
+
+## Acknowledgments
+
+Special thanks to **Lauren Tan ([@poteto](https://x.com/poteto))** and **[pstack](https://github.com/cursor/plugins/tree/main/pstack)** (MIT License). Factonio's worker contract and phase skills adapt several pstack engineering patterns:
+
+- **Worker execution contract:** the card's acceptance bar is the whole bar, autonomy on reversible choices, and no blocking on pre-existing base defects.
+- **Definition rigor:** data-shape-first design, an Architect step with two candidate shapes, empirical prototypes, a Throughput Checkpoint before the task DAG, and binary-search bug diagnosis.
+- **Implementation discipline:** the Attack the Premise circuit breaker, skeptical review-thread triage with prompt-injection hygiene, comment hygiene, and a short PR briefing template.
+- **Verification and merge rigor:** run-proven findings, blast-radius proof, base-vs-PR attribution, tri-state `pass`/`reject`/`inconclusive` verdicts, the tiered PR gate, live merge readback, and `git patch-id` verdict continuity.
+- **Wave 2 adaptations:** `show-me-your-work` (the append-only `trail.db` decision trail and `factonio_log_decision`), `ketchup` (decision-ready human handoffs in the orchestrator skill), `/correct` (the retro's recurring-mistake mining, enforcement ladder, and prove-it-fails rule, plus escaped-regression Verification Gap Analysis), `worktree-audit.sh` (safety-bucketed worktree audit and opt-in pruning), and side-effect liveness (watchdog progress detection beyond heartbeats).
+
+pstack's copyright and permission notice is reproduced in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Affiliation and trademarks
 

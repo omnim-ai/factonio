@@ -231,43 +231,57 @@ class TestOrchestratorAndRepos(unittest.TestCase):
     def test_pr_gate_and_merge_refuse_red_or_stale_head(self):
         from factonio.repos import inspect_pr_gate, merge_pr
 
-        green_payload = {
-            "number": 12,
-            "url": "https://github.com/acme/sample/pull/12",
-            "title": "Add retries",
-            "state": "OPEN",
-            "isDraft": False,
-            "headRefName": "feat/retries",
-            "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "baseRefName": "main",
-            "mergeable": "MERGEABLE",
-            "mergeStateStatus": "CLEAN",
-            "statusCheckRollup": [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}],
-        }
-        red_payload = {
-            **green_payload,
-            "statusCheckRollup": [{"name": "ci", "status": "COMPLETED", "conclusion": "FAILURE"}],
-        }
+        def _graphql(conclusion: str) -> str:
+            pr = {
+                "number": 12,
+                "url": "https://github.com/acme/sample/pull/12",
+                "title": "Add retries",
+                "state": "OPEN",
+                "isDraft": False,
+                "headRefName": "feat/retries",
+                "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "baseRefName": "main",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "reviewDecision": "APPROVED",
+                "reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+                "commits": {"nodes": [{"commit": {"oid": "a" * 40, "statusCheckRollup": {
+                    "state": conclusion,
+                    "contexts": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "nodes": [{"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": conclusion}],
+                    },
+                }}}]},
+            }
+            return json.dumps({"data": {"repository": {"pullRequest": pr}}})
+
+        green_payload = _graphql("SUCCESS")
+        red_payload = _graphql("FAILURE")
+        merged_readback = json.dumps({"state": "MERGED", "mergedAt": "2026-11-25T12:00:00Z", "baseRefName": "main"})
 
         def _proc(stdout: str, rc: int = 0):
             return subprocess.CompletedProcess(args=["gh"], returncode=rc, stdout=stdout, stderr="")
 
         with isolated_hermes_home():
-            with mock.patch("factonio.repos._run_gh", return_value=_proc(json.dumps(red_payload))):
+            with mock.patch("factonio.repos._run_gh", return_value=_proc(red_payload)):
                 gate = inspect_pr_gate("acme/sample", 12)
                 self.assertTrue(gate["ok"])
                 self.assertFalse(gate["ready_to_merge"])
                 self.assertTrue(any("Failed checks" in b for b in gate["blockers"]))
 
-            with mock.patch("factonio.repos._run_gh", return_value=_proc(json.dumps(green_payload))):
+            with mock.patch("factonio.repos._run_gh", return_value=_proc(green_payload)):
                 stale = merge_pr("acme/sample", 12, expected_head_sha="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
                 self.assertFalse(stale["merged"])
                 self.assertIn("HEAD mismatch", stale["error"])
 
-            with mock.patch("factonio.repos._run_gh", side_effect=[_proc(json.dumps(green_payload)), _proc("")]):
+            with mock.patch(
+                "factonio.repos._run_gh",
+                side_effect=[_proc(green_payload), _proc(""), _proc(merged_readback)],
+            ):
                 merged = merge_pr("acme/sample", 12, expected_head_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
                 self.assertTrue(merged["ok"])
                 self.assertTrue(merged["merged"])
+                self.assertFalse(merged["queued"])
 
 
 _CONFIG_REPO_YAML = """plugins:

@@ -7,14 +7,15 @@ This guide covers repository layout, local development against Hermes Agent, run
 ```text
 __init__.py                  Plugin entrypoint: registers aux models, skills, tools, CLI, watchdog, blueprint
 plugin.yaml                  Hermes plugin manifest (v2) and config_schema
-agent_tools.py               9 agent-callable tools (`factonio_*`)
-commands.py                  CLI subcommands (`hermes factonio init|add|update|remove|list|models|status|pr-gate|doctor`)
+agent_tools.py               10 agent-callable tools (`factonio_*`), including `factonio_log_decision`
+commands.py                  CLI subcommands (`hermes factonio init|add|update|remove|list|models|status|pr-gate|trail|doctor`)
 config.py                    Settings, durable repos.json store (atomic writes + flock), phase model & design resolution
 orchestrator.py              Workstream lifecycle, Kanban DAG creation, holdout/ isolation, session notify+wake subscriptions
 profile_setup.py             Dedicated headless `factonio` profile initializer and `doctor` diagnostics
 repos.py                     GitHub repo registration, validation, exact-HEAD PR gate, and squash-merge helpers
+trail.py                     Append-only SQLite decision trail (`trail.db`: WAL, schema_meta, immutability triggers)
 metrics.py                   Read-only SQLite queries over `kanban.db` (phase timings, pass rates, rework, escapes, enriched cards)
-watchdog.py                  In-process `on_kanban_dispatch_tick` stall/triage detector with throttling and deduplication
+watchdog.py                  In-process `on_kanban_dispatch_tick` PID/side-effect liveness, phase-aware stall detection, bounded triage
 dashboard/
   manifest.json              Hermes Dashboard API discovery manifest
   plugin_api.py              FastAPI router mounted at `/api/plugins/factonio/*`
@@ -34,6 +35,9 @@ tests/
   test_orchestrator_and_repos.py
   test_cli_and_tools.py
   test_watchdog_metrics_api.py
+  test_watchdog_liveness.py   PID/side-effect liveness, phase thresholds, bounded triage
+  test_worktree_audit.py     Real-git worktree safety buckets, --prune-safe, `worktrees` CLI
+  test_trail.py              trail.db store, transition hooks, CLI/API/tool, retro, cross-vendor warning
   test_desktop_plugin.py     Node ESM smoke tests + Desktop SDK surface lint (59 tests)
 tools/
   check_repo_integrity.py    Manifest, skill frontmatter (runtime + contributor), and Markdown link verifier
@@ -44,7 +48,7 @@ tools/
 docs/
   architecture.md            Deep dive on phases, information barrier, storage, and APIs
   development.md             This file
-  images/                    Screenshots, architecture SVG, and animated GIFs for README.md
+  images/                    Brand logos/banners, 2:1 marketplace/social cover, screenshots, architecture SVG, and GIFs
 ```
 
 ## Local setup

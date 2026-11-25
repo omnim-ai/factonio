@@ -33,7 +33,7 @@ EXPECTED_CONTRIBUTOR_SKILLS = (
 )
 
 MD_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
-HTML_SRC_RE = re.compile(r"""(?:src|href)=["']([^"']+)["']""")
+HTML_SRC_RE = re.compile(r"""(?:src|srcset|href)=["']([^"']+)["']""")
 
 
 def check_plugin_manifest(errors: list[str]) -> None:

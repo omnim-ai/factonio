@@ -34,10 +34,22 @@ Factonio is active for orchestrating software delivery on registered GitHub repo
 - Start workstreams with `factonio_start`, spawn Phase 1b UI design with `factonio_spawn_design` when a task touches UI (or on request), fan out parallel worktree units with `factonio_spawn_implement`, and always verify PRs with `factonio_spawn_verify` (which launches Diff Check and Black-Box Check in parallel with mutually exclusive inputs to prevent confirmation bias).
 - Before reporting a PR ready or merging, verify live HEAD and CI via `factonio_pr_gate`. Auto-merge with `factonio_merge_pr` only when CI and both isolated verification checks pass (unless the repo sets `merge_policy: ask`).
 - If the user reports a bug in work that passed Verification, start the fix with `escaped_from=<verify_card_id>` so escape rate stays measurable.
+- Factory transitions are recorded in the append-only decision trail (`trail.db`); log forks, pivots, and merge countersigns with `factonio_log_decision`, and correct a decision by logging a new row with `supersedes_id`.
 """
 
-RETRO_BLUEPRINT_PROMPT = """Inspect recently merged Factonio pull requests and Kanban phase metrics using `factonio_status` and `read_file` on recent worker outputs.
-Identify any phase whose duration exceeded 2x the repository median or required multiple fix rounds, determine the concrete root cause, and write a brief, actionable improvement proposal (skill or workflow adjustment) without changing repository code."""
+RETRO_BLUEPRINT_PROMPT = """Run a Factonio `/correct` retrospective. Do not change repository code; produce a proposal.
+
+1. Gather evidence from BOTH sources:
+   - Kanban phase metrics: `factonio_status` (all=true) and the Desktop `/metrics` data (phase medians/P90, Diff vs Black-Box pass rates, rework, escape rate).
+   - The append-only decision trail `trail.db`: run `hermes factonio trail --json --limit 500` (or `--markdown`) and read gate outcomes, fix rounds, superseded decisions, Attack the Premise probes, and `escape` rows.
+2. Flag outliers: phases slower than 2x the repository median, cards with multiple fix rounds, verification rejects, and regressions that escaped verification.
+3. Mine recurring mistake classes: group failures by root cause (not by symptom or card). Only a class with >= 2 occurrences qualifies; cite every occurrence (card id, PR, decision id). Single occurrences are listed as watch items only.
+4. For each recurring class, apply the `/correct` enforcement ladder and pick the HIGHEST rung that can make the mistake impossible or loudly caught:
+   Architecture (make it unrepresentable) -> Types -> Lint/CI check whose failure message names the fix -> Behavioral test -> Skill text last.
+   Skill/prompt text is acceptable only when you show why every higher rung cannot work.
+5. Prove before adopting: a proposed check or test MUST be shown to fail on a real past failure from the trail (replay the bad commit, input, or fixture) and pass on the fix. Report the exact command and both outcomes; drop any proposal you cannot prove.
+6. Record the outcome with `factonio_log_decision` (phase `retro`, evidence = occurrences + proof command), superseding earlier retro decisions it replaces.
+7. Deliver a decision-ready handoff: plain language, the key table or chart first, then one recommendation per class with its evidence and risk."""
 
 
 def _parse_frontmatter(skill_md: Path) -> tuple[str, dict[str, Any]]:
@@ -117,7 +129,7 @@ def register(ctx: Any) -> None:
         ctx.register_automation_blueprint(
             "retro",
             title="Factonio Phase Retro",
-            description="Inspect recent merged PRs with slow phases or rework and propose concrete improvements.",
+            description="/correct retro: mine Kanban metrics and the trail.db decision trail for recurring mistakes and propose proven, highest-rung fixes.",
             schedule_template="every 6h",
             prompt_template=RETRO_BLUEPRINT_PROMPT,
             category="engineering",

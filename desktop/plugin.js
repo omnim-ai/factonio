@@ -282,6 +282,133 @@ select.fc-input { padding: 0 22px 0 8px; }
 }
 .fc-sb-sub { display: inline-flex; align-items: center; gap: 2px; }
 .fc-sb-sub-l { color: var(--ui-text-secondary); }
+/* Decision Trail — dashboard (.fc-trail*): host theme tokens, transparent, currentColor and color-mix only. */
+.fc-trail {
+  --fc-trail-warn: var(--ui-warning, var(--ui-yellow, color-mix(in srgb, var(--dt-destructive) 55%, var(--ui-success))));
+  --fc-trail-ok-text: color-mix(in srgb, var(--ui-success) 78%, var(--ui-text-primary));
+  --fc-trail-bad-text: color-mix(in srgb, var(--dt-destructive) 72%, var(--ui-text-primary));
+  --fc-trail-warn-text: color-mix(in srgb, var(--fc-trail-warn) 52%, var(--ui-text-primary));
+  --fc-trail-info-text: color-mix(in srgb, var(--ui-accent) 70%, var(--ui-text-primary));
+}
+.fc-trail-head-l { min-width: 0; }
+.fc-trail-sum { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.fc-trail-stat { display: inline-flex; align-items: baseline; gap: 5px; height: 24px; box-sizing: border-box; padding: 0 8px; border: 1px solid var(--ui-stroke-tertiary); border-radius: 6px; background: transparent; color: var(--ui-text-secondary); font: inherit; font-size: 11.5px; line-height: 22px; }
+.fc-trail-stat b { font-family: var(--dt-font-mono); font-variant-numeric: tabular-nums; font-weight: 600; color: var(--ui-text-primary); }
+button.fc-trail-stat { cursor: pointer; }
+button.fc-trail-stat:hover { background: var(--ui-row-hover-background); color: var(--ui-text-primary); }
+button.fc-trail-stat[aria-pressed="true"] { border-color: color-mix(in srgb, var(--ui-accent) 55%, transparent); background: color-mix(in srgb, var(--ui-accent) 12%, transparent); color: var(--ui-text-primary); }
+.fc-trail-stat .fc-sb-ico { align-self: center; }
+
+.fc-trail-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; margin-bottom: 8px; border: 1px solid var(--ui-stroke-secondary); border-radius: 8px; background: var(--ui-bg-elevated); }
+.fc-trail-bar[data-disabled="true"] { opacity: 0.58; }
+.fc-trail-sel { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.fc-trail-sel label { font-size: 11px; color: var(--ui-text-secondary); white-space: nowrap; }
+.fc-trail-sel .fc-input { width: auto; min-width: 140px; max-width: 240px; padding-right: 4px; }
+.fc-trail-sel .fc-input[data-set="true"] { border-color: color-mix(in srgb, var(--ui-accent) 60%, transparent); }
+.fc-trail-phases { display: flex; flex-wrap: wrap; gap: 2px; padding: 2px; border-radius: 7px; border: 1px solid var(--ui-stroke-tertiary); background: var(--ui-row-hover-background); }
+.fc-trail-phases button { height: 22px; padding: 0 8px; border: 0; border-radius: 5px; background: transparent; color: var(--ui-text-secondary); font: inherit; font-family: var(--dt-font-mono); font-size: 11px; cursor: pointer; }
+.fc-trail-phases button:hover:not(:disabled) { color: var(--ui-text-primary); }
+.fc-trail-phases button:disabled, .fc-trail-sel .fc-input:disabled { opacity: 0.55; cursor: default; }
+.fc-trail-phases button[aria-pressed="true"] { background: var(--ui-chat-surface-background); color: var(--ui-text-primary); font-weight: 600; box-shadow: 0 0 0 1px var(--ui-stroke-secondary); }
+.fc-trail-phases button .fc-trail-n { margin-left: 4px; font-weight: 400; color: var(--ui-text-tertiary); }
+.fc-trail-bar-end { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; font-size: 11px; color: var(--ui-text-secondary); font-variant-numeric: tabular-nums; }
+
+.fc-trail-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--ui-stroke-secondary); border-radius: 8px; overflow: hidden; }
+.fc-trail-row { display: grid; grid-template-columns: 104px minmax(0, 1fr); gap: 4px 14px; padding: 11px 14px 12px; border-bottom: 1px solid var(--ui-stroke-tertiary); background: transparent; scroll-margin: 64px; outline: none; transition: background-color 160ms ease, box-shadow 160ms ease; }
+.fc-trail-row:last-child { border-bottom: 0; }
+.fc-trail-row:hover { background: var(--ui-row-hover-background); }
+.fc-trail-row[data-superseded="true"] { background: color-mix(in srgb, var(--ui-text-tertiary) 6%, transparent); }
+.fc-trail-row[data-superseded="true"] .fc-trail-title { color: var(--ui-text-secondary); text-decoration: line-through; text-decoration-color: var(--ui-text-tertiary); text-decoration-thickness: 1px; }
+.fc-trail-row[data-superseded="true"] .fc-trail-why { opacity: 0.85; }
+.fc-trail-row[data-flash="true"] { background: color-mix(in srgb, var(--ui-accent) 14%, transparent); box-shadow: inset 3px 0 0 var(--ui-accent); }
+.fc-trail-row:focus-visible { box-shadow: inset 0 0 0 2px var(--ui-accent); }
+.fc-trail-when { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding-top: 1px; }
+.fc-trail-time { font-family: var(--dt-font-mono); font-variant-numeric: tabular-nums; font-size: 11.5px; color: var(--ui-text-primary); }
+.fc-trail-ago { font-size: 11px; color: var(--ui-text-secondary); }
+.fc-trail-id { font-family: var(--dt-font-mono); font-size: 10.5px; color: var(--ui-text-tertiary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fc-trail-main { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.fc-trail-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.fc-trail-title { margin: 0; font-size: 13px; font-weight: 600; line-height: 1.35; color: var(--ui-text-primary); }
+.fc-trail-why { margin: 0; max-width: 72ch; font-size: 12.5px; line-height: 1.5; color: var(--ui-text-secondary); }
+.fc-trail-end { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+
+.fc-trail-phase { display: inline-flex; align-items: center; height: 18px; padding: 0 6px; border-radius: 4px; font-family: var(--dt-font-mono); font-size: 10.5px; background: var(--ui-row-active-background); color: var(--ui-text-secondary); white-space: nowrap; }
+.fc-trail-phase[data-phase="escape"], .fc-trail-phase[data-phase="watchdog"] { box-shadow: inset 0 0 0 1px var(--ui-stroke-secondary); color: var(--ui-text-primary); }
+.fc-trail-actor { display: inline-flex; align-items: center; gap: 4px; height: 18px; padding: 0 6px 0 5px; border-radius: 999px; border: 1px solid var(--ui-stroke-secondary); font-size: 11px; color: var(--ui-text-secondary); white-space: nowrap; }
+.fc-trail-actor[data-actor="human"] { border-color: color-mix(in srgb, var(--ui-accent) 50%, transparent); color: var(--fc-trail-info-text); }
+.fc-trail-result { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 7px; border-radius: 999px; font-family: var(--dt-font-mono); font-size: 11px; font-weight: 600; white-space: nowrap; background: var(--ui-row-active-background); color: var(--ui-text-secondary); }
+.fc-trail-result[data-tone="ok"] { background: color-mix(in srgb, var(--ui-success) 15%, transparent); color: var(--fc-trail-ok-text); }
+.fc-trail-result[data-tone="bad"] { background: color-mix(in srgb, var(--dt-destructive) 15%, transparent); color: var(--fc-trail-bad-text); }
+.fc-trail-result[data-tone="warn"] { background: color-mix(in srgb, var(--fc-trail-warn) 17%, transparent); color: var(--fc-trail-warn-text); }
+.fc-trail-result[data-tone="info"] { background: color-mix(in srgb, var(--ui-accent) 13%, transparent); color: var(--fc-trail-info-text); }
+
+.fc-trail-ev { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; }
+.fc-trail-pill { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; height: 20px; box-sizing: border-box; padding: 0 7px; border-radius: 999px; border: 1px solid var(--ui-stroke-secondary); background: transparent; font-family: var(--dt-font-mono); font-size: 11px; color: var(--ui-text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-decoration: none; }
+.fc-trail-pill .fc-trail-k { font-family: var(--dt-font-sans); color: var(--ui-text-tertiary); }
+.fc-trail-pill[data-tone="ok"] { border-color: color-mix(in srgb, var(--ui-success) 40%, transparent); color: var(--fc-trail-ok-text); }
+.fc-trail-pill[data-tone="bad"] { border-color: color-mix(in srgb, var(--dt-destructive) 45%, transparent); color: var(--fc-trail-bad-text); }
+a.fc-trail-pill:hover, button.fc-trail-pill:hover { background: var(--ui-row-hover-background); border-color: var(--ui-accent); color: var(--ui-text-primary); }
+button.fc-trail-pill { font: inherit; font-family: var(--dt-font-mono); font-size: 11px; cursor: pointer; }
+.fc-trail-link { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 7px; border-radius: 999px; font: inherit; font-size: 11px; cursor: pointer; white-space: nowrap; }
+.fc-trail-link .fc-sb-mono, .fc-trail-link code { font-family: var(--dt-font-mono); font-size: 10.5px; }
+.fc-trail-link[data-kind="superseded-by"] { border: 1px dashed color-mix(in srgb, var(--ui-accent) 45%, var(--ui-stroke-primary, var(--ui-stroke-secondary))); background: transparent; color: var(--fc-trail-info-text); }
+.fc-trail-link[data-kind="supersedes"] { border: 1px solid color-mix(in srgb, var(--ui-accent) 55%, transparent); background: color-mix(in srgb, var(--ui-accent) 12%, transparent); color: var(--fc-trail-info-text); }
+.fc-trail-link:hover { border-color: var(--ui-accent); background: color-mix(in srgb, var(--ui-accent) 18%, transparent); }
+.fc-trail :focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 1px; }
+
+.fc-trail-state { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 32px 16px 34px; border: 1px dashed var(--ui-stroke-secondary); border-radius: 8px; text-align: center; color: var(--ui-text-secondary); font-size: 12px; }
+.fc-trail-state h3 { margin: 0; font-size: 13px; font-weight: 600; color: var(--ui-text-primary); }
+.fc-trail-state p { margin: 0; max-width: 46ch; line-height: 1.5; }
+.fc-trail-state-ico { width: 32px; height: 32px; border-radius: 999px; display: grid; place-items: center; background: var(--ui-row-active-background); color: var(--ui-text-secondary); margin-bottom: 2px; }
+.fc-trail-state .fc-step-cmd { margin: 6px 0 2px; color: var(--ui-text-primary); }
+.fc-trail-state .fc-btn { margin-top: 6px; }
+.fc-trail-active { display: flex; flex-wrap: wrap; justify-content: center; gap: 4px; }
+.fc-trail-alert { align-items: center; padding: 9px 10px 9px 12px; }
+.fc-trail-alert .fc-trail-alert-body { flex: 1; min-width: 0; }
+.fc-trail-alert .fc-trail-alert-body b { color: var(--ui-text-primary); }
+.fc-trail-alert .fc-btn { flex: none; display: inline-flex; align-items: center; gap: 5px; color: var(--ui-text-primary); }
+.fc-trail-skel { display: grid; grid-template-columns: 104px minmax(0, 1fr); gap: 14px; padding: 13px 14px; border-bottom: 1px solid var(--ui-stroke-tertiary); }
+.fc-trail-skel:last-child { border-bottom: 0; }
+.fc-trail-skel span { display: block; height: 9px; border-radius: 4px; background: color-mix(in srgb, var(--ui-text-secondary) 20%, transparent); animation: fc-sb-pulse 1.6s ease-in-out infinite; }
+.fc-trail-skel div { display: flex; flex-direction: column; gap: 8px; }
+.fc-trail-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+@media (max-width: 640px) {
+  .fc-trail-row, .fc-trail-skel { grid-template-columns: minmax(0, 1fr); }
+  .fc-trail-when { flex-direction: row; flex-wrap: wrap; gap: 8px; }
+  .fc-trail-bar-end { margin-left: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fc-trail *, .fc-trail-row { animation: none !important; transition: none !important; }
+}
+
+/* Decision Trail — sidebar (.fc-sb-trail*): inside .fc-sb, reuses --fc-sb-* tone tokens. */
+.fc-sb-trail { display: flex; flex-direction: column; gap: 5px; }
+.fc-sb-trail-toggle { width: 100%; display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 7px; border: 1px dashed var(--ui-stroke-secondary); border-radius: 6px; background: transparent; color: var(--ui-text-secondary) !important; font-size: 11px; cursor: pointer; text-align: left; min-width: 0; }
+.fc-sb-trail-toggle:hover { background: var(--ui-row-hover-background); color: var(--ui-text-primary) !important; }
+.fc-sb-trail-toggle .fc-sb-trail-phases { flex: 1; min-width: 0; opacity: 0.82; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: var(--dt-font-mono); font-size: 10px; }
+.fc-sb-trail-toggle .fc-sb-trail-flag { flex: none; display: inline-flex; align-items: center; gap: 3px; font-size: 10.5px; font-weight: 600; color: var(--fc-sb-danger-text); }
+.fc-sb-trail-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; border: 1px solid var(--ui-stroke-tertiary); border-radius: 6px; overflow: hidden; }
+.fc-sb-trail-item { min-width: 0; display: flex; flex-direction: column; gap: 3px; padding: 6px 7px; border-bottom: 1px solid var(--ui-stroke-tertiary); }
+.fc-sb-trail-item:last-child { border-bottom: 0; }
+.fc-sb-trail-item[data-superseded="true"] { background: color-mix(in srgb, var(--ui-text-tertiary) 6%, transparent); }
+.fc-sb-trail-item[data-superseded="true"] .fc-sb-trail-title { color: var(--ui-text-secondary); text-decoration: line-through; text-decoration-color: var(--ui-text-tertiary); }
+.fc-sb-trail-top { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 4px; min-width: 0; }
+.fc-sb-trail-time { margin-left: auto; flex: none; font-family: var(--dt-font-mono); font-variant-numeric: tabular-nums; font-size: 10px; color: var(--ui-text-secondary); }
+.fc-sb-trail-title { margin: 0; font-size: 11.5px; font-weight: 500; line-height: 1.35; overflow-wrap: anywhere; }
+.fc-sb-trail-why { margin: 0; font-size: 11px; line-height: 1.4; color: var(--ui-text-secondary); overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.fc-sb-trail-ev { display: flex; flex-wrap: wrap; gap: 3px; min-width: 0; }
+.fc-sb-trail-ev .fc-sb-chip { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fc-sb-trail-ev .fc-sb-chip[data-tone="ok"] { color: var(--fc-sb-success-text); border-color: color-mix(in srgb, var(--ui-success) 40%, transparent); }
+.fc-sb-trail-ev .fc-sb-chip[data-tone="bad"] { color: var(--fc-sb-danger-text); border-color: color-mix(in srgb, var(--dt-destructive) 45%, transparent); }
+.fc-sb-tag[data-tone="info"] { background: color-mix(in srgb, var(--ui-accent) 14%, transparent); color: color-mix(in srgb, var(--ui-accent) 70%, var(--ui-text-primary)); }
+.fc-sb-trail-sup { flex: none; font-size: 10px; line-height: 16px; padding: 0 4px; border-radius: 4px; border: 1px dashed var(--ui-stroke-secondary); color: var(--ui-text-secondary); white-space: nowrap; }
+.fc-sb-trail-more { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 5px 7px; font-size: 10.5px; color: var(--ui-text-secondary); background: var(--ui-row-hover-background); }
+.fc-sb-trail-more button { border: 0; background: transparent; padding: 0; color: var(--ui-accent) !important; font-size: 10.5px; cursor: pointer; white-space: nowrap; }
+.fc-sb-trail-more button:hover { text-decoration: underline; }
+.fc-sb-drawer .fc-sb-trail-dt { margin-top: 3px; padding-top: 5px; border-top: 1px dashed var(--ui-stroke-tertiary); }
+.fc-sb-drawer .fc-sb-trail-dd { display: block; }
+.fc-sb-drawer .fc-sb-trail-dd .fc-sb-trail-list { margin-top: 1px; }
+.fc-sb-trail-none { color: var(--ui-text-tertiary); font-style: italic; font-size: 11px; }
 `
 
 function fmtDur(seconds) {
@@ -957,6 +1084,776 @@ function ReposSection({ ctx, reposQ }) {
   })
 }
 
+// ---------------------------------------------------------------------------
+// Decision Trail (approved Phase 1b design: design/DESIGN.md). GET /trail feeds
+// both the /factonio TrailSection and the sidebar strips / card drawers through
+// one shared query key; filtering happens client-side.
+// ---------------------------------------------------------------------------
+
+const TRAIL_LIMIT = 200
+const TRAIL_QUERY_KEY = ['factonio', 'trail', TRAIL_LIMIT]
+const TRAIL_PHASE_ORDER = ['define', 'design', 'implement', 'verify', 'gate', 'merge', 'escape', 'watchdog']
+const TRAIL_TONE = {
+  merged: 'ok', pass: 'ok', approved: 'ok', ready: 'ok',
+  reject: 'bad', stalled: 'bad', dead_worker: 'bad', blocked: 'bad', refused: 'bad', error: 'bad',
+  inconclusive: 'warn', pivot: 'warn', escape: 'warn',
+  spawned: 'info', recorded: 'info', queued: 'info'
+}
+const TRAIL_SB_TONE = { ok: 'pass', bad: 'reject', warn: 'warn', info: 'info' }
+const TRAIL_ACTOR_ICON = { orchestrator: 'dash', worker: 'running', watchdog: 'queued', human: 'person' }
+const TRAIL_KNOWN_EVIDENCE = new Set(['pr_number', 'head_sha', 'patch_id', 'tests_passed', 'tests_failed', 'escaped_from', 'side_effect_age_s', 'worker_pid', 'card_id'])
+const GH_SLUG = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
+
+const resultTone = r => TRAIL_TONE[String(r || '').toLowerCase()] || null
+
+// "pr_merged" -> "PR merged"
+function humanDecision(code) {
+  const s = String(code || '').replace(/_/g, ' ').trim()
+  return (s.charAt(0).toUpperCase() + s.slice(1)).replace(/\b(pr|Pr)\b/g, 'PR')
+}
+
+// trail.db stores microsecond ISO timestamps; Date.parse needs milliseconds.
+function trailMs(ts) {
+  const ms = Date.parse(String(ts || '').replace(/(\.\d{3})\d+/, '$1'))
+  return Number.isNaN(ms) ? null : ms
+}
+function fmtTrailClock(ts) {
+  const ms = trailMs(ts)
+  return ms == null ? '—' : new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })
+}
+function fmtTrailWhen(ts) {
+  const ms = trailMs(ts)
+  if (ms == null) return String(ts || '—')
+  return `${new Date(ms).toLocaleDateString([], { month: 'short', day: 'numeric' })} · ${fmtTrailClock(ts)}`
+}
+function fmtAgo(ts, now = Date.now()) {
+  const ms = trailMs(ts)
+  if (ms == null) return ''
+  const m = Math.round((now - ms) / 60000)
+  if (m < 1) return 'just now'
+  if (m < 60) return `${m}m ago`
+  if (m < 1440) return `${Math.floor(m / 60)}h ${m % 60}m ago`
+  return `${Math.floor(m / 1440)}d ago`
+}
+function fmtIdle(seconds) {
+  const s = Math.max(0, Math.round(Number(seconds) || 0))
+  if (s < 60) return `${s}s`
+  if (s < 3600) return `${Math.round(s / 60)}m`
+  return `${Math.floor(s / 3600)}h ${Math.round((s % 3600) / 60)}m`
+}
+const shortId = id => String(id || '').slice(0, 10)
+
+// Newest first; ties keep the API order (already newest-first by ts, rowid).
+function trailDecisions(data) {
+  const list = Array.isArray(data?.decisions) ? data.decisions.filter(d => d && typeof d === 'object' && d.id) : []
+  return list.map((d, i) => [d, i]).sort((a, b) => (trailMs(b[0].ts) ?? 0) - (trailMs(a[0].ts) ?? 0) || a[1] - b[1]).map(x => x[0])
+}
+
+// GitHub owner/repo for a decision's repo_slug: registered repo mapping first,
+// then a literal "owner/repo" slug. Anything else gets no PR link.
+function trailGithubRepo(slug, ghBySlug) {
+  const s = String(slug || '')
+  const mapped = ghBySlug?.[s]
+  if (mapped && GH_SLUG.test(mapped)) return mapped
+  return GH_SLUG.test(s) ? s : null
+}
+
+// Ordered evidence pills: { key, text, label?, tone?, href?, title }.
+function evidencePills(d, gh) {
+  const e = d?.evidence && typeof d.evidence === 'object' && !Array.isArray(d.evidence) ? d.evidence : {}
+  const has = k => e[k] != null && e[k] !== ''
+  const out = []
+  if (has('pr_number')) {
+    const n = Number(e.pr_number)
+    const href = gh && Number.isSafeInteger(n) && n > 0 ? `https://github.com/${gh}/pull/${n}` : null
+    out.push({ key: 'pr_number', text: `PR #${e.pr_number}`, href, title: href ? `Open ${gh}#${n}` : `pr_number ${e.pr_number}` })
+  }
+  if (has('head_sha')) out.push({ key: 'head_sha', text: String(e.head_sha).slice(0, 7), title: `head_sha ${e.head_sha}` })
+  if (has('patch_id')) out.push({ key: 'patch_id', label: 'patch-id', text: String(e.patch_id).slice(0, 7), title: `patch_id ${e.patch_id}` })
+  if (has('tests_passed')) out.push({ key: 'tests_passed', text: `${e.tests_passed} pass`, tone: 'ok', title: `tests_passed ${e.tests_passed}` })
+  if (has('tests_failed') && Number(e.tests_failed) !== 0) out.push({ key: 'tests_failed', text: `${e.tests_failed} fail`, tone: 'bad', title: `tests_failed ${e.tests_failed}` })
+  if (has('escaped_from')) out.push({ key: 'escaped_from', label: 'escaped from', text: String(e.escaped_from), title: `escaped_from ${e.escaped_from}` })
+  if (has('side_effect_age_s')) out.push({ key: 'side_effect_age_s', label: 'idle', text: fmtIdle(e.side_effect_age_s), tone: 'bad', title: `side_effect_age_s ${e.side_effect_age_s}` })
+  if (has('worker_pid')) out.push({ key: 'worker_pid', label: 'pid', text: String(e.worker_pid), title: `worker_pid ${e.worker_pid}` })
+  if (has('card_id')) out.push({ key: 'card_id', text: String(e.card_id), title: `card_id ${e.card_id}` })
+  for (const [k, v] of Object.entries(e)) {
+    if (TRAIL_KNOWN_EVIDENCE.has(k) || v == null || v === '' || typeof v === 'object') continue
+    out.push({ key: k, label: k.replace(/_/g, ' '), text: String(v).slice(0, 32), title: `${k} ${v}` })
+  }
+  return out
+}
+
+const prefersReducedMotion = () => {
+  try { return !!globalThis.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches } catch { return false }
+}
+
+// `?tenant=` from the hash route (`#/factonio?tenant=…`) or the plain search string.
+function routeQueryParam(name) {
+  try {
+    const loc = globalThis.location
+    const hash = String(loc?.hash || '')
+    const q = hash.includes('?') ? hash.slice(hash.indexOf('?') + 1) : String(loc?.search || '').replace(/^\?/, '')
+    return new URLSearchParams(q).get(name) || null
+  } catch {
+    return null
+  }
+}
+
+function retryQuery(query, queryClient, queryKey) {
+  if (typeof query?.refetch === 'function') return query.refetch()
+  if (typeof queryClient?.invalidateQueries === 'function') return queryClient.invalidateQueries({ queryKey })
+  return null
+}
+
+function trailWsLabel(tenant, ghRepos) {
+  return wsName(tenant, ghRepos).slug
+}
+
+function TrailPill({ ctx, pill }) {
+  const kids = [pill.label ? jsx('span', { key: 'k', className: 'fc-trail-k', children: pill.label }) : null, pill.text]
+  if (pill.href) {
+    return jsxs('a', {
+      className: 'fc-trail-pill',
+      href: pill.href,
+      target: '_blank',
+      rel: 'noopener noreferrer',
+      title: pill.title,
+      'data-ev': pill.key,
+      'data-action': 'open-pr',
+      onClick: e => {
+        e?.preventDefault?.()
+        openExternalUrl(ctx, pill.href)
+      },
+      children: [...kids, jsx(Icon, { key: 'ext', name: 'ext', size: 10 })]
+    })
+  }
+  return jsxs('span', { className: 'fc-trail-pill', 'data-ev': pill.key, 'data-tone': pill.tone || undefined, title: pill.title, children: kids })
+}
+
+function TrailRow({ ctx, d, gh, flash, showWs, wsLabel, onJump, rowRef }) {
+  const tone = resultTone(d.result)
+  const superseded = !!d.is_superseded
+  const lineage = [
+    d.supersedes_id
+      ? jsxs('button', {
+          key: 'sup',
+          type: 'button',
+          className: 'fc-trail-link',
+          'data-kind': 'supersedes',
+          'data-jump': d.supersedes_id,
+          'aria-label': `Supersedes ${d.supersedes_id}, jump to it`,
+          onClick: () => onJump(d.supersedes_id),
+          children: [jsx(Icon, { key: 'i', name: 'link', size: 11 }), 'Supersedes ', jsx('code', { key: 'c', children: shortId(d.supersedes_id) })]
+        })
+      : null,
+    ...(Array.isArray(d.superseded_by) ? d.superseded_by : []).map(id => jsxs('button', {
+      key: `by-${id}`,
+      type: 'button',
+      className: 'fc-trail-link',
+      'data-kind': 'superseded-by',
+      'data-jump': id,
+      'aria-label': `Superseded by ${id}, jump to it`,
+      onClick: () => onJump(id),
+      children: ['Superseded by ', jsx('code', { key: 'c', children: shortId(id) }), jsx(Icon, { key: 'i', name: 'chev', size: 10 })]
+    }))
+  ]
+  const pills = evidencePills(d, gh).map(p => jsx(TrailPill, { key: p.key, ctx, pill: p }))
+  const ws = showWs && d.tenant
+    ? jsxs('span', { key: 'ws', className: 'fc-trail-pill', 'data-ev': 'tenant', title: d.tenant, children: [jsx('span', { className: 'fc-trail-k', children: 'ws' }), wsLabel] })
+    : null
+  return jsxs('li', {
+    className: 'fc-trail-row',
+    id: `trail-${domSafe(d.id)}`,
+    tabIndex: -1,
+    ref: rowRef,
+    'data-id': d.id,
+    'data-superseded': String(superseded),
+    'data-flash': String(!!flash),
+    children: [
+      jsxs('div', {
+        className: 'fc-trail-when',
+        children: [
+          jsx('time', { className: 'fc-trail-time', dateTime: d.ts, title: d.ts, children: fmtTrailWhen(d.ts) }),
+          jsx('span', { className: 'fc-trail-ago', children: fmtAgo(d.ts) }),
+          jsx('span', { className: 'fc-trail-id', title: d.id, children: d.id })
+        ]
+      }),
+      jsxs('div', {
+        className: 'fc-trail-main',
+        children: [
+          jsxs('div', {
+            className: 'fc-trail-line',
+            children: [
+              jsx('span', { className: 'fc-trail-phase', 'data-phase': d.phase || '', children: d.phase || '—' }),
+              jsxs('span', {
+                className: 'fc-trail-actor',
+                'data-actor': d.actor || '',
+                children: [jsx(Icon, { name: TRAIL_ACTOR_ICON[d.actor] || 'running', size: 11 }), d.actor || 'unknown']
+              }),
+              jsxs('h3', {
+                className: 'fc-trail-title',
+                title: d.decision,
+                children: [humanDecision(d.decision), superseded ? jsx('span', { key: 'sr', className: 'fc-trail-sr', children: ' (superseded)' }) : null]
+              }),
+              jsx('span', {
+                className: 'fc-trail-end',
+                children: jsx('span', { className: 'fc-trail-result', 'data-tone': tone || undefined, children: d.result || '—' })
+              })
+            ]
+          }),
+          d.why ? jsx('p', { className: 'fc-trail-why', children: d.why }) : null,
+          jsx('div', { className: 'fc-trail-ev', children: [...lineage, ...pills, ws] })
+        ]
+      })
+    ]
+  })
+}
+
+function TrailSkeleton() {
+  const sk = (i, a, b, c) => jsxs('div', {
+    key: i,
+    className: 'fc-trail-skel',
+    'aria-hidden': 'true',
+    children: [
+      jsxs('div', { children: [jsx('span', { style: { width: '70%' } }), jsx('span', { style: { width: '52%' } })] }),
+      jsxs('div', { children: [jsx('span', { style: { width: `${a}%` } }), jsx('span', { style: { width: `${b}%` } }), jsx('span', { style: { width: `${c}%` } })] })
+    ]
+  })
+  return jsxs('div', {
+    className: 'fc-trail-list',
+    'aria-busy': 'true',
+    'aria-label': 'Loading decisions',
+    children: [sk(0, 38, 88, 46), sk(1, 30, 74, 52), sk(2, 42, 81, 36), jsx('span', { key: 'sr', className: 'fc-trail-sr', children: 'Loading decision trail…' })]
+  })
+}
+
+function TrailSection({ ctx, reposQ }) {
+  const routeTenant = routeQueryParam('tenant')
+  const [repo, setRepo] = useState('')
+  const [tenant, setTenant] = useState(routeTenant || '')
+  const [phase, setPhase] = useState('')
+  const [hideSup, setHideSup] = useState(false)
+  const [flash, setFlash] = useState(null)
+  const [msg, setMsg] = useState('')
+  // A deep link (`/factonio?tenant=…`) scopes the fetch server-side until the
+  // user picks another workstream or clears the filters.
+  const [scoped, setScoped] = useState(routeTenant || null)
+  // Lineage targets fetched on demand because they sit outside the loaded
+  // window or server scope; merged into the ledger so a jump lands on a row.
+  const [pinned, setPinned] = useState({})
+  const headingRef = useRef(null)
+  const rowEls = useRef({})
+  const pendingJump = useRef(null)
+  const flashTimer = useRef(null)
+  const jumpSeq = useRef(0)
+  const latest = useRef({})
+  const queryClient = useQueryClient()
+  const queryKey = scoped ? [...TRAIL_QUERY_KEY, 'tenant', scoped] : TRAIL_QUERY_KEY
+  const query = useQuery({
+    queryKey,
+    queryFn: () => ctx.rest(scoped ? `/trail?tenant=${encodeURIComponent(scoped)}&limit=${TRAIL_LIMIT}` : `/trail?limit=${TRAIL_LIMIT}`),
+    refetchInterval: 30000
+  })
+
+  useEffect(() => {
+    if (!routeTenant) return
+    setTenant(routeTenant)
+    setScoped(routeTenant)
+    setRepo('')
+    setPhase('')
+    setHideSup(false)
+    headingRef.current?.scrollIntoView?.({ block: 'start', behavior: prefersReducedMotion() ? 'auto' : 'smooth' })
+  }, [routeTenant])
+
+  useEffect(() => {
+    const id = pendingJump.current
+    if (!id) return
+    // Clearing a server scope refetches; keep the jump pending until the row renders.
+    const el = visible.some(d => d.id === id) ? rowEls.current[id] : null
+    if (!el) {
+      if (!loading) pendingJump.current = null
+      return
+    }
+    pendingJump.current = null
+    el.scrollIntoView?.({ block: 'center', behavior: prefersReducedMotion() ? 'auto' : 'smooth' })
+    el.focus?.({ preventScroll: true })
+    clearTimeout(flashTimer.current)
+    flashTimer.current = setTimeout(() => setFlash(cur => (cur === id ? null : cur)), 1600)
+  })
+
+  const data = query.data
+  const isError = !!query.isError
+  const hasData = data != null
+  const loading = !hasData && !isError
+  const loaded = trailDecisions(data)
+  const loadedIds = new Set(loaded.map(d => d.id))
+  const extra = Object.values(pinned).filter(d => d && !loadedIds.has(d.id))
+  const all = extra.length ? trailDecisions({ decisions: [...loaded, ...extra] }) : loaded
+  const empty = hasData && all.length === 0 && !scoped
+
+  const registered = Array.isArray(reposQ?.data?.repos) ? reposQ.data.repos : []
+  const ghBySlug = Object.fromEntries(registered.filter(r => r?.slug && r?.repo).map(r => [r.slug, r.repo]))
+  const ghRepos = [...new Set([...registered.map(r => r?.repo).filter(Boolean), ...all.map(d => trailGithubRepo(d.repo_slug, ghBySlug)).filter(Boolean)])]
+  const summary = data?.summary && typeof data.summary === 'object' ? data.summary : {}
+  const stat = (k, fallback) => (Number.isFinite(summary[k]) ? summary[k] : fallback)
+  const total = stat('total', all.length)
+  const supN = stat('superseded', all.filter(d => d.is_superseded).length)
+  const activeN = stat('active', total - supN)
+
+  const repoOpts = [...new Set([...all.map(d => d.repo_slug).filter(Boolean), ...registered.map(r => r?.slug).filter(Boolean), ...(repo ? [repo] : [])])].sort()
+  const tenantOpts = [...new Set([
+    ...Object.keys(summary.by_tenant && typeof summary.by_tenant === 'object' ? summary.by_tenant : {}).filter(t => t && t !== 'unknown'),
+    ...all.map(d => d.tenant).filter(Boolean),
+    ...(tenant ? [tenant] : [])
+  ])].sort()
+  const inScope = d => (!repo || d.repo_slug === repo) && (!tenant || d.tenant === tenant)
+  const visibleOf = (r, t, p, h) => all.filter(d => (!r || d.repo_slug === r) && (!t || d.tenant === t) && (!p || d.phase === p) && !(h && d.is_superseded))
+  const visible = visibleOf(repo, tenant, phase, hideSup)
+  const anyFilter = !!(repo || tenant || phase)
+  const present = new Set(all.map(d => d.phase).filter(Boolean))
+  if (phase) present.add(phase)
+  const phases = hasData
+    ? [...TRAIL_PHASE_ORDER.filter(p => present.has(p)), ...[...present].filter(p => !TRAIL_PHASE_ORDER.includes(p)).sort()]
+    : TRAIL_PHASE_ORDER
+  const phaseN = p => all.filter(d => d.phase === p && inScope(d)).length
+  const controlsOff = !hasData
+
+  const announce = (r, t, p, h) => {
+    const n = visibleOf(r, t, p, h).length
+    setMsg(`${plural(n, 'decision', 'decisions')} shown.`)
+  }
+  const clearAll = () => {
+    setRepo(''); setTenant(''); setPhase(''); setHideSup(false); setScoped(null)
+    setMsg('Filters cleared.')
+  }
+  const onFilter = (key, value) => {
+    const v = value || ''
+    if (key === 'repo') { setRepo(v); announce(v, tenant, phase, hideSup) }
+    if (key === 'tenant') {
+      setTenant(v)
+      if (scoped && v !== scoped) setScoped(null)
+      announce(repo, v, phase, hideSup)
+    }
+  }
+  const passes = (d, f) => (!f.repo || d.repo_slug === f.repo) && (!f.tenant || d.tenant === f.tenant) && (!f.phase || d.phase === f.phase) && !(f.hideSup && d.is_superseded)
+  latest.current = { repo, tenant, phase, hideSup, scoped }
+  const land = (id, row, f) => {
+    if (!passes(row, f)) {
+      setRepo(''); setTenant(''); setPhase(''); setHideSup(false); setScoped(null)
+      setMsg(`Filters cleared to show ${id}.`)
+    } else {
+      setMsg(`Jumped to ${id}.`)
+    }
+    pendingJump.current = id
+    setFlash(id)
+  }
+  // Single-row lookup; older hosts without GET /trail/{id} fall back to one
+  // wide unscoped /trail page when the target may sit outside what is loaded.
+  const fetchDecision = async (id, mayBeOutside) => {
+    try {
+      const res = await ctx.rest(`/trail/${encodeURIComponent(id)}`)
+      if (res?.decision?.id === id) return res.decision
+    } catch (err) {
+      if (describeSaveError(err).status === 404) return null
+    }
+    if (!mayBeOutside) return null
+    return trailDecisions(await ctx.rest('/trail?limit=1000')).find(d => d.id === id) || null
+  }
+  const jump = async id => {
+    const seq = ++jumpSeq.current
+    const known = all.find(d => d.id === id)
+    if (known) {
+      land(id, known, { repo, tenant, phase, hideSup })
+      return
+    }
+    pendingJump.current = null
+    setMsg(`Loading ${id}…`)
+    const row = await fetchDecision(id, !!scoped || total > loaded.length).catch(() => null)
+    if (seq !== jumpSeq.current) return
+    if (!row) {
+      setMsg(`Could not load decision ${id}.`)
+      return
+    }
+    setPinned(cur => ({ ...cur, [row.id]: row }))
+    land(id, row, latest.current)
+  }
+
+  const select = (id, key, label, allLabel, opts, value) => jsxs('span', {
+    key,
+    className: 'fc-trail-sel',
+    children: [
+      jsx('label', { htmlFor: id, children: label }),
+      jsx('select', {
+        id,
+        className: 'fc-input',
+        'data-filter': key,
+        'data-set': String(!!value),
+        disabled: controlsOff,
+        value,
+        onChange: ev => onFilter(key, ev?.target?.value),
+        children: [jsx('option', { key: '__all', value: '', children: allLabel }), ...opts.map(o => jsx('option', { key: o.v, value: o.v, children: o.l }))]
+      })
+    ]
+  })
+
+  const head = jsxs('div', {
+    className: 'fc-sec-head',
+    children: [
+      jsxs('div', {
+        className: 'fc-trail-head-l',
+        children: [
+          jsx('h2', { id: 'fc-trail-h', ref: headingRef, children: 'Decision Trail' }),
+          jsxs('p', {
+            className: 'fc-sec-sub',
+            children: ['Append-only ledger from ', jsx('span', { className: 'fc-mono', children: 'trail.db' }), ' — every gate, pivot and override, with the evidence behind it.']
+          })
+        ]
+      }),
+      loading
+        ? jsxs('div', {
+            className: 'fc-trail-sum',
+            'aria-label': 'Trail summary',
+            children: ['total', 'active', 'superseded'].map(k => jsxs('span', { key: k, className: 'fc-trail-stat', children: [jsx('b', { children: '–' }), ` ${k}`] }))
+          })
+        : hasData && !empty
+          ? jsxs('div', {
+              className: 'fc-trail-sum',
+              'aria-label': 'Trail summary',
+              children: [
+                jsxs('span', { key: 't', className: 'fc-trail-stat', 'data-stat': 'total', children: [jsx('b', { children: String(total) }), ' total'] }),
+                jsxs('span', { key: 'a', className: 'fc-trail-stat', 'data-stat': 'active', children: [jsx('b', { children: String(activeN) }), ' active'] }),
+                jsxs('button', {
+                  key: 's',
+                  type: 'button',
+                  className: 'fc-trail-stat',
+                  'data-stat': 'superseded',
+                  'data-action': 'toggle-sup',
+                  'aria-pressed': String(hideSup),
+                  title: `${hideSup ? 'Show' : 'Hide'} superseded decisions`,
+                  onClick: () => {
+                    const next = !hideSup
+                    setHideSup(next)
+                    setMsg(next ? 'Superseded decisions hidden.' : 'Superseded decisions shown.')
+                  },
+                  children: [jsx('b', { children: String(supN) }), hideSup ? ' superseded · hidden' : ' superseded']
+                })
+              ]
+            })
+          : null
+    ]
+  })
+
+  const bar = empty
+    ? null
+    : jsxs('div', {
+        className: 'fc-trail-bar',
+        role: 'search',
+        'aria-label': 'Filter decisions',
+        'data-disabled': String(controlsOff),
+        children: [
+          select('fc-trail-repo', 'repo', 'Repository', 'All repos', repoOpts.map(r => ({ v: r, l: r })), repo),
+          select('fc-trail-ws', 'tenant', 'Workstream', 'All workstreams', tenantOpts.map(t => ({ v: t, l: trailWsLabel(t, ghRepos) })), tenant),
+          jsxs('div', {
+            className: 'fc-trail-phases',
+            role: 'group',
+            'aria-label': 'Phase',
+            children: [
+              jsx('button', {
+                key: '__all',
+                type: 'button',
+                'data-phase': '',
+                'aria-pressed': String(!phase),
+                disabled: controlsOff,
+                onClick: () => { setPhase(''); announce(repo, tenant, '', hideSup) },
+                children: 'All'
+              }),
+              ...phases.map(p => jsxs('button', {
+                key: p,
+                type: 'button',
+                'data-phase': p,
+                'aria-pressed': String(phase === p),
+                disabled: controlsOff,
+                onClick: () => { setPhase(p); announce(repo, tenant, p, hideSup) },
+                children: [p, hasData ? jsx('span', { key: 'n', className: 'fc-trail-n', children: String(phaseN(p)) }) : null]
+              }))
+            ]
+          }),
+          jsxs('span', {
+            className: 'fc-trail-bar-end',
+            children: [
+              hasData ? jsx('span', { key: 'n', 'data-field': 'shown', children: `${visible.length} of ${all.length}` }) : null,
+              hasData && anyFilter
+                ? jsx('button', { key: 'clear', type: 'button', className: 'fc-btn', 'data-action': 'clear', onClick: clearAll, children: 'Clear filters' })
+                : null
+            ]
+          })
+        ]
+      })
+
+  let errStatus = null
+  if (isError) errStatus = describeSaveError(query.error).status
+  const alert = isError
+    ? jsxs('div', {
+        className: 'fc-alert fc-trail-alert',
+        role: 'alert',
+        children: [
+          jsx(Icon, { name: 'attention' }),
+          jsxs('div', {
+            className: 'fc-trail-alert-body',
+            children: [
+              jsx('b', { children: 'Couldn’t load the decision trail.' }),
+              errStatus
+                ? [' The trail endpoint returned ', jsx('span', { key: 's', className: 'fc-mono', children: String(errStatus) }), '.']
+                : ' The trail endpoint could not be reached.',
+              hasData ? ' Showing the last loaded decisions. Nothing was changed.' : ' Nothing was changed.'
+            ]
+          }),
+          jsxs('button', {
+            type: 'button',
+            className: 'fc-btn',
+            'data-action': 'retry',
+            onClick: () => retryQuery(query, queryClient, queryKey),
+            children: [jsx(Icon, { name: 'retry' }), 'Retry']
+          })
+        ]
+      })
+    : null
+
+  let body
+  if (loading) {
+    body = jsx(TrailSkeleton, {})
+  } else if (!hasData) {
+    body = null
+  } else if (empty) {
+    body = jsxs('div', {
+      className: 'fc-trail-state',
+      'data-state': 'empty',
+      children: [
+        jsx('span', { className: 'fc-trail-state-ico', children: jsx(Icon, { name: 'trail', size: 16 }) }),
+        jsx('h3', { children: 'No decisions recorded yet' }),
+        jsx('p', { children: 'The orchestrator, workers and watchdog log each gate, pivot and override here automatically as cards move. You can also inspect it from a terminal:' }),
+        jsx('div', { className: 'fc-step-cmd', children: 'hermes factonio trail --limit 20' })
+      ]
+    })
+  } else if (!visible.length) {
+    const chips = [
+      repo && `repo ${repo}`,
+      tenant && `workstream ${trailWsLabel(tenant, ghRepos)}`,
+      phase && `phase ${phase}`,
+      hideSup && 'superseded hidden'
+    ].filter(Boolean)
+    body = jsxs('div', {
+      className: 'fc-trail-state',
+      'data-state': 'filtered',
+      children: [
+        jsx('span', { className: 'fc-trail-state-ico', children: jsx(Icon, { name: 'filter', size: 16 }) }),
+        jsx('h3', { children: 'No decisions match these filters' }),
+        jsx('div', { className: 'fc-trail-active', children: chips.map(c => jsx('span', { key: c, className: 'fc-trail-pill', children: c })) }),
+        jsx('p', { children: `${plural(all.length, 'decision exists', 'decisions exist')} outside this view.` }),
+        jsx('button', { type: 'button', className: 'fc-btn fc-btn--primary', 'data-action': 'clear', onClick: clearAll, children: 'Clear filters' })
+      ]
+    })
+  } else {
+    const showWs = !tenant && (!!repo || !!phase)
+    body = jsx('ol', {
+      className: 'fc-trail-list',
+      'aria-label': 'Decisions, newest first',
+      children: visible.map(d => jsx(TrailRow, {
+        key: d.id,
+        ctx,
+        d,
+        gh: trailGithubRepo(d.repo_slug, ghBySlug),
+        flash: flash === d.id,
+        showWs,
+        wsLabel: trailWsLabel(d.tenant, ghRepos),
+        onJump: jump,
+        rowRef: el => { rowEls.current[d.id] = el }
+      }))
+    })
+  }
+
+  return jsxs('section', {
+    className: 'fc-sec fc-trail',
+    'aria-labelledby': 'fc-trail-h',
+    'aria-busy': String(loading),
+    'data-state': loading ? 'loading' : isError && !hasData ? 'error' : empty ? 'empty' : hasData && !visible.length ? 'filtered' : 'populated',
+    children: [head, bar, alert, body, jsx('p', { className: 'fc-trail-sr', 'aria-live': 'polite', children: msg })]
+  })
+}
+
+// --- sidebar --------------------------------------------------------------
+
+// One `{ status, byTenant, byCard, retry }` view of the shared trail query.
+function sidebarTrail(query, queryClient) {
+  const data = query?.data
+  const isError = !!query?.isError
+  const retry = () => retryQuery(query, queryClient, TRAIL_QUERY_KEY)
+  if (data == null) return { status: isError ? 'error' : 'loading', byTenant: new Map(), byCard: new Map(), retry }
+  const all = trailDecisions(data)
+  return { status: 'ready', stale: isError, byTenant: groupBy(all, d => d.tenant || ''), byCard: groupBy(all.filter(d => d.card_id), d => d.card_id), retry }
+}
+
+function TrailItem({ d, why, hideCard }) {
+  const tone = resultTone(d.result)
+  const sup = !!d.is_superseded
+  const pills = evidencePills(d, null).filter(p => !(hideCard && p.key === 'card_id'))
+  const max = 3
+  const chip = p => jsx('span', {
+    key: p.key,
+    className: 'fc-sb-chip',
+    'data-ev': p.key,
+    'data-tone': p.tone || undefined,
+    title: p.title,
+    children: p.label ? `${p.label} ${p.text}` : p.text
+  })
+  const chips = [
+    ...pills.slice(0, max).map(chip),
+    pills.length > max
+      ? jsx('span', { key: 'more', className: 'fc-sb-chip', 'data-ev': 'more', title: pills.slice(max).map(p => p.title).join(', '), children: `+${pills.length - max}` })
+      : null
+  ]
+  return jsxs('li', {
+    className: 'fc-sb-trail-item',
+    'data-id': d.id,
+    'data-superseded': String(sup),
+    children: [
+      jsxs('div', {
+        className: 'fc-sb-trail-top',
+        children: [
+          jsx('span', { className: 'fc-sb-tag', 'data-phase': d.phase || '', children: d.phase || '—' }),
+          jsx('span', { className: 'fc-sb-tag', 'data-tone': TRAIL_SB_TONE[tone] || undefined, 'data-result': d.result || '', children: d.result || '—' }),
+          sup
+            ? jsx('span', { className: 'fc-sb-trail-sup', title: `Superseded by ${(d.superseded_by || []).join(', ')}`, children: 'superseded' })
+            : null,
+          jsx('time', { className: 'fc-sb-trail-time', dateTime: d.ts, title: d.ts, children: fmtTrailClock(d.ts) })
+        ]
+      }),
+      jsx('p', { className: 'fc-sb-trail-title', title: d.decision, children: humanDecision(d.decision) }),
+      why && d.why ? jsx('p', { className: 'fc-sb-trail-why', children: d.why }) : null,
+      pills.length ? jsx('div', { className: 'fc-sb-trail-ev', children: chips }) : null
+    ]
+  })
+}
+
+function TrailStrip({ tenant, trail, open, onToggle }) {
+  if (!trail) return null
+  if (trail.status === 'loading') {
+    return jsx('div', {
+      className: 'fc-sb-trail',
+      children: jsxs('button', {
+        type: 'button',
+        className: 'fc-sb-trail-toggle',
+        'data-action': 'toggle-trail',
+        disabled: true,
+        'aria-busy': 'true',
+        children: [jsx(Icon, { name: 'trail' }), jsx('span', { children: 'Loading decisions…' })]
+      })
+    })
+  }
+  if (trail.status === 'error') {
+    return jsx('div', {
+      className: 'fc-sb-trail',
+      children: jsxs('button', {
+        type: 'button',
+        className: 'fc-sb-trail-toggle',
+        'data-action': 'retry-trail',
+        title: 'Retry loading decisions',
+        onClick: e => {
+          e?.stopPropagation?.()
+          trail.retry()
+        },
+        children: [
+          jsx('span', { className: 'fc-sb-tone-attention', children: jsx(Icon, { name: 'attention' }) }),
+          jsx('span', { style: { flex: 1, minWidth: 0 }, children: 'Decisions unavailable' }),
+          jsx('span', { className: 'fc-sb-tone-running', children: 'Retry' })
+        ]
+      })
+    })
+  }
+  const ds = trail.byTenant.get(tenant || '') || []
+  if (!ds.length) return null
+  const listId = `fc-sb-trail-${domSafe(tenant || '__ungrouped')}`
+  const bad = ds.filter(d => resultTone(d.result) === 'bad' && !d.is_superseded)
+  const uniq = [...new Set(ds.map(d => d.phase).filter(Boolean))]
+  const phases = uniq.length > 3 ? `${uniq.slice(0, 3).join(' · ')} · +${uniq.length - 3}` : uniq.join(' · ')
+  const cap = 5
+  return jsxs('div', {
+    className: 'fc-sb-trail',
+    'data-tenant': tenant || '',
+    children: [
+      jsxs('button', {
+        key: 'toggle',
+        type: 'button',
+        className: 'fc-sb-trail-toggle',
+        'data-action': 'toggle-trail',
+        'aria-expanded': String(open),
+        'aria-controls': listId,
+        onClick: onToggle,
+        children: [
+          jsx(Icon, { name: 'chev', className: 'fc-sb-chev' }),
+          jsx(Icon, { name: 'trail' }),
+          jsxs('span', { children: [jsx('span', { className: 'fc-sb-mono', children: String(ds.length) }), ds.length === 1 ? ' decision' : ' decisions'] }),
+          jsx('span', { className: 'fc-sb-trail-phases', children: phases }),
+          bad.length
+            ? jsxs('span', {
+                className: 'fc-sb-trail-flag',
+                title: `${plural(bad.length, 'active decision', 'active decisions')} need attention: ${bad.map(d => d.result).join(', ')}`,
+                children: [jsx(Icon, { name: 'attention', size: 10 }), String(bad.length)]
+              })
+            : null
+        ]
+      }),
+      open
+        ? jsxs('ul', {
+            key: 'list',
+            className: 'fc-sb-trail-list',
+            id: listId,
+            'aria-label': 'Decisions for this workstream, newest first',
+            children: [
+              ...ds.slice(0, cap).map(d => jsx(TrailItem, { key: d.id, d })),
+              jsxs('li', {
+                key: 'more',
+                className: 'fc-sb-trail-more',
+                children: [
+                  jsx('span', { children: ds.length > cap ? `+${ds.length - cap} older` : 'Full ledger' }),
+                  jsx('button', {
+                    type: 'button',
+                    'data-action': 'open-trail',
+                    onClick: () => host.navigate(`${ROUTE_PATH}?tenant=${encodeURIComponent(tenant || '')}`),
+                    children: 'Open in Decision Trail ›'
+                  })
+                ]
+              })
+            ]
+          })
+        : null
+    ]
+  })
+}
+
+function CardDecisions({ card, trail }) {
+  const ds = trail?.status === 'ready' ? trail.byCard.get(card.id) || [] : []
+  let value
+  if (!trail || trail.status === 'loading') value = jsx('span', { className: 'fc-sb-trail-none', children: 'Loading…' })
+  else if (trail.status === 'error') value = jsx('span', { className: 'fc-sb-trail-none', children: 'Unavailable' })
+  else if (!ds.length) value = jsx('span', { className: 'fc-sb-trail-none', children: 'None recorded' })
+  else {
+    value = jsx('ul', {
+      className: 'fc-sb-trail-list',
+      'aria-label': 'Decisions for this card, newest first',
+      children: ds.map(d => jsx(TrailItem, { key: d.id, d, why: true, hideCard: true }))
+    })
+  }
+  return [
+    jsxs('dt', {
+      key: 'decisions-t',
+      className: 'fc-sb-full fc-sb-trail-dt',
+      children: ['Decisions', trail?.status === 'ready' ? jsx('span', { key: 'n', className: 'fc-sb-mono', children: ` · ${ds.length}` }) : null]
+    }),
+    jsx('dd', { key: 'decisions-d', className: 'fc-sb-full fc-sb-trail-dd', 'data-field': 'decisions', children: value })
+  ]
+}
+
 function FactonioPage({ ctx }) {
   const [range, setRange] = useState('30d')
   const metricsQ = useQuery({
@@ -1112,6 +2009,7 @@ function FactonioPage({ ctx }) {
               })
             ]
           }),
+          jsx(TrailSection, { ctx, reposQ }),
           jsxs('div', {
             className: 'fc-sec',
             children: [
@@ -1360,7 +2258,11 @@ const ICON = {
   dash: [['rect', { x: 1.8, y: 1.8, width: 3.6, height: 4.2, rx: 0.8 }], ['rect', { x: 6.6, y: 1.8, width: 3.6, height: 2.6, rx: 0.8 }], ['rect', { x: 6.6, y: 5.6, width: 3.6, height: 4.6, rx: 0.8 }], ['rect', { x: 1.8, y: 7.2, width: 3.6, height: 3, rx: 0.8 }]],
   thread: [['path', { d: 'M2 2.5h8v5.5H5.2L3 10V8H2z' }]],
   filter: [['path', { d: 'M1.8 2.5h8.4L7 6.3v3.4L5 10.5V6.3z' }]],
-  inbox: [['path', { d: 'M1.8 6.8 3.2 2.5h5.6l1.4 4.3v2.7H1.8z' }], ['path', { d: 'M1.8 6.8h2.6l.6 1.2h2l.6-1.2h2.6' }]]
+  inbox: [['path', { d: 'M1.8 6.8 3.2 2.5h5.6l1.4 4.3v2.7H1.8z' }], ['path', { d: 'M1.8 6.8h2.6l.6 1.2h2l.6-1.2h2.6' }]],
+  trail: [['circle', { cx: 2.6, cy: 2.8, r: 1.1 }], ['circle', { cx: 2.6, cy: 9.2, r: 1.1 }], ['path', { d: 'M2.6 3.9v4.2M5.2 2.8h5M5.2 6h5M5.2 9.2h3.4' }]],
+  person: [['circle', { cx: 6, cy: 4, r: 2 }], ['path', { d: 'M2.2 10.4c.4-2 1.9-3.2 3.8-3.2s3.4 1.2 3.8 3.2' }]],
+  link: [['path', { d: 'M5 7 7 5' }], ['path', { d: 'M4.3 5.4 3.1 6.6a1.7 1.7 0 0 0 2.4 2.4l1.2-1.2M7.7 6.6l1.2-1.2a1.7 1.7 0 0 0-2.4-2.4L5.3 4.2' }]],
+  retry: [['path', { d: 'M9.6 5.2A3.8 3.8 0 1 0 9 8' }], ['path', { d: 'M9.8 2.4v2.9H6.9' }]]
 }
 
 function Icon({ name, size = 12, className = '' }) {
@@ -1551,7 +2453,7 @@ function Pipeline({ pipe }) {
   })
 }
 
-function CardDrawer({ card: c, id }) {
+function CardDrawer({ card: c, id, trail }) {
   const rework = c.phase === 'implement' && c.runs > 1
   const tone = verdictTone(c.verdict)
   const row = (k, label, value, extra) => [
@@ -1579,12 +2481,13 @@ function CardDrawer({ card: c, id }) {
         : []),
       ...(c.verdict ? row('verdict', 'Verdict', jsx('span', { className: 'fc-sb-tag', 'data-tone': tone || undefined, children: String(c.verdict) })) : []),
       ...(c.last_outcome ? row('outcome', 'Outcome', String(c.last_outcome).replace(/_/g, ' '), { className: 'fc-sb-mono' }) : []),
+      ...CardDecisions({ card: c, trail }),
       ...(c.summary ? row('summary', 'Worker summary', String(c.summary), { full: true, className: 'fc-sb-full fc-sb-summary' }) : [])
     ]
   })
 }
 
-function CardRow({ ctx, card: c, wsCards, open, onToggle }) {
+function CardRow({ ctx, card: c, wsCards, open, onToggle, trail }) {
   const rej = isUnresolvedReject(c, wsCards)
   const attn = isAttention(c, wsCards)
   const tone = verdictTone(c.verdict)
@@ -1630,7 +2533,7 @@ function CardRow({ ctx, card: c, wsCards, open, onToggle }) {
           jsxs('span', { className: 'fc-sb-callout-body', children: [jsx('span', { className: 'fc-sb-kind', children: co.kind }), co.text] })
         ]
       })),
-      open ? jsx(CardDrawer, { key: 'drawer', card: c, id: drawerId }) : null,
+      open ? jsx(CardDrawer, { key: 'drawer', card: c, id: drawerId, trail }) : null,
       jsxs('div', {
         className: 'fc-sb-card-foot',
         children: [
@@ -1672,7 +2575,7 @@ function CardRow({ ctx, card: c, wsCards, open, onToggle }) {
   })
 }
 
-function DoneGroup({ ctx, wsKey, cards, wsCards, open, onToggle, cardOpen, toggleCard }) {
+function DoneGroup({ ctx, wsKey, cards, wsCards, open, onToggle, cardOpen, toggleCard, trail }) {
   const listId = `fc-sb-done-${domSafe(wsKey)}`
   return [
     jsxs('button', {
@@ -1694,7 +2597,7 @@ function DoneGroup({ ctx, wsKey, cards, wsCards, open, onToggle, cardOpen, toggl
           key: 'done-list',
           className: 'fc-sb-done-list',
           id: listId,
-          children: cards.map(c => jsx(CardRow, { key: c.id, ctx, card: c, wsCards, open: !!cardOpen[c.id], onToggle: () => toggleCard(c.id) }))
+          children: cards.map(c => jsx(CardRow, { key: c.id, ctx, card: c, wsCards, open: !!cardOpen[c.id], onToggle: () => toggleCard(c.id), trail }))
         })
       : null
   ]
@@ -1788,7 +2691,7 @@ function Workstream({ ctx, ws, ui }) {
           jsxs('div', {
             className: 'fc-sb-ws-cards',
             children: [
-              ...main.map(c => jsx(CardRow, { key: c.id, ctx, card: c, wsCards: ws.wsCards, open: !!ui.cardOpen[c.id], onToggle: () => toggleCard(c.id) })),
+              ...main.map(c => jsx(CardRow, { key: c.id, ctx, card: c, wsCards: ws.wsCards, open: !!ui.cardOpen[c.id], onToggle: () => toggleCard(c.id), trail: ui.trail })),
               doneCards.length
                 ? jsx(DoneGroup, {
                     key: 'done',
@@ -1799,9 +2702,17 @@ function Workstream({ ctx, ws, ui }) {
                     open: doneOpen,
                     onToggle: () => ui.setDoneOpen({ ...ui.doneOpen, [key]: !doneOpen }),
                     cardOpen: ui.cardOpen,
-                    toggleCard
+                    toggleCard,
+                    trail: ui.trail
                   })
-                : null
+                : null,
+              jsx(TrailStrip, {
+                key: 'trail',
+                tenant: ws.tenant || '',
+                trail: ui.trail,
+                open: !!ui.trailOpen[key],
+                onToggle: () => ui.setTrailOpen({ ...ui.trailOpen, [key]: !ui.trailOpen[key] })
+              })
             ]
           })
         ]
@@ -1860,6 +2771,13 @@ function ThreadCardsPane({ ctx, visible = true }) {
     enabled,
     refetchInterval: visible ? CARDS_POLL_MS : false
   })
+  const [trailOpen, setTrailOpen] = useState({})
+  const trailQuery = useQuery({
+    queryKey: TRAIL_QUERY_KEY,
+    queryFn: () => ctx.rest(`/trail?limit=${TRAIL_LIMIT}`),
+    refetchInterval: visible ? CARDS_POLL_MS : false
+  })
+  const trail = sidebarTrail(trailQuery, useQueryClient())
 
   const data = enabled ? query.data : undefined
   const scoped = Array.isArray(data?.cards) ? data.cards : []
@@ -1907,7 +2825,7 @@ function ThreadCardsPane({ ctx, visible = true }) {
       })
     } else {
       const repos = [...new Set(scoped.filter(c => c.pr?.repo).map(c => c.pr.repo))]
-      const ui = { status, wsOpen, setWsOpen, doneOpen, setDoneOpen, cardOpen, setCardOpen }
+      const ui = { status, wsOpen, setWsOpen, doneOpen, setDoneOpen, cardOpen, setCardOpen, trail, trailOpen, setTrailOpen }
       body = groupWorkstreams(byTenant, visibleCards, repos).map(ws =>
         jsx(Workstream, { key: ws.tenant || '__ungrouped', ctx, ws, ui })
       )
