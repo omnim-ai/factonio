@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import unittest
@@ -626,6 +627,189 @@ class TestWorktreeAudit(unittest.TestCase):
             self.assertFalse(paths["merged"].exists())
             self.assertNotIn(str(paths["merged"]), _worktree_paths(paths["main"]))
             self.assertGreater(res["reclaimed_bytes"], 8192)
+
+    def _add_nested(self, paths: dict[str, Path]) -> tuple[Path, Path]:
+        """Clean merged ``nest`` worktree with a second registered worktree ``nest/child`` inside it."""
+        parent = paths["main"].parent.parent / "wt" / "nest"
+        _git(paths["main"], "worktree", "add", "-q", "-b", "feat-nest", str(parent), "main")
+        child = parent / "child"
+        _git(paths["main"], "worktree", "add", "-q", "-b", "feat-nest-child", str(child), "main")
+        return parent, child
+
+    def _assert_nest_survives(self, res, paths, parent: Path, child: Path, readme: str = "hello") -> None:
+        removed = {r["path"] for r in res["removed"]}
+        self.assertNotIn(str(parent), removed)
+        self.assertNotIn(str(child), removed)
+        self.assertTrue(parent.is_dir() and child.is_dir())
+        registered = _worktree_paths(paths["main"])
+        self.assertIn(str(parent), registered)
+        self.assertIn(str(child), registered)
+        self.assertEqual((child / "README.md").read_text(encoding="utf-8"), readme)
+        held = {h["path"]: h for h in res["held"]}
+        self.assertNotEqual(held[str(parent)]["bucket"], "safe")
+        # Unrelated safe worktrees are still pruned.
+        self.assertIn(str(paths["scratch"]), removed)
+
+    def test_parent_of_held_nested_worktree_is_never_safe_or_pruned(self):
+        from factonio import repos
+        from hermes_cli.kanban_db_connect import connect_closing
+
+        variants = {
+            "hold-wip": "hold-wip", "hold-active-card": "hold-active-card", "locked": "review", "review": "review",
+        }
+        for variant, child_bucket in variants.items():
+            with self.subTest(variant=variant), isolated_hermes_home() as home:
+                paths = _build_fixture(home)
+                db = home / "kanban.db"
+                _seed_cards(db, paths)
+                parent, child = self._add_nested(paths)
+                readme = "hello"
+                if variant == "hold-wip":
+                    readme = "irreplaceable child edit"
+                    (child / "README.md").write_text(readme, encoding="utf-8")
+                elif variant == "hold-active-card":
+                    with connect_closing(db_path=db) as conn:
+                        conn.execute(
+                            "INSERT INTO tasks (id, title, assignee, status, workspace_path, created_at)"
+                            " VALUES ('t_child', 't', 'factonio', 'running', ?, 0)",
+                            (str(child),),
+                        )
+                        conn.commit()
+                elif variant == "locked":
+                    _git(paths["main"], "worktree", "lock", "--reason", "operator hold", str(child))
+                else:
+                    _commit(child, "child-only.txt", "unmerged")
+
+                by_path = {w["path"]: w for w in self._audit(paths)["worktrees"]}
+                self.assertEqual(by_path[str(child)]["bucket"], child_bucket, by_path[str(child)])
+                p = by_path[str(parent)]
+                expected_parent = "hold-active-card" if variant == "hold-active-card" else "review"
+                self.assertEqual(p["bucket"], expected_parent, p)
+                if variant == "hold-active-card":
+                    self.assertIn("t_child", p["hold_reason"])
+                else:
+                    self.assertIn("nested", p["hold_reason"])
+                    self.assertIn(str(child), p["hold_reason"])
+
+                with mock.patch.object(repos, "_run_gh", side_effect=_gh_ok):
+                    res = repos.prune_safe_worktrees(str(paths["main"]))
+                self._assert_nest_survives(res, paths, parent, child, readme)
+                if variant == "review":
+                    self.assertEqual((child / "child-only.txt").read_text(encoding="utf-8"), "unmerged")
+
+    def test_prune_holds_parent_when_nested_worktree_added_after_audit(self):
+        with isolated_hermes_home() as home:
+            paths = _build_fixture(home)
+            _seed_cards(home / "kanban.db", paths)
+            parent = paths["merged"]
+            child = parent / "late-child"
+
+            def add_child() -> None:
+                _git(paths["main"], "worktree", "add", "-q", "-b", "feat-late-child", str(child), "main")
+                (child / "README.md").write_text("late edit", encoding="utf-8")
+
+            res = self._prune_with_post_audit_hook(paths, add_child)
+            held = {h["path"]: h for h in res["held"]}
+            self.assertEqual(held[str(parent)]["bucket"], "review", held[str(parent)])
+            self.assertIn(str(child), held[str(parent)]["hold_reason"])
+            self.assertEqual((child / "README.md").read_text(encoding="utf-8"), "late edit")
+            self.assertEqual((parent / "merged.txt").read_text(encoding="utf-8"), "m" * 4096)
+            self.assertIn(str(child), _worktree_paths(paths["main"]))
+
+    def test_active_card_workspace_nested_inside_worktree_holds_it(self):
+        from factonio import repos
+        from hermes_cli.kanban_db_connect import connect_closing
+
+        for when in ("before-audit", "after-audit", "via-symlink"):
+            with self.subTest(when=when), isolated_hermes_home() as home:
+                paths = _build_fixture(home)
+                db = home / "kanban.db"
+                _seed_cards(db, paths)
+                parent = paths["merged"]
+                ws = parent / "cards" / "t_nested"
+                ws.mkdir(parents=True)
+                (ws / "notes.md").write_text("card scratch", encoding="utf-8")
+                claimed = ws
+                if when == "via-symlink":
+                    alias = home / "alias"
+                    alias.symlink_to(parent, target_is_directory=True)
+                    claimed = alias / "cards" / "t_nested"
+
+                def claim() -> None:
+                    with connect_closing(db_path=db) as conn:
+                        conn.execute(
+                            "INSERT INTO tasks (id, title, assignee, status, workspace_path, created_at)"
+                            " VALUES ('t_nested', 't', 'factonio', 'running', ?, 0)",
+                            (str(claimed),),
+                        )
+                        conn.commit()
+
+                if when == "after-audit":
+                    self.assertEqual(
+                        {w["path"]: w for w in self._audit(paths)["worktrees"]}[str(parent)]["bucket"], "safe"
+                    )
+                    res = self._prune_with_post_audit_hook(paths, claim)
+                else:
+                    claim()
+                    audited = {w["path"]: w for w in self._audit(paths)["worktrees"]}[str(parent)]
+                    self.assertEqual(audited["bucket"], "hold-active-card", audited)
+                    self.assertIn("t_nested", audited["hold_reason"])
+                    with mock.patch.object(repos, "_run_gh", side_effect=_gh_ok):
+                        res = repos.prune_safe_worktrees(str(paths["main"]))
+                held = {h["path"]: h for h in res["held"]}
+                self.assertEqual(held[str(parent)]["bucket"], "hold-active-card", held[str(parent)])
+                self.assertIn("t_nested", held[str(parent)]["hold_reason"])
+                self.assertEqual((ws / "notes.md").read_text(encoding="utf-8"), "card scratch")
+                self.assertEqual((parent / "merged.txt").read_text(encoding="utf-8"), "m" * 4096)
+                self.assertIn(str(parent), _worktree_paths(paths["main"]))
+
+    def test_nested_unregistered_git_repo_holds_worktree(self):
+        from factonio import repos
+
+        with isolated_hermes_home() as home:
+            paths = _build_fixture(home)
+            nested = paths["merged"] / "vendor" / "lib"
+            nested.mkdir(parents=True)
+            _git(nested, "init", "-q", "-b", "main")
+            _commit(nested, "local.txt", "only copy")
+            (nested / "local.txt").write_text("uncommitted", encoding="utf-8")
+
+            audited = {w["path"]: w for w in self._audit(paths)["worktrees"]}[str(paths["merged"])]
+            self.assertNotEqual(audited["bucket"], "safe", audited)
+            self.assertIn("vendor/lib", audited["hold_reason"])
+            with mock.patch.object(repos, "_run_gh", side_effect=_gh_ok):
+                res = repos.prune_safe_worktrees(str(paths["main"]))
+            self.assertNotIn(str(paths["merged"]), {r["path"] for r in res["removed"]})
+            self.assertEqual((nested / "local.txt").read_text(encoding="utf-8"), "uncommitted")
+
+    def test_fallback_rmtree_refuses_leftovers_containing_registered_worktree(self):
+        from factonio import repos
+
+        with isolated_hermes_home() as home:
+            paths = _build_fixture(home)
+            real_run_git = repos._run_git
+            target = paths["scratch"]
+            child = target / "child"
+
+            def deregister_leaving_nested(args: list[str], **kw: Any):
+                if args[:2] == ["worktree", "remove"] and Path(args[-1]) == target:
+                    # A nested worktree appears at the removal boundary; git then drops only the parent's admin dir.
+                    real_run_git(["worktree", "add", "-q", "-b", "feat-boundary", str(child), "main"], cwd=paths["main"])
+                    (child / "README.md").write_text("boundary edit", encoding="utf-8")
+                    admin = Path(_git(paths["main"], "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+                    shutil.rmtree(admin / "worktrees" / "scratch")
+                    return subprocess.CompletedProcess(args, 1, "", "error: failed to delete: Directory not empty")
+                return real_run_git(args, **kw)
+
+            with mock.patch.object(repos, "_run_gh", side_effect=_gh_ok), \
+                    mock.patch.object(repos, "_run_git", side_effect=deregister_leaving_nested):
+                res = repos.prune_safe_worktrees(str(paths["main"]))
+            self.assertNotIn(str(target), {r["path"] for r in res["removed"]})
+            self.assertEqual((child / "README.md").read_text(encoding="utf-8"), "boundary edit")
+            self.assertIn(str(child), _worktree_paths(paths["main"]))
+            held = {h["path"]: h for h in res["held"]}
+            self.assertEqual(held[str(target)]["bucket"], "review", held[str(target)])
+            self.assertIn(str(child), held[str(target)]["hold_reason"])
 
     def test_parse_status_z_handles_renames_and_spaces(self):
         from factonio.repos import parse_status_z

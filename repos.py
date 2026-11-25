@@ -1154,8 +1154,12 @@ def _dirty_inventory(wt_path: Path) -> dict[str, Any]:
     tracked: list[str] = []
     ignored_data: list[str] = []
     scratch: list[str] = []
+    nested_repos: list[str] = []
     for code, rel in parse_status_z(proc.stdout):
-        if code == "??":
+        if code in ("??", "!!") and rel.endswith("/") and (wt_path / rel / ".git").exists():
+            # Nested repository/worktree: git lists it as one opaque entry, but it holds its own history.
+            nested_repos.append(rel.rstrip("/"))
+        elif code == "??":
             scratch.append(rel)
         elif code == "!!":
             if not _is_regenerable_ignored(rel):
@@ -1180,6 +1184,7 @@ def _dirty_inventory(wt_path: Path) -> dict[str, Any]:
         "tracked": tracked[:_MAX_LISTED_PATHS],
         "ignored_data": ignored_data[:_MAX_LISTED_PATHS],
         "scratch": scratch[:_MAX_LISTED_PATHS],
+        "nested_repos": nested_repos,
         "hold_reason": reason,
     }
 
@@ -1279,17 +1284,36 @@ def _active_cards(kanban_db_path: Optional[Path]) -> list[dict[str, Any]]:
     return _query_active_cards(kanban_db_path)[0]
 
 
+def _path_forms(path: str | Path) -> set[Path]:
+    """Lexically-normalized absolute path plus its symlink-resolved real path."""
+    lexical = Path(os.path.abspath(os.path.expanduser(str(path))))
+    forms = {lexical}
+    try:
+        forms.add(lexical.resolve())
+    except (OSError, RuntimeError):
+        pass
+    return forms
+
+
+def _is_within(inner: str | Path, outer: str | Path, *, strict: bool = False) -> bool:
+    """Whether ``inner`` is (strictly, if asked) inside ``outer``, comparing lexical and real paths."""
+    outer_forms, inner_forms = _path_forms(outer), _path_forms(inner)
+    if strict and outer_forms & inner_forms:
+        return False
+    return any(i.is_relative_to(o) for i in inner_forms for o in outer_forms)
+
+
 def _match_active_card(cards: list[dict[str, Any]], wt_path: Path, branch: Optional[str]) -> Optional[dict[str, Any]]:
-    resolved = str(wt_path.resolve()) if wt_path.exists() else str(wt_path)
+    """Active card whose workspace is ``wt_path`` or lies anywhere inside it (else matching branch)."""
+    nested: Optional[dict[str, Any]] = None
     for card in cards:
         ws = card.get("workspace_path")
-        if ws:
-            try:
-                ws_resolved = str(Path(str(ws)).expanduser().resolve())
-            except OSError:
-                ws_resolved = str(ws)
-            if ws_resolved == resolved:
+        if ws and _is_within(str(ws), wt_path):
+            if not _is_within(str(ws), wt_path, strict=True):
                 return card
+            nested = nested or card
+    if nested is not None:
+        return nested
     if branch:
         for card in cards:
             if card.get("branch_name") and str(card["branch_name"]) == branch:
@@ -1357,10 +1381,15 @@ def _bucket_for(entry: dict[str, Any]) -> tuple[str, str]:
     if dirty.startswith("wip:"):
         return "hold-wip", str(entry.get("dirty_reason") or f"uncommitted work ({dirty})")
     if entry.get("active_card"):
-        return "hold-active-card", f"active card {entry['active_card']} ({entry.get('active_card_status') or 'active'})"
+        where = f" via nested workspace {entry['active_card_workspace']}" if entry.get("active_card_workspace") else ""
+        return "hold-active-card", f"active card {entry['active_card']} ({entry.get('active_card_status') or 'active'}){where}"
     pr_state = str(entry.get("pr_state") or "").upper()
     if pr_state in ("OPEN", "DRAFT"):
         return "hold-open-pr", f"open PR {entry['pr'].split('/')[0]}"
+    nested = entry.get("nested") or []
+    if nested:
+        more = f" (+{len(nested) - 1} more)" if len(nested) > 1 else ""
+        return "review", f"contains nested worktree/repository {nested[0]}{more}; removal would delete it"
     if entry.get("locked"):
         return "review", "worktree is locked"
     if entry.get("prunable") or entry.get("exists") is False:
@@ -1435,7 +1464,7 @@ def _audit_one_repo(
             continue
         entry = _inspect_worktree(
             raw, main_path=main_path, full_repo=full_repo, slug=target.get("slug"),
-            resolved_base=resolved_base, prs=prs, cards=cards, now_ts=now_ts,
+            resolved_base=resolved_base, prs=prs, cards=cards, now_ts=now_ts, registered=entries,
         )
         entry.pop("scratch_paths", None)
         result["worktrees"].append(entry)
@@ -1452,12 +1481,16 @@ def _inspect_worktree(
     prs: dict[str, dict[str, Any]],
     cards: list[dict[str, Any]],
     now_ts: float,
+    registered: list[dict[str, Any]],
     measure: bool = True,
 ) -> dict[str, Any]:
     """Classify one ``git worktree list --porcelain`` entry.
 
     The single source of truth for bucket safety, shared by the audit and the pre-removal
     recheck so the two can never drift. ``measure=False`` skips size/age/remote (informational only).
+    ``registered`` is the full live porcelain listing: a worktree that contains any other registered
+    worktree (or the main checkout) or a nested repository is never ``safe``, because removing it
+    would recursively delete the nested one.
     """
     wt_path = Path(raw["path"])
     branch = raw.get("branch")
@@ -1489,6 +1522,12 @@ def _inspect_worktree(
     entry["scratch_paths"] = list(inventory.get("scratch") or [])
     if inventory.get("hold_reason"):
         entry["dirty_reason"] = inventory["hold_reason"]
+    nested = [
+        str(other["path"]) for other in registered
+        if other.get("path") and other["path"] != raw["path"] and _is_within(other["path"], wt_path, strict=True)
+    ]
+    nested += [str(wt_path / rel) for rel in inventory.get("nested_repos") or [] if str(wt_path / rel) not in nested]
+    entry["nested"] = nested
     if measure:
         entry["remote"] = _classify_remote(wt_path, branch) if exists else ("detached" if not branch else "no-remote")
 
@@ -1508,6 +1547,8 @@ def _inspect_worktree(
     card = _match_active_card(cards, wt_path, branch)
     entry["active_card"] = card.get("id") if card else None
     entry["active_card_status"] = card.get("status") if card else None
+    if card and card.get("workspace_path") and _is_within(str(card["workspace_path"]), wt_path, strict=True):
+        entry["active_card_workspace"] = str(card["workspace_path"])
 
     entry["bucket"], entry["hold_reason"] = _bucket_for(entry)
     return entry
@@ -1578,12 +1619,19 @@ def _linked_worktree_admin_dir(wt_path: Path, main_path: Path) -> Optional[Path]
     return admin
 
 
-def _live_worktree_entry(main_path: Path, wt_path_str: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
-    """Current porcelain entry for ``wt_path_str`` (``None`` if unregistered) or an error string."""
+def _live_worktree_listing(main_path: Path) -> tuple[list[dict[str, Any]], Optional[str]]:
     listing = _run_git_ro(["worktree", "list", "--porcelain"], cwd=main_path)
     if listing.returncode != 0:
-        return None, _git_err(listing, "worktree list")
-    return next((e for e in _parse_worktree_porcelain(listing.stdout) if e.get("path") == wt_path_str), None), None
+        return [], _git_err(listing, "worktree list")
+    return _parse_worktree_porcelain(listing.stdout), None
+
+
+def _live_worktree_entry(main_path: Path, wt_path_str: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Current porcelain entry for ``wt_path_str`` (``None`` if unregistered) or an error string."""
+    entries, err = _live_worktree_listing(main_path)
+    if err:
+        return None, err
+    return next((e for e in entries if e.get("path") == wt_path_str), None), None
 
 
 def _recheck_before_removal(
@@ -1602,9 +1650,10 @@ def _recheck_before_removal(
     audit. Returns ``(hold, dropped_scratch, kanban_error)``; ``hold`` is ``(bucket, reason)``.
     Kanban ownership fails closed.
     """
-    current, err = _live_worktree_entry(main_path, wt["path"])
+    registered, err = _live_worktree_listing(main_path)
     if err:
         return ("review", f"worktree changed since audit: {err}"), [], None
+    current = next((e for e in registered if e.get("path") == wt["path"]), None)
     if current is None:
         return ("review", "worktree changed since audit: no longer registered"), [], None
     if current.get("branch") != wt["branch"] or current.get("head_sha") != wt["head_sha"]:
@@ -1621,7 +1670,8 @@ def _recheck_before_removal(
         )
     fresh = _inspect_worktree(
         current, main_path=main_path, full_repo=repo_out.get("repo"), slug=repo_out.get("slug"),
-        resolved_base=repo_out.get("base_ref"), prs=prs, cards=cards, now_ts=time.time(), measure=False,
+        resolved_base=repo_out.get("base_ref"), prs=prs, cards=cards, now_ts=time.time(),
+        registered=registered, measure=False,
     )
     if fresh["bucket"] != "safe":
         return (fresh["bucket"], f"changed since audit: {fresh['hold_reason']}"), [], None
@@ -1759,6 +1809,15 @@ def _fallback_refusal(
     if admin.exists():
         # Admin dir (and any lock file in it) still present: git did not release this worktree.
         return None, f"refusing rmtree: worktree admin dir still exists ({admin})", None
+    registered, list_err = _live_worktree_listing(main_path)
+    if list_err:
+        return None, f"refusing rmtree: {list_err}", None
+    for other in registered:
+        if other.get("path") and _is_within(other["path"], wt_path, strict=True):
+            return (("review", f"contains nested worktree {other['path']}; removal would delete it"), "", None)
+    for root, dirs, files in os.walk(wt_path):
+        if Path(root) != wt_path and (".git" in dirs or ".git" in files):
+            return (("review", f"contains nested repository {root}; removal would delete it"), "", None)
     cards, kanban_err = _query_active_cards(db_path, required=db_required)
     if kanban_err:
         return (
