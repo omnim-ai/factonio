@@ -14,7 +14,7 @@ orchestrator.py              Workstream lifecycle, Kanban DAG creation, holdout/
 profile_setup.py             Dedicated headless `factonio` profile initializer and `doctor` diagnostics
 repos.py                     GitHub repo registration, validation, exact-HEAD PR gate, and squash-merge helpers
 metrics.py                   Read-only SQLite queries over `kanban.db` (phase timings, pass rates, rework, escapes, enriched cards)
-watchdog.py                  In-process `on_kanban_dispatch_tick` stall/triage detector with throttling and deduplication
+watchdog.py                  In-process `on_kanban_dispatch_tick` PID/side-effect liveness, phase-aware stall detection, bounded triage
 dashboard/
   manifest.json              Hermes Dashboard API discovery manifest
   plugin_api.py              FastAPI router mounted at `/api/plugins/factonio/*`
@@ -34,6 +34,8 @@ tests/
   test_orchestrator_and_repos.py
   test_cli_and_tools.py
   test_watchdog_metrics_api.py
+  test_watchdog_liveness.py   PID/side-effect liveness, phase thresholds, bounded triage
+  test_worktree_audit.py     Real-git worktree safety buckets, --prune-safe, `worktrees` CLI
   test_desktop_plugin.py     Node ESM smoke tests + Desktop SDK surface lint (59 tests)
 tools/
   check_repo_integrity.py    Manifest, skill frontmatter (runtime + contributor), and Markdown link verifier

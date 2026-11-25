@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
+import os
 import re
+import shutil
+import sqlite3
 import subprocess
+import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Optional
 
@@ -1028,4 +1034,514 @@ def merge_pr(
         "state": live.get("state"),
         "local_synced": False,
         "local_sync_note": "skipped: PR queued or not yet merged",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Worktree audit & safety-gated cleanup
+# ---------------------------------------------------------------------------
+
+WORKTREE_BUCKETS: tuple[str, ...] = ("hold-wip", "hold-active-card", "hold-open-pr", "safe", "review")
+_INACTIVE_CARD_STATUSES = ("done", "archived", "cancelled")
+# Untracked paths that are regenerable build/tool output; anything else untracked counts as WIP.
+_SCRATCH_PATTERNS: tuple[str, ...] = (
+    "__pycache__/", "*.pyc", ".pytest_cache/", ".ruff_cache/", ".mypy_cache/", ".tox/", ".venv/",
+    "venv/", "node_modules/", "dist/", "build/", ".coverage", "coverage/", "*.log", ".DS_Store",
+    "*.orig", "*.rej", "*.swp", "tmp/", ".tmp/", ".cache/",
+)
+
+
+def _human_size(num_bytes: int) -> str:
+    size = float(max(0, int(num_bytes)))
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"
+
+
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(Path(entry.path))
+                    else:
+                        total += st.st_size
+        except OSError:
+            continue
+    return total
+
+
+def _parse_worktree_porcelain(text: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    current: dict[str, Any] = {}
+    for line in text.splitlines():
+        if not line.strip():
+            if current:
+                entries.append(current)
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            if current:
+                entries.append(current)
+            current = {"path": value}
+        elif key == "HEAD":
+            current["head_sha"] = value
+        elif key == "branch":
+            current["branch"] = value[len("refs/heads/"):] if value.startswith("refs/heads/") else value
+        elif key in ("detached", "bare"):
+            current[key] = True
+        elif key in ("locked", "prunable"):
+            current[key] = value or True
+    if current:
+        entries.append(current)
+    return entries
+
+
+def _is_scratch_path(rel: str) -> bool:
+    rel = rel.strip().strip('"')
+    name = rel.rstrip("/").rsplit("/", 1)[-1]
+    for pat in _SCRATCH_PATTERNS:
+        if pat.endswith("/"):
+            dir_name = pat.rstrip("/")
+            if rel.rstrip("/") == dir_name or rel.startswith(pat) or f"/{pat}" in f"/{rel}/":
+                return True
+        elif fnmatch.fnmatch(name, pat):
+            return True
+    return False
+
+
+def _classify_dirty(wt_path: Path) -> str:
+    proc = _run_git(["status", "--porcelain", "--untracked-files=normal"], cwd=wt_path)
+    if proc.returncode != 0:
+        # Unknown state must never look prunable.
+        return "wip:?"
+    wip = scratch = 0
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        code, rel = line[:2], line[3:]
+        if code == "??" and _is_scratch_path(rel):
+            scratch += 1
+        else:
+            wip += 1
+    if wip:
+        return f"wip:{wip}"
+    if scratch:
+        return f"scratch:{scratch}"
+    return "clean"
+
+
+def _classify_remote(wt_path: Path, branch: Optional[str]) -> str:
+    if not branch:
+        return "detached"
+    upstream = _run_git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], cwd=wt_path)
+    remote_ref = upstream.stdout.strip() if upstream.returncode == 0 else ""
+    if not remote_ref:
+        candidate = f"refs/remotes/origin/{branch}"
+        if _run_git(["rev-parse", "--verify", "--quiet", candidate], cwd=wt_path).returncode == 0:
+            remote_ref = candidate
+    if not remote_ref:
+        return "no-remote"
+    ahead = _run_git(["rev-list", "--count", f"{remote_ref}..HEAD"], cwd=wt_path)
+    if ahead.returncode != 0 or not ahead.stdout.strip().isdigit():
+        return "no-remote"
+    count = int(ahead.stdout.strip())
+    return "pushed" if count == 0 else f"ahead:{count}"
+
+
+def _worktree_age_days(wt_path: Path, now_ts: float) -> Optional[float]:
+    stamps: list[float] = []
+    ct = _run_git(["log", "-1", "--format=%ct"], cwd=wt_path)
+    if ct.returncode == 0 and ct.stdout.strip().isdigit():
+        stamps.append(float(ct.stdout.strip()))
+    git_dir = _run_git(["rev-parse", "--absolute-git-dir"], cwd=wt_path)
+    if git_dir.returncode == 0 and git_dir.stdout.strip():
+        try:
+            stamps.append((Path(git_dir.stdout.strip()) / "index").stat().st_mtime)
+        except OSError:
+            pass
+    if not stamps:
+        try:
+            stamps.append(wt_path.stat().st_mtime)
+        except OSError:
+            return None
+    return round(max(0.0, now_ts - max(stamps)) / 86400.0, 1)
+
+
+def _default_kanban_db_path() -> Optional[Path]:
+    try:
+        from hermes_cli.kanban_db import kanban_db_path
+
+        return Path(kanban_db_path())
+    except Exception:
+        pass
+    try:
+        from .config import get_root_hermes_home_path
+
+        return get_root_hermes_home_path() / "kanban.db"
+    except Exception:
+        return None
+
+
+def _active_cards(kanban_db_path: Optional[Path]) -> list[dict[str, Any]]:
+    """Read-only list of non-terminal Kanban cards with their workspace path / branch."""
+    if kanban_db_path is None or not Path(kanban_db_path).is_file():
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{Path(kanban_db_path)}?mode=ro", uri=True, timeout=3.0)
+    except sqlite3.Error:
+        return []
+    conn.row_factory = sqlite3.Row
+    try:
+        with closing(conn):
+            cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+            if not {"id", "status"} <= cols:
+                return []
+            select = ", ".join(c if c in cols else f"NULL AS {c}" for c in ("id", "status", "workspace_path", "branch_name"))
+            placeholders = ", ".join("?" for _ in _INACTIVE_CARD_STATUSES)
+            rows = conn.execute(
+                f"SELECT {select} FROM tasks WHERE status NOT IN ({placeholders})",
+                _INACTIVE_CARD_STATUSES,
+            ).fetchall()
+            return [dict(r) for r in rows]
+    except sqlite3.Error:
+        return []
+
+
+def _match_active_card(cards: list[dict[str, Any]], wt_path: Path, branch: Optional[str]) -> Optional[dict[str, Any]]:
+    resolved = str(wt_path.resolve()) if wt_path.exists() else str(wt_path)
+    for card in cards:
+        ws = card.get("workspace_path")
+        if ws:
+            try:
+                ws_resolved = str(Path(str(ws)).expanduser().resolve())
+            except OSError:
+                ws_resolved = str(ws)
+            if ws_resolved == resolved:
+                return card
+    if branch:
+        for card in cards:
+            if card.get("branch_name") and str(card["branch_name"]) == branch:
+                return card
+    return None
+
+
+_PR_STATE_RANK = {"OPEN": 0, "MERGED": 1, "CLOSED": 2}
+
+
+def _list_prs_by_branch(full_repo: Optional[str]) -> tuple[dict[str, dict[str, Any]], Optional[str]]:
+    if not full_repo:
+        return {}, "no GitHub repository known"
+    try:
+        proc = _run_gh(
+            ["pr", "list", "--repo", full_repo, "--state", "all",
+             "--json", "number,state,isDraft,headRefName,url", "--limit", "200"],
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {}, f"gh pr list failed: {exc}"
+    if proc.returncode != 0:
+        return {}, f"gh pr list failed: {(proc.stderr or proc.stdout or '').strip()[:200]}"
+    try:
+        items = json.loads(proc.stdout or "[]")
+    except ValueError:
+        return {}, "gh pr list returned invalid JSON"
+    by_branch: dict[str, dict[str, Any]] = {}
+    for pr in items if isinstance(items, list) else []:
+        if not isinstance(pr, dict) or not pr.get("headRefName"):
+            continue
+        head = str(pr["headRefName"])
+        state = str(pr.get("state") or "").upper()
+        best = by_branch.get(head)
+        key = (_PR_STATE_RANK.get(state, 3), -int(pr.get("number") or 0))
+        if best is None or key < (_PR_STATE_RANK.get(str(best.get("state") or "").upper(), 3), -int(best.get("number") or 0)):
+            by_branch[head] = pr
+    return by_branch, None
+
+
+def _resolve_base_ref(main_path: Path, default_branch: str, base_ref: Optional[str]) -> Optional[str]:
+    if base_ref:
+        ref = _validate_git_ref(base_ref, "base_ref")
+        if _run_git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], cwd=main_path).returncode == 0:
+            return ref
+        raise ValueError(f"base_ref {ref!r} does not resolve to a commit in {main_path}")
+    for candidate in (f"origin/{default_branch}", default_branch):
+        if _run_git(["rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"], cwd=main_path).returncode == 0:
+            return candidate
+    return None
+
+
+def _origin_full_repo(main_path: Path) -> Optional[str]:
+    proc = _run_git(["remote", "get-url", "origin"], cwd=main_path)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        return normalize_repo(proc.stdout.strip())[0]
+    except ValueError:
+        return None
+
+
+def _bucket_for(entry: dict[str, Any]) -> tuple[str, str]:
+    dirty = str(entry.get("dirty") or "")
+    if dirty.startswith("wip:"):
+        return "hold-wip", f"uncommitted work ({dirty})"
+    if entry.get("active_card"):
+        return "hold-active-card", f"active card {entry['active_card']} ({entry.get('active_card_status') or 'active'})"
+    pr_state = str(entry.get("pr_state") or "").upper()
+    if pr_state in ("OPEN", "DRAFT"):
+        return "hold-open-pr", f"open PR {entry['pr'].split('/')[0]}"
+    if entry.get("locked"):
+        return "review", "worktree is locked"
+    if dirty == "clean" or dirty.startswith("scratch:"):
+        if entry.get("merged") is True:
+            return "safe", ""
+        if pr_state in ("MERGED", "CLOSED"):
+            return "safe", ""
+    if entry.get("merged") is None:
+        return "review", "merge state unknown (base ref unresolved)"
+    return "review", "not merged into base and no merged/closed PR"
+
+
+def _resolve_audit_targets(repo_spec: Optional[str]) -> list[dict[str, Any]]:
+    if repo_spec:
+        entry = get_repo(repo_spec)
+        if entry is not None:
+            return [entry]
+        path = Path(repo_spec).expanduser()
+        if path.is_dir():
+            return [{"slug": path.name, "repo": None, "path": str(path.resolve()), "default_branch": None}]
+        raise RepoNotFoundError(f"Repository {repo_spec!r} is not registered and is not a local directory")
+    repos = list_repos()
+    return [dict(info, slug=info.get("slug") or slug) for slug, info in sorted(repos.items()) if isinstance(info, dict)]
+
+
+def _audit_one_repo(
+    target: dict[str, Any],
+    *,
+    base_ref: Optional[str],
+    cards: list[dict[str, Any]],
+    check_pr: bool,
+    now_ts: float,
+) -> dict[str, Any]:
+    main_path = Path(str(target.get("path") or "")).expanduser()
+    result: dict[str, Any] = {
+        "slug": target.get("slug"),
+        "repo": target.get("repo"),
+        "path": str(main_path),
+        "base_ref": None,
+        "worktrees": [],
+        "pr_error": None,
+        "error": None,
+    }
+    if not main_path.is_dir():
+        result["error"] = f"local checkout not found: {main_path}"
+        return result
+    listing = _run_git(["worktree", "list", "--porcelain"], cwd=main_path)
+    if listing.returncode != 0:
+        result["error"] = _git_err(listing, "worktree list")
+        return result
+
+    entries = _parse_worktree_porcelain(listing.stdout)
+    main_entry = entries[0] if entries else None
+    full_repo = target.get("repo") or _origin_full_repo(main_path)
+    result["repo"] = full_repo
+    default_branch = str(target.get("default_branch") or (main_entry or {}).get("branch") or "main")
+    resolved_base = _resolve_base_ref(main_path, default_branch, base_ref)
+    result["base_ref"] = resolved_base
+
+    prs: dict[str, dict[str, Any]] = {}
+    if check_pr:
+        prs, result["pr_error"] = _list_prs_by_branch(full_repo)
+
+    main_resolved = Path(main_entry["path"]).resolve() if main_entry else main_path.resolve()
+    for raw in entries[1:]:
+        if raw.get("bare"):
+            continue
+        wt_path = Path(raw["path"])
+        if wt_path.exists() and wt_path.resolve() == main_resolved:
+            continue
+        branch = raw.get("branch")
+        exists = wt_path.is_dir()
+        head_sha = raw.get("head_sha")
+        entry: dict[str, Any] = {
+            "path": str(wt_path),
+            "repo": full_repo,
+            "slug": target.get("slug"),
+            "branch": branch,
+            "head_sha": head_sha,
+            "exists": exists,
+            "locked": bool(raw.get("locked")),
+        }
+        size = _dir_size_bytes(wt_path) if exists else 0
+        entry["size_bytes"] = size
+        entry["size_human"] = _human_size(size)
+        entry["age_days"] = _worktree_age_days(wt_path, now_ts) if exists else None
+
+        merged: Optional[bool] = None
+        if resolved_base and head_sha:
+            probe = _run_git(["merge-base", "--is-ancestor", head_sha, resolved_base], cwd=main_path)
+            merged = True if probe.returncode == 0 else (False if probe.returncode == 1 else None)
+        entry["merged"] = merged
+        entry["dirty"] = _classify_dirty(wt_path) if exists else "clean"
+        entry["remote"] = _classify_remote(wt_path, branch) if exists else ("detached" if not branch else "no-remote")
+
+        pr = prs.get(branch) if branch else None
+        if pr:
+            state = str(pr.get("state") or "").upper()
+            if state == "OPEN" and pr.get("isDraft"):
+                state = "DRAFT"
+            entry["pr"] = f"#{pr.get('number')}/{state.lower()}"
+            entry["pr_state"] = state
+            entry["pr_url"] = pr.get("url")
+        else:
+            entry["pr"] = "-"
+            entry["pr_state"] = None
+            entry["pr_url"] = None
+
+        card = _match_active_card(cards, wt_path, branch)
+        entry["active_card"] = card.get("id") if card else None
+        entry["active_card_status"] = card.get("status") if card else None
+
+        entry["bucket"], entry["hold_reason"] = _bucket_for(entry)
+        result["worktrees"].append(entry)
+    return result
+
+
+def audit_worktrees(
+    repo_spec: Optional[str] = None,
+    *,
+    base_ref: Optional[str] = None,
+    kanban_db_path: Optional[str | Path] = None,
+    check_pr: bool = True,
+) -> dict[str, Any]:
+    """Read-only audit of every linked git worktree (never the main checkout).
+
+    Each worktree is classified into a priority-ordered bucket:
+    ``hold-wip`` > ``hold-active-card`` > ``hold-open-pr`` > ``safe`` > ``review``.
+    """
+    targets = _resolve_audit_targets(repo_spec)
+    db_path = Path(kanban_db_path) if kanban_db_path else _default_kanban_db_path()
+    cards = _active_cards(db_path)
+    now_ts = time.time()
+
+    repos_out = [
+        _audit_one_repo(t, base_ref=base_ref, cards=cards, check_pr=check_pr, now_ts=now_ts) for t in targets
+    ]
+    worktrees = [wt for r in repos_out for wt in r["worktrees"]]
+    by_bucket = {b: 0 for b in WORKTREE_BUCKETS}
+    for wt in worktrees:
+        by_bucket[wt["bucket"]] += 1
+    total = sum(int(wt["size_bytes"]) for wt in worktrees)
+    safe_bytes = sum(int(wt["size_bytes"]) for wt in worktrees if wt["bucket"] == "safe")
+    return {
+        "ok": all(not r.get("error") for r in repos_out),
+        "repos": repos_out,
+        "worktrees": worktrees,
+        "summary": {
+            "count": len(worktrees),
+            "by_bucket": by_bucket,
+            "total_bytes": total,
+            "total_human": _human_size(total),
+            "safe_bytes": safe_bytes,
+            "safe_human": _human_size(safe_bytes),
+        },
+    }
+
+
+def _is_linked_worktree_of(wt_path: Path, main_path: Path) -> bool:
+    """True only if ``wt_path`` is a linked worktree whose admin dir lives under ``main_path``'s git dir."""
+    marker = wt_path / ".git"
+    if not marker.is_file():
+        return False
+    try:
+        text = marker.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return False
+    if not text.startswith("gitdir:"):
+        return False
+    admin = Path(text[len("gitdir:"):].strip())
+    if not admin.is_absolute():
+        admin = (wt_path / admin)
+    common = _run_git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=main_path)
+    if common.returncode != 0 or not common.stdout.strip():
+        return False
+    worktrees_root = Path(common.stdout.strip()).resolve() / "worktrees"
+    try:
+        admin.resolve().relative_to(worktrees_root)
+    except ValueError:
+        return False
+    return True
+
+
+def prune_safe_worktrees(
+    repo_spec: Optional[str] = None,
+    *,
+    base_ref: Optional[str] = None,
+    kanban_db_path: Optional[str | Path] = None,
+    check_pr: bool = True,
+) -> dict[str, Any]:
+    """Remove ONLY ``bucket == "safe"`` worktrees; every held/review worktree is left untouched."""
+    audit = audit_worktrees(repo_spec, base_ref=base_ref, kanban_db_path=kanban_db_path, check_pr=check_pr)
+    removed: list[dict[str, Any]] = []
+    held: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    for repo_out in audit["repos"]:
+        main_path = Path(repo_out["path"])
+        touched = False
+        for wt in repo_out["worktrees"]:
+            if wt["bucket"] != "safe":
+                held.append({
+                    "path": wt["path"], "branch": wt["branch"], "bucket": wt["bucket"],
+                    "hold_reason": wt["hold_reason"], "size_bytes": wt["size_bytes"],
+                })
+                continue
+            wt_path = Path(wt["path"])
+            # Re-check right before deleting: work may have appeared since the audit.
+            if wt_path.is_dir():
+                fresh = _classify_dirty(wt_path)
+                if fresh.startswith("wip:"):
+                    held.append({
+                        "path": wt["path"], "branch": wt["branch"], "bucket": "hold-wip",
+                        "hold_reason": f"uncommitted work appeared before removal ({fresh})",
+                        "size_bytes": wt["size_bytes"],
+                    })
+                    continue
+            touched = True
+            proc = _run_git(["worktree", "remove", "--force", str(wt_path)], cwd=main_path, timeout=120)
+            note = "git worktree remove"
+            if wt_path.exists():
+                if wt_path.resolve() != main_path.resolve() and _is_linked_worktree_of(wt_path, main_path):
+                    shutil.rmtree(wt_path, ignore_errors=True)
+                    note = "fallback rmtree"
+                if wt_path.exists():
+                    errors.append({"path": wt["path"], "error": _git_err(proc, "worktree remove")})
+                    continue
+            removed.append({
+                "path": wt["path"], "branch": wt["branch"], "size_bytes": wt["size_bytes"],
+                "size_human": wt["size_human"], "method": note,
+            })
+        if touched:
+            _run_git(["worktree", "prune"], cwd=main_path)
+
+    reclaimed = sum(int(r["size_bytes"]) for r in removed)
+    return {
+        "ok": audit["ok"] and not errors,
+        "removed": removed,
+        "held": held,
+        "errors": errors,
+        "reclaimed_bytes": reclaimed,
+        "reclaimed_human": _human_size(reclaimed),
+        "audit": audit["summary"],
     }

@@ -15,7 +15,15 @@ from .config import (
 )
 from .orchestrator import workstream_status
 from .profile_setup import init_factonio_profile, run_doctor
-from .repos import RepoNotFoundError, add_repo, inspect_pr_gate, remove_repo, update_repo
+from .repos import (
+    RepoNotFoundError,
+    add_repo,
+    audit_worktrees,
+    inspect_pr_gate,
+    prune_safe_worktrees,
+    remove_repo,
+    update_repo,
+)
 
 
 def _print_result(data: dict[str, Any], as_json: bool) -> None:
@@ -23,6 +31,42 @@ def _print_result(data: dict[str, Any], as_json: bool) -> None:
         print(json.dumps(data, indent=2, default=str))
         return
     print(json.dumps(data, indent=2, default=str))
+
+
+def _print_audit(res: dict[str, Any]) -> None:
+    for repo in res["repos"]:
+        base = repo.get("base_ref") or "?"
+        print(f"{repo.get('repo') or repo.get('slug')} ({repo['path']}) base={base}")
+        if repo.get("error"):
+            print(f"  Error: {repo['error']}")
+            continue
+        if repo.get("pr_error"):
+            print(f"  Note: PR lookup skipped ({repo['pr_error']})")
+        if not repo["worktrees"]:
+            print("  (no linked worktrees)")
+        for wt in repo["worktrees"]:
+            age = "?" if wt.get("age_days") is None else f"{wt['age_days']}d"
+            card = wt.get("active_card") or "-"
+            print(
+                f"  {wt['bucket']:<16} {wt['size_human']:>10} {age:>7}  {wt.get('branch') or '(detached)'}"
+                f"  merged={wt['merged']} dirty={wt['dirty']} remote={wt['remote']} pr={wt['pr']} card={card}"
+            )
+            print(f"    {wt['path']}" + (f"  [{wt['hold_reason']}]" if wt.get("hold_reason") else ""))
+    s = res["summary"]
+    counts = " ".join(f"{k}={v}" for k, v in s["by_bucket"].items())
+    print(f"\n{s['count']} worktrees, {s['total_human']} total; {counts}")
+    if s["by_bucket"].get("safe"):
+        print(f"Reclaimable with --prune-safe: {s['safe_human']}")
+
+
+def _print_prune(res: dict[str, Any]) -> None:
+    for item in res["removed"]:
+        print(f"Removed {item['path']} ({item['size_human']}, {item['method']})")
+    for item in res["held"]:
+        print(f"Held    {item['path']} [{item['bucket']}: {item['hold_reason']}]")
+    for item in res["errors"]:
+        print(f"Error   {item['path']}: {item['error']}")
+    print(f"\nReclaimed {res['reclaimed_human']} from {len(res['removed'])} worktree(s); held {len(res['held'])}.")
 
 
 def register_cli(ctx: Any, plugin_dir: Path) -> None:
@@ -87,6 +131,24 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         p_pr.add_argument("repo", help="Repo slug or 'owner/repo'.")
         p_pr.add_argument("pr_number", type=int, help="Pull request number.")
 
+        p_wt = sub.add_parser(
+            "worktrees",
+            help="Audit git worktrees into safety buckets (read-only unless --prune-safe).",
+        )
+        p_wt.add_argument("repo", nargs="?", default=None, help="Repo slug, 'owner/repo', or local path (default: all registered).")
+        p_wt.add_argument("--base", default=None, help="Base ref for merged detection (default: origin/<default_branch>).")
+        p_wt.add_argument(
+            "--prune-safe",
+            action="store_true",
+            help="Remove ONLY worktrees in the 'safe' bucket; held/review worktrees are never touched.",
+        )
+        p_wt.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Output machine-readable JSON.",
+        )
+
         sub.add_parser("doctor", help="Verify git, gh auth, worker profile, Kanban config, and phase models.")
 
     def handle_cli(args: Any) -> None:
@@ -94,7 +156,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         as_json = bool(getattr(args, "json", False))
 
         if not cmd:
-            print("Usage: hermes factonio {init|add|update|remove|list|models|status|pr-gate|doctor} [--json]")
+            print("Usage: hermes factonio {init|add|update|remove|list|models|status|pr-gate|worktrees|doctor} [--json]")
             return
 
         if cmd == "init":
@@ -254,6 +316,28 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                 sys.exit(1)
             return
 
+        if cmd == "worktrees":
+            try:
+                if getattr(args, "prune_safe", False):
+                    res = prune_safe_worktrees(args.repo, base_ref=args.base)
+                else:
+                    res = audit_worktrees(args.repo, base_ref=args.base)
+            except (RepoNotFoundError, ValueError) as exc:
+                if as_json:
+                    print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+                else:
+                    print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            if as_json:
+                print(json.dumps(res, indent=2, default=str))
+            elif getattr(args, "prune_safe", False):
+                _print_prune(res)
+            else:
+                _print_audit(res)
+            if not res.get("ok"):
+                sys.exit(1)
+            return
+
         if cmd == "doctor":
             res = run_doctor(plugin_dir)
             if as_json:
@@ -271,7 +355,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
 
     ctx.register_cli_command(
         "factonio",
-        help="Manage the Factonio pure-Hermes software factory (init, add, update, models, status, doctor).",
+        help="Manage the Factonio pure-Hermes software factory (init, add, update, models, status, worktrees, doctor).",
         setup_fn=setup_parser,
         handler_fn=handle_cli,
     )
