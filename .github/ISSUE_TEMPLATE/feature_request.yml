@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose a workflow improvement, new skill capability, CLI option, or Desktop UI enhancement.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What workflow friction or missing capability are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: How should Factonio behave (CLI, agent tools, skills, or Desktop UI)?
+    validations:
+      required: true
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Impact on Factonio invariants
+      description: Does this affect the `holdout/` information barrier, exact-HEAD merge gate, cross-model verification, or `@hermes/plugin-sdk` constraints?

@@ -1,0 +1,55 @@
+name: Hermes Upstream
+
+# Daily compatibility check against NousResearch/hermes-agent main (and manual check against any ref).
+# Catches upstream Hermes Agent API or Desktop SDK changes before they break Factonio.
+
+on:
+  schedule:
+    - cron: "37 5 * * *"
+  workflow_dispatch:
+    inputs:
+      hermes_ref:
+        description: Hermes Agent branch, tag, or commit SHA to test against
+        required: false
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-upstream-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  upstream:
+    name: Test suite on Hermes (${{ inputs.hermes_ref || 'main' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          path: factonio
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ inputs.hermes_ref || 'main' }}
+          path: hermes-agent
+      - name: Show Hermes Agent commit under test
+        working-directory: hermes-agent
+        run: git log -1 --format='Hermes Agent %H (%cs) %s'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: hermes-agent/uv.lock
+      - name: Sync Hermes Agent runtime
+        working-directory: hermes-agent
+        run: uv sync --locked --python 3.14 --group dev
+      - name: Run Factonio test suite
+        working-directory: factonio
+        env:
+          PYTHONPATH: ${{ github.workspace }}/hermes-agent
+        run: |
+          "${{ github.workspace }}/hermes-agent/.venv/bin/python" -m unittest discover -s tests -v

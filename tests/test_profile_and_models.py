@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import sys
 import unittest
-from pathlib import Path
 
 from tests._env import PLUGIN_ROOT, isolated_hermes_home
 

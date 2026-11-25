@@ -22,9 +22,11 @@ import re
 import shutil
 import subprocess
 import unittest
-from pathlib import Path
 
-import yaml
+try:
+    import hermes_yaml as yaml
+except ImportError:
+    import yaml
 
 from tests._env import PLUGIN_ROOT
 

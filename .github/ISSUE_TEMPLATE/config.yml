@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/omnim-ai/factonio/security/advisories/new
+    about: Report vulnerabilities privately through GitHub Security Advisories, not in a public issue.
+  - name: Issue in Hermes Agent itself
+    url: https://github.com/NousResearch/hermes-agent/issues
+    about: Hermes Agent (core runtime, Kanban engine, Desktop host, and plugin SDK) is a separate project by Nous Research.
