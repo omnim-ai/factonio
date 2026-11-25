@@ -8,10 +8,12 @@ import sqlite3
 import statistics
 import time
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from .config import WORKER_PROFILE
+from .trail import summarize_trail
 
 RANGE_SECONDS: dict[str, Optional[int]] = {
     "7d": 7 * 86400,
@@ -219,6 +221,27 @@ def _percentile(values: list[float], pct: float) -> Optional[float]:
     return round(s[idx], 1)
 
 
+def _trail_metrics(*, tenant: Optional[str], cutoff: Optional[float]) -> dict[str, Any]:
+    """Additive `trail` block summarizing `trail.db` decisions for the same tenant/range window."""
+    since = (
+        datetime.fromtimestamp(cutoff, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        if cutoff is not None
+        else None
+    )
+    try:
+        summary = summarize_trail(tenant=tenant, since=since)
+    except (sqlite3.Error, OSError):
+        # An unreadable trail.db must not take down the Kanban KPIs it is appended to.
+        summary = {}
+    return {
+        "decision_count": int(summary.get("total") or 0),
+        "active_count": int(summary.get("active") or 0),
+        "superseded_count": int(summary.get("superseded") or 0),
+        "by_tenant": dict(summary.get("by_tenant") or {}),
+        "by_phase": dict(summary.get("by_phase") or {}),
+    }
+
+
 def compute_metrics(
     db_path: Path,
     *,
@@ -227,7 +250,22 @@ def compute_metrics(
     assignee: str = WORKER_PROFILE,
     now: Optional[float] = None,
 ) -> dict[str, Any]:
-    """Compute phase durations, verification pass rates, rework, and escape rate."""
+    """Compute phase durations, verification pass rates, rework, escape rate, and trail counts."""
+    result = _compute_kanban_metrics(db_path, range_key=range_key, tenant=tenant, assignee=assignee, now=now)
+    window = RANGE_SECONDS[range_key]
+    now_ts = float(now if now is not None else time.time())
+    result["trail"] = _trail_metrics(tenant=tenant, cutoff=(now_ts - window) if window is not None else None)
+    return result
+
+
+def _compute_kanban_metrics(
+    db_path: Path,
+    *,
+    range_key: str,
+    tenant: Optional[str],
+    assignee: str,
+    now: Optional[float],
+) -> dict[str, Any]:
     if range_key not in RANGE_SECONDS:
         raise ValueError(f"Unsupported range {range_key!r} (expected one of {', '.join(RANGE_SECONDS)})")
 

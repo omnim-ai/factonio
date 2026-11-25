@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+import os
+from typing import Any, Optional
 
 from .config import (
     PLUGIN_ID,
@@ -20,6 +21,7 @@ from .orchestrator import (
     workstream_status,
 )
 from .repos import EDITABLE_REPO_FIELDS, add_repo, inspect_pr_gate, merge_pr, update_repo
+from .trail import log_decision, record_transition
 
 
 def _json_ok(payload: dict[str, Any]) -> str:
@@ -28,6 +30,73 @@ def _json_ok(payload: dict[str, Any]) -> str:
 
 def _json_err(exc: Exception) -> str:
     return json.dumps({"ok": False, "error": str(exc)})
+
+
+def _trail_context(args: dict[str, Any]) -> dict[str, Any]:
+    """Tenant/card/actor for tool-originated trail rows, defaulting to the Kanban worker env."""
+    worker_card = os.environ.get("HERMES_KANBAN_TASK") or ""
+    return {
+        "tenant": args.get("tenant") or os.environ.get("HERMES_TENANT") or "",
+        "card_id": args.get("card_id") or worker_card,
+        "actor": args.get("actor") or ("worker" if worker_card else "orchestrator"),
+    }
+
+
+def _gate_result(gate: dict[str, Any]) -> str:
+    if not gate.get("ok"):
+        return "error"
+    return "ready" if gate.get("ready_to_merge") else "blocked"
+
+
+def _record_pr_gate(args: dict[str, Any], gate: dict[str, Any]) -> None:
+    checks = gate.get("checks") if isinstance(gate.get("checks"), dict) else {}
+    blockers = list(gate.get("blockers") or [])
+    result = _gate_result(gate)
+    why = (
+        "All merge gate tiers clear"
+        if result == "ready"
+        else ("; ".join(blockers) if blockers else str(gate.get("error") or "gate inspection failed"))
+    )
+    record_transition(
+        "pr_gate",
+        repo_slug=str(args.get("repo") or ""),
+        phase="gate",
+        why=why[:500],
+        evidence={
+            "pr_number": int(args["pr_number"]),
+            "head_sha": gate.get("head_sha"),
+            "blocker_tier": gate.get("blocker_tier"),
+            "checks_passed": len(checks.get("passed") or []),
+            "checks_failed": len(checks.get("failed") or []),
+            "checks_pending": len(checks.get("pending") or []),
+        },
+        result=result,
+        **_trail_context(args),
+    )
+
+
+def _record_merge(args: dict[str, Any], res: dict[str, Any], expected_head_sha: Optional[str]) -> None:
+    if res.get("merged"):
+        result = "merged"
+    elif res.get("queued"):
+        result = "queued"
+    else:
+        result = "refused"
+    record_transition(
+        "merge_pr",
+        repo_slug=str(args.get("repo") or ""),
+        phase="merge",
+        why=(str(res.get("error") or f"PR #{int(args['pr_number'])} {result}"))[:500],
+        evidence={
+            "pr_number": int(args["pr_number"]),
+            "head_sha": res.get("head_sha") or (res.get("gate") or {}).get("head_sha"),
+            "expected_head_sha": expected_head_sha,
+            "method": res.get("method") or args.get("method") or "squash",
+            "url": res.get("url"),
+        },
+        result=result,
+        **_trail_context(args),
+    )
 
 
 def register_tools(ctx: Any) -> None:
@@ -324,9 +393,11 @@ def register_tools(ctx: Any) -> None:
 
     def handle_pr_gate(args: dict[str, Any], **kwargs: Any) -> str:
         try:
-            return _json_ok(inspect_pr_gate(str(args["repo"]), int(args["pr_number"])))
+            gate = inspect_pr_gate(str(args["repo"]), int(args["pr_number"]))
         except Exception as exc:
             return _json_err(exc)
+        _record_pr_gate(args, gate)
+        return _json_ok(gate)
 
     ctx.register_tool(
         name="factonio_pr_gate",
@@ -342,6 +413,8 @@ def register_tools(ctx: Any) -> None:
                 "properties": {
                     "repo": {"type": "string", "description": "Registered repo slug or 'owner/repo'."},
                     "pr_number": {"type": "integer", "description": "GitHub pull request number."},
+                    "tenant": {"type": "string", "description": "Workstream tenant for the decision trail (defaults to the worker's tenant)."},
+                    "card_id": {"type": "string", "description": "Kanban card id for the decision trail (defaults to the worker's card)."},
                 },
                 "required": ["repo", "pr_number"],
             },
@@ -351,16 +424,16 @@ def register_tools(ctx: Any) -> None:
 
     def handle_merge_pr(args: dict[str, Any], **kwargs: Any) -> str:
         try:
-            return _json_ok(
-                merge_pr(
-                    str(args["repo"]),
-                    int(args["pr_number"]),
-                    expected_head_sha=args.get("expected_head_sha"),
-                    method=str(args.get("method") or "squash"),
-                )
+            res = merge_pr(
+                str(args["repo"]),
+                int(args["pr_number"]),
+                expected_head_sha=args.get("expected_head_sha"),
+                method=str(args.get("method") or "squash"),
             )
         except Exception as exc:
             return _json_err(exc)
+        _record_merge(args, res, args.get("expected_head_sha"))
+        return _json_ok(res)
 
     ctx.register_tool(
         name="factonio_merge_pr",
@@ -377,9 +450,66 @@ def register_tools(ctx: Any) -> None:
                     "pr_number": {"type": "integer", "description": "GitHub pull request number."},
                     "expected_head_sha": {"type": "string", "description": "Exact HEAD commit SHA verified by Diff and Black-Box checks."},
                     "method": {"type": "string", "enum": ["squash", "merge", "rebase"], "default": "squash"},
+                    "tenant": {"type": "string", "description": "Workstream tenant for the decision trail (defaults to the worker's tenant)."},
+                    "card_id": {"type": "string", "description": "Kanban card id for the decision trail (defaults to the worker's card)."},
                 },
                 "required": ["repo", "pr_number"],
             },
         },
         handler=handle_merge_pr,
+    )
+
+    def handle_log_decision(args: dict[str, Any], **kwargs: Any) -> str:
+        try:
+            evidence = args.get("evidence")
+            if isinstance(evidence, str) and evidence.strip():
+                evidence = json.loads(evidence)
+            row = log_decision(
+                str(args.get("decision") or ""),
+                repo_slug=args.get("repo"),
+                phase=args.get("phase"),
+                why=args.get("why"),
+                evidence=evidence,
+                result=args.get("result"),
+                supersedes_id=args.get("supersedes_id"),
+                **_trail_context(args),
+            )
+            return _json_ok({"ok": True, "decision": row})
+        except Exception as exc:
+            return _json_err(exc)
+
+    ctx.register_tool(
+        name="factonio_log_decision",
+        toolset=PLUGIN_ID,
+        schema={
+            "name": "factonio_log_decision",
+            "description": (
+                "Append a decision to Factonio's append-only trail.db (show-me-your-work): forks, pivots, "
+                "Attack the Premise probes, gate countersigns, and corrections. Rows are immutable; to correct one, "
+                "log a new row with `supersedes_id` set to the old row's id."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "decision": {"type": "string", "description": "Short decision label, e.g. 'pivot_to_wal' or 'countersign_merge'."},
+                    "why": {"type": "string", "description": "Plain-language reason a reviewer can audit."},
+                    "phase": {
+                        "type": "string",
+                        "description": "Phase: define, design, implement, verify, gate, merge, escape, retro, or watchdog.",
+                    },
+                    "result": {"type": "string", "description": "Outcome, e.g. 'adopted', 'rejected', 'pass', 'blocked'."},
+                    "evidence": {
+                        "type": "object",
+                        "description": "Structured evidence (pr_number, head_sha, patch_id, tests_passed, command, ...).",
+                    },
+                    "repo": {"type": "string", "description": "Registered repo slug or 'owner/repo'."},
+                    "tenant": {"type": "string", "description": "Workstream tenant (defaults to the worker's tenant)."},
+                    "card_id": {"type": "string", "description": "Kanban card id (defaults to the worker's card)."},
+                    "actor": {"type": "string", "description": "Who decided (defaults to 'worker' inside a card, else 'orchestrator')."},
+                    "supersedes_id": {"type": "string", "description": "Id (d_...) of an earlier decision this row corrects."},
+                },
+                "required": ["decision", "why"],
+            },
+        },
+        handler=handle_log_decision,
     )
