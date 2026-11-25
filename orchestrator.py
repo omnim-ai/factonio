@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -18,6 +19,7 @@ from .config import (
     resolve_phase_model,
     resolve_rigor,
     resolve_verify_panel,
+    single_line,
 )
 from .harness import HARNESS_DIR_NAME, HOOK_KINDS, REQUIRED_SECTIONS, VERIFY_MD_NAME, discover_harness
 from .metrics import aggregate_panel_verdicts as aggregate_panel_verdicts  # public re-export
@@ -712,9 +714,15 @@ _PANEL_LANE_NOTE = (
 )
 
 
+def _stamp_token(value: Any, default: str) -> str:
+    """Single-line, backtick-free rendering of a stamp field so it cannot break the panel stamp parser."""
+    return single_line(str(value or "").replace("`", "'")) or default
+
+
 def _panel_card_line(panel_id: str, entry: dict[str, Any]) -> str:
-    vendor = entry.get("vendor") or "unknown"
-    return f"- Verification panel: `{panel_id}` (rigor=`high`, vendor=`{vendor}`, model=`{entry['label']}`)\n"
+    vendor = _stamp_token(entry.get("vendor"), "unknown")
+    model = _stamp_token(entry.get("label") or entry.get("model"), "unknown")
+    return f"- Verification panel: `{panel_id}` (rigor=`high`, vendor=`{vendor}`, model=`{model}`)\n"
 
 
 def spawn_verification_pair(
@@ -965,6 +973,28 @@ def _lane_fingerprint(lanes: list[dict[str, Any]]) -> list[list[Any]]:
     return sorted([str(lane.get("task_id") or ""), lane.get("verdict")] for lane in lanes)
 
 
+def _expected_panel_lane_ids(panel_id: str, lanes: list[dict[str, Any]]) -> Optional[list[str]]:
+    """Every task id ``spawn_verification_pair`` recorded in `trail.db` for ``panel_id``; ``None`` if unknown."""
+    tenant = next((lane.get("tenant") for lane in lanes if lane.get("tenant")), None)
+    try:
+        rows = query_decisions(tenant=tenant or None, phase="verify", limit=500)
+    except (sqlite3.Error, OSError):
+        return None
+    for row in rows:
+        ev = row.get("evidence") or {}
+        if row.get("decision") != "spawn_verify" or ev.get("panel_id") != panel_id:
+            continue
+        ids = [
+            str(lane[key])
+            for lane in ev.get("panel_lanes") or []
+            if isinstance(lane, dict)
+            for key in ("verify_diff_task_id", "verify_blackbox_task_id")
+            if lane.get(key)
+        ]
+        return ids or None
+    return None
+
+
 def _already_recorded(panel_id: str, tenant: Optional[str], consensus: str, fingerprint: list[list[Any]]) -> Optional[str]:
     """Id of an active identical `verify_panel_consensus` row, so repeated evaluations do not spam trail.db."""
     try:
@@ -1013,7 +1043,10 @@ def evaluate_verification_panel(
         return {"ok": False, "error": f"No verification panel found for {target}.", "panel_id": pid}
 
     candidates = sorted(
-        (summarize_panel(key, lanes) for key, lanes in grouped.items()),
+        (
+            summarize_panel(key, lanes, expected_lane_ids=_expected_panel_lane_ids(key, lanes))
+            for key, lanes in grouped.items()
+        ),
         key=lambda p: (p.get("created_at") or 0, p.get("seq") or 0),
     )
     summary = next((p for p in candidates if p["panel_id"] == pid), None) if pid else candidates[-1]
@@ -1075,7 +1108,10 @@ def workstream_status(
     if panel_ids:
         grouped = load_panel_lanes(db_path, panel_ids=panel_ids)
         panels = sorted(
-            (summarize_panel(pid, lanes) for pid, lanes in grouped.items()),
+            (
+                summarize_panel(pid, lanes, expected_lane_ids=_expected_panel_lane_ids(pid, lanes))
+                for pid, lanes in grouped.items()
+            ),
             key=lambda p: (p.get("created_at") or 0, p.get("seq") or 0),
             reverse=True,
         )

@@ -763,6 +763,14 @@ def resolve_rigor(*, repo_slug: Optional[str] = None, override: Optional[str] = 
     return configured or "standard"
 
 
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
+
+
+def single_line(text: Any) -> str:
+    """Collapse newlines/control characters to single spaces so a value fits one Markdown line."""
+    return " ".join(_CONTROL_CHARS_RE.sub(" ", str(text or "")).split())
+
+
 def _normalize_panel_entry(raw: Any, *, source: str, index: int) -> Optional[dict[str, Any]]:
     """Normalize one panel member: ``{"provider", "model", "label"}``, ``"provider/model"`` or ``"model"``.
 
@@ -776,7 +784,7 @@ def _normalize_panel_entry(raw: Any, *, source: str, index: int) -> Optional[dic
     if isinstance(raw, Mapping):
         model = str(raw.get("model") or "").strip()
         provider = str(raw.get("provider") or "").strip() or None
-        label = str(raw.get("label") or "").strip() or None
+        label = single_line(raw.get("label")) or None
     elif isinstance(raw, str):
         text = raw.strip()
         head, sep, tail = text.partition("/")

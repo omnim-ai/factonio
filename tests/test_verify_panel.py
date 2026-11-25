@@ -192,6 +192,9 @@ class TestPanelValidation(unittest.TestCase):
         e = _normalize_panel_entry("gpt-5", source="s", index=3)
         assert e is not None
         self.assertEqual((e["provider"], e["model"], e["vendor"]), (None, "gpt-5", "openai"))
+        e = _normalize_panel_entry({"model": "gpt-5", "label": " GPT (v5)\r\n\talt\x00 "}, source="s", index=4)
+        assert e is not None
+        self.assertEqual(e["label"], "GPT (v5) alt")
         for bad in (None, 7, {"provider": "openai"}, "", "  "):
             with self.subTest(bad=bad):
                 self.assertIsNone(_normalize_panel_entry(bad, source="s", index=0))
@@ -782,6 +785,95 @@ class TestEvaluatePanel(unittest.TestCase):
             self.assertIn("pass: verify-diff/anthropic", summary)
             self.assertIn("inconclusive: verify-blackbox/openai", summary)
             self.assertIn("Headless browser unavailable in sandbox", summary)
+
+    def test_panel_tag_identity_ignores_model_label(self):
+        from factonio.metrics import parse_panel_tag
+
+        stamp = "- Verification panel: `vp_abc123` (rigor=`high`, vendor=`anthropic`, model=`{}`)\n"
+        for label, model in (("`Claude` (opus)", "`Claude` (opus)"), ("x`)`y", "x`)`y"), ("", "")):
+            with self.subTest(label=label):
+                tag = parse_panel_tag("intro\n" + stamp.format(label) + "tail `z`)")
+                self.assertEqual(
+                    tag, {"panel_id": "vp_abc123", "rigor": "high", "vendor": "anthropic", "model": model}
+                )
+        legacy = parse_panel_tag("- Verification panel: `vp_abc123` (rigor=`high`, vendor=`openai`)")
+        self.assertEqual((legacy or {}).get("vendor"), "openai")
+        self.assertIsNone((legacy or {}).get("model"))
+        self.assertIsNone(parse_panel_tag("- Verification p4nel: `vp_abc123` (rigor=`high`, vendor=`openai`)"))
+
+    def test_delimiter_bearing_labels_keep_every_lane(self):
+        from factonio.orchestrator import evaluate_verification_panel, spawn_verification_pair
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            spawn = spawn_verification_pair("acme/svc", "t-lbl", 90, rigor="high", panel_models=[
+                {"provider": "anthropic", "model": "claude-opus-4-6", "label": "`Claude`"},
+                {"provider": "openai", "model": "gpt-5", "label": "GPT (v5)\nalt"},
+                {"provider": "google", "model": "gemini-2.5-pro", "label": "Gemini"},
+            ])
+            self.assertTrue(spawn["ok"], spawn)
+            lanes = spawn["panel"]["lanes"]
+            self.assertEqual([lane["vendor"] for lane in lanes], ["anthropic", "openai", "google"])
+            for lane in lanes:
+                verdict = "reject" if lane["vendor"] == "anthropic" else "pass"
+                findings = ["Critical auth defect"] if verdict == "reject" else []
+                for key in ("verify_diff_task_id", "verify_blackbox_task_id"):
+                    body = _get_task(lane[key]).body
+                    stamp = next(line for line in body.splitlines() if "Verification panel:" in line)
+                    self.assertNotIn("\n", stamp)
+                    _complete(lane[key], verdict, findings=findings)
+
+            res = evaluate_verification_panel(panel_id=spawn["panel"]["panel_id"], record_trail=False)
+            self.assertEqual(res["lane_count"], 6)
+            self.assertEqual((res["consensus"], res["merge_allowed"]), ("reject", False))
+            self.assertEqual([f["item"] for f in res["findings"]], ["Critical auth defect"] * 2)
+            self.assertEqual({f["vendor"] for f in res["findings"]}, {"anthropic"})
+            self.assertIn("reject: verify-diff/anthropic", res["disagreement_summary"])
+            self.assertIn("Critical auth defect", res["disagreement_summary"])
+
+    def test_missing_expected_lane_fails_closed(self):
+        from hermes_cli.kanban_db_connect import connect_closing
+
+        from factonio.orchestrator import evaluate_verification_panel, spawn_verification_pair, workstream_status
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            spawn = spawn_verification_pair("acme/svc", "t-gap", 91, rigor="high", panel_models=[
+                "anthropic/claude-opus-4-6", "openai/gpt-5", "google/gemini-2.5-pro",
+            ])
+            pid = spawn["panel"]["panel_id"]
+            lanes = spawn["panel"]["lanes"]
+            dropped = lanes[0]["verify_diff_task_id"]
+            with connect_closing() as conn:
+                conn.execute(
+                    "UPDATE tasks SET body = replace(body, 'Verification panel:', 'Verification p4nel:') WHERE id = ?",
+                    (dropped,),
+                )
+                conn.commit()
+            _complete(dropped, "reject", findings=["hidden defect"])
+            for lane in lanes:
+                for key in ("verify_diff_task_id", "verify_blackbox_task_id"):
+                    if lane[key] != dropped:
+                        _complete(lane[key], "pass")
+
+            ev = evaluate_verification_panel(panel_id=pid)
+            self.assertTrue(ev["ok"], ev)
+            self.assertEqual(ev["lane_count"], 5)
+            self.assertFalse(ev["merge_allowed"])
+            self.assertNotEqual(ev["consensus"], "pass")
+            self.assertEqual(ev["consensus"], "inconclusive")
+            self.assertEqual(ev["expected_lane_count"], 6)
+            self.assertEqual(ev["missing_lane_ids"], [dropped])
+            self.assertIn(dropped, ev["disagreement_summary"])
+            self.assertTrue(any(dropped in str(lim["item"]) for lim in ev["disclosed_limits"]))
+            row = _trail_rows("verify_panel_consensus", "t-gap")[0]
+            self.assertEqual(row["result"], "inconclusive")
+            self.assertFalse(row["evidence"]["merge_allowed"])
+
+            by_pr = evaluate_verification_panel(tenant="t-gap", pr_number=91, record_trail=False)
+            self.assertEqual((by_pr["consensus"], by_pr["merge_allowed"]), ("inconclusive", False))
+            panels = workstream_status(tenant="t-gap")["panels"]
+            self.assertEqual([(p["panel_id"], p["merge_allowed"]) for p in panels], [(pid, False)])
 
     def test_tool_and_cli(self):
         import hermes_yaml as yaml

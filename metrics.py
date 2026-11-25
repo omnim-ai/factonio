@@ -31,9 +31,10 @@ _REJECT_VERDICTS = frozenset({"reject", "fail", "block", "changes_requested"})
 # Tri-state verification: `inconclusive` is never a pass and always needs attention.
 _INCONCLUSIVE_VERDICTS = frozenset({"inconclusive"})
 _VERIFY_PHASES = frozenset({"verify-diff", "verify-blackbox"})
-_PANEL_TAG_RE = re.compile(
-    r"Verification panel: `(vp_[a-z0-9]+)` \(rigor=`([^`]+)`, vendor=`([^`]+)`, model=`([^`]+)`\)"
-)
+# Panel identity (id, rigor, vendor) is parsed independently of the free-form display `model=` label,
+# so no label content can make a lane vanish from aggregation.
+_PANEL_TAG_RE = re.compile(r"Verification panel: `(vp_[a-z0-9]+)` \(rigor=`([^`\n]+)`, vendor=`([^`\n]+)`")
+_PANEL_MODEL_RE = re.compile(r", model=`([^\n]*)`\)")
 _PASS_VERDICTS = frozenset({"pass"})
 # Run outcomes that are not failures: a clean latest run clears any stale error.
 _CLEAN_OUTCOMES = frozenset({"completed", "review_requested", "changes_requested", "scheduled", "approved"})
@@ -177,10 +178,17 @@ def _parse_json_dict(raw: Any) -> dict[str, Any]:
 
 def parse_panel_tag(body: Any) -> Optional[dict[str, str]]:
     """Parse the ``- Verification panel: `vp_...` (rigor=..., vendor=..., model=...)`` card stamp."""
-    m = _PANEL_TAG_RE.search(str(body or ""))
+    text = str(body or "")
+    m = _PANEL_TAG_RE.search(text)
     if not m:
         return None
-    return {"panel_id": m.group(1), "rigor": m.group(2), "vendor": m.group(3), "model": m.group(4)}
+    model = _PANEL_MODEL_RE.match(text, m.end())
+    return {
+        "panel_id": m.group(1),
+        "rigor": m.group(2),
+        "vendor": m.group(3),
+        "model": model.group(1) if model else None,
+    }
 
 
 def _known_vendor(vendor: Any) -> Optional[str]:
@@ -356,9 +364,39 @@ def _panel_lane(task: dict[str, Any], runs: list[dict[str, Any]], tag: dict[str,
     }
 
 
-def summarize_panel(panel_id: str, lanes: list[dict[str, Any]]) -> dict[str, Any]:
-    """`aggregate_panel_verdicts` plus panel identity (tenant, PR) derived from its lanes."""
+def _require_expected_lanes(agg: dict[str, Any], lanes: list[dict[str, Any]], expected: list[str]) -> list[str]:
+    """Fail closed when spawned lanes are absent from ``lanes`` (missing card or unparseable stamp)."""
+    observed = {str(lane.get("task_id")) for lane in lanes if lane.get("task_id")}
+    missing = [tid for tid in dict.fromkeys(str(t) for t in expected if t) if tid not in observed]
+    if not missing:
+        return missing
+    note = (
+        f"{len(missing)} of {len(set(expected))} spawned panel lane(s) missing or unparseable: "
+        f"{', '.join(missing)}; the panel cannot pass without every lane"
+    )
+    if agg["consensus"] != "reject":
+        agg["consensus"] = "inconclusive"
+        agg["reason"] = note
+    agg["merge_allowed"] = False
+    prior = agg.get("disagreement_summary")
+    agg["disagreement_summary"] = f"{prior} {note}." if prior else f"{note}."
+    for tid in missing:
+        agg["disclosed_limits"].append(
+            {"lane": tid, "vendor": None, "phase": None, "item": f"Expected panel lane {tid} missing or unparseable"}
+        )
+    return missing
+
+
+def summarize_panel(
+    panel_id: str, lanes: list[dict[str, Any]], *, expected_lane_ids: Optional[list[str]] = None
+) -> dict[str, Any]:
+    """`aggregate_panel_verdicts` plus panel identity (tenant, PR) derived from its lanes.
+
+    ``expected_lane_ids`` (every task id spawned for the panel, when known) makes the summary fail
+    closed if any spawned lane is absent, so a panel can never shrink into a passing subset.
+    """
     agg = aggregate_panel_verdicts(lanes)
+    missing = _require_expected_lanes(agg, lanes, expected_lane_ids) if expected_lane_ids else []
     first = lanes[0] if lanes else {}
     return {
         "panel_id": panel_id,
@@ -367,6 +405,8 @@ def summarize_panel(panel_id: str, lanes: list[dict[str, Any]]) -> dict[str, Any
         "created_at": min((lane.get("created_at") or 0 for lane in lanes), default=None),
         "seq": max((lane.get("seq") or 0 for lane in lanes), default=0),
         **agg,
+        "expected_lane_count": len(set(expected_lane_ids)) if expected_lane_ids else None,
+        "missing_lane_ids": missing,
     }
 
 
