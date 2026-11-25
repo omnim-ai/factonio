@@ -23,7 +23,10 @@ import shutil
 import subprocess
 import unittest
 
-import yaml
+try:
+    import hermes_yaml as yaml
+except ImportError:
+    import yaml
 
 from tests._env import PLUGIN_ROOT
 
