@@ -233,7 +233,8 @@ class TestWatchdogMetricsAndApi(unittest.TestCase):
                 body = r.json()
                 self.assertEqual(
                     body["defaults"],
-                    {"merge_policy": "auto", "max_fix_rounds": 3, "design_provider": "auto", "design_approval": "ask"},
+                    {"merge_policy": "auto", "max_fix_rounds": 3, "design_provider": "auto", "design_approval": "ask",
+                     "default_rigor": "standard"},
                 )
                 item = body["repos"][0]
                 for key in ("slug", "repo", "url", "path", "default_branch", "merge_policy", "max_fix_rounds",

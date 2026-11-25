@@ -64,7 +64,16 @@ def _repo_defaults(settings: dict[str, Any]) -> dict[str, Any]:
         "max_fix_rounds": settings.get("default_max_fix_rounds") or 3,
         "design_provider": settings.get("design_provider") or "auto",
         "design_approval": settings.get("design_approval") or "ask",
+        "default_rigor": settings.get("default_rigor") or "standard",
     }
+
+
+def _safe_rigor(repo_slug: Optional[str] = None) -> Optional[str]:
+    """Effective rigor, or None when a stored value is invalid (surfaced instead of raising a 500)."""
+    try:
+        return _config.resolve_rigor(repo_slug=repo_slug)
+    except ValueError:
+        return None
 
 
 def _serialize_repo(slug: str, info: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
@@ -94,6 +103,8 @@ def _serialize_repo(slug: str, info: dict[str, Any], settings: dict[str, Any]) -
         "effective_design_provider": effective_provider,
         "effective_design_approval": effective_approval,
         "resolved_design_provider": resolved_provider,
+        "default_rigor": info.get("default_rigor") or None,
+        "effective_default_rigor": _safe_rigor(slug),
         "has_required_checks": bool(info.get("has_required_checks")),
         "models": _config.resolve_all_phase_models(repo_slug=slug),
     }
@@ -151,6 +162,8 @@ def models(repo: Optional[str] = Query(None), profile: Optional[str] = Query(Non
     return {
         "models": _config.resolve_all_phase_models(repo_slug=repo),
         "cross_model_warning": _config.check_cross_model_warning(repo_slug=repo),
+        "verify_panel": _config.resolve_verify_panel(repo_slug=repo),
+        "default_rigor": _safe_rigor(repo),
     }
 
 

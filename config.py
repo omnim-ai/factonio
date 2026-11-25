@@ -24,6 +24,7 @@ PHASES: tuple[str, ...] = ("define", "design", "implement", "verify", "watchdog"
 DESIGN_PROVIDERS: tuple[str, ...] = ("auto", "claude-design", "hermes", "off")
 DESIGN_APPROVAL_POLICIES: tuple[str, ...] = ("ask", "auto")
 MERGE_POLICIES: tuple[str, ...] = ("auto", "ask")
+RIGOR_LEVELS: tuple[str, ...] = ("standard", "high")
 
 AUX_TASK_SPECS: tuple[dict[str, str], ...] = (
     {
@@ -68,6 +69,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "watchdog_interval_minutes": 5,
     "stale_heartbeat_minutes": 20,
     "blocked_reminder_minutes": 45,
+    "default_rigor": "standard",
+    "verify_panel": [],
     "repos": {},
 }
 
@@ -718,3 +721,226 @@ def infer_model_vendor(provider: Optional[str], model: Optional[str]) -> Optiona
     if not prov or prov == "auto" or prov in _ROUTER_PROVIDERS:
         return None
     return _vendor_from_token(prov)
+
+
+# --- Opt-in high-rigor multi-vendor verification panel -------------------------------------
+
+_RIGOR_INHERIT_TOKENS = frozenset({"", "inherit", "default"})
+VERIFY_PANEL_AUX_KEY = "factonio_verify_panel"
+
+
+def _normalize_rigor(value: Any, *, source: str) -> Optional[str]:
+    """Return a canonical rigor level, ``None`` for unset/inherit, or raise ``ValueError``."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in _RIGOR_INHERIT_TOKENS:
+            return None
+        if norm in RIGOR_LEVELS:
+            return norm
+    raise ValueError(f"{source} must be one of {', '.join(RIGOR_LEVELS)}; got {value!r}")
+
+
+def resolve_rigor(*, repo_slug: Optional[str] = None, override: Optional[str] = None) -> str:
+    """Resolve the effective verification rigor.
+
+    Precedence: explicit ``override`` -> ``repos.<slug>.default_rigor`` -> plugin
+    ``settings.default_rigor`` -> ``"standard"``. An invalid value at any level raises
+    ``ValueError`` instead of silently degrading to a weaker rigor.
+    """
+    explicit = _normalize_rigor(override, source="rigor")
+    if explicit:
+        return explicit
+    if repo_slug:
+        repo = get_repo(repo_slug)
+        if isinstance(repo, dict):
+            field = f"repos.{repo.get('slug') or repo_slug}.default_rigor"
+            per_repo = _normalize_rigor(repo.get("default_rigor"), source=field)
+            if per_repo:
+                return per_repo
+    configured = _normalize_rigor(load_settings(use_root=True).get("default_rigor"), source="settings.default_rigor")
+    return configured or "standard"
+
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
+
+
+def single_line(text: Any) -> str:
+    """Collapse newlines/control characters to single spaces so a value fits one Markdown line."""
+    return " ".join(_CONTROL_CHARS_RE.sub(" ", str(text or "")).split())
+
+
+def _normalize_panel_entry(raw: Any, *, source: str, index: int) -> Optional[dict[str, Any]]:
+    """Normalize one panel member: ``{"provider", "model", "label"}``, ``"provider/model"`` or ``"model"``.
+
+    ``"openrouter/anthropic/claude-opus-4-6"`` splits at the first ``/`` into provider
+    ``openrouter`` and model ``anthropic/claude-opus-4-6``; the vendor family is inferred from the
+    model id first, so router-backed models resolve to their real vendor. Returns ``None`` for
+    entries without a model.
+    """
+    provider: Optional[str] = None
+    label: Optional[str] = None
+    if isinstance(raw, Mapping):
+        model = str(raw.get("model") or "").strip()
+        provider = str(raw.get("provider") or "").strip() or None
+        label = single_line(raw.get("label")) or None
+    elif isinstance(raw, str):
+        text = raw.strip()
+        head, sep, tail = text.partition("/")
+        if sep and head.strip() and tail.strip():
+            provider, model = head.strip(), tail.strip()
+        else:
+            model = text.strip("/").strip()
+    else:
+        return None
+    if not model:
+        return None
+    if provider and provider.lower() == "auto":
+        provider = None
+    return {
+        "provider": provider,
+        "model": model,
+        "label": label or (f"{provider}/{model}" if provider else model),
+        "vendor": infer_model_vendor(provider, model),
+        "source": source,
+        "index": int(index),
+    }
+
+
+def _coerce_panel_list(raw: Any) -> Optional[list[Any]]:
+    """Accept a list, a ``{"models": [...]}`` mapping, or a comma-separated string; ``None`` when empty."""
+    if isinstance(raw, Mapping):
+        raw = raw.get("models") if raw.get("models") is not None else raw.get("panel")
+    if isinstance(raw, str):
+        raw = [part for part in (p.strip() for p in raw.split(",")) if part]
+    if isinstance(raw, (list, tuple)) and len(raw) > 0:
+        return list(raw)
+    return None
+
+
+def _read_aux_panel() -> Optional[list[Any]]:
+    """Read ``auxiliary.factonio_verify_panel`` raw (Hermes's aux-slot reader drops list values)."""
+    candidates: list[Any] = []
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        if isinstance(cfg, dict):
+            candidates.append((cfg.get("auxiliary") or {}).get(VERIFY_PANEL_AUX_KEY))
+    except Exception:
+        pass
+    cfg_path = get_root_hermes_home_path() / "config.yaml"
+    if cfg_path.is_file():
+        try:
+            import hermes_yaml as yaml
+
+            data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+            if isinstance(data, dict):
+                candidates.append((data.get("auxiliary") or {}).get(VERIFY_PANEL_AUX_KEY))
+        except Exception:
+            pass
+    for candidate in candidates:
+        coerced = _coerce_panel_list(candidate)
+        if coerced:
+            return coerced
+    return None
+
+
+def validate_verify_panel(raw_entries: Any, *, source: str = "override") -> dict[str, Any]:
+    """Normalize panel members and check vendor-family diversity.
+
+    ``valid`` requires at least two members spanning at least two distinct *known* vendor
+    families; members whose vendor cannot be inferred never count toward diversity.
+    """
+    raw_list = _coerce_panel_list(raw_entries) or []
+    entries: list[dict[str, Any]] = []
+    invalid: list[Any] = []
+    for idx, raw in enumerate(raw_list):
+        entry = _normalize_panel_entry(raw, source=source, index=idx)
+        if entry is None:
+            invalid.append(raw)
+        else:
+            entries.append(entry)
+
+    vendor_counts: dict[str, int] = {}
+    for entry in entries:
+        if entry["vendor"]:
+            vendor_counts[entry["vendor"]] = vendor_counts.get(entry["vendor"], 0) + 1
+    vendors = list(vendor_counts)
+    duplicate_vendors = [v for v, n in vendor_counts.items() if n > 1]
+    unknown = [e["label"] for e in entries if not e["vendor"]]
+    valid = len(entries) >= 2 and len(vendors) >= 2
+
+    warning: Optional[str] = None
+    if not valid:
+        if not entries:
+            warning = (
+                "rigor=high requires a verification panel of at least 2 models from distinct vendor families, "
+                "but no verify_panel is configured (set repos.<slug>.models.verify_panel, "
+                f"auxiliary.{VERIFY_PANEL_AUX_KEY}, or settings.verify_panel)."
+            )
+        elif len(entries) < 2:
+            warning = (
+                f"rigor=high requires at least 2 panel models from distinct vendor families; only "
+                f"{entries[0]['label']} is configured ({source})."
+            )
+        elif unknown:
+            known = f"only {vendors[0]} is known and " if vendors else ""
+            warning = (
+                f"rigor=high requires at least 2 distinct known vendor families; {known}the vendor of "
+                f"{', '.join(unknown)} could not be inferred ({source}). Use vendor-prefixed model ids "
+                "(e.g. `openrouter/anthropic/...`)."
+            )
+        else:
+            warning = (
+                f"rigor=high verify panel collapses to a single vendor family ({vendors[0]}): "
+                f"{', '.join(e['label'] for e in entries)}. Add a model from a different vendor ({source})."
+            )
+    advisories: list[str] = []
+    if valid and duplicate_vendors:
+        advisories.append(f"Panel repeats vendor family: {', '.join(duplicate_vendors)}.")
+    if valid and unknown:
+        advisories.append(f"Vendor could not be inferred for: {', '.join(unknown)} (not counted toward diversity).")
+    if invalid:
+        advisories.append(f"Ignored {len(invalid)} malformed panel entr{'y' if len(invalid) == 1 else 'ies'}.")
+
+    return {
+        "entries": entries,
+        "vendors": vendors,
+        "distinct_vendor_count": len(vendors),
+        "duplicate_vendors": duplicate_vendors,
+        "unknown_vendor_models": unknown,
+        "valid": valid,
+        "warning": warning,
+        "source": source,
+        "advisories": advisories,
+    }
+
+
+def resolve_verify_panel(
+    *,
+    repo_slug: Optional[str] = None,
+    override: Optional[list[Any]] = None,
+) -> dict[str, Any]:
+    """Resolve and validate the high-rigor verification panel.
+
+    Precedence (first non-empty wins): explicit ``override`` -> ``repos.<slug>.models.verify_panel``
+    -> ``auxiliary.factonio_verify_panel`` -> plugin ``settings.verify_panel``.
+    """
+    explicit = _coerce_panel_list(override)
+    if explicit:
+        return validate_verify_panel(explicit, source="override")
+    if repo_slug:
+        repo = get_repo(repo_slug)
+        models_map = repo.get("models") if isinstance(repo, dict) else None
+        if isinstance(models_map, Mapping):
+            per_repo = _coerce_panel_list(models_map.get("verify_panel"))
+            if per_repo:
+                slug = str((repo or {}).get("slug") or repo_slug)
+                return validate_verify_panel(per_repo, source=f"repo:{slug}.models.verify_panel")
+    aux = _read_aux_panel()
+    if aux:
+        return validate_verify_panel(aux, source=f"auxiliary.{VERIFY_PANEL_AUX_KEY}")
+    configured = _coerce_panel_list(load_settings(use_root=True).get("verify_panel"))
+    return validate_verify_panel(configured or [], source="settings.verify_panel" if configured else "unset")

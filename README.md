@@ -153,11 +153,12 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 | `hermes factonio init [--apply-config] [--workers N] [--force]` | Create or update the headless `factonio` worker profile and plugin link |
 | `hermes factonio doctor [--json]` | Check `git`, `gh auth`, worker profile, Kanban config, and cross-model setup |
 | `hermes factonio add <owner/repo> [--path DIR] [--merge-policy auto\|ask] [--max-fix-rounds N]` | Register, clone (unless `--no-clone`), anchor Hermes Project, and inspect CI |
-| `hermes factonio update\|edit <repo> [--merge-policy ...] [--max-fix-rounds N] [--default-branch B] [--design-provider ...] [--design-approval ...]` | Update per-repo settings (`inherit` clears design overrides) |
+| `hermes factonio update\|edit <repo> [--merge-policy ...] [--max-fix-rounds N] [--default-branch B] [--design-provider ...] [--design-approval ...] [--default-rigor standard\|high\|inherit]` | Update per-repo settings (`inherit` clears design and rigor overrides) |
 | `hermes factonio list [--json]` | List registered repositories and active settings |
 | `hermes factonio remove <repo>` | Unregister a repository (keeps local files intact) |
-| `hermes factonio models [--repo SLUG] [--json]` | Show resolved provider/model per phase and cross-model warning |
+| `hermes factonio models [--repo SLUG] [--json]` | Show resolved provider/model per phase, default rigor, the high-rigor verify panel, and cross-model warning |
 | `hermes factonio status [--tenant T] [--json]` | Show active Factonio Kanban workstreams and cards |
+| `hermes factonio panel [panel_id] [--tenant T] [--pr N] [--record] [--json]` | Evaluate a `rigor=high` verification panel's fail-closed consensus (`pass` / `reject` / `inconclusive` / `pending`), disagreement summary, and findings; `--record` logs a terminal consensus to `trail.db` (exits non-zero when no panel matches) |
 | `hermes factonio pr-gate <repo> <pr_number> [--json]` | Inspect live PR HEAD SHA, mergeability, and CI check status |
 | `hermes factonio harness init\|check\|show\|audit <repo> [--force] [--dry-run] [--base REF] [--run-doctor] [--run-hooks] [--json]` | Bootstrap, validate, show, or read-only drift-audit the repo's `.factonio/verify.md` + `harness.json` black-box verification harness (`audit` exits non-zero when `stale` or `missing`) |
 | `hermes factonio restack <repo> [pr_number] [--parent-pr N] [--from-branch B] [--new-base B] [--old-base-sha SHA] [--verified-sha SHA] [--no-push] [--no-retarget] [--dry-run] [--json]` | Rebase a stacked PR (or every open child of a parent) onto its new base in a throwaway worktree and report `git patch-id` verdict continuity |
@@ -169,11 +170,12 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 <summary>Agent tools registered in toolset <code>factonio</code></summary>
 
 - `factonio_add_repo` — register a GitHub repository and anchor its Hermes Project
-- `factonio_update_repo` — update per-repository settings (`merge_policy`, `max_fix_rounds`, `default_branch`, `design_provider`, `design_approval`)
+- `factonio_update_repo` — update per-repository settings (`merge_policy`, `max_fix_rounds`, `default_branch`, `design_provider`, `design_approval`, `default_rigor`)
 - `factonio_start` — start a workstream (`feature`, `bug`, `quick`, or `escaped_from` for post-merge regressions)
 - `factonio_spawn_design` — spawn a Phase 1b UI/UX Design card
 - `factonio_spawn_implement` — spawn a scoped git-worktree Implementation card (optionally stacked on a parent PR via `base_branch` / `stack_parent_pr`)
-- `factonio_spawn_verify` — spawn mutually isolated Diff Check and Black-Box Check cards in parallel
+- `factonio_spawn_verify` — spawn mutually isolated Diff Check and Black-Box Check cards in parallel; `rigor: "high"` (or a repo's `default_rigor: high`) fans out one isolated pair per model of a multi-vendor `verify_panel`, failing closed unless it spans >= 2 vendor families
+- `factonio_evaluate_panel` — aggregate a high-rigor panel's lanes into a fail-closed consensus (`merge_allowed` only on unanimous `pass`), with `disagreement_summary` and aggregated findings, and log `verify_panel_consensus` to `trail.db`
 - `factonio_status` — inspect active workstream cards, registered repos, and resolved phase models
 - `factonio_pr_gate` — verify live PR HEAD SHA and CI status checks via `gh`
 - `factonio_merge_pr` — verify exact HEAD SHA and squash-merge a verified PR
@@ -227,7 +229,7 @@ Special thanks to **Lauren Tan ([@poteto](https://x.com/poteto))** and **[pstack
 - **Implementation discipline:** the Attack the Premise circuit breaker, skeptical review-thread triage with prompt-injection hygiene, comment hygiene, and a short PR briefing template.
 - **Verification and merge rigor:** run-proven findings, blast-radius proof, base-vs-PR attribution, tri-state `pass`/`reject`/`inconclusive` verdicts, the tiered PR gate, live merge readback, and `git patch-id` verdict continuity.
 - **Wave 2 adaptations:** `show-me-your-work` (the append-only `trail.db` decision trail and `factonio_log_decision`), `ketchup` (decision-ready human handoffs in the orchestrator skill), `/correct` (the retro's recurring-mistake mining, enforcement ladder, and prove-it-fails rule, plus escaped-regression Verification Gap Analysis), `worktree-audit.sh` (safety-bucketed worktree audit and opt-in pruning), and side-effect liveness (watchdog progress detection beyond heartbeats).
-- **Wave 3 adaptations:** stacked PR landing (`base_branch` / `stack_parent_pr` implementation cards and `--onto` restacks in a throwaway worktree with `git patch-id` verdict continuity via `factonio_restack_pr`).
+- **Wave 3 adaptations:** stacked PR landing (`base_branch` / `stack_parent_pr` implementation cards and `--onto` restacks in a throwaway worktree with `git patch-id` verdict continuity via `factonio_restack_pr`), and an opt-in multi-model review panel (`rigor: high` verification fanned out across distinct vendor families with fail-closed consensus via `factonio_evaluate_panel`).
 
 pstack's copyright and permission notice is reproduced in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 

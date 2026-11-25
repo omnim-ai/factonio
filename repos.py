@@ -19,6 +19,7 @@ from .config import (
     DESIGN_APPROVAL_POLICIES,
     DESIGN_PROVIDERS,
     MERGE_POLICIES,
+    RIGOR_LEVELS,
     get_repo,
     list_repos,
     load_settings,
@@ -45,7 +46,11 @@ EDITABLE_REPO_FIELDS: tuple[str, ...] = (
     "default_branch",
     "design_provider",
     "design_approval",
+    "default_rigor",
 )
+
+# Fields whose `None` (inherit) value removes the per-repo override instead of storing null.
+_CLEARABLE_REPO_FIELDS = frozenset({"design_provider", "design_approval", "default_rigor"})
 
 _INHERIT_TOKENS = frozenset({"", "inherit", "default"})
 
@@ -96,6 +101,11 @@ def _validate_design_override(field: str, value: Any, allowed: tuple[str, ...]) 
     )
 
 
+def _validate_rigor_override(value: Any) -> Optional[str]:
+    """Validate a per-repo ``default_rigor``; returns None when the override should be cleared."""
+    return _validate_design_override("default_rigor", value, RIGOR_LEVELS)
+
+
 def _validate_editable_fields(fields: dict[str, Any]) -> dict[str, Any]:
     """Validate supplied editable fields; returns normalized values (None = clear override)."""
     validated: dict[str, Any] = {}
@@ -110,6 +120,8 @@ def _validate_editable_fields(fields: dict[str, Any]) -> dict[str, Any]:
             validated[field] = _validate_design_override(field, value, DESIGN_PROVIDERS)
         elif field == "design_approval":
             validated[field] = _validate_design_override(field, value, DESIGN_APPROVAL_POLICIES)
+        elif field == "default_rigor":
+            validated[field] = _validate_rigor_override(value)
         else:
             raise ValueError(f"Unknown editable repository field {field!r}")
     return validated
@@ -366,14 +378,15 @@ def update_repo(
     default_branch: Any = _UNSET,
     design_provider: Any = _UNSET,
     design_approval: Any = _UNSET,
+    default_rigor: Any = _UNSET,
 ) -> dict[str, Any]:
     """Update editable parameters of a registered repository (only fields explicitly supplied).
 
     All supplied values are validated before anything is written (all-or-nothing). The full
     entry (including fields that only lived in config.yaml) is persisted atomically to
     ``plugin-data/factonio/repos.json``. Passing ``None``/``""``/``"inherit"``/``"default"`` for
-    ``design_provider`` or ``design_approval`` removes the per-repo override so the global
-    default applies.
+    ``design_provider``, ``design_approval`` or ``default_rigor`` removes the per-repo override so
+    the global default applies.
     """
     found = get_repo(slug_or_full)
     if found is None:
@@ -385,6 +398,7 @@ def update_repo(
         "default_branch": default_branch,
         "design_provider": design_provider,
         "design_approval": design_approval,
+        "default_rigor": default_rigor,
     }
     supplied = {k: v for k, v in supplied.items() if v is not _UNSET}
     if not supplied:
@@ -404,7 +418,7 @@ def update_repo(
         entry: dict[str, Any] = dict(base)
         entry["slug"] = slug
         for field, value in validated.items():
-            if field in ("design_provider", "design_approval") and value is None:
+            if field in _CLEARABLE_REPO_FIELDS and value is None:
                 entry.pop(field, None)
             else:
                 entry[field] = value

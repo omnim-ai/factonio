@@ -13,9 +13,12 @@ from .config import (
     WORKER_PROFILE,
     check_cross_model_warning,
     get_root_hermes_home_path,
+    list_repos,
     load_settings,
     resolve_all_phase_models,
     resolve_design_provider,
+    resolve_rigor,
+    resolve_verify_panel,
     save_settings,
 )
 
@@ -243,6 +246,33 @@ def _cmd_check(name: str, args: list[str]) -> dict[str, Any]:
         return {"name": name, "ok": False, "detail": str(exc)}
 
 
+def _rigor_diagnostics(warnings: list[str]) -> dict[str, Any]:
+    """Warn when rigor=high (global or per repo) has no valid multi-vendor verify panel."""
+    try:
+        rigor: Optional[str] = resolve_rigor()
+    except ValueError as exc:
+        rigor = None
+        warnings.append(str(exc))
+    panel = resolve_verify_panel()
+    if rigor == "high" and not panel["valid"]:
+        warnings.append(f"default_rigor=high but rigor=high verification will fail closed: {panel['warning']}")
+    for slug in sorted(list_repos()):
+        try:
+            repo_rigor = resolve_rigor(repo_slug=slug)
+        except ValueError as exc:
+            warnings.append(f"Repository {slug}: {exc}")
+            continue
+        if repo_rigor != "high":
+            continue
+        repo_panel = resolve_verify_panel(repo_slug=slug)
+        already_warned = rigor == "high" and repo_panel["source"] == panel["source"]
+        if not repo_panel["valid"] and not already_warned:
+            warnings.append(
+                f"Repository {slug} has default_rigor=high but its verify panel is invalid: {repo_panel['warning']}"
+            )
+    return {"default_rigor": rigor, "verify_panel": panel}
+
+
 def run_doctor(plugin_dir: Path) -> dict[str, Any]:
     """Run clean-room readiness checks for Factonio."""
     from hermes_cli.profiles import get_profile_dir, profile_exists
@@ -316,11 +346,14 @@ def run_doctor(plugin_dir: Path) -> dict[str, Any]:
             "Phase 1b design_provider=auto: Claude CLI/credentials not detected, will use pure-Hermes prototyping fallback."
         )
 
+    rigor_info = _rigor_diagnostics(warnings)
+
     return {
         "ok": all(c["ok"] for c in checks),
         "checks": checks,
         "warnings": warnings,
         "models": models,
         "design": design_info,
+        **rigor_info,
         "plugin_dir": str(plugin_dir.resolve()),
     }

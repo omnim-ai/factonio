@@ -19,6 +19,7 @@ Verify observable behavior end to end against acceptance criteria and hidden hol
 This barrier is the entire reason Black-Box Verification runs in an isolated card:
 - **Allowed:** Acceptance criteria from `spec.md`, approved `design/` previews and `DESIGN.md` (if linked on this card), every scenario file under the card's `holdout/` directory, build/run/test entrypoints (`README.md`, `package.json`, `Makefile`, `pyproject.toml`), the repo verification harness `.factonio/verify.md` and `.factonio/harness.json` (black-box playbooks, not implementation source), and running the built binary, CLI, API, or web UI (`terminal` or `browser_exec`).
 - **Forbidden:** Never run `git diff`, `git show`, `gh pr diff`, or read implementation source files under `src/`, `lib/`, `app/`, etc. Judge the software strictly by what a user or caller observes. The `.factonio/` harness never lifts this ban: follow its commands, but do not open the source files its Feature Map globs point at.
+- **Panel lanes:** a card stamped `- Verification panel: \`vp_...\`` is one independent lane of a `rigor: high` multi-vendor panel. The barrier and harness instructions above apply unchanged to every lane. Do not read, wait for, or echo other lanes' cards or verdicts; return your own `pass`/`reject`/`inconclusive`. Any lane's `reject` or `inconclusive` blocks the panel consensus.
 
 ## Procedure
 

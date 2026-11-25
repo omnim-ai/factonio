@@ -18,6 +18,7 @@ Independently audit a pull request's code diff against the written specification
 
 - Read `spec.md` (if linked), the pull request metadata, and the git diff (`gh pr diff <pr> --repo <owner/repo>`).
 - Never search for, open, or read any `holdout/` directory. Holdout scenarios belong exclusively to Black-Box Verification.
+- **Panel lanes:** a card stamped `- Verification panel: \`vp_...\`` is one independent lane of a `rigor: high` multi-vendor panel. Review on your own: do not read, wait for, or echo other lanes' cards or verdicts. The orchestrator aggregates lanes fail-closed, so a dissenting `reject` from your lane blocks the merge on its own.
 
 ## Review Checklist
 

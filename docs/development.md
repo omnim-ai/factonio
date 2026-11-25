@@ -7,8 +7,8 @@ This guide covers repository layout, local development against Hermes Agent, run
 ```text
 __init__.py                  Plugin entrypoint: registers aux models, skills, tools, CLI, watchdog, blueprint
 plugin.yaml                  Hermes plugin manifest (v2) and config_schema
-agent_tools.py               12 agent-callable tools (`factonio_*`), including `factonio_log_decision`, `factonio_bootstrap_verify` and `factonio_restack_pr`
-commands.py                  CLI subcommands (`hermes factonio init|add|update|remove|list|models|status|pr-gate|restack|worktrees|harness|trail|doctor`)
+agent_tools.py               13 agent-callable tools (`factonio_*`), including `factonio_log_decision`, `factonio_bootstrap_verify`, `factonio_restack_pr` and `factonio_evaluate_panel`
+commands.py                  CLI subcommands (`hermes factonio init|add|update|remove|list|models|status|panel|pr-gate|restack|worktrees|harness|trail|doctor`)
 config.py                    Settings, durable repos.json store (atomic writes + flock), phase model & design resolution
 orchestrator.py              Workstream lifecycle, Kanban DAG creation, holdout/ isolation, session notify+wake subscriptions
 profile_setup.py             Dedicated headless `factonio` profile initializer and `doctor` diagnostics
@@ -40,6 +40,7 @@ tests/
   test_worktree_audit.py     Real-git worktree safety buckets, --prune-safe, `worktrees` CLI
   test_verify_harness.py     Real-git `.factonio/` harness detection, init/check/hooks, read-only drift audit, CLI/tool/blueprint, Black-Box injection
   test_stacked_prs.py        Real-git stacked spawn/seeding, true-base gate & merge, `--onto` restack continuity, `restack` CLI/tool
+  test_verify_panel.py       rigor/verify_panel config + vendor diversity, per-repo default_rigor (tool/CLI/API/doctor), high-rigor fan-out, fail-closed consensus, panel CLI/tool, additive metrics
   test_trail.py              trail.db store, transition hooks, CLI/API/tool, retro, cross-vendor warning
   test_desktop_plugin.py     Node ESM smoke tests + Desktop SDK surface lint (59 tests)
 tools/

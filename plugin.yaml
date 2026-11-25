@@ -30,6 +30,7 @@ provides_tools:
   - factonio_log_decision
   - factonio_bootstrap_verify
   - factonio_restack_pr
+  - factonio_evaluate_panel
 provides_hooks:
   - on_kanban_dispatch_tick
 config_schema:
@@ -81,6 +82,17 @@ config_schema:
     default: 45
     label: "Blocked reminder threshold (minutes)"
     description: "Minutes a needs_input card waits before escalating to the owning thread."
+  default_rigor:
+    type: str
+    choices: [standard, high]
+    default: standard
+    label: "Default verification rigor"
+    description: "standard spawns one Diff + Black-Box pair per PR; high fans out a multi-vendor verify panel (one pair per panel model) and merges only on unanimous pass."
+  verify_panel:
+    type: list
+    default: []
+    label: "High-rigor verification panel"
+    description: "Panel models for rigor=high, as 'provider/model' strings or {provider, model, label} objects; needs >= 2 models from distinct vendor families. Overridden by auxiliary.factonio_verify_panel and repos.<slug>.models.verify_panel."
   repos:
     type: dict
     default: {}
