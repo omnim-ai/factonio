@@ -118,7 +118,8 @@
         "`trail --audit` exits 0 when clean and 1 with findings, with `--json` / `--markdown` and tenant/repo/phase/card filters",
         "`start <repo> <request> --kind feature|bug|quick|refactor|perf|investigate --json` starts a workstream with additive kind / read_only / report_path; `--kind investigate --skip-define` exits 1 without creating a card",
         "`trail --recall --repo <repo> [--query Q] [--limit N] --json` / `--markdown` returns read-only deduplicated escapes / superseded / rejects_and_blocks / keyword recall excluding --tenant, never creating trail.db, and exits 1 when trail.db is unreadable",
-        "`publish-pr <repo> <branch> --expected-head-sha <sha> --title <t> --json` exits 0 only when the PR is published and 1 on refusal/error (`--json` accepted before or after the subcommand); `add` / `update --publish-policy auto|ask` persist the policy and `list` prints `publish=<policy>`; `add` and `list` exit 1 on a persisted null/empty/invalid publish_policy or default_publish_policy"
+        "`publish-pr <repo> <branch> --expected-head-sha <sha> --title <t> --json` exits 0 only when the PR is published and 1 on refusal/error (`--json` accepted before or after the subcommand); `add` / `update --publish-policy auto|ask` persist the policy and `list` prints `publish=<policy>`; `add` and `list` exit 1 on a persisted null/empty/invalid publish_policy or default_publish_policy",
+        "`panel --branch <branch>` selects the latest unpublished local-branch panel (exit 1 when none, or with --pr), and `status` shows `[owner/repo@branch]` badges for local targets while `status --json` carries `settings_publish_policy`"
       ]
     },
     {
@@ -136,7 +137,8 @@
         "Refused merge/gate trail rows never carry override hints (allow_stacked_merge) in why; only real overrides read as gate_loosening in trail --audit (tests.test_pr_gate_hardening.TestMergeTrailAudit)",
         "factonio_start `kind` enum equals WORKSTREAM_KINDS (feature, bug, quick, refactor, perf, investigate)",
         "factonio_publish_pr passes raw arguments to repos.publish_pr (no coercion; title=None, non-boolean draft, empty base_branch/remote and missing keys are refused); factonio_add_repo / factonio_update_repo accept publish_policy auto|ask, an omitted publish_policy inherits/preserves and an explicit null is refused without mutating repos.json",
-        "factonio_triage_issues supports action triage | verify_existing_fix, is listed in plugin.yaml provides_tools, and rejects boolean or sub-minimum integers (required_runs >= 2; pr_number, issue_number, limit >= 1)"
+        "factonio_triage_issues supports action triage | verify_existing_fix, is listed in plugin.yaml provides_tools, and rejects boolean or sub-minimum integers (required_runs >= 2; pr_number, issue_number, limit >= 1)",
+        "factonio_spawn_verify requires only repo + tenant and passes raw pr_number / branch / base_branch / head_sha to spawn_verification_pair (both, neither, bool pr_number or short SHA are refused with nothing spawned); factonio_evaluate_panel accepts a branch filter"
       ]
     },
     {
@@ -146,11 +148,12 @@
         "orchestrator.py"
       ],
       "commands": [
-        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_orchestrator_and_repos tests.test_verify_panel tests.test_workstream_modes tests.test_recall_and_principles -v'"
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_orchestrator_and_repos tests.test_verify_panel tests.test_workstream_modes tests.test_recall_and_principles tests.test_local_publish_gate -v'"
       ],
       "scenarios": [
         "Black-box cards receive holdout/ and the harness; implement/diff cards never do",
         "rigor=high panels fail closed unless every expected lane passes",
+        "publish_policy: ask makes Implementation cards local-only (completion_contract local-only even with required checks; `## Local-Only Delivery (publish_policy: ask)` forbids git push / gh pr create and requires branch, base_branch, head_sha, pr_title, pr_body); spawn_verification_pair / factonio_spawn_verify accept pr_number XOR branch + full head_sha (+ base_branch), fail closed on both/neither, short or non-hex SHAs, invalid refs (@, HEAD, NUL, control chars, surrogates, backticks) and branch == base, and spawn `owner/repo@branch` local Diff (rev-parse + git diff <base_ref>...<sha>, no holdout) and Black-Box (--no-hardlinks clone detached at <sha> + holdout + harness, no diff) cards for standard and rigor=high panels; `panel --branch` / factonio_evaluate_panel(branch) filter local panels and verify_panel_consensus rows carry branch, base_branch and head_sha",
         "refactor cards pin behavior, perf cards embed the 7+7 benchmark checklist, and investigate rejects skip_define and spawns a read-only `[define] [investigate]` card that writes only investigation.md",
         "Definition cards (feature, bug, refactor, perf, investigate) gain a bounded `## Prior Institutional Memory (Recall)` section with no holdout references only when other workstreams' memory matches; quick / skip_define cards never do; results carry additive recall_count",
         "A holdout reference in a prior decision's tenant, phase, card_id or correction never reaches a Definition card; the recall section is dropped if any reference survives redaction",
@@ -289,7 +292,8 @@
         "`recall_decisions` resolves supersession chains (A <- B <- C, branching, cyclic) to the current terminal corrections, never a stale intermediate, emits inline corrections only inside --repo and outside the excluded tenant (else correction_out_of_scope with no correction content), and redacts holdout references from every emitted field including tenant, phase, card_id and nested corrections",
         "`recall_decisions(repo=)` treats owner/repo and its registered or derived slug (or a list of aliases) as one repository, case-insensitively, while distinct repositories such as scope/one and scope/two stay isolated",
         "`recall_decisions` fails closed on the whole field: any emitted string or evidence value referencing holdout becomes exactly [redacted] (no trailing words or path suffix), while prose such as \"hold out for review\" is left untouched",
-        "`contains_holdout_reference` strips complete ANSI CSI/OSC/DCS/C1 escape sequences before matching and also matches the byte-deleted reading, so escape sequences can neither split nor swallow the holdout marker"
+        "`contains_holdout_reference` strips complete ANSI CSI/OSC/DCS/C1 escape sequences before matching and also matches the byte-deleted reading, so escape sequences can neither split nor swallow the holdout marker",
+        "metrics `_extract_local_target` surfaces additive `local_target` (repo, branch, base_branch, head_sha) on panel lanes, panel summaries and thread cards from the orchestrator `Local branch target:` stamp (stamped cards never yield a phantom PR ref) or a PR-less full-SHA completion handoff"
       ]
     },
     {

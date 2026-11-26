@@ -45,6 +45,12 @@ _VERIFY_PHASES = frozenset({"verify-diff", "verify-blackbox"})
 _PANEL_TAG_RE = re.compile(r"Verification panel: `(vp_[a-z0-9]+)` \(rigor=`([^`\n]+)`, vendor=`([^`\n]+)`")
 _PANEL_MODEL_RE = re.compile(r", model=`([^\n]*)`\)")
 _PASS_VERDICTS = frozenset({"pass"})
+# Orchestrator-written stamp of an unpublished local-branch verification target (spawn_verification_pair).
+_LOCAL_TARGET_RE = re.compile(
+    r"^- Local branch target: `([^`\n]+)` \(base=`([^`\n]+)`, head=`([0-9a-f]{40}|[0-9a-f]{64})`\)$", re.MULTILINE
+)
+_REPO_LINE_RE = re.compile(r"^- Repository: `([^`\n]+)`", re.MULTILINE)
+_FULL_SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 # Run outcomes that are not failures: a clean latest run clears any stale error.
 _CLEAN_OUTCOMES = frozenset({"completed", "review_requested", "changes_requested", "scheduled", "approved"})
 
@@ -352,10 +358,71 @@ def aggregate_panel_verdicts(lanes: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _local_target_from_body(body: Any) -> Optional[dict[str, Any]]:
+    text = str(body or "")
+    m = _LOCAL_TARGET_RE.search(text)
+    if not m:
+        return None
+    repo = _REPO_LINE_RE.search(text)
+    return {
+        "repo": repo.group(1) if repo else None,
+        "branch": m.group(1),
+        "base_branch": m.group(2),
+        "head_sha": m.group(3),
+        "source": "card",
+    }
+
+
+def _local_target_from_metadata(meta: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+    if meta.get("pr_number") or meta.get("published_pr") or meta.get("pr_url"):
+        return None
+    branch, sha = meta.get("branch"), meta.get("head_sha")
+    if not (isinstance(branch, str) and branch.strip() and isinstance(sha, str)):
+        return None
+    sha = sha.strip().lower()
+    if not _FULL_SHA_RE.fullmatch(sha) or any(c.isspace() or c == "`" for c in branch.strip()):
+        return None
+    base = meta.get("base_branch")
+    repo = meta.get("repo")
+    return {
+        "repo": str(repo) if isinstance(repo, str) and repo.strip() else None,
+        "branch": branch.strip(),
+        "base_branch": base.strip() if isinstance(base, str) and base.strip() else None,
+        "head_sha": sha,
+        "source": "metadata",
+    }
+
+
+def _extract_local_target(task: dict[str, Any], runs: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Unpublished local-branch target (``repo``, ``branch``, ``base_branch``, ``head_sha``) or ``None``.
+
+    The orchestrator-written ``Local branch target:`` card stamp wins over worker-reported metadata;
+    metadata (latest run first) counts only with a full commit SHA and no PR reference, e.g. a
+    ``publish_policy: ask`` Implementation card's completion handoff.
+    """
+    stamped = _local_target_from_body(task.get("body"))
+    if stamped is not None:
+        return stamped
+    for run in reversed(runs):
+        found = _local_target_from_metadata(_parse_json_dict(run.get("metadata")))
+        if found is not None:
+            return found
+    return None
+
+
+def _card_targets(task: dict[str, Any], runs: list[dict[str, Any]]) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+    """``(pr, local_target)``; a stamped local card has no PR, even if its branch name looks like ``a/b#1``."""
+    local = _extract_local_target(task, runs)
+    if local is not None and local.get("source") == "card":
+        return None, local
+    return _extract_pr_ref(task, runs), local
+
+
 def _panel_lane(task: dict[str, Any], runs: list[dict[str, Any]], tag: dict[str, str]) -> dict[str, Any]:
     phase = classify_phase(task)
     status = str(task.get("status") or "")
     meta = _parse_json_dict(runs[-1].get("metadata")) if runs else {}
+    pr, local = _card_targets(task, runs)
     return {
         "task_id": task.get("id"),
         "title": task.get("title"),
@@ -365,7 +432,8 @@ def _panel_lane(task: dict[str, Any], runs: list[dict[str, Any]], tag: dict[str,
         "vendor": tag["vendor"],
         "model": tag["model"],
         "tenant": task.get("tenant"),
-        "pr": _extract_pr_ref(task, runs),
+        "pr": pr,
+        "local_target": local,
         "findings": meta.get("findings") if isinstance(meta.get("findings"), list) else [],
         "disclosed_limits": meta.get("disclosed_limits") if isinstance(meta.get("disclosed_limits"), list) else [],
         "created_at": task.get("created_at"),
@@ -411,6 +479,7 @@ def summarize_panel(
         "panel_id": panel_id,
         "tenant": first.get("tenant"),
         "pr": next((lane.get("pr") for lane in lanes if lane.get("pr")), None),
+        "local_target": next((lane.get("local_target") for lane in lanes if lane.get("local_target")), None),
         "created_at": min((lane.get("created_at") or 0 for lane in lanes), default=None),
         "seq": max((lane.get("seq") or 0 for lane in lanes), default=0),
         **agg,
@@ -425,9 +494,14 @@ def load_panel_lanes(
     panel_ids: Optional[list[str]] = None,
     tenant: Optional[str] = None,
     pr_number: Optional[int] = None,
+    branch: Optional[str] = None,
     assignee: str = WORKER_PROFILE,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Read panel verification cards from `kanban.db` (read-only), grouped by ``panel_id``."""
+    """Read panel verification cards from `kanban.db` (read-only), grouped by ``panel_id``.
+
+    ``pr_number`` keeps only PR-target lanes for that PR; ``branch`` only local-branch-target lanes
+    for that branch.
+    """
     conn = _open_ro(db_path)
     if conn is None:
         return {}
@@ -473,6 +547,8 @@ def load_panel_lanes(
             continue
         lane = _panel_lane(task, runs_by_task.get(task["id"], []), tag)
         if pr_number is not None and int((lane.get("pr") or {}).get("number") or -1) != int(pr_number):
+            continue
+        if branch is not None and (lane.get("local_target") or {}).get("branch") != branch:
             continue
         grouped.setdefault(tag["panel_id"], []).append(lane)
     return grouped
@@ -970,6 +1046,7 @@ def thread_cards(
                 phase = classify_phase(r)
                 verdict = _card_verdict(phase, st, runs)
                 panel_tag = parse_panel_tag(r.get("body")) if phase in _VERIFY_PHASES else None
+                pr_ref, local_target = _card_targets(r, runs)
                 if verdict in _REJECT_VERDICTS:
                     counts["rejected"] += 1
                 elif verdict in _INCONCLUSIVE_VERDICTS:
@@ -985,7 +1062,8 @@ def thread_cards(
                     "provider": r.get("provider_override"),
                     "block_kind": r.get("block_kind"),
                     "block_reason": r.get("result") if st in ("blocked", "triage") else None,
-                    "pr": _extract_pr_ref(r, runs),
+                    "pr": pr_ref,
+                    "local_target": local_target,
                     "runs": len(runs),
                     "elapsed_seconds": elapsed,
                     "created_at": created,
