@@ -93,6 +93,7 @@
       ],
       "scenarios": [
         "`add` subcommand runs and exits 0 with --help",
+        "`arena` subcommand runs and exits 0 with --help",
         "`doctor` subcommand runs and exits 0 with --help",
         "`harness` subcommand runs and exits 0 with --help",
         "`init` subcommand runs and exits 0 with --help",
@@ -141,6 +142,23 @@
         "Black-box cards receive holdout/ and the harness; implement/diff cards never do",
         "rigor=high panels fail closed unless every expected lane passes",
         "refactor cards pin behavior, perf cards embed the 7+7 benchmark checklist, and investigate rejects skip_define and spawns a read-only `[define] [investigate]` card that writes only investigation.md"
+      ]
+    },
+    {
+      "id": "arena",
+      "surface": "Opt-in arena (competing define/design candidates + judge)",
+      "paths": [
+        "arena.py"
+      ],
+      "commands": [
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_arena -v'"
+      ],
+      "scenarios": [
+        "`arena spawn` fails closed (exit 1, zero Kanban cards) unless candidates span >= 2 distinct known vendor families; `--strict-cross-vendor` rejects an overlapping or unknown judge before any card exists",
+        "Each candidate writes only to runs/<tenant>/arena/<arena_id>/candidates/<slot>/; design candidates and the design judge never receive a holdout/ path",
+        "The judge card depends on every candidate (parents) and is told to hand-graft the canonical artifact citing each candidate's strengths and risks and log arena_synthesis",
+        "`arena status --json` reads kanban.db read-only and reports ready_for_synthesis / synthesized / canonical_artifact_exists; `synthesized` requires every candidate done with an artifact, a done judge and a canonical artifact changed since canonical_baseline; archived candidates read degraded, failed/cancelled candidates or judge read needs_attention, and an unreadable canonical artifact is never synthesized",
+        "`--spawn-judge` creates a missing judge exactly once, reusing the saved judge model and persisted strict_cross_vendor and reporting its real Kanban status; a failure on any arena card rolls back every card and the arena directory; a deferred judge whose manifest write fails is rolled back (zero judge card, unchanged manifest, CLI JSON error + exit 1) and a retry succeeds"
       ]
     },
     {
@@ -345,6 +363,7 @@
     ],
     "cli_commands": [
       "add",
+      "arena",
       "doctor",
       "harness",
       "init",

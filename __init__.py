@@ -35,6 +35,7 @@ Factonio is active for orchestrating software delivery on registered GitHub repo
 - Before reporting a PR ready or merging, verify live HEAD and CI via `factonio_pr_gate`. Auto-merge with `factonio_merge_pr` only when CI and both isolated verification checks pass (unless the repo sets `merge_policy: ask`).
 - Stack a unit on an unmerged parent PR with `factonio_spawn_implement(base_branch=..., stack_parent_pr=...)`; after the parent merges, run `factonio_restack_pr` and re-verify only when it reports `reverify_required`.
 - For risky PRs, `factonio_spawn_verify(rigor="high")` (or repo `default_rigor: high`) fans out a multi-vendor verify panel; merge only when `factonio_evaluate_panel` returns `consensus: pass`.
+- For a contested spec or design, `factonio_spawn_arena` (opt-in) runs competing cross-vendor candidates plus a judge; track it with `factonio_evaluate_arena`.
 - If the user reports a bug in work that passed Verification, start the fix with `escaped_from=<verify_card_id>` so escape rate stays measurable.
 - Bootstrap or refresh a repo's `.factonio/verify.md` black-box harness with `factonio_bootstrap_verify` (or `hermes factonio harness init|check|show|audit <repo>`); `factonio_spawn_verify` feeds it to Black-Box cards automatically.
 - Factory transitions are recorded in the append-only decision trail (`trail.db`); log forks, pivots, and merge countersigns with `factonio_log_decision`, and correct a decision by logging a new row with `supersedes_id`.

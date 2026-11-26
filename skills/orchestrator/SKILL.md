@@ -35,6 +35,15 @@ Coordinate software delivery on registered GitHub repositories across Definition
    - **Read-only investigation (`kind="investigate"`):** one Definition card titled `[define] [investigate] ...` writes a forensic root-cause report to `report_path` (`investigation.md`) and stops: no source edits, branches, or PRs, and `skip_define` is rejected. Read the report, then start a follow-up `bug`/`feature`/`refactor`/`perf` workstream if a fix is warranted. CLI: `hermes factonio start <repo> "<request>" --kind investigate`.
 5. If the user reports a regression in work that previously passed Verification, pass `escaped_from="<verify_card_id>"` to `factonio_start` so escape rate stays accurate. The Definition card then requires a `Verification Gap Analysis` in `spec.md`, and an `escape` row is written to the decision trail.
 
+### 1b. Optional Arena Mode (Contested Specs or Designs)
+
+Opt-in only: use it when the user asks for competing proposals, or the approach or UI direction is genuinely contested and a wrong pick is expensive. Default to a single Definition or Design card.
+
+1. Call `factonio_spawn_arena(repo, tenant, request, target="define"|"design", candidate_models=[...])` (CLI: `hermes factonio arena spawn <repo> --request "..." --candidate <provider/model> ...`). Candidates default to the configured `verify_panel`; it **fails closed** with no cards unless they span >= 2 distinct known vendor families. Pass `strict_cross_vendor=true` (and a `judge_model`) to require a judge from a vendor family no candidate uses.
+2. Each candidate card writes only to its own `runs/<tenant>/arena/<arena_id>/candidates/<slot>/` (`spec.md` + `holdout/` for `define`, `design/` for `design`) and never reads sibling candidates. Design candidates and the design judge never see `holdout/`.
+3. The judge card depends on every candidate and hand-grafts the canonical `spec.md` (+ `holdout/`) or `design/`, citing strengths and risks of each candidate, then logs `arena_synthesis` with `factonio_log_decision`.
+4. Track it with `factonio_evaluate_arena(arena_id=...)` (CLI: `hermes factonio arena status --arena-id <id>`; read-only Kanban). `spawn_judge=true` creates a missing judge. Continue to §2 or §3 only after `synthesized: true`, treating the judged artifact like any Definition or Design output.
+
 ### 2. Optional Phase 1b Design (UI Work)
 
 1. When Definition completes with `has_ui: true` (or the user explicitly requests a design pass) and `design_provider` is not `off`, call `factonio_spawn_design(repo, tenant, title=..., brief=..., parents=[define_task_id])`.

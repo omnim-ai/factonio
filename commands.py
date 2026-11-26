@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .arena import ARENA_TARGETS, evaluate_arena, spawn_arena
 from .config import (
     check_cross_model_warning,
     list_repos,
@@ -327,6 +328,71 @@ def _print_stack_gate(stack: dict) -> None:
     print(f"  Next action: {action.get('action')}{target}")
 
 
+def _print_arena(action: str, res: dict[str, Any]) -> None:
+    if action == "spawn":
+        judge = res.get("judge") or {}
+        print(f"Spawned arena {res['arena_id']} ({res['target']}) in tenant {res['tenant']} for {res['repo']}")
+        for cand in res["candidates"]:
+            print(f"  candidate {cand['slot']:<16} {cand['task_id']}  {cand['label']} [{cand.get('vendor') or 'unknown'}]")
+        if res.get("judge_task_id"):
+            cross = "cross-vendor" if judge.get("cross_vendor") else "NOT cross-vendor"
+            print(f"  judge     {res['judge_task_id']}  {judge.get('label') or '(profile default)'} ({cross})")
+        else:
+            print("  judge     (not spawned; run `hermes factonio arena status --arena-id ... --spawn-judge`)")
+    else:
+        print(f"{str(res['status']).upper()}: arena {res['arena_id']} ({res['target']}, tenant {res['tenant']})")
+        for cand in res["candidates"]:
+            art = cand["artifact"]
+            size = f"{art['size_bytes']}B" if art["exists"] else "missing"
+            print(f"  candidate {cand['slot']:<16} {cand['task_id']}  {cand['status']:<8} artifact={size}")
+        judge = res.get("judge")
+        print(f"  judge     {judge['task_id']}  {judge['status']}" if judge else "  judge     (none)")
+        print(
+            f"  ready_for_synthesis={res['ready_for_synthesis']} synthesized={res['synthesized']}"
+            f" canonical_artifact_exists={res['canonical_artifact_exists']}"
+        )
+    for note in res.get("advisories") or []:
+        print(f"  Advisory: {note}")
+
+
+def _handle_arena(args: Any, as_json: bool) -> None:
+    """`hermes factonio arena {spawn|status}`: exit 1 on a fail-closed spawn or an unknown arena."""
+    try:
+        if args.action == "spawn":
+            if not args.repo or not args.request:
+                raise ValueError("arena spawn needs a repo and --request")
+            res = spawn_arena(
+                args.repo,
+                args.tenant,
+                args.request,
+                target=args.target,
+                title=args.title,
+                candidate_models=args.candidates,
+                judge_model=args.judge_model,
+                auto_judge=not args.no_judge,
+                strict_cross_vendor=bool(args.strict_cross_vendor),
+                parents=args.parents,
+            )
+        else:
+            res = evaluate_arena(
+                arena_id=args.arena_id,
+                tenant=args.tenant,
+                spawn_judge=bool(args.spawn_judge),
+                judge_model=args.judge_model,
+                strict_cross_vendor=bool(args.strict_cross_vendor),
+            )
+    except (ValueError, OSError) as exc:
+        res = {"ok": False, "error": str(exc)}
+    if as_json:
+        print(json.dumps({"action": args.action, **res}, indent=2, default=str))
+    elif not res.get("ok"):
+        print(f"Error: {res.get('error')}", file=sys.stderr)
+    else:
+        _print_arena(args.action, res)
+    if not res.get("ok"):
+        sys.exit(1)
+
+
 def register_cli(ctx: Any, plugin_dir: Path) -> None:
     """Register `hermes factonio <subcommand>`."""
 
@@ -562,6 +628,40 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
 
         sub.add_parser("doctor", help="Verify git, gh auth, worker profile, Kanban config, and phase models.")
 
+        p_ar = sub.add_parser(
+            "arena",
+            help="Opt-in arena: competing cross-vendor define/design candidates plus a judge (spawn), or its progress (status).",
+        )
+        p_ar.add_argument("action", choices=["spawn", "status"], help="Arena action.")
+        p_ar.add_argument("repo", nargs="?", default=None, help="spawn: repo slug or 'owner/repo'.")
+        p_ar.add_argument("--request", default=None, help="spawn: problem statement or design brief for every candidate.")
+        p_ar.add_argument("--target", choices=list(ARENA_TARGETS), default="define", help="spawn: define or design.")
+        p_ar.add_argument("--tenant", default=None, help="Workstream tenant (spawn: omit to derive; status: latest arena).")
+        p_ar.add_argument("--title", default=None, help="spawn: short arena title.")
+        p_ar.add_argument(
+            "--candidate",
+            dest="candidates",
+            action="append",
+            default=None,
+            help="spawn: candidate 'provider/model' (repeat; default: the configured verify_panel).",
+        )
+        p_ar.add_argument("--judge-model", default=None, help="Judge 'provider/model' override.")
+        p_ar.add_argument("--no-judge", action="store_true", help="spawn: do not create the judge card yet.")
+        p_ar.add_argument(
+            "--strict-cross-vendor",
+            action="store_true",
+            help="Fail closed unless the judge's vendor family differs from every candidate's.",
+        )
+        p_ar.add_argument("--parent", dest="parents", action="append", default=None, help="spawn: parent card id (repeat).")
+        p_ar.add_argument("--arena-id", default=None, help="status: arena id (ar_...).")
+        p_ar.add_argument("--spawn-judge", action="store_true", help="status: create the judge card if none exists.")
+        p_ar.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Output machine-readable JSON.",
+        )
+
     def handle_cli(args: Any) -> None:
         cmd = getattr(args, "factonio_cmd", None)
         as_json = bool(getattr(args, "json", False))
@@ -569,7 +669,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         if not cmd:
             print(
                 "Usage: hermes factonio {init|add|update|remove|list|models|start|status|panel|pr-gate|restack|worktrees"
-                "|harness|trail|metrics|doctor} [--json]"
+                "|harness|trail|metrics|arena|doctor} [--json]"
             )
             return
 
@@ -967,6 +1067,10 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                 sys.exit(1)
             return
 
+        if cmd == "arena":
+            _handle_arena(args, as_json)
+            return
+
         if cmd == "doctor":
             res = run_doctor(plugin_dir)
             if as_json:
@@ -986,7 +1090,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         "factonio",
         help=(
             "Manage the Factonio pure-Hermes software factory "
-            "(init, add, update, models, start, status, panel, restack, worktrees, harness, trail, metrics, doctor)."
+            "(init, add, update, models, start, status, panel, restack, worktrees, harness, trail, metrics, arena, doctor)."
         ),
         setup_fn=setup_parser,
         handler_fn=handle_cli,

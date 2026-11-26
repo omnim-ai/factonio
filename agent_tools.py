@@ -7,6 +7,7 @@ import os
 import re
 from typing import Any, Optional
 
+from .arena import ARENA_TARGETS, evaluate_arena, spawn_arena
 from .config import (
     PLUGIN_ID,
     check_cross_model_warning,
@@ -516,6 +517,125 @@ def register_tools(ctx: Any) -> None:
             },
         },
         handler=handle_evaluate_panel,
+    )
+
+    model_entry_schema = {
+        "anyOf": [
+            {"type": "string", "description": "'provider/model' or 'model'."},
+            {
+                "type": "object",
+                "properties": {
+                    "provider": {"type": "string"},
+                    "model": {"type": "string"},
+                    "label": {"type": "string"},
+                },
+                "required": ["model"],
+            },
+        ]
+    }
+
+    def handle_spawn_arena(args: dict[str, Any], **kwargs: Any) -> str:
+        try:
+            res = spawn_arena(
+                str(args["repo"]),
+                args.get("tenant") or None,
+                str(args["request"]),
+                target=str(args.get("target") or "define"),
+                title=args.get("title"),
+                candidate_models=args.get("candidate_models") or None,
+                judge_model=args.get("judge_model") or None,
+                auto_judge=bool(args.get("auto_judge", True)),
+                strict_cross_vendor=bool(args.get("strict_cross_vendor", False)),
+                parents=args.get("parents") or None,
+                session_id=kwargs.get("session_id"),
+            )
+            return _json_ok(res)
+        except Exception as exc:
+            return _json_err(exc)
+
+    ctx.register_tool(
+        name="factonio_spawn_arena",
+        toolset=PLUGIN_ID,
+        schema={
+            "name": "factonio_spawn_arena",
+            "description": (
+                "Opt-in arena for a contested spec or design: fan out one isolated Definition (target='define') or "
+                "Design (target='design') candidate card per model across >= 2 vendor families (fails closed, no "
+                "cards, otherwise), each writing only to runs/<tenant>/arena/<arena_id>/candidates/<slot>/, plus a "
+                "dependent cross-vendor judge card that hand-grafts the canonical spec.md or design/ and logs "
+                "arena_synthesis. Track it with factonio_evaluate_arena."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Registered repo slug or 'owner/repo'."},
+                    "tenant": {"type": "string", "description": "Workstream tenant (omit to derive a new one)."},
+                    "request": {"type": "string", "description": "Problem statement or design brief every candidate gets."},
+                    "target": {"type": "string", "enum": list(ARENA_TARGETS), "default": "define"},
+                    "title": {"type": "string", "description": "Short arena title."},
+                    "candidate_models": {
+                        "type": "array",
+                        "items": model_entry_schema,
+                        "description": "Candidate models (default: the configured verify_panel).",
+                    },
+                    "judge_model": {
+                        **model_entry_schema,
+                        "description": "Judge model (default: the target/verify phase model, preferring a vendor no candidate uses).",
+                    },
+                    "auto_judge": {"type": "boolean", "default": True, "description": "Spawn the dependent judge card now."},
+                    "strict_cross_vendor": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Fail closed unless the judge's vendor family differs from every candidate's.",
+                    },
+                    "parents": {"type": "array", "items": {"type": "string"}, "description": "Parent card ids for the candidates."},
+                },
+                "required": ["repo", "request"],
+            },
+        },
+        handler=handle_spawn_arena,
+    )
+
+    def handle_evaluate_arena(args: dict[str, Any], **kwargs: Any) -> str:
+        try:
+            res = evaluate_arena(
+                arena_id=args.get("arena_id") or None,
+                tenant=args.get("tenant") or None,
+                spawn_judge=bool(args.get("spawn_judge", False)),
+                judge_model=args.get("judge_model") or None,
+                strict_cross_vendor=bool(args.get("strict_cross_vendor", False)),
+                session_id=kwargs.get("session_id"),
+            )
+            return _json_ok(res)
+        except Exception as exc:
+            return _json_err(exc)
+
+    ctx.register_tool(
+        name="factonio_evaluate_arena",
+        toolset=PLUGIN_ID,
+        schema={
+            "name": "factonio_evaluate_arena",
+            "description": (
+                "Read-only arena progress from kanban.db and the candidate directories: per-candidate card status "
+                "and artifact size, judge status, status, ready_for_synthesis, synthesized and "
+                "canonical_artifact_exists. spawn_judge=true creates the dependent judge card when none exists."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "arena_id": {"type": "string", "description": "Arena id (ar_...) from factonio_spawn_arena."},
+                    "tenant": {"type": "string", "description": "Workstream tenant (latest arena when arena_id is omitted)."},
+                    "spawn_judge": {"type": "boolean", "default": False, "description": "Create the judge card if missing."},
+                    "judge_model": {**model_entry_schema, "description": "spawn_judge: judge model override."},
+                    "strict_cross_vendor": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "spawn_judge: fail closed unless the judge is from a vendor family no candidate uses.",
+                    },
+                },
+            },
+        },
+        handler=handle_evaluate_arena,
     )
 
     def handle_status(args: dict[str, Any], **kwargs: Any) -> str:

@@ -29,6 +29,7 @@ Factonio adapts engineering patterns and instruction text from the third-party p
   - PR shipping gate: owner-approval gates separated from CI, review-automation waits, single flake rerun, bot review triage with safe file-based replies and an ask-by-default risk boundary, tiered trunk drift, a stack-wide tier-major gate, and bottom-up stacked merge ordering (`repos.py` `inspect_pr_gate` / `inspect_stack_gate` / `merge_pr`, `factonio_pr_gate`, `factonio_merge_pr`, `hermes factonio pr-gate --stack`, `skills/implement/SKILL.md`, `skills/orchestrator/SKILL.md`).
 - Wave 5 adapted patterns:
   - workstream modes: behavior-preserving `refactor`, `perf` with the `benchmark-checklist` (7 pre-optimization questions and 7 measurement mantras), and a read-only forensic `investigate` mode (`orchestrator.py` `WORKSTREAM_KINDS` / `BENCHMARK_PRE_OPT_QUESTIONS` / `BENCHMARK_MEASUREMENT_MANTRAS` / `investigation_report_path`, `factonio_start`, `hermes factonio start`, `skills/define/SKILL.md`, `skills/verify-diff/SKILL.md`, `skills/orchestrator/SKILL.md`).
+  - `/arena` competing-candidate fan-out: opt-in parallel Definition or Design candidates across distinct vendor families with an independent judge that hand-grafts one canonical synthesis from every candidate's strengths and risks (`arena.py` `spawn_arena` / `evaluate_arena`, `factonio_spawn_arena`, `factonio_evaluate_arena`, `hermes factonio arena`, `skills/orchestrator/SKILL.md` §1b).
 
 ```text
 MIT License
