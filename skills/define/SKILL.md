@@ -12,13 +12,14 @@ Produce a codebase-grounded specification, a parallelizable task breakdown, and 
 
 - Preloaded on `[define]` Kanban cards running under the `factonio` worker profile.
 - Handles both feature design (`mode: feature`) and bug root-cause diagnosis (`mode: bug`).
+- Also handles `mode: refactor`, `mode: perf`, and the read-only `mode: investigate` (see §1c).
 - Do not use to implement features, commit code, or open pull requests.
 
 ## Inputs
 
 Read from the Kanban card body:
 - Target repository path and `owner/repo`
-- Mode (`feature` or `bug`)
+- Mode (`feature`, `bug`, `refactor`, `perf`, or `investigate`)
 - Output path for `spec.md`
 - Output path for the hidden `holdout/` directory
 
@@ -45,6 +46,14 @@ Read from the Kanban card body:
 ### 1b. Architect Before Locking the Approach
 
 Before writing the Technical approach, sketch **2 candidate shapes**. For each, note the core types, which component owns each piece of state, and the module/API boundaries it introduces or touches. Pick one against the Core Principles and record the rejected shape in one line (why it lost) so implementers do not rediscover it.
+
+### 1c. Mode-Specific Contracts (refactor, perf, investigate)
+
+The card body carries the full contract for these modes; follow it on top of the steps above.
+
+- **`refactor` (behavior preservation):** list the existing contract/characterization tests that pin every touched public surface, and make "pin behavior first" the blocking first DAG unit when coverage is missing. Pinned tests must not change; acceptance criteria state zero unintended behavioral drift for Diff Check.
+- **`perf` (benchmark-checklist):** answer all 7 pre-optimization questions in `spec.md` (metric and target, reproducible benchmark, profiler-proven hot path, bottleneck location, achievable bound, correctness contracts, acceptable cost and stop condition) and put the exact before/after benchmark command under Verification commands. Every unit follows the 7 measurement mantras: identical inputs, warmup, repeated runs with variance, one change at a time, and no correctness regression.
+- **`investigate` (read-only):** a forensic / root-cause mode. Write only the investigation report at the path in the card (`investigation.md`); do not write `spec.md`, a Task DAG, or holdout scenarios. Never edit, commit, or push source files, create branches, or open pull requests; run probes in a scratch directory. Speculative fixes are forbidden: recommend a follow-up `bug`, `feature`, `refactor`, or `perf` workstream instead, and complete with `report_path` and `root_cause` in metadata.
 
 ### 2. Write `spec.md`
 

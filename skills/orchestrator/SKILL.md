@@ -30,6 +30,9 @@ Coordinate software delivery on registered GitHub repositories across Definition
    - **Feature (`kind="feature"`):** Definition -> optional Phase 1b Design (when `has_ui: true` or requested) -> parallel Implementation -> parallel Verification -> Merge.
    - **Bug (`kind="bug"`):** Definition (diagnosis mode) -> Implementation -> parallel Verification -> Merge.
    - **Small obvious change (`kind="quick"`):** Implementation -> Verification -> Merge.
+   - **Behavior-preserving refactor (`kind="refactor"`):** Definition pins existing contract/characterization tests before internal edits -> Implementation -> Verification (Diff Check proves zero unintended behavioral drift) -> Merge.
+   - **Performance (`kind="perf"`):** Definition answers the 7 pre-optimization questions and the card carries the 7 measurement mantras (`benchmark-checklist`) -> Implementation -> Verification (before/after benchmarks on identical inputs, variance, no correctness regression) -> Merge.
+   - **Read-only investigation (`kind="investigate"`):** one Definition card titled `[define] [investigate] ...` writes a forensic root-cause report to `report_path` (`investigation.md`) and stops: no source edits, branches, or PRs, and `skip_define` is rejected. Read the report, then start a follow-up `bug`/`feature`/`refactor`/`perf` workstream if a fix is warranted. CLI: `hermes factonio start <repo> "<request>" --kind investigate`.
 5. If the user reports a regression in work that previously passed Verification, pass `escaped_from="<verify_card_id>"` to `factonio_start` so escape rate stays accurate. The Definition card then requires a `Verification Gap Analysis` in `spec.md`, and an `escape` row is written to the decision trail.
 
 ### 2. Optional Phase 1b Design (UI Work)
