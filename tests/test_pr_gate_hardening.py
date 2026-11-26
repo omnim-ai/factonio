@@ -895,5 +895,75 @@ class TestCliAndTools(unittest.TestCase):
             self.assertEqual(flags, [False, True])
 
 
+class TestMergeTrailAudit(unittest.TestCase):
+    """Cross-unit: refused merges must not read as gate loosening in `trail --audit`."""
+
+    CTX = {"repo": "acme/sample", "tenant": "demo-stack", "card_id": "t_demo", "actor": "orchestrator"}
+
+    def _handler(self):
+        from factonio.agent_tools import register_tools
+
+        tools: dict[str, Any] = {}
+
+        class _Ctx:
+            def register_tool(self, **kw: Any) -> None:
+                tools[kw["name"]] = kw
+
+            def __getattr__(self, name: str) -> Any:
+                return lambda *a, **k: None
+
+        register_tools(_Ctx())
+        return tools["factonio_merge_pr"]["handler"]
+
+    def _audit(self) -> dict:
+        from factonio import trail
+
+        return trail.audit_trail_evidence(tenant=self.CTX["tenant"])
+
+    def test_refused_stacked_merge_then_bottom_up_is_clean(self):
+        with isolated_hermes_home():
+            handler = self._handler()
+            prs = _stack_prs()
+            views = {10: {"state": "MERGED", "mergedAt": "2026-11-26T00:00:00Z", "baseRefName": "main"},
+                     11: {"state": "MERGED", "mergedAt": "2026-11-26T00:01:00Z", "baseRefName": "main"}}
+            with mock.patch("factonio.repos._run_gh", Gh(prs, views=views)):
+                refused = json.loads(handler({**self.CTX, "pr_number": 11}))
+            self.assertFalse(refused["ok"])
+            self.assertIn("allow_stacked_merge=True", refused["error"])
+
+            restacked = dict(prs)
+            restacked[11] = _pr_node(11, head_branch="s/2", head_sha="2" * 40, base_branch="main")
+            with mock.patch("factonio.repos._run_gh", Gh(restacked, views=views)):
+                first = json.loads(handler({**self.CTX, "pr_number": 10}))
+                second = json.loads(handler({**self.CTX, "pr_number": 11}))
+            self.assertTrue(first["merged"], first)
+            self.assertTrue(second["merged"], second)
+
+            audit = self._audit()
+            self.assertEqual(audit["counts"]["gate_loosening"], 0, audit)
+            self.assertTrue(audit["clean"], audit)
+
+    def test_refused_head_mismatch_without_continuity_is_not_loosening(self):
+        with isolated_hermes_home():
+            handler = self._handler()
+            with mock.patch("factonio.repos._run_gh", Gh({12: _pr_node(12)})):
+                refused = json.loads(handler({**self.CTX, "pr_number": 12, "expected_head_sha": "b" * 40,
+                                              "method": "force_merge"}))
+            self.assertFalse(refused["ok"])
+            self.assertIn("HEAD mismatch", refused["error"])
+            self.assertEqual(self._audit()["counts"]["gate_loosening"], 0)
+
+    def test_explicit_stacked_override_is_flagged(self):
+        with isolated_hermes_home():
+            handler = self._handler()
+            views = {11: {"state": "MERGED", "mergedAt": "2026-11-26T00:00:00Z", "baseRefName": "s/1"}}
+            with mock.patch("factonio.repos._run_gh", Gh(_stack_prs(), views=views)):
+                forced = json.loads(handler({**self.CTX, "pr_number": 11, "allow_stacked_merge": True}))
+            self.assertTrue(forced["merged"], forced)
+            audit = self._audit()
+            self.assertFalse(audit["clean"])
+            self.assertEqual(audit["counts"]["gate_loosening"], 1, audit)
+
+
 if __name__ == "__main__":
     unittest.main()

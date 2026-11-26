@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Optional
 
 from .config import (
@@ -39,7 +40,7 @@ from .repos import (
     restack_stack,
     update_repo,
 )
-from .trail import log_decision, record_transition
+from .trail import _GATE_LOOSENING_TOKENS, _norm_token_text, log_decision, record_transition
 
 
 def _json_ok(payload: dict[str, Any]) -> str:
@@ -58,6 +59,18 @@ def _trail_context(args: dict[str, Any]) -> dict[str, Any]:
         "card_id": args.get("card_id") or worker_card,
         "actor": args.get("actor") or ("worker" if worker_card else "orchestrator"),
     }
+
+
+def _scrub_loosening_hints(why: str, fallback: str) -> str:
+    """Drop clauses that merely *mention* a gate-loosening knob (e.g. a refusal's override hint).
+
+    `trail.audit_trail_evidence` flags `_GATE_LOOSENING_TOKENS` anywhere in `why`; real overrides are
+    recorded in `evidence`, so a hint in refusal prose would be a permanent false positive.
+    """
+    tokens = [_norm_token_text(t) for t in _GATE_LOOSENING_TOKENS]
+    clauses = re.split(r"\s*;\s*|,\s+or\s+", why)
+    kept = [c for c in clauses if c and not any(t in _norm_token_text(c) for t in tokens)]
+    return "; ".join(kept) or fallback
 
 
 def _gate_result(gate: dict[str, Any]) -> str:
@@ -79,7 +92,7 @@ def _record_pr_gate(args: dict[str, Any], gate: dict[str, Any]) -> None:
         "pr_gate",
         repo_slug=str(args.get("repo") or ""),
         phase="gate",
-        why=why[:500],
+        why=_scrub_loosening_hints(why, f"PR gate {result}")[:500],
         evidence={
             "pr_number": int(args["pr_number"]),
             "head_sha": gate.get("head_sha"),
@@ -108,7 +121,7 @@ def _record_stack_gate(args: dict[str, Any], stack: dict[str, Any], pr_numbers: 
         "pr_gate",
         repo_slug=str(args.get("repo") or ""),
         phase="gate",
-        why=why[:500],
+        why=_scrub_loosening_hints(why, f"Stack gate {result}")[:500],
         evidence={
             "stack_pr_numbers": pr_numbers,
             "order": stack.get("order"),
@@ -128,16 +141,24 @@ def _record_merge(args: dict[str, Any], res: dict[str, Any], expected_head_sha: 
         result = "queued"
     else:
         result = "refused"
+    pr_number = int(args["pr_number"])
+    gate = res.get("gate") if isinstance(res.get("gate"), dict) else {}
+    if result == "refused" and gate.get("is_stacked") and not args.get("allow_stacked_merge"):
+        why = f"Refused stacked PR #{pr_number} on {gate.get('base_branch')!r}: merge the stack bottom-up and restack"
+    else:
+        why = str(res.get("error") or f"PR #{pr_number} {result}")
+    method = res.get("method") or args.get("method") or "squash"
     record_transition(
         "merge_pr",
         repo_slug=str(args.get("repo") or ""),
         phase="merge",
-        why=(str(res.get("error") or f"PR #{int(args['pr_number'])} {result}"))[:500],
+        why=_scrub_loosening_hints(why, f"PR #{pr_number} {result}")[:500],
         evidence={
-            "pr_number": int(args["pr_number"]),
-            "head_sha": res.get("head_sha") or (res.get("gate") or {}).get("head_sha"),
+            "pr_number": pr_number,
+            "head_sha": res.get("head_sha") or gate.get("head_sha"),
             "expected_head_sha": expected_head_sha,
-            "method": res.get("method") or args.get("method") or "squash",
+            # merge_pr falls back to squash for unknown methods; never echo caller text into evidence.
+            "method": method if method in ("squash", "merge", "rebase") else "squash",
             "url": res.get("url"),
             # Overrides are logged only when used so trail audits can flag them.
             **({"allow_stacked_merge": True} if args.get("allow_stacked_merge") else {}),
