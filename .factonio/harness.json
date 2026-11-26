@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-26T17:18:58Z",
+  "generated_at": "2026-11-26T18:48:31Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -144,7 +144,8 @@
         "rigor=high panels fail closed unless every expected lane passes",
         "refactor cards pin behavior, perf cards embed the 7+7 benchmark checklist, and investigate rejects skip_define and spawns a read-only `[define] [investigate]` card that writes only investigation.md",
         "Definition cards (feature, bug, refactor, perf, investigate) gain a bounded `## Prior Institutional Memory (Recall)` section with no holdout references only when other workstreams' memory matches; quick / skip_define cards never do; results carry additive recall_count",
-        "A holdout reference in a prior decision's tenant, phase, card_id or correction never reaches a Definition card; the recall section is dropped if any reference survives redaction"
+        "A holdout reference in a prior decision's tenant, phase, card_id or correction never reaches a Definition card; the recall section is dropped if any reference survives redaction",
+        "Control and format characters interleaved in a holdout path (NUL, BEL, ESC, zero-width) are deleted, not spaced, before redaction, so no fragment of the path reaches recall output or a Definition card; Definition-card recall matches history logged under the registered owner/repo or its slug"
       ]
     },
     {
@@ -224,7 +225,8 @@
         "A spent best-effort trail budget still records an uncontended cold snapshot while a held trail.db.lock fails fast",
         "`trail --audit` treats malformed evidence pr_number strings (Unicode digits such as '²', overlong digit strings) as absent and returns a structured audit instead of crashing",
         "`recall_decisions` is read-only (absent store stays absent, unversioned store never migrated) and fails closed (ok false, items []) on a directory, dangling symlink or garbage trail.db; `render_recall_markdown` never exceeds max_chars",
-        "`recall_decisions` resolves supersession chains (A <- B <- C, branching, cyclic) to the current terminal corrections, never a stale intermediate, emits inline corrections only inside --repo and outside the excluded tenant (else correction_out_of_scope with no correction content), and redacts holdout references from every emitted field including tenant, phase, card_id and nested corrections"
+        "`recall_decisions` resolves supersession chains (A <- B <- C, branching, cyclic) to the current terminal corrections, never a stale intermediate, emits inline corrections only inside --repo and outside the excluded tenant (else correction_out_of_scope with no correction content), and redacts holdout references from every emitted field including tenant, phase, card_id and nested corrections",
+        "`recall_decisions(repo=)` treats owner/repo and its registered or derived slug (or a list of aliases) as one repository, case-insensitively, while distinct repositories such as scope/one and scope/two stay isolated"
       ]
     },
     {
