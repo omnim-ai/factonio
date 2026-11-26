@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-26T11:30:00Z",
+  "generated_at": "2026-11-26T11:45:00Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -165,7 +165,8 @@
         "Route/CLI discovery ignores tests/, test/, spec/, __tests__/ fixtures",
         "`harness init --prove` fails closed (ok/written false, prior .factonio/ bytes restored, proof_failed trail row, exit 1) unless Doctor, required hooks and evidence survival pass",
         "`harness check --base <ref>` fails when a required hook is removed or downgraded to optional or a Doctor command is dropped; `audit` reports gate_loosening as stale",
-        "`audit` drift_classification ranks product_regression > harness_gap > doc_drift > clean"
+        "`audit` drift_classification ranks product_regression > harness_gap > doc_drift > clean",
+        "Malformed `harness.json` (invalid JSON or unsupported schema_version) makes `audit` stale and classifies as harness_gap; removing a required hook a hook-less `harness.json` inherits from verify.md is gate loosening"
       ]
     },
     {
