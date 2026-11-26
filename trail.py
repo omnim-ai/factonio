@@ -795,7 +795,7 @@ def render_trail_markdown(rows: list[Mapping[str, Any]]) -> str:
 # --- trail --audit: deterministic, read-only pre-handoff evidence audit ----------------------
 
 AUDIT_FINDING_KINDS = ("missing_evidence", "weak_evidence", "unclosed_escalation", "gate_loosening")
-_HIGH_STAKES_PHASES = frozenset({"verify", "escape", "retro", "merge"})
+_HIGH_STAKES_PHASES = frozenset({"verify", "escape", "retro", "merge", "publish"})
 _OVERRIDE_DECISION_TOKENS = ("override", "countersign")
 _ARTIFACT_KEYS = (
     "pr_number", "head_sha", "commit", "patch_id", "command", "proof", "proof_command", "repro",
@@ -805,7 +805,7 @@ _ARTIFACT_KEYS = (
 _ESCALATION_RESULTS = frozenset(
     {"blocked", "escalated", "needs_input", "reject", "inconclusive", "conflict", "proof_failed"}
 )
-_RESOLVING_RESULTS = frozenset({"pass", "merged", "resolved", "adopted", "continuous", "ready"})
+_RESOLVING_RESULTS = frozenset({"pass", "merged", "resolved", "adopted", "continuous", "ready", "published"})
 _GATE_LOOSENING_TOKENS = (
     "gate_loosening", "skip_test", "disable_ci", "continue-on-error", "downgrade_hook",
     "allow_stacked_merge", "allow_patch_continuity", "force_merge", "bypass_gate", "skip_gate",
@@ -917,7 +917,7 @@ def audit_trail_evidence(
     Superseded rows are skipped (their correction is audited instead). Findings:
 
     - ``missing_evidence``: blank ``why`` or empty / all-null ``evidence``.
-    - ``weak_evidence``: a ``verify`` / ``escape`` / ``retro`` / ``merge`` row, or an override /
+    - ``weak_evidence``: a ``verify`` / ``escape`` / ``retro`` / ``merge`` / ``publish`` row, or an override /
       countersign decision, whose evidence names no verifiable artifact (`_ARTIFACT_KEYS`).
     - ``unclosed_escalation``: an ``escape`` row or an escalating ``result`` with no later active
       resolving row in the same scope (``(tenant, card_id)``, or the tenant when no card is set).

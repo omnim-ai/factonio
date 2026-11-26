@@ -14,6 +14,8 @@ from .config import (
     check_cross_model_warning,
     list_repos,
     resolve_all_phase_models,
+    resolve_default_publish_policy,
+    resolve_publish_policy,
     resolve_rigor,
     resolve_verify_panel,
 )
@@ -28,6 +30,7 @@ from .repos import (
     inspect_pr_gate,
     inspect_stack_gate,
     prune_safe_worktrees,
+    publish_pr,
     remove_repo,
     restack_pr,
     restack_stack,
@@ -47,6 +50,30 @@ from .trail import (
     render_trail_text,
     trail_payload,
 )
+
+
+def _publish_policy_label(repo: dict[str, Any]) -> str:
+    """Effective publish policy for display; legacy entries inherit the global default."""
+    try:
+        return resolve_publish_policy(repo=repo)
+    except ValueError:
+        return "invalid"
+
+
+def _publish_policy_errors(repos: dict[str, Any]) -> list[str]:
+    """Every persisted publish-policy problem (global default and per-repo, ``null``/``""`` included)."""
+    errors: list[str] = []
+    try:
+        resolve_default_publish_policy()
+    except ValueError as exc:
+        errors.append(str(exc))
+    for slug, r in sorted(repos.items()):
+        if isinstance(r, dict) and "publish_policy" in r:
+            try:
+                resolve_publish_policy(repo={**r, "slug": r.get("slug") or slug})
+            except ValueError as exc:
+                errors.append(str(exc))
+    return errors
 
 
 def _print_result(data: dict[str, Any], as_json: bool) -> None:
@@ -418,6 +445,12 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         p_add.add_argument("repo", help="GitHub repository ('owner/repo' or URL).")
         p_add.add_argument("--path", dest="local_path", default=None, help="Local checkout path override.")
         p_add.add_argument("--merge-policy", choices=["auto", "ask"], default=None, help="PR merge policy.")
+        p_add.add_argument(
+            "--publish-policy",
+            choices=["auto", "ask"],
+            default=None,
+            help="PR publish policy: 'ask' keeps work on verified local branches until publish-pr.",
+        )
         p_add.add_argument("--max-fix-rounds", type=int, default=None, help="Max verification fix rounds per PR.")
         p_add.add_argument("--no-clone", action="store_true", help="Do not clone if local directory is absent.")
 
@@ -428,6 +461,12 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         )
         p_upd.add_argument("repo", help="Repo slug or 'owner/repo'.")
         p_upd.add_argument("--merge-policy", choices=["auto", "ask"], default=None, help="PR merge policy.")
+        p_upd.add_argument(
+            "--publish-policy",
+            choices=["auto", "ask"],
+            default=None,
+            help="PR publish policy: 'ask' keeps work on verified local branches until publish-pr.",
+        )
         p_upd.add_argument("--max-fix-rounds", type=int, default=None, help="Max verification fix rounds per PR (>= 1).")
         p_upd.add_argument("--default-branch", default=None, help="Base branch for PRs and worktrees.")
         p_upd.add_argument(
@@ -535,6 +574,31 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         p_rs.add_argument("--no-retarget", action="store_true", help="Do not retarget the PR base via gh pr edit.")
         p_rs.add_argument("--dry-run", action="store_true", help="Rebase and compare patch-ids only; no push/retarget.")
         p_rs.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Output machine-readable JSON.",
+        )
+
+        p_pub = sub.add_parser(
+            "publish-pr",
+            help="Push a verified local branch by exact SHA and open its GitHub PR (fail-closed on drift).",
+        )
+        p_pub.add_argument("repo", help="Registered repo slug or 'owner/repo'.")
+        p_pub.add_argument("branch", help="Local feature branch to publish.")
+        p_pub.add_argument(
+            "--expected-head-sha", required=True, help="Full commit SHA local verification passed on."
+        )
+        p_pub.add_argument("--title", required=True, help="Single-line PR title.")
+        body_group = p_pub.add_mutually_exclusive_group()
+        body_group.add_argument("--body", default=None, help="PR body text.")
+        body_group.add_argument("--body-file", default=None, help="Path to a UTF-8 PR body file.")
+        p_pub.add_argument("--base", dest="base_branch", default=None, help="PR base branch (default: repo default).")
+        p_pub.add_argument("--draft", action="store_true", help="Open the PR as a draft.")
+        p_pub.add_argument("--remote", default="origin", help="Git remote to push to (default: origin).")
+        p_pub.add_argument("--tenant", default=None, help="Workstream tenant for the decision trail.")
+        p_pub.add_argument("--card-id", default=None, help="Kanban card id for the decision trail.")
+        p_pub.add_argument(
             "--json",
             action="store_true",
             default=argparse.SUPPRESS,
@@ -681,7 +745,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
 
         if not cmd:
             print(
-                "Usage: hermes factonio {init|add|update|remove|list|models|start|status|panel|pr-gate|restack|worktrees"
+                "Usage: hermes factonio {init|add|update|remove|list|models|start|status|panel|pr-gate|publish-pr|restack|worktrees"
                 "|harness|trail|metrics|arena|doctor} [--json]"
             )
             return
@@ -715,13 +779,23 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             return
 
         if cmd == "add":
-            res = add_repo(
-                args.repo,
-                local_path=args.local_path,
-                merge_policy=args.merge_policy,
-                max_fix_rounds=args.max_fix_rounds,
-                clone=not bool(args.no_clone),
-            )
+            cli_policy = getattr(args, "publish_policy", None)
+            policy_kwargs = {"publish_policy": cli_policy} if cli_policy is not None else {}
+            try:
+                res = add_repo(
+                    args.repo,
+                    local_path=args.local_path,
+                    merge_policy=args.merge_policy,
+                    max_fix_rounds=args.max_fix_rounds,
+                    clone=not bool(args.no_clone),
+                    **policy_kwargs,
+                )
+            except ValueError as exc:
+                if as_json:
+                    print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+                else:
+                    print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
             if as_json:
                 print(json.dumps(res, indent=2, default=str))
                 return
@@ -729,12 +803,16 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             print(f"Registered {r['repo']} (slug: {r['slug']})")
             print(f"  Path: {r['path']} (project: {r['project_slug']})")
             print(f"  Default branch: {r['default_branch']} | Required checks: {len(r['required_checks'])}")
-            print(f"  Merge policy: {r['merge_policy']} | Max fix rounds: {r['max_fix_rounds']}")
+            print(
+                f"  Merge policy: {r['merge_policy']} | Publish policy: {_publish_policy_label(r)}"
+                f" | Max fix rounds: {r['max_fix_rounds']}"
+            )
             return
 
         if cmd in ("update", "edit"):
             flag_map = {
                 "merge_policy": getattr(args, "merge_policy", None),
+                "publish_policy": getattr(args, "publish_policy", None),
                 "max_fix_rounds": getattr(args, "max_fix_rounds", None),
                 "default_branch": getattr(args, "default_branch", None),
                 "design_provider": getattr(args, "design_provider", None),
@@ -757,7 +835,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             print(f"Updated {r.get('repo')} (slug: {r['slug']}): {', '.join(res['updated_fields'])}")
             print(
                 f"  Branch: {r.get('default_branch', 'main')} | Merge policy: {r.get('merge_policy', 'auto')}"
-                f" | Max fix rounds: {r.get('max_fix_rounds', 3)}"
+                f" | Publish policy: {_publish_policy_label(r)} | Max fix rounds: {r.get('max_fix_rounds', 3)}"
             )
             print(
                 f"  Design provider: {r.get('design_provider') or 'inherit'}"
@@ -778,16 +856,27 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
 
         if cmd == "list":
             repos = list_repos()
+            policy_errors = _publish_policy_errors(repos)
             if as_json:
-                print(json.dumps({"repos": repos}, indent=2, default=str))
+                payload: dict[str, Any] = {"repos": repos}
+                if policy_errors:
+                    payload.update(ok=False, errors=policy_errors)
+                print(json.dumps(payload, indent=2, default=str))
+                if policy_errors:
+                    sys.exit(1)
                 return
             if not repos:
                 print("No repositories registered. Run: hermes factonio add owner/repo")
+                for err in policy_errors:
+                    print(f"Error: {err}", file=sys.stderr)
+                if policy_errors:
+                    sys.exit(1)
                 return
             for slug, r in sorted(repos.items()):
                 tags = [
                     f"branch={r.get('default_branch', 'main')}",
                     f"merge={r.get('merge_policy', 'auto')}",
+                    f"publish={_publish_policy_label(r)}",
                     f"fix_rounds={r.get('max_fix_rounds', 3)}",
                 ]
                 if r.get("design_provider"):
@@ -798,6 +887,10 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                     tags.append(f"rigor={r['default_rigor']}")
                 print(f"- {slug}: {r.get('repo')} ({r.get('path')}) [{' '.join(tags)}]")
             print("\nEdit settings with: hermes factonio update <repo> --merge-policy ... (see --help)")
+            if policy_errors:
+                for err in policy_errors:
+                    print(f"Error: {err}", file=sys.stderr)
+                sys.exit(1)
             return
 
         if cmd == "models":
@@ -950,6 +1043,35 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                 for b in res["blockers"]:
                     print(f"  Blocker: {b}")
             if not res.get("ready_to_merge"):
+                sys.exit(1)
+            return
+
+        if cmd == "publish-pr":
+            res = publish_pr(
+                args.repo,
+                args.branch,
+                expected_head_sha=args.expected_head_sha,
+                title=args.title,
+                body=args.body,
+                body_file=args.body_file,
+                base_branch=args.base_branch,
+                draft=bool(args.draft),
+                remote=args.remote,
+                tenant=args.tenant,
+                card_id=args.card_id,
+                actor="cli",
+            )
+            if as_json:
+                print(json.dumps(res, indent=2, default=str))
+            elif res.get("published"):
+                state = "draft " if res.get("draft") else ""
+                print(f"Published {state}PR {res['repo']}#{res['pr_number']}: {res['url']}")
+                print(f"  {res['branch']} -> {res['base_branch']} at {res['head_sha']}")
+            else:
+                label = "Refused" if res.get("refused") else "Error"
+                print(f"{label}: {res.get('error')}", file=sys.stderr)
+                print(f"  pushed={bool(res.get('pushed'))} created={bool(res.get('created'))}", file=sys.stderr)
+            if not res.get("published"):
                 sys.exit(1)
             return
 
@@ -1121,7 +1243,8 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         "factonio",
         help=(
             "Manage the Factonio pure-Hermes software factory "
-            "(init, add, update, models, start, status, panel, restack, worktrees, harness, trail, metrics, arena, doctor)."
+            "(init, add, update, models, start, status, panel, publish-pr, restack, worktrees, harness, trail, metrics, "
+            "arena, doctor)."
         ),
         setup_fn=setup_parser,
         handler_fn=handle_cli,

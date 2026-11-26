@@ -38,6 +38,7 @@ from .repos import (
     inspect_pr_gate,
     inspect_stack_gate,
     merge_pr,
+    publish_pr,
     restack_pr,
     restack_stack,
     update_repo,
@@ -176,12 +177,15 @@ def register_tools(ctx: Any) -> None:
 
     def handle_add_repo(args: dict[str, Any], **kwargs: Any) -> str:
         try:
+            # An omitted publish_policy inherits; an explicit null must reach add_repo and fail closed.
+            policy_kwargs = {"publish_policy": args["publish_policy"]} if "publish_policy" in args else {}
             res = add_repo(
                 str(args["repo"]),
                 local_path=args.get("local_path"),
                 merge_policy=args.get("merge_policy"),
                 max_fix_rounds=args.get("max_fix_rounds"),
                 clone=bool(args.get("clone", True)),
+                **policy_kwargs,
             )
             return _json_ok(res)
         except Exception as exc:
@@ -202,6 +206,14 @@ def register_tools(ctx: Any) -> None:
                     "repo": {"type": "string", "description": "GitHub repo as 'owner/repo' or full GitHub URL."},
                     "local_path": {"type": "string", "description": "Optional local checkout path override."},
                     "merge_policy": {"type": "string", "enum": ["auto", "ask"], "description": "PR merge policy."},
+                    "publish_policy": {
+                        "type": "string",
+                        "enum": ["auto", "ask"],
+                        "description": (
+                            "PR publish policy: 'auto' lets Implementation push and open PRs; 'ask' keeps work on "
+                            "verified local branches until factonio_publish_pr."
+                        ),
+                    },
                     "max_fix_rounds": {"type": "integer", "minimum": 1, "description": "Max repair loops per PR."},
                     "clone": {"type": "boolean", "default": True, "description": "Clone via gh if not present locally."},
                 },
@@ -231,7 +243,8 @@ def register_tools(ctx: Any) -> None:
             "name": "factonio_update_repo",
             "description": (
                 "Update settings of an already-registered Factonio repository. Only fields you pass are changed: "
-                "merge_policy, max_fix_rounds, default_branch, design_provider, design_approval, default_rigor. Pass "
+                "merge_policy, publish_policy, max_fix_rounds, default_branch, design_provider, design_approval, "
+                "default_rigor. Pass "
                 "'inherit' (or null) for design_provider/design_approval/default_rigor to clear the per-repo override "
                 "and use the global default."
             ),
@@ -240,6 +253,14 @@ def register_tools(ctx: Any) -> None:
                 "properties": {
                     "repo": {"type": "string", "description": "Registered repo slug or 'owner/repo'."},
                     "merge_policy": {"type": "string", "enum": ["auto", "ask"], "description": "PR merge policy."},
+                    "publish_policy": {
+                        "type": "string",
+                        "enum": ["auto", "ask"],
+                        "description": (
+                            "PR publish policy: 'auto' lets Implementation push and open PRs; 'ask' keeps work on "
+                            "verified local branches until factonio_publish_pr."
+                        ),
+                    },
                     "max_fix_rounds": {"type": "integer", "minimum": 1, "description": "Max repair loops per PR."},
                     "default_branch": {"type": "string", "description": "Base branch for PRs and worktrees."},
                     "design_provider": {
@@ -799,6 +820,61 @@ def register_tools(ctx: Any) -> None:
             },
         },
         handler=handle_merge_pr,
+    )
+
+    def handle_publish_pr(args: dict[str, Any], **kwargs: Any) -> str:
+        try:
+            ctx_args = _trail_context(args)
+            # Pass raw values: publish_pr validates and records a refused trail row for bad input.
+            res = publish_pr(
+                args.get("repo"),
+                args.get("branch"),
+                expected_head_sha=args.get("expected_head_sha"),
+                title=args.get("title"),
+                body=args.get("body"),
+                body_file=args.get("body_file"),
+                base_branch=args["base_branch"] if "base_branch" in args else None,
+                draft=args["draft"] if "draft" in args else False,
+                remote=args["remote"] if "remote" in args else "origin",
+                tenant=ctx_args["tenant"] or None,
+                card_id=ctx_args["card_id"] or None,
+                actor=ctx_args["actor"],
+            )
+            return _json_ok(res)
+        except Exception as exc:
+            return _json_err(exc)
+
+    ctx.register_tool(
+        name="factonio_publish_pr",
+        toolset=PLUGIN_ID,
+        schema={
+            "name": "factonio_publish_pr",
+            "description": (
+                "Explicitly publish a verified local branch (publish_policy: ask): refuse unless refs/heads/<branch> "
+                "is exactly expected_head_sha, push that SHA, open the GitHub PR via --body-file, and confirm it live."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Registered repo slug or 'owner/repo'."},
+                    "branch": {"type": "string", "description": "Local feature branch to publish (never the base branch)."},
+                    "expected_head_sha": {
+                        "type": "string",
+                        "description": "Full 40/64-hex commit SHA that local verification passed on.",
+                    },
+                    "title": {"type": "string", "description": "Single-line PR title."},
+                    "body": {"type": "string", "description": "PR body text (mutually exclusive with body_file)."},
+                    "body_file": {"type": "string", "description": "Path to a UTF-8 PR body file (mutually exclusive with body)."},
+                    "base_branch": {"type": "string", "description": "PR base branch (defaults to the repo default branch)."},
+                    "draft": {"type": "boolean", "default": False, "description": "Open the PR as a draft."},
+                    "remote": {"type": "string", "default": "origin", "description": "Git remote to push to."},
+                    "tenant": {"type": "string", "description": "Workstream tenant for the decision trail (defaults to the worker's tenant)."},
+                    "card_id": {"type": "string", "description": "Kanban card id for the decision trail (defaults to the worker's card)."},
+                },
+                "required": ["repo", "branch", "expected_head_sha", "title"],
+            },
+        },
+        handler=handle_publish_pr,
     )
 
     def handle_bootstrap_verify(args: dict[str, Any], **kwargs: Any) -> str:

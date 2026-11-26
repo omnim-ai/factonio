@@ -27,6 +27,7 @@ provides_tools:
   - factonio_status
   - factonio_pr_gate
   - factonio_merge_pr
+  - factonio_publish_pr
   - factonio_log_decision
   - factonio_bootstrap_verify
   - factonio_restack_pr
@@ -52,6 +53,12 @@ config_schema:
     default: auto
     label: "Default PR merge policy"
     description: "auto squash-merges once CI and both isolated verification checks pass; ask waits for human approval."
+  default_publish_policy:
+    type: str
+    choices: [auto, ask]
+    default: auto
+    label: "Default PR publish policy"
+    description: "auto lets Implementation push branches and open GitHub PRs; ask keeps implementation and verification on local branches until an explicit factonio_publish_pr / `hermes factonio publish-pr`."
   default_max_fix_rounds:
     type: int
     default: 3

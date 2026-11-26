@@ -19,12 +19,15 @@ from .config import (
     DESIGN_APPROVAL_POLICIES,
     DESIGN_PROVIDERS,
     MERGE_POLICIES,
+    PUBLISH_POLICIES,
     RIGOR_LEVELS,
     get_repo,
     list_repos,
     load_settings,
     repos_store_lock,
+    resolve_publish_policy,
     save_settings,
+    single_line,
 )
 from .metrics import capture_metrics_snapshot
 
@@ -43,6 +46,7 @@ _UNSET: Any = object()
 
 EDITABLE_REPO_FIELDS: tuple[str, ...] = (
     "merge_policy",
+    "publish_policy",
     "max_fix_rounds",
     "default_branch",
     "design_provider",
@@ -62,6 +66,14 @@ def _validate_merge_policy(value: Any) -> str:
         if norm in MERGE_POLICIES:
             return norm
     raise ValueError(f"merge_policy must be one of {', '.join(MERGE_POLICIES)}; got {value!r}")
+
+
+def _validate_publish_policy(value: Any) -> str:
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in PUBLISH_POLICIES:
+            return norm
+    raise ValueError(f"publish_policy must be one of {', '.join(PUBLISH_POLICIES)}; got {value!r}")
 
 
 def _validate_max_fix_rounds(value: Any) -> int:
@@ -113,6 +125,8 @@ def _validate_editable_fields(fields: dict[str, Any]) -> dict[str, Any]:
     for field, value in fields.items():
         if field == "merge_policy":
             validated[field] = _validate_merge_policy(value)
+        elif field == "publish_policy":
+            validated[field] = _validate_publish_policy(value)
         elif field == "max_fix_rounds":
             validated[field] = _validate_max_fix_rounds(value)
         elif field == "default_branch":
@@ -235,11 +249,12 @@ def add_repo(
     default_branch: Optional[str] = None,
     design_provider: Any = _UNSET,
     design_approval: Any = _UNSET,
+    publish_policy: Any = _UNSET,
 ) -> dict[str, Any]:
     """Register a GitHub repository with Factonio and anchor a Hermes Project.
 
     Re-running on an already-registered repository preserves existing per-repo overrides
-    (merge policy, fix rounds, default branch, design settings, CI contract, models)
+    (merge policy, publish policy, fix rounds, default branch, design settings, CI contract, models)
     unless explicitly overridden by the caller.
     """
     full_repo, slug = normalize_repo(repo_spec)
@@ -255,6 +270,13 @@ def add_repo(
         policy = str(existing["merge_policy"])
     else:
         policy = _validate_merge_policy(settings.get("default_merge_policy") or "auto")
+
+    # Omitted inherits (missing key -> global default); an explicit value, including None, must be
+    # valid, and a persisted null/"" fails closed here.
+    if publish_policy is _UNSET:
+        publish = resolve_publish_policy(repo=existing)
+    else:
+        publish = _validate_publish_policy(publish_policy)
 
     if max_fix_rounds is not None:
         rounds = _validate_max_fix_rounds(max_fix_rounds)
@@ -312,6 +334,8 @@ def add_repo(
         existing = raw_existing if isinstance(raw_existing, dict) else {}
         if merge_policy is None and existing.get("merge_policy"):
             policy = str(existing["merge_policy"])
+        if publish_policy is _UNSET and "publish_policy" in existing:
+            publish = resolve_publish_policy(repo=existing)
         if max_fix_rounds is None and existing.get("max_fix_rounds") is not None:
             rounds = existing["max_fix_rounds"]
         entry = _build_added_entry(
@@ -325,6 +349,7 @@ def add_repo(
             policy=policy,
             rounds=rounds,
             design_updates=design_updates,
+            publish_policy=publish,
         )
         repos[slug] = entry
         save_settings({"repos": repos})
@@ -348,6 +373,7 @@ def _build_added_entry(
     policy: Any,
     rounds: Any,
     design_updates: dict[str, Optional[str]],
+    publish_policy: str = "auto",
 ) -> dict[str, Any]:
     entry: dict[str, Any] = {
         **existing,
@@ -360,6 +386,7 @@ def _build_added_entry(
         "has_required_checks": bool(remote_info["has_required_checks"]),
         "required_checks": list(remote_info["required_checks"]),
         "merge_policy": policy,
+        "publish_policy": publish_policy,
         "max_fix_rounds": rounds,
         "ci_contract": existing.get("ci_contract") or "auto",
     }
@@ -380,6 +407,7 @@ def update_repo(
     design_provider: Any = _UNSET,
     design_approval: Any = _UNSET,
     default_rigor: Any = _UNSET,
+    publish_policy: Any = _UNSET,
 ) -> dict[str, Any]:
     """Update editable parameters of a registered repository (only fields explicitly supplied).
 
@@ -395,6 +423,7 @@ def update_repo(
 
     supplied = {
         "merge_policy": merge_policy,
+        "publish_policy": publish_policy,
         "max_fix_rounds": max_fix_rounds,
         "default_branch": default_branch,
         "design_provider": design_provider,
@@ -1256,9 +1285,18 @@ def _validate_git_ref(value: Any, field: str = "ref") -> str:
 
 def _validate_remote(value: Any) -> str:
     remote = _validate_git_ref(value, "remote")
-    if "/" in remote or ".." in remote:
+    if any(ch in remote for ch in "/\\:") or ".." in remote:
         raise ValueError(f"remote must be a plain remote name; got {value!r}")
     return remote
+
+
+def _is_configured_remote(cwd: Path, remote: str) -> bool:
+    """True only when ``remote`` is a named remote in ``cwd``'s git config (not a path or URL)."""
+    # Exact line membership: a configured name containing spaces must not tokenize into others.
+    proc = _run_git(["remote"], cwd=cwd)
+    if proc.returncode != 0 or remote not in (proc.stdout or "").splitlines():
+        return False
+    return _run_git(["remote", "get-url", "--", remote], cwd=cwd).returncode == 0
 
 
 def _sync_local_default_branch(repo_path: Path, branch: str) -> tuple[bool, str]:
@@ -1662,6 +1700,325 @@ def merge_pr(
         "local_synced": False,
         "local_sync_note": "skipped: PR queued or not yet merged",
     }
+
+
+# ---------------------------------------------------------------------------
+# Explicit, fail-closed publish of a verified local branch (publish_policy: ask)
+# ---------------------------------------------------------------------------
+
+_FULL_SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_PR_URL_RE = re.compile(r"https://\S+/pull/(\d+)\b")
+_PUBLISH_EVIDENCE_KEYS = (
+    "repo", "branch", "base_branch", "head_sha", "expected_head_sha", "pr_number", "url", "draft",
+)
+
+
+def _validate_full_sha(value: Any, field: str = "expected_head_sha") -> str:
+    """Accept only a full 40/64-hex commit id (lowercased); abbreviations and refs are refused."""
+    sha = value.strip().lower() if isinstance(value, str) else ""
+    if not _FULL_SHA_RE.fullmatch(sha):
+        raise ValueError(f"{field} must be a full 40- or 64-character hex commit SHA; got {value!r}")
+    return sha
+
+
+def _echo(value: Any) -> Optional[str]:
+    """Bounded echo of caller input into results/trail evidence before it is validated."""
+    # Lone surrogates are replaced and NULs dropped so a refusal can still be written to trail.db.
+    if not isinstance(value, str):
+        return None
+    return value[:200].encode("utf-8", "replace").decode("utf-8").replace("\x00", "")
+
+
+def _trail_safe(value: Any) -> str:
+    """Untruncated UTF-8-safe, NUL-free form of a trail context field; non-strings become ``""``."""
+    if not isinstance(value, str):
+        return ""
+    return value.encode("utf-8", "replace").decode("utf-8").replace("\x00", "")
+
+
+def _validate_branch_field(value: Any, field: str) -> str:
+    try:
+        return _validate_default_branch(value)
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("default_branch", field, 1)) from None
+
+
+def _validate_git_ref_name(cwd: Path, name: str, field: str) -> None:
+    """Refuse anything git would not accept as a plain branch name (``@``, ``main~1``, ``@{-1}``, ``HEAD``...)."""
+    if name == "@":
+        raise ValueError(f"{field} {name!r} is not a valid branch name")
+    for args in (["check-ref-format", f"refs/heads/{name}"], ["check-ref-format", "--branch", name]):
+        if _run_git(args, cwd=cwd).returncode != 0:
+            raise ValueError(f"{field} {name!r} is not a valid branch name")
+    if name == "HEAD":
+        raise ValueError(f"{field} {name!r} is not a valid branch name")
+
+
+def _require_clean_str(value: Any, field: str, *, optional: bool = False, non_empty: bool = False) -> None:
+    """The one preflight check for every caller string that can reach git, gh, a UTF-8 file or trail.db."""
+    if value is None and optional:
+        return
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string; got {type(value).__name__}")
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        raise ValueError(f"{field} is not valid UTF-8 (contains unencodable characters)") from None
+    if "\x00" in value:
+        raise ValueError(f"{field} must not contain NUL (\\x00) characters")
+    if non_empty and not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+
+
+def _record_publish(result: dict[str, Any], *, outcome: str, reason: str, repo_slug: str,
+                    tenant: Optional[str], card_id: Optional[str], actor: Optional[str]) -> None:
+    from .trail import record_transition
+
+    evidence: dict[str, Any] = {k: result.get(k) for k in _PUBLISH_EVIDENCE_KEYS}
+    # The `gate` artifact keeps every row (refusals included) auditable as a high-stakes decision.
+    evidence["gate"] = {
+        "check": reason,
+        "pushed": bool(result.get("pushed")),
+        "created": bool(result.get("created")),
+        "published": bool(result.get("published")),
+    }
+    if outcome == "published":
+        why = f"Published PR #{result.get('pr_number')} at verified HEAD {result.get('head_sha')}"
+    else:
+        why = str(result.get("error") or f"publish {outcome}")
+    # Sanitized independently of preflight so the row lands even when these fields were the bad input.
+    record_transition(
+        "publish_pr",
+        tenant=_trail_safe(tenant),
+        repo_slug=repo_slug,
+        phase="publish",
+        card_id=_trail_safe(card_id),
+        actor=_trail_safe(actor).strip() or "orchestrator",
+        why=why[:500],
+        evidence=evidence,
+        result=outcome,
+    )
+
+
+def publish_pr(
+    repo_spec: str,
+    branch: str,
+    *,
+    expected_head_sha: str,
+    title: str,
+    body: Optional[str] = None,
+    body_file: Optional[str] = None,
+    base_branch: Optional[str] = None,
+    draft: bool = False,
+    remote: str = "origin",
+    tenant: Optional[str] = None,
+    card_id: Optional[str] = None,
+    actor: Optional[str] = "orchestrator",
+) -> dict[str, Any]:
+    """Push a verified local branch by exact SHA and open its GitHub PR (explicit publish step).
+
+    Every precondition is checked before any remote call: valid inputs, a registered repo with a
+    local checkout, ``branch`` distinct from the target base, and ``refs/heads/<branch>`` resolving
+    to exactly ``expected_head_sha``. Any failure returns ``ok: False`` with ``refused: True`` and
+    nothing pushed. The push sends ``<expected_head_sha>:refs/heads/<branch>`` (never the moving
+    branch name), the body travels via a temporary ``--body-file`` that is always removed, and
+    success is reported only after ``gh pr view`` confirms the live PR head and base. Each call
+    appends a ``publish_pr`` row (``phase="publish"``) to ``trail.db``.
+    """
+    result: dict[str, Any] = {
+        "ok": False,
+        "published": False,
+        "pushed": False,
+        "created": False,
+        "refused": False,
+        "repo": None,
+        "pr_number": None,
+        "url": None,
+        "head_sha": None,
+        "expected_head_sha": _echo(expected_head_sha),
+        "branch": _echo(branch),
+        "base_branch": _echo(base_branch),
+        "draft": draft if isinstance(draft, bool) else None,
+        "state": None,
+    }
+    # trail.record_transition maps a registered spec to its slug and keeps unknown specs verbatim.
+    repo_slug = (_echo(repo_spec.strip()) or "") if isinstance(repo_spec, str) else ""
+
+    def finish(outcome: str, reason: str, error: Optional[str] = None) -> dict[str, Any]:
+        if error:
+            result["error"] = error
+        result["refused"] = outcome == "refused"
+        _record_publish(result, outcome=outcome, reason=reason, repo_slug=repo_slug,
+                        tenant=tenant, card_id=card_id, actor=actor)
+        return result
+
+    try:
+        for field, value, optional in (
+            ("repo", repo_spec, False), ("branch", branch, False), ("expected_head_sha", expected_head_sha, False),
+            ("title", title, False), ("body", body, True), ("body_file", body_file, True),
+            ("base_branch", base_branch, True), ("remote", remote, False),
+            ("tenant", tenant, True), ("card_id", card_id, True),
+        ):
+            _require_clean_str(value, field, optional=optional)
+        _require_clean_str(actor, "actor", optional=True, non_empty=True)
+        spec = repo_spec.strip()
+        if not spec:
+            raise ValueError("repo must be a registered slug or 'owner/repo'")
+        if not isinstance(draft, bool):
+            raise ValueError(f"draft must be a boolean; got {type(draft).__name__}")
+        clean_branch = _validate_branch_field(branch, "branch")
+        result["branch"] = clean_branch
+        clean_remote = _validate_remote(remote)
+        sha = _validate_full_sha(expected_head_sha)
+        result["expected_head_sha"] = sha
+        clean_title = single_line(title) if isinstance(title, str) else ""
+        if not clean_title:
+            raise ValueError("title must be a non-empty single line")
+        if body is not None and body_file is not None:
+            raise ValueError("pass either body or body_file, not both")
+        clean_base = _validate_branch_field(base_branch, "base_branch") if base_branch is not None else None
+    except ValueError as exc:
+        return finish("refused", "invalid_input", str(exc))
+
+    if body_file is not None:
+        if not (isinstance(body_file, str) and body_file.strip()):
+            return finish("refused", "invalid_input", f"body_file must be a non-empty path; got {_echo(body_file)!r}")
+        try:
+            body_text = Path(body_file).expanduser().read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            return finish("refused", "body_file_unreadable", f"cannot read body_file {body_file[:200]!r}: {exc}")
+    else:
+        body_text = body or ""
+    try:
+        _require_clean_str(body_text, "body_file content" if body_file is not None else "body")
+    except ValueError as exc:
+        return finish("refused", "invalid_input", str(exc))
+
+    entry, cwd = _registered_checkout(spec)
+    if entry is None:
+        try:
+            result["repo"], repo_slug = normalize_repo(spec)
+        except ValueError:
+            pass
+        return finish("refused", "unregistered_repo", f"Repository {spec!r} is not registered with Factonio")
+    repo_slug = str(entry.get("slug") or "")
+    full_repo = str(entry.get("repo") or "")
+    if not _OWNER_REPO_RE.match(full_repo):
+        return finish("refused", "unregistered_repo", f"Registered entry for {spec!r} has no valid owner/repo")
+    result["repo"] = full_repo
+    if cwd is None:
+        return finish("refused", "missing_checkout", f"Local checkout for {full_repo} is not registered or missing")
+    try:
+        target_base = clean_base or _validate_default_branch(str(entry.get("default_branch") or "main"))
+    except ValueError as exc:
+        return finish("refused", "invalid_input", str(exc))
+    result["base_branch"] = target_base
+    try:
+        _require_clean_str(target_base, "base_branch")
+        _validate_git_ref_name(cwd, clean_branch, "branch")
+        _validate_git_ref_name(cwd, target_base, "base_branch")
+    except ValueError as exc:
+        return finish("refused", "invalid_input", str(exc))
+    except (OSError, subprocess.SubprocessError) as exc:
+        return finish("refused", "git_unavailable", f"cannot validate branch names: {exc}")
+    if clean_branch == target_base:
+        return finish(
+            "refused", "branch_is_base",
+            f"Refusing to publish {clean_branch!r}: it is the target base branch; publish a feature branch",
+        )
+
+    try:
+        local_head = _verify_commit(cwd, f"refs/heads/{clean_branch}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return finish("refused", "git_unavailable", f"cannot inspect local branch: {exc}")
+    if not local_head:
+        return finish("refused", "missing_branch", f"Local branch refs/heads/{clean_branch} does not exist in {cwd}")
+    result["head_sha"] = local_head.lower()
+    if local_head.lower() != sha:
+        return finish(
+            "refused", "head_drift",
+            f"HEAD drift: refs/heads/{clean_branch} is at {local_head}, expected verified {sha}",
+        )
+
+    try:
+        configured = _is_configured_remote(cwd, clean_remote)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return finish("refused", "git_unavailable", f"cannot list git remotes: {exc}")
+    if not configured:
+        return finish(
+            "refused", "unknown_remote",
+            f"remote {clean_remote!r} is not a configured git remote in {cwd}; refusing to push",
+        )
+
+    try:
+        push = _run_git(["push", clean_remote, f"{sha}:refs/heads/{clean_branch}"], cwd=cwd, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return finish("error", "push_failed", f"git push failed: {exc}")
+    if push.returncode != 0:
+        return finish("error", "push_failed", _git_err(push, "push"))
+    result["pushed"] = True
+
+    tmp_path: Optional[str] = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix="factonio-pr-body-", suffix=".md")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body_text)
+        args = [
+            "pr", "create", "--repo", full_repo, "--base", target_base, "--head", clean_branch,
+            "--title", clean_title, "--body-file", tmp_path,
+        ]
+        if draft:
+            args.append("--draft")
+        created = _run_gh(args, timeout=60)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        # ValueError covers UnicodeError on the body write; preflight should already have refused it.
+        return finish("error", "create_failed", f"gh pr create failed: {exc}")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+    if created.returncode != 0:
+        detail = (created.stderr or created.stdout or f"exit {created.returncode}").strip()
+        return finish("error", "create_failed", f"gh pr create failed: {detail}")
+    result["created"] = True
+
+    urls = _PR_URL_RE.findall(created.stdout or "")
+    pr_ref = urls[-1] if urls else clean_branch
+    live: Any = None
+    detail = "invalid JSON"
+    try:
+        view = _run_gh(
+            ["pr", "view", pr_ref, "--repo", full_repo, "--json", "number,url,headRefOid,baseRefName,state,isDraft"],
+            timeout=30,
+        )
+        if view.returncode == 0:
+            live = json.loads(view.stdout or "")
+        else:
+            detail = (view.stderr or view.stdout or f"exit {view.returncode}").strip()
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        detail = str(exc)
+    if not isinstance(live, dict):
+        return finish("error", "readback_failed", f"gh pr create succeeded but live PR readback failed: {detail}")
+
+    number = _comment_id(live.get("number"))
+    result["pr_number"] = number if number and number > 0 else None
+    result["url"] = str(live.get("url") or "") or None
+    result["state"] = live.get("state")
+    result["draft"] = bool(live.get("isDraft"))
+    live_head = str(live.get("headRefOid") or "").lower()
+    live_base = str(live.get("baseRefName") or "")
+    if result["pr_number"] is None or live_head != sha or live_base != target_base:
+        return finish(
+            "error", "readback_mismatch",
+            f"live PR does not match the verified publish (head {live_head or '?'} vs {sha}, "
+            f"base {live_base or '?'} vs {target_base})",
+        )
+    result["head_sha"] = live_head
+    result["ok"] = True
+    result["published"] = True
+    return finish("published", "published")
 
 
 # ---------------------------------------------------------------------------

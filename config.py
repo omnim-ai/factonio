@@ -24,6 +24,7 @@ PHASES: tuple[str, ...] = ("define", "design", "implement", "verify", "watchdog"
 DESIGN_PROVIDERS: tuple[str, ...] = ("auto", "claude-design", "hermes", "off")
 DESIGN_APPROVAL_POLICIES: tuple[str, ...] = ("ask", "auto")
 MERGE_POLICIES: tuple[str, ...] = ("auto", "ask")
+PUBLISH_POLICIES: tuple[str, ...] = ("auto", "ask")
 RIGOR_LEVELS: tuple[str, ...] = ("standard", "high")
 
 AUX_TASK_SPECS: tuple[dict[str, str], ...] = (
@@ -63,6 +64,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "repos_root": "~/dev",
     "max_concurrent_workers": 4,
     "default_merge_policy": "auto",
+    "default_publish_policy": "auto",
     "default_max_fix_rounds": 3,
     "design_provider": "auto",
     "design_approval": "ask",
@@ -825,6 +827,53 @@ def resolve_rigor(*, repo_slug: Optional[str] = None, override: Optional[str] = 
                 return per_repo
     configured = _normalize_rigor(load_settings(use_root=True).get("default_rigor"), source="settings.default_rigor")
     return configured or "standard"
+
+
+def _strict_publish_policy(value: Any, *, source: str) -> str:
+    """Return ``"auto"``/``"ask"`` or raise ``ValueError`` (``None`` and ``""`` included)."""
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in PUBLISH_POLICIES:
+            return norm
+    raise ValueError(f"{source} must be one of {', '.join(PUBLISH_POLICIES)}; got {value!r}")
+
+
+def resolve_default_publish_policy() -> str:
+    """Global ``settings.default_publish_policy`` from the root config.yaml, or ``"auto"`` when absent.
+
+    Reads the raw plugin settings because ``load_settings`` drops ``None`` values: an explicit
+    ``default_publish_policy: null`` (or ``""``) must fail closed, not fall back to ``"auto"``.
+    """
+    raw = _read_plugin_settings_from_file(get_root_hermes_home_path() / "config.yaml")
+    if "default_publish_policy" in raw:
+        return _strict_publish_policy(raw["default_publish_policy"], source="settings.default_publish_policy")
+    return str(DEFAULT_SETTINGS["default_publish_policy"])
+
+
+def resolve_publish_policy(
+    *,
+    repo_slug: Optional[str] = None,
+    repo: Optional[Mapping[str, Any]] = None,
+    override: Optional[str] = None,
+) -> str:
+    """Resolve whether Factonio may push branches and open PRs on its own (``"auto"``) or must stop
+    at a verified local branch and wait for an explicit publish (``"ask"``).
+
+    Precedence: explicit ``override`` -> ``repo["publish_policy"]`` (``repo`` or the entry
+    registered as ``repo_slug``) -> plugin ``settings.default_publish_policy`` -> ``"auto"``. Only
+    entries that omit the ``publish_policy`` key (legacy records) inherit the global default; a
+    present-but-invalid value at any level (including ``null`` and ``""``) raises ``ValueError``
+    rather than silently falling back to publishing. ``override=None`` means "not given".
+    """
+    if override is not None:
+        return _strict_publish_policy(override, source="publish_policy")
+    entry: Any = repo
+    if entry is None and repo_slug:
+        entry = get_repo(repo_slug)
+    if isinstance(entry, Mapping) and "publish_policy" in entry:
+        field = f"repos.{entry.get('slug') or repo_slug or '?'}.publish_policy"
+        return _strict_publish_policy(entry["publish_policy"], source=field)
+    return resolve_default_publish_policy()
 
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
