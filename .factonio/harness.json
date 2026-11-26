@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-26T08:40:00Z",
+  "generated_at": "2026-11-26T11:30:00Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -60,7 +60,8 @@
       ],
       "scenarios": [
         "Plugin loads in an isolated HERMES_HOME and `hermes factonio --help` lists every subcommand",
-        "plugin.yaml declares every factonio_* tool and bundled skill"
+        "plugin.yaml declares every factonio_* tool and bundled skill",
+        "harness-audit blueprint pairs `harness audit` with a live `harness check --run-doctor --run-hooks` and the doc_drift / harness_gap / product_regression rubric"
       ]
     },
     {
@@ -116,7 +117,8 @@
         "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_cli_and_tools tests.test_plugin_registration -v'"
       ],
       "scenarios": [
-        "Every factonio_* tool in plugin.yaml provides_tools is registered with a JSON schema"
+        "Every factonio_* tool in plugin.yaml provides_tools is registered with a JSON schema",
+        "factonio_bootstrap_verify accepts prove (init) and base_ref (check/audit)"
       ]
     },
     {
@@ -160,7 +162,10 @@
       "scenarios": [
         "`harness check \"$PWD\" --run-doctor --run-hooks --json` exits 0 with valid: true",
         "`harness audit \"$PWD\" --json` reports severity clean without mutating .git/index",
-        "Route/CLI discovery ignores tests/, test/, spec/, __tests__/ fixtures"
+        "Route/CLI discovery ignores tests/, test/, spec/, __tests__/ fixtures",
+        "`harness init --prove` fails closed (ok/written false, prior .factonio/ bytes restored, proof_failed trail row, exit 1) unless Doctor, required hooks and evidence survival pass",
+        "`harness check --base <ref>` fails when a required hook is removed or downgraded to optional or a Doctor command is dropped; `audit` reports gate_loosening as stale",
+        "`audit` drift_classification ranks product_regression > harness_gap > doc_drift > clean"
       ]
     },
     {
@@ -232,7 +237,8 @@
         "uv run --with pyyaml python tools/check_repo_integrity.py"
       ],
       "scenarios": [
-        "Every SKILL.md has valid frontmatter and keeps the holdout/ information barrier"
+        "Every SKILL.md has valid frontmatter and keeps the holdout/ information barrier",
+        "verify-blackbox drives from the user's point of view and reports verified-unreachable scenarios as inconclusive, never pass"
       ]
     },
     {
