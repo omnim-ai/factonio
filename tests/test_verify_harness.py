@@ -8,6 +8,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -702,6 +703,152 @@ class TestTimeoutKillsDescendants(unittest.TestCase):
                              (3, "hi", "err", False))
             missing = _run_command(["/nonexistent/factonio-binary"], home, 5)
             self.assertEqual((missing["exit_code"], missing["ok"]), (127, False))
+
+
+class TestTestDirsExcludedFromSurfaces(unittest.TestCase):
+    def test_test_directory_fixtures_never_become_routes_or_cli_commands(self):
+        from factonio.harness import _TEST_DIRS, bootstrap_verify_harness, check_harness, detect_repo_profile
+
+        self.assertEqual(_TEST_DIRS, frozenset({"tests", "test", "spec", "__tests__"}))
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            _write(repo, "tests/test_fixture.py", (
+                "@router.get('/login')\ndef login():\n    pass\n\n"
+                "@app.route('/legacy', methods=['POST'])\ndef legacy():\n    pass\n\n"
+                "sub.add_parser('export')\n"
+            ))
+            _write(repo, "test/test_cli.py", "@cli.command('ghost')\ndef ghost():\n    pass\n")
+            _write(repo, "spec/api.spec.js", "app.get('/spec-only', h)\n")
+            _write(repo, "__tests__/server.test.ts", "router.post('/jest-only', h)\n")
+            _write(repo, "lib/tests_helpers.py", "@router.get('/real')\ndef real():\n    pass\n")
+            _commit_all(repo, "fixtures")
+
+            profile = detect_repo_profile(repo)
+            self.assertEqual(profile["routes"], ["GET /items", "GET /real", "POST /items/{item_id}"])
+            self.assertEqual(profile["cli_commands"], ["serve", "svc", "sync"])
+            for rel in ("tests/test_fixture.py", "test/test_cli.py", "spec/api.spec.js", "__tests__/server.test.ts"):
+                self.assertIn(rel, profile["source_files"])
+
+            res = bootstrap_verify_harness(str(repo))
+            surfaces = res["manifest"]["discovered_surfaces"]
+            self.assertEqual(surfaces["routes"], profile["routes"])
+            self.assertEqual(surfaces["cli_commands"], profile["cli_commands"])
+            by_glob = {f["paths"][0]: f for f in res["manifest"]["feature_map"]}
+            for glob in ("tests/**", "test/**", "spec/**", "__tests__/**"):
+                self.assertEqual(by_glob[glob]["surface"], "Tests")
+                self.assertEqual(by_glob[glob]["scenarios"], [])
+            self.assertEqual(by_glob["lib/**"]["surface"], "HTTP API")
+            self.assertTrue(check_harness(str(repo))["valid"])
+
+
+def _copy_tracked_checkout(src: Path, dest: Path) -> Path:
+    """Snapshot the checkout's tracked + untracked (non-ignored) files into a fresh single-commit repo."""
+    listed = subprocess.run(
+        ["git", "--no-optional-locks", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        cwd=str(src), capture_output=True, text=True, check=False,
+    )
+    if listed.returncode != 0:
+        raise unittest.SkipTest(f"{src} is not a git checkout: {listed.stderr.strip()}")
+    dest.mkdir(parents=True)
+    for rel in filter(None, listed.stdout.split("\0")):
+        path = src / rel
+        if not path.is_file():
+            continue  # deleted-but-unstaged entries
+        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, dest / rel)
+    _git(dest, "init", "-q")
+    _commit_all(dest, "snapshot")
+    return dest
+
+
+class TestRepoDogfoodHarness(unittest.TestCase):
+    """The committed `.factonio/` harness for this repository stays valid, complete, and drift-free."""
+
+    REQUIRED_HOOKS = ("compileall", "ruff-static", "desktop-syntax", "repo-integrity")
+
+    def _manifest(self) -> dict[str, Any]:
+        path = PLUGIN_ROOT / ".factonio" / "harness.json"
+        self.assertTrue(path.is_file(), "omnim-ai/factonio must commit .factonio/harness.json")
+        self.assertTrue((PLUGIN_ROOT / ".factonio" / "verify.md").is_file())
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_manifest_shape_hooks_and_drive_wrapper(self):
+        from factonio.harness import REQUIRED_SECTIONS, discover_harness
+
+        manifest = self._manifest()
+        self.assertEqual(manifest["schema_version"], 1)
+        self.assertIsNone(manifest["base_commit"])
+        self.assertEqual(manifest["repo"], "omnim-ai/factonio")
+        hooks = {h["name"]: h for h in manifest["hooks"]}
+        for name in self.REQUIRED_HOOKS:
+            self.assertEqual(hooks[name]["kind"], "invariant")
+            self.assertFalse(hooks[name]["optional"])
+        drive = "\n".join(manifest["phases"]["drive"])
+        for needle in ("mktemp -d", 'ln -s "$PWD" "$d/factonio"', "env -u HERMES_DELEGATED_CHILD_CONTEXT",
+                       "python3 -m unittest discover -s tests"):
+            self.assertIn(needle, drive)
+
+        info = discover_harness(PLUGIN_ROOT)
+        self.assertEqual(info["mode"], "full")
+        self.assertEqual(info["missing_sections"], [])
+        for section in (*REQUIRED_SECTIONS, "Feature Map", "Hooks"):
+            self.assertIn(section, info["sections"])
+
+    def test_feature_map_and_surfaces_match_live_repository(self):
+        from factonio.harness import _any_match, detect_repo_profile
+
+        manifest = self._manifest()
+        profile = detect_repo_profile(PLUGIN_ROOT)
+        surfaces = manifest["discovered_surfaces"]
+        self.assertEqual(surfaces["routes"], profile["routes"])
+        self.assertEqual(surfaces["cli_commands"], profile["cli_commands"])
+        for src in [*profile["route_sources"].values(), *profile["cli_sources"].values()]:
+            self.assertFalse(src.startswith(("tests/", "test/", "spec/", "__tests__/")), src)
+        self.assertIn("PATCH /repos/{slug}", surfaces["routes"])
+        self.assertIn("harness", surfaces["cli_commands"])
+
+        globs = [g for feat in manifest["feature_map"] for g in feat["paths"]]
+        uncovered = [rel for rel in profile["source_files"] if not _any_match(globs, rel)]
+        self.assertEqual(uncovered, [])
+        for rel in ("plugin.yaml", "dashboard/manifest.json", "skills/verify-blackbox/SKILL.md",
+                    ".agents/skills/update-readme-media/SKILL.md", "CHANGELOG.md"):
+            self.assertTrue(_any_match(globs, rel), rel)
+        surfaces_by_id = {f["id"]: f["surface"] for f in manifest["feature_map"]}
+        self.assertEqual(surfaces_by_id["dashboard-api"], "HTTP API")
+        self.assertEqual(surfaces_by_id["cli"], "CLI")
+        self.assertEqual(surfaces_by_id["desktop-ui"], "Desktop UI")
+        self.assertEqual(surfaces_by_id["tests"], "Tests")
+
+    @unittest.skipUnless(
+        shutil.which("node") and shutil.which("uvx") and shutil.which("git"),
+        "running the harness hooks needs git, node and uvx on PATH (provided in CI)",
+    )
+    def test_check_with_doctor_and_hooks_and_read_only_clean_audit(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo = _copy_tracked_checkout(PLUGIN_ROOT, home / "dogfood" / "factonio")
+            # Doctor/hooks call `python3`; resolve it to this interpreter, which has hermes_cli and PyYAML.
+            path = os.pathsep.join([str(Path(sys.executable).parent), os.environ.get("PATH", "")])
+            with mock.patch.dict(os.environ, {"PATH": path}):
+                chk = check_harness(str(repo), run_doctor=True, run_hooks=True)
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertTrue(chk["ok"])
+            self.assertEqual((chk["dead_globs"], chk["warnings"]), ([], []))
+            self.assertTrue(chk["doctor"]["ok"], chk["doctor"])
+            ran = {r["name"]: r["ok"] for r in chk["hook_results"]["results"]}
+            for name in self.REQUIRED_HOOKS:
+                self.assertTrue(ran.get(name), chk["hook_results"])
+
+            _git(repo, "status", "--porcelain")  # refresh the stat cache before fingerprinting
+            before_index = _index_fingerprint(repo)
+            audit = audit_harness(str(repo))
+            self.assertEqual(_index_fingerprint(repo), before_index)
+            self.assertEqual((audit["severity"], audit["drifted"]), ("clean", False), audit)
+            self.assertEqual(audit["base_source"], "last commit touching .factonio/")
+            for key in ("uncovered_changed_files", "orphaned_globs", "new_routes", "removed_routes",
+                        "new_cli_commands", "removed_cli_commands"):
+                self.assertEqual(audit[key], [], key)
 
 
 class TestVerificationHarnessInjection(unittest.TestCase):
