@@ -6,7 +6,7 @@ This file describes how to run and observe the software; it is not implementatio
 
 - Schema: `.factonio/harness.json` (schema_version 1)
 - Detected stack: hermes-plugin, github-actions, python, node
-- Generated at: 2026-11-26T05:29:41Z from `working tree`
+- Generated at: 2026-11-26T05:33:33Z from `working tree`
 
 ## Launch
 
@@ -27,8 +27,9 @@ Prove the environment is ready before driving it (each command must exit 0).
 ```bash
 git --version
 python3 --version
-python3 -c "import hermes_cli, yaml"
+python3 -c "import hermes_cli"
 node --version
+uv --version
 uvx --version
 ```
 
@@ -47,7 +48,7 @@ sh -c 'd=$(mktemp -d); trap "rm -rf \"$d\"" EXIT; ln -s "$PWD" "$d/factonio"; en
 python3 -W error -m compileall -q .
 uvx ruff check --select E9,F .
 node --check desktop/plugin.js
-python3 tools/check_repo_integrity.py
+uv run --with pyyaml python tools/check_repo_integrity.py
 HERMES_HOME="$FACTONIO_VERIFY_HOME" HERMES_KANBAN_DB="$FACTONIO_VERIFY_HOME/kanban.db" hermes factonio harness check "$PWD" --run-doctor --run-hooks --json
 HERMES_HOME="$FACTONIO_VERIFY_HOME" HERMES_KANBAN_DB="$FACTONIO_VERIFY_HOME/kanban.db" hermes factonio harness audit "$PWD" --json
 HERMES_HOME="$FACTONIO_VERIFY_HOME" HERMES_KANBAN_DB="$FACTONIO_VERIFY_HOME/kanban.db" hermes factonio models --json
@@ -90,8 +91,8 @@ Tear down everything Launch and Drive started.
 | `observability` | Decision trail, metrics & watchdog | `trail.py`, `metrics.py`, `watchdog.py` | `sh -c 'd=$(mktemp -d); trap "rm -rf \"$d\"" EXIT; ln -s "$PWD" "$d/factonio"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH="$d${PYTHONPATH:+:$PYTHONPATH}" python3 -m unittest tests.test_trail tests.test_watchdog_liveness tests.test_watchdog_metrics_api -v'`; `trail --json` lists append-only decisions; Watchdog ticks flag silent and blocked cards |
 | `dashboard-api` | HTTP API | `dashboard/**` | `sh -c 'd=$(mktemp -d); trap "rm -rf \"$d\"" EXIT; ln -s "$PWD" "$d/factonio"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH="$d${PYTHONPATH:+:$PYTHONPATH}" python3 -m unittest tests.test_watchdog_metrics_api tests.test_orchestrator_and_repos -v'`; `GET /cards` under /api/plugins/factonio responds as documented; `GET /doctor` under /api/plugins/factonio responds as documented; `GET /metrics` under /api/plugins/factonio responds as documented |
 | `desktop-ui` | Desktop UI | `desktop/**` | `node --check desktop/plugin.js`; `sh -c 'd=$(mktemp -d); trap "rm -rf \"$d\"" EXIT; ln -s "$PWD" "$d/factonio"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH="$d${PYTHONPATH:+:$PYTHONPATH}" python3 -m unittest tests.test_desktop_plugin -v'`; Zero-build ESM importing only @hermes/plugin-sdk, react and react/jsx-runtime; Dashboard, sidebar and repo editor render with host theme tokens only |
-| `skills` | Bundled & contributor skills | `skills/**`, `.agents/skills/**` | `python3 tools/check_repo_integrity.py`; Every SKILL.md has valid frontmatter and keeps the holdout/ information barrier |
-| `repo-tooling` | Repo tooling, docs & CI | `tools/**`, `docs/**`, `.github/**`, `*.md` | `python3 tools/check_repo_integrity.py`; `uvx ruff check --select E9,F .`; Manifest, skill frontmatter and local doc links stay valid; README media regenerates with tools/capture_readme_media.py |
+| `skills` | Bundled & contributor skills | `skills/**`, `.agents/skills/**` | `uv run --with pyyaml python tools/check_repo_integrity.py`; Every SKILL.md has valid frontmatter and keeps the holdout/ information barrier |
+| `repo-tooling` | Repo tooling, docs & CI | `tools/**`, `docs/**`, `.github/**`, `*.md` | `uv run --with pyyaml python tools/check_repo_integrity.py`; `uvx ruff check --select E9,F .`; Manifest, skill frontmatter and local doc links stay valid; README media regenerates with tools/capture_readme_media.py |
 | `tests` | Tests | `tests/**` | `sh -c 'd=$(mktemp -d); trap "rm -rf \"$d\"" EXIT; ln -s "$PWD" "$d/factonio"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH="$d${PYTHONPATH:+:$PYTHONPATH}" python3 -m unittest discover -s tests -v'`; Full suite passes from any checkout or worktree directory name |
 
 ## Hooks
@@ -101,4 +102,4 @@ Repo-defined checks (`visual_diff`, `invariant`, `custom`). Required hook failur
 - **compileall** (`invariant`, required): `python3 -W error -m compileall -q .`
 - **ruff-static** (`invariant`, required): `uvx ruff check --select E9,F .`
 - **desktop-syntax** (`invariant`, required): `node --check desktop/plugin.js`
-- **repo-integrity** (`invariant`, required): `python3 tools/check_repo_integrity.py`
+- **repo-integrity** (`invariant`, required): `uv run --with pyyaml python tools/check_repo_integrity.py`

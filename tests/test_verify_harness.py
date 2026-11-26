@@ -820,15 +820,15 @@ class TestRepoDogfoodHarness(unittest.TestCase):
         self.assertEqual(surfaces_by_id["tests"], "Tests")
 
     @unittest.skipUnless(
-        shutil.which("node") and shutil.which("uvx") and shutil.which("git"),
-        "running the harness hooks needs git, node and uvx on PATH (provided in CI)",
+        all(shutil.which(tool) for tool in ("git", "node", "uv", "uvx")),
+        "running the harness hooks needs git, node, uv and uvx on PATH (provided in CI)",
     )
     def test_check_with_doctor_and_hooks_and_read_only_clean_audit(self):
         from factonio.harness import audit_harness, check_harness
 
         with isolated_hermes_home() as home:
             repo = _copy_tracked_checkout(PLUGIN_ROOT, home / "dogfood" / "factonio")
-            # Doctor/hooks call `python3`; resolve it to this interpreter, which has hermes_cli and PyYAML.
+            # Doctor runs `python3 -c "import hermes_cli"`; resolve `python3` to this interpreter.
             path = os.pathsep.join([str(Path(sys.executable).parent), os.environ.get("PATH", "")])
             with mock.patch.dict(os.environ, {"PATH": path}):
                 chk = check_harness(str(repo), run_doctor=True, run_hooks=True)

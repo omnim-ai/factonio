@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-26T05:29:41Z",
+  "generated_at": "2026-11-26T05:33:33Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -19,8 +19,9 @@
     "doctor": [
       "git --version",
       "python3 --version",
-      "python3 -c \"import hermes_cli, yaml\"",
+      "python3 -c \"import hermes_cli\"",
       "node --version",
+      "uv --version",
       "uvx --version"
     ],
     "drive": [
@@ -28,7 +29,7 @@
       "python3 -W error -m compileall -q .",
       "uvx ruff check --select E9,F .",
       "node --check desktop/plugin.js",
-      "python3 tools/check_repo_integrity.py",
+      "uv run --with pyyaml python tools/check_repo_integrity.py",
       "HERMES_HOME=\"$FACTONIO_VERIFY_HOME\" HERMES_KANBAN_DB=\"$FACTONIO_VERIFY_HOME/kanban.db\" hermes factonio harness check \"$PWD\" --run-doctor --run-hooks --json",
       "HERMES_HOME=\"$FACTONIO_VERIFY_HOME\" HERMES_KANBAN_DB=\"$FACTONIO_VERIFY_HOME/kanban.db\" hermes factonio harness audit \"$PWD\" --json",
       "HERMES_HOME=\"$FACTONIO_VERIFY_HOME\" HERMES_KANBAN_DB=\"$FACTONIO_VERIFY_HOME/kanban.db\" hermes factonio models --json",
@@ -221,7 +222,7 @@
         ".agents/skills/**"
       ],
       "commands": [
-        "python3 tools/check_repo_integrity.py"
+        "uv run --with pyyaml python tools/check_repo_integrity.py"
       ],
       "scenarios": [
         "Every SKILL.md has valid frontmatter and keeps the holdout/ information barrier"
@@ -237,7 +238,7 @@
         "*.md"
       ],
       "commands": [
-        "python3 tools/check_repo_integrity.py",
+        "uv run --with pyyaml python tools/check_repo_integrity.py",
         "uvx ruff check --select E9,F ."
       ],
       "scenarios": [
@@ -284,9 +285,9 @@
     {
       "name": "repo-integrity",
       "kind": "invariant",
-      "command": "python3 tools/check_repo_integrity.py",
+      "command": "uv run --with pyyaml python tools/check_repo_integrity.py",
       "optional": false,
-      "description": "plugin.yaml, dashboard manifest, skill frontmatter and doc links are consistent."
+      "description": "plugin.yaml, dashboard manifest, skill frontmatter and doc links are consistent (PyYAML via uv, as in CI)."
     }
   ],
   "discovered_surfaces": {
