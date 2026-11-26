@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-26T11:45:00Z",
+  "generated_at": "2026-11-26T12:07:00Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -188,6 +188,7 @@
         "Watchdog ticks flag silent and blocked cards",
         "`metrics --history --json` returns chronological append-only snapshots from trail.db v2 with summary.snapshot_count",
         "`trail --audit --json` flags missing_evidence, weak_evidence, unclosed_escalation and gate_loosening read-only, never creating trail.db",
+        "`trail --audit --json` fails closed (ok/clean false, exit 1) when trail.db is a directory or dangling symlink",
         "Watchdog flags `silent_start` before the phase threshold when only heartbeats/startup bookkeeping exist, then escalates to stale_running / no_side_effects"
       ]
     },
