@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-26T14:00:00Z",
+  "generated_at": "2026-11-26T15:55:00Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -198,7 +198,10 @@
         "`metrics --history --json` returns chronological append-only snapshots from trail.db v2 with summary.snapshot_count",
         "`trail --audit --json` flags missing_evidence, weak_evidence, unclosed_escalation and gate_loosening read-only, never creating trail.db",
         "`trail --audit --json` fails closed (ok/clean false, exit 1) when trail.db is a directory or dangling symlink",
-        "Watchdog flags `silent_start` before the phase threshold when only heartbeats/startup bookkeeping exist, then escalates to stale_running / no_side_effects"
+        "Watchdog flags `silent_start` before the phase threshold when only heartbeats/startup bookkeeping exist, then escalates to stale_running / no_side_effects",
+        "`trail --audit` flags allow_patch_continuity overrides, ignores gate-loosening prose on start/spawn_*/refused/rejecting-consensus rows without a truthy override key, and closes escalations by evidence pr_number across cards in a tenant",
+        "A spent best-effort trail budget still records an uncontended cold snapshot while a held trail.db.lock fails fast",
+        "`trail --audit` treats malformed evidence pr_number strings (Unicode digits such as '²', overlong digit strings) as absent and returns a structured audit instead of crashing"
       ]
     },
     {
@@ -256,7 +259,8 @@
         "Every SKILL.md has valid frontmatter and keeps the holdout/ information barrier",
         "verify-blackbox drives from the user's point of view and reports verified-unreachable scenarios as inconclusive, never pass",
         "verify-diff keeps the Gate-Integrity Audit, MUST KILL rule, certainty ladder and `dropped` list; orchestrator section 4 tiers rigor=high fix-round re-verification and runs a pre-handoff `trail --audit` Attention check",
-        "define §1c, verify-diff checklist item 11 and orchestrator §1.4 document the refactor, perf and read-only investigate modes"
+        "define §1c, verify-diff checklist item 11 and orchestrator §1.4 document the refactor, perf and read-only investigate modes",
+        "orchestrator section 5 caps trunk-drift rebases (escalate before a 3rd rebase of the same PR) and runs merge-result caller checks on disjoint drift"
       ]
     },
     {
@@ -275,7 +279,8 @@
       "scenarios": [
         "Manifest, skill frontmatter and local doc links stay valid",
         "README media regenerates with tools/capture_readme_media.py",
-        "CHANGELOG Unreleased, docs/architecture.md and THIRD_PARTY_NOTICES.md document each Wave 4 and Wave 5 unit"
+        "CHANGELOG Unreleased, docs/architecture.md and THIRD_PARTY_NOTICES.md document each Wave 4 and Wave 5 unit",
+        "CHANGELOG Unreleased and docs/architecture.md document the Wave 4 polish trail-audit, malformed-pr_number and lock-budget changes"
       ]
     },
     {
@@ -290,7 +295,8 @@
       "scenarios": [
         "Full suite passes from any checkout or worktree directory name",
         "Sidebar missing-lane regressions (shrunk or extended live lane sets) fail closed in tests.test_desktop_plugin",
-        "silent_start, trail audit and skill prose contracts are covered in tests.test_watchdog_liveness, tests.test_trail and tests.test_plugin_registration"
+        "silent_start, trail audit and skill prose contracts are covered in tests.test_watchdog_liveness, tests.test_trail and tests.test_plugin_registration",
+        "Trail-audit false positives, PR-scoped closure, malformed pr_number evidence and the cold-init lock-budget regression are covered in tests.test_trail, tests.test_pr_gate_hardening and tests.test_metrics_history"
       ]
     }
   ],
