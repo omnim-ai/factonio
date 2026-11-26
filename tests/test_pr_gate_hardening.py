@@ -953,6 +953,38 @@ class TestMergeTrailAudit(unittest.TestCase):
             self.assertIn("HEAD mismatch", refused["error"])
             self.assertEqual(self._audit()["counts"]["gate_loosening"], 0)
 
+    @unittest.skipUnless(shutil.which("git"), "git is required")
+    def test_patch_continuity_override_is_flagged_but_refused_mismatch_is_not(self):
+        with isolated_hermes_home() as home, _git_env():
+            handler = self._handler()
+            repo = Repo(home)
+            repo.register()
+            verified = repo.head
+            repo.trunk({"c.txt": "unrelated\n"})
+            _git(repo.seed, "checkout", "-q", "feat/x")
+            _git(repo.seed, "rebase", "-q", "main")
+            rebased = _git(repo.seed, "rev-parse", "HEAD")
+            _git(repo.seed, "push", "-q", "--force", "origin", "feat/x")
+            _git(repo.seed, "checkout", "-q", "main")
+            _git(repo.local, "fetch", "-q", "origin")
+            views = {12: {"state": "MERGED", "mergedAt": "2026-11-26T00:00:00Z", "baseRefName": "main"}}
+            args = {**self.CTX, "pr_number": 12, "expected_head_sha": verified}
+
+            with mock.patch("factonio.repos._run_gh", Gh({12: _pr_node(head_sha=rebased)}, views=views)):
+                refused = json.loads(handler(args))
+            self.assertFalse(refused["ok"])
+            self.assertIn("HEAD mismatch", refused["error"])
+            self.assertEqual(self._audit()["counts"]["gate_loosening"], 0)
+
+            with mock.patch("factonio.repos._run_gh", Gh({12: _pr_node(head_sha=rebased)}, views=views)):
+                carried = json.loads(handler({**args, "allow_patch_continuity": True}))
+            self.assertTrue(carried["merged"], carried)
+            audit = self._audit()
+            self.assertEqual(audit["counts"]["gate_loosening"], 1, audit)
+            finding = next(f for f in audit["findings"] if f["kind"] == "gate_loosening")
+            self.assertEqual(finding["tokens"], ["allow_patch_continuity"])
+            self.assertEqual(finding["result"], "merged")
+
     def test_explicit_stacked_override_is_flagged(self):
         with isolated_hermes_home():
             handler = self._handler()

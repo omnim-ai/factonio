@@ -807,8 +807,13 @@ _ESCALATION_RESULTS = frozenset(
 _RESOLVING_RESULTS = frozenset({"pass", "merged", "resolved", "adopted", "continuous", "ready"})
 _GATE_LOOSENING_TOKENS = (
     "gate_loosening", "skip_test", "disable_ci", "continue-on-error", "downgrade_hook",
-    "allow_stacked_merge", "force_merge", "bypass_gate", "weaken_assertion", "raise_timeout",
+    "allow_stacked_merge", "allow_patch_continuity", "force_merge", "bypass_gate", "skip_gate",
+    "weaken_assertion", "raise_timeout",
 )
+# Dispatch rows only *describe* work (a card title may be "fix the gate_loosening detector"), and
+# rejection/refusal rows quote the defect they blocked; neither enacts a loosening, so their prose is
+# not scanned. They are flagged only when evidence carries a truthy override key.
+_NON_ENACTING_DECISIONS = frozenset({"start", "spawn_design", "spawn_implement", "spawn_verify"})
 _TOKEN_SEP_RE = re.compile(r"[\s\-]+")
 
 
@@ -824,6 +829,41 @@ def _phase_family(phase: Any) -> str:
 
 def _is_nullish(value: Any) -> bool:
     return value is None or (isinstance(value, (str, list, dict, tuple)) and len(value) == 0)
+
+
+def _is_non_enacting(decision: str, result: str) -> bool:
+    return (
+        decision in _NON_ENACTING_DECISIONS
+        or result == "refused"
+        or (decision == "verify_panel_consensus" and result == "reject")
+    )
+
+
+def _truthy_flag(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "off", "none", "null")
+    return bool(value)
+
+
+def _override_keys(evidence: Mapping[str, Any]) -> list[str]:
+    """Gate-loosening tokens named by a truthy top-level evidence *key* (an explicit override)."""
+    keys = {_norm_token_text(str(k)) for k, v in evidence.items() if _truthy_flag(v)}
+    return [t for t in _GATE_LOOSENING_TOKENS if _norm_token_text(t) in keys]
+
+
+def _evidence_pr_number(evidence: Any) -> Optional[int]:
+    """Positive ``pr_number`` from ``evidence`` or ``evidence["gate"]``; ``None`` otherwise."""
+    if not isinstance(evidence, Mapping):
+        return None
+    gate = evidence.get("gate")
+    for value in (evidence.get("pr_number"), gate.get("pr_number") if isinstance(gate, Mapping) else None):
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value > 0:
+            return value
+        if isinstance(value, str) and value.strip().isdigit() and int(value) > 0:
+            return int(value)
+    return None
 
 
 def _audit_scope(row: Any) -> tuple[str, Optional[str]]:
@@ -870,7 +910,11 @@ def audit_trail_evidence(
       countersign decision, whose evidence names no verifiable artifact (`_ARTIFACT_KEYS`).
     - ``unclosed_escalation``: an ``escape`` row or an escalating ``result`` with no later active
       resolving row in the same scope (``(tenant, card_id)``, or the tenant when no card is set).
+      A row whose evidence names a ``pr_number`` (or ``gate.pr_number``) is also closed by a later
+      resolving row in the same tenant for the same PR, whichever card logged it.
     - ``gate_loosening``: a gate-loosening token in ``decision``/``why``/``result``/``evidence``.
+      Non-enacting rows (``start`` / ``spawn_*`` dispatches, ``refused`` results, rejecting
+      ``verify_panel_consensus``) are flagged only for a truthy override key in ``evidence``.
 
     Resolution rows are looked up across every phase, so ``--phase verify`` still sees a later
     ``merged`` row. Returns ``{ok, clean, inspected, active_inspected, counts, findings, filters}``.
@@ -913,9 +957,9 @@ def audit_trail_evidence(
             }
             marks = ", ".join("?" for _ in _RESOLVING_RESULTS)
             resolvers = [
-                (r["ts"], r["_seq"], _audit_scope(r))
+                (r["ts"], r["_seq"], _audit_scope(r), _evidence_pr_number(_row_to_dict(r)["evidence"]))
                 for r in conn.execute(
-                    f"SELECT rowid AS _seq, id, ts, tenant, card_id FROM decisions"
+                    f"SELECT rowid AS _seq, * FROM decisions"
                     f" WHERE lower(trim(result)) IN ({marks})",
                     sorted(_RESOLVING_RESULTS),
                 ).fetchall()
@@ -961,11 +1005,17 @@ def audit_trail_evidence(
 
         if (family == "escape" or result_l in _ESCALATION_RESULTS) and result_l not in _RESOLVING_RESULTS:
             scope = _audit_scope(row)
+            pr_number = _evidence_pr_number(evidence)
             closed = any(
                 (ts, seq) > (raw["ts"], raw["_seq"])
                 and r_scope[0] == scope[0]
-                and (scope[1] is None or r_scope[1] == scope[1])
-                for ts, seq, r_scope in resolvers
+                and (
+                    scope[1] is None
+                    or r_scope[1] == scope[1]
+                    # A PR outlives its cards: a later merge/rebase card resolving the same PR closes it.
+                    or (pr_number is not None and r_pr == pr_number)
+                )
+                for ts, seq, r_scope, r_pr in resolvers
             )
             if not closed:
                 what = "escape row" if family == "escape" else f"result '{result_l}'"
@@ -975,15 +1025,18 @@ def audit_trail_evidence(
                     f"{'card ' + scope[1] if scope[1] else 'tenant ' + (scope[0] or '(none)')}.",
                 )
 
-        # False/None evidence values record that a gate was *not* loosened; leave them out.
-        asserted = {k: v for k, v in evidence.items() if v is not None and v is not False}
-        haystack = _norm_token_text(
-            " ".join(
-                [str(row["decision"] or ""), str(row["why"] or ""), str(row["result"] or ""),
-                 json.dumps(asserted, sort_keys=True, default=str)]
+        if _is_non_enacting(decision_l.strip(), result_l):
+            tokens = _override_keys(evidence)
+        else:
+            # False/None evidence values record that a gate was *not* loosened; leave them out.
+            asserted = {k: v for k, v in evidence.items() if v is not None and v is not False}
+            haystack = _norm_token_text(
+                " ".join(
+                    [str(row["decision"] or ""), str(row["why"] or ""), str(row["result"] or ""),
+                     json.dumps(asserted, sort_keys=True, default=str)]
+                )
             )
-        )
-        tokens = [t for t in _GATE_LOOSENING_TOKENS if _norm_token_text(t) in haystack]
+            tokens = [t for t in _GATE_LOOSENING_TOKENS if _norm_token_text(t) in haystack]
         if tokens:
             flag(
                 "gate_loosening",
