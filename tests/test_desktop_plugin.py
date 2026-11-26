@@ -1673,6 +1673,28 @@ async function runPolishScenarios(report) {
     none: cw([card({ id: 't_x', tenant: T0, phase: 'implement', status: 'done' })], []),
     nullInputs: cw(null, null)
   }
+  // Expected-lane membership: a recorded/spawned 4-lane panel shrunk to its 2 diff lanes.
+  const four = ['openai', 'google', 'openai', 'google'].map((v, i) => lane({ id: 't_' + i, tenant: T0, panel_id: 'vp_m4', panel_vendor: v, phase: i < 2 ? 'verify-diff' : 'verify-blackbox', verdict: 'pass' }))
+  const rec4 = (result = 'pass', ev = {}) => consensusRow(T0, 'vp_m4', result, {
+    lanes: four.map(c => ({ task_id: c.id, phase: c.phase, vendor: c.panel_vendor, status: 'done', verdict: 'pass' })),
+    lane_fingerprint: four.map(c => [c.id, 'pass']), ...ev
+  })
+  const spawn4 = dec({ id: 'd_sv_m4', ts: '2026-11-25T16:00:00.000000Z', tenant: T0, phase: 'verify', actor: 'orchestrator', decision: 'spawn_verify', why: 'panel', result: 'spawned', evidence: { panel_id: 'vp_m4', panel_lanes: [
+    { vendor: 'openai', label: 'openai', verify_diff_task_id: 't_0', verify_blackbox_task_id: 't_2' },
+    { vendor: 'google', label: 'google', verify_diff_task_id: 't_1', verify_blackbox_task_id: 't_3' }
+  ] } })
+  const diff2 = four.slice(0, 2)
+  P.panels.missing = {
+    recordedLanes: cw(diff2, [rec4()]),
+    recordedStringLanes: cw(diff2, [consensusRow(T0, 'vp_m4', 'pass', { lanes: ['t_0', 't_1', 't_2', 't_3'] })]),
+    spawned: cw(diff2, [spawn4, consensusRow(T0, 'vp_m4', 'pass')]),
+    spawnedNoConsensus: cw(diff2, [spawn4]),
+    countOnly: cw(diff2, [consensusRow(T0, 'vp_m4', 'pass', { expected_lane_count: 4 })]),
+    rejectWins: cw([diff2[0], { ...diff2[1], verdict: 'reject' }], [rec4()]),
+    recordedRejectWins: cw(diff2, [rec4('reject')]),
+    full: cw(four, [spawn4, rec4()]),
+    staleSubsetPass: cw([...four, lane({ id: 't_9', tenant: T0, panel_id: 'vp_m4', panel_vendor: 'openai', verdict: 'pass' })], [rec4()])
+  }
 
   // --- Registered Repositories: Rigor column + Default rigor editor field ----
   const client = { invalidateQueries: () => Promise.resolve() }
@@ -1792,6 +1814,7 @@ async function runPolishScenarios(report) {
   const WS_DIS = 'omnim-ai-factonio-tenant-card-index'
   const WS_PEND = 'omnim-ai-factonio-watchdog-liveness'
   const WS_REC = 'omnim-ai-factonio-recorded-panel'
+  const WS_MISS = 'omnim-ai-factonio-shrunk-panel'
   const PR214 = { repo: 'omnim-ai/factonio', number: 214, url: 'https://github.com/omnim-ai/factonio/pull/214' }
   const PANEL_CARDS = [
     card({ id: 't_imp', tenant: WS_DIS, phase: 'implement', status: 'done', title: '[implement] index migration', pr: PR214, created_at: 100 }),
@@ -1804,9 +1827,12 @@ async function runPolishScenarios(report) {
     lane({ id: 't_r1', tenant: WS_REC, panel_id: 'vp_3f71b0', panel_vendor: 'openai', verdict: 'pass', created_at: 500 }),
     lane({ id: 't_r2', tenant: WS_REC, panel_id: 'vp_3f71b0', panel_vendor: 'google', verdict: 'pass', created_at: 500 }),
     lane({ id: 't_r3', tenant: WS_REC, panel_id: 'vp_3f71b0', panel_vendor: 'openai', verdict: 'pass', phase: 'verify-blackbox', created_at: 500 }),
-    lane({ id: 't_r4', tenant: WS_REC, panel_id: 'vp_3f71b0', panel_vendor: 'google', verdict: 'pass', phase: 'verify-blackbox', created_at: 500 })
+    lane({ id: 't_r4', tenant: WS_REC, panel_id: 'vp_3f71b0', panel_vendor: 'google', verdict: 'pass', phase: 'verify-blackbox', created_at: 500 }),
+    lane({ id: 't_m0', tenant: WS_MISS, panel_id: 'vp_5e0d12', panel_vendor: 'openai', verdict: 'pass', created_at: 500 }),
+    lane({ id: 't_m1', tenant: WS_MISS, panel_id: 'vp_5e0d12', panel_vendor: 'google', verdict: 'pass', created_at: 500 })
   ]
-  const PANEL_TRAIL = { decisions: [consensusRow(WS_REC, 'vp_3f71b0', 'pass')], summary: { total: 1 }, filters: {} }
+  const MISS_LANES = ['t_m0', 't_m1', 't_m2', 't_m3'].map(task_id => ({ task_id, status: 'done', verdict: 'pass' }))
+  const PANEL_TRAIL = { decisions: [consensusRow(WS_REC, 'vp_3f71b0', 'pass'), consensusRow(WS_MISS, 'vp_5e0d12', 'pass', { lanes: MISS_LANES })], summary: { total: 2 }, filters: {} }
   const readStrip = (t, tenant) => {
     const sec = find(t, n => n.type === 'section' && n.props['data-tenant'] === tenant)
     const st = sec && find(sec.node, cls('fc-sb-panel'))
@@ -1851,6 +1877,10 @@ async function runPolishScenarios(report) {
   S.dis = readStrip(tree, WS_DIS)
   S.pend = readStrip(tree, WS_PEND)
   S.rec = readStrip(tree, WS_REC)
+  S.miss = readStrip(tree, WS_MISS)
+  fire(find(find(tree, n => n.type === 'article' && n.props['data-id'] === 't_m0').node, byAttr('data-action', 'toggle-card'))); tree = m.render()
+  const mdl = find(find(tree, n => n.type === 'article' && n.props['data-id'] === 't_m0').node, n => n.type === 'dl').node
+  S.missDrawer = Object.fromEntries(findAll(mdl, n => n.type === 'dd').map(h => [h.node.props['data-field'], norm(h.node)]))
   S.cards = Object.fromEntries(['t_8f2a', 't_8f2b', 't_8f2c', 't_w3', 't_imp'].map(id => [id, cardTop(tree, id)]))
   fire(find(find(tree, n => n.type === 'article' && n.props['data-id'] === 't_8f2a').node, byAttr('data-action', 'toggle-card'))); tree = m.render()
   const dl = find(find(tree, n => n.type === 'article' && n.props['data-id'] === 't_8f2a').node, n => n.type === 'dl').node
@@ -3544,6 +3574,60 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual(d["peers"], ["pass", "inconclusive"])
         for field in ("panel", "vendor", "peers"):
             self.assertNotIn(field, sb["nonPanelDrawer"])
+        self.assertNotIn("missing", d["fields"])
+
+    # --- fix round 1: expected-lane membership fails closed (mirrors summarize_panel) ---
+    def test_compute_workstream_panels_missing_expected_lanes_from_recorded_consensus(self):
+        ms = self.report["polish"]["panels"]["missing"]
+        for key in ("recordedLanes", "recordedStringLanes"):
+            p = ms[key][0]
+            self.assertEqual(p["consensus"], "inconclusive", key)  # never the stale recorded pass
+            self.assertEqual(p["missingLaneIds"], ["t_2", "t_3"], key)
+            self.assertEqual(p["expectedLaneCount"], 4, key)
+            self.assertEqual(p["reason"], "2 expected lane(s) missing: t_2, t_3", key)
+            self.assertEqual(len(p["lanes"]), 2, key)
+        cnt = ms["countOnly"][0]
+        self.assertEqual((cnt["consensus"], cnt["missingLaneIds"], cnt["expectedLaneCount"]), ("inconclusive", [], 4))
+        self.assertEqual(cnt["reason"], "2 expected lane(s) missing")
+
+    def test_compute_workstream_panels_missing_expected_lanes_from_spawn_verify(self):
+        ms = self.report["polish"]["panels"]["missing"]
+        for key in ("spawned", "spawnedNoConsensus"):
+            p = ms[key][0]
+            self.assertEqual(p["consensus"], "inconclusive", key)
+            self.assertEqual((p["missingLaneIds"], p["expectedLaneCount"]), (["t_2", "t_3"], 4), key)
+
+    def test_compute_workstream_panels_reject_beats_missing_lanes(self):
+        ms = self.report["polish"]["panels"]["missing"]
+        for key in ("rejectWins", "recordedRejectWins"):
+            p = ms[key][0]
+            self.assertEqual(p["consensus"], "reject", key)
+            self.assertEqual(p["missingLaneIds"], ["t_2", "t_3"], key)
+            self.assertIsNone(p["reason"], key)
+
+    def test_compute_workstream_panels_full_and_grown_lane_sets(self):
+        ms = self.report["polish"]["panels"]["missing"]
+        full = ms["full"][0]
+        self.assertEqual((full["consensus"], full["missingLaneIds"], full["expectedLaneCount"], full["reason"]), ("pass", [], 4, None))
+        # A recorded pass covers only the lanes it evaluated; a new lane waits for re-evaluation.
+        self.assertEqual(ms["staleSubsetPass"][0]["consensus"], "pending")
+        self.assertIsNone(self.report["polish"]["panels"]["passRecorded"][0]["expectedLaneCount"])
+
+    def test_sidebar_panel_strip_and_drawer_surface_missing_lanes(self):
+        sb = self.report["polish"]["sidebar"]
+        miss = sb["miss"]
+        self.assertEqual(miss["consensus"], "inconclusive")
+        self.assertEqual(miss["tag"], {"tone": "warn", "text": "inconclusive"})
+        self.assertEqual(miss["lanes"], "2/4 lanes")
+        self.assertEqual(miss["label"], "Verification panel vp_5e0d12: inconclusive, 2 of 4 lanes, 2 expected lane(s) missing: t_m2, t_m3")
+        co = miss["callout"]
+        self.assertEqual((co["tone"], co["kind"], co["role"]), ("warn", "missing", "note"))
+        self.assertEqual(co["text"], "missing 2 expected lane(s) missing: t_m2, t_m3")
+        self.assertEqual(co["title"], "2 expected lane(s) missing: t_m2, t_m3; the panel cannot pass without every lane")
+        self.assertEqual(sb["missDrawer"]["panel"], "vp_5e0d12 inconclusive")
+        self.assertEqual(sb["missDrawer"]["missing"], "2 expected lane(s) missing: t_m2, t_m3")
+        self.assertIsNone(sb["rec"]["callout"])
+        self.assertEqual(sb["rec"]["lanes"], "4/4 lanes")
 
     def test_polish_styles_use_theme_tokens_only(self):
         source = PLUGIN_JS.read_text(encoding="utf-8")

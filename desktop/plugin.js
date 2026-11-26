@@ -2919,13 +2919,47 @@ function panelDissent(buckets) {
   return { lead: `${names(dissent)} ${worst} vs ${vs}`, quote: quote ? String(quote) : null }
 }
 
+const laneIdOf = l => {
+  const id = Array.isArray(l) ? l[0] : l && typeof l === 'object' ? l.task_id ?? l.id : l
+  return id == null || id === '' ? null : String(id)
+}
+const laneIdList = v => (Array.isArray(v) ? v.map(laneIdOf).filter(Boolean) : [])
+const laneCount = v => (Number.isInteger(v) && v > 0 ? v : 0)
+
+// Lanes a panel must contain before it can pass, mirroring backend summarize_panel's
+// expected_lane_ids: every lane spawn_verify recorded plus every lane a recorded consensus
+// covered. `recordedIds` is the newest consensus row's own lane set (null when unrecorded).
+function expectedPanelLanes(spawnRows, row) {
+  const ids = new Set()
+  let count = 0
+  for (const d of spawnRows) {
+    const ev = d.evidence
+    for (const l of Array.isArray(ev.panel_lanes) ? ev.panel_lanes : []) {
+      if (!l || typeof l !== 'object') continue
+      for (const k of ['verify_diff_task_id', 'verify_blackbox_task_id', 'task_id']) if (l[k]) ids.add(String(l[k]))
+    }
+    for (const id of [...laneIdList(ev.expected_lane_ids), ...laneIdList(ev.lanes)]) ids.add(id)
+    count = Math.max(count, laneCount(ev.expected_lane_count))
+  }
+  let recordedIds = null
+  if (row) {
+    const ev = row.evidence
+    const own = [...laneIdList(ev.lanes), ...laneIdList(ev.lane_fingerprint)]
+    if (own.length) recordedIds = new Set(own)
+    for (const id of [...own, ...laneIdList(ev.expected_lane_ids), ...laneIdList(ev.missing_lane_ids)]) ids.add(id)
+    count = Math.max(count, laneCount(ev.expected_lane_count), laneCount(ev.lane_count))
+  }
+  return { ids: [...ids], count: Math.max(count, ids.size), recordedIds }
+}
+
 // Panels of one workstream, newest first: [{ id, consensus, lanes, decided, vendors,
-// hasDisagreement, dissent, recorded, createdAt }]. `trailDecisions` are that tenant's
-// /trail rows (any order).
+// hasDisagreement, dissent, recorded, missingLaneIds, expectedLaneCount, reason, createdAt }].
+// `trailDecisions` are that tenant's /trail rows (any order).
 function computeWorkstreamPanels(wsCards, trailDecisions) {
   const groups = groupBy((wsCards || []).filter(c => c && c.panel_id), c => String(c.panel_id))
-  const consensusRows = (Array.isArray(trailDecisions) ? trailDecisions : [])
-    .filter(d => d && d.decision === 'verify_panel_consensus' && !d.is_superseded && d.evidence && typeof d.evidence === 'object')
+  const rows = (Array.isArray(trailDecisions) ? trailDecisions : []).filter(d => d && d.evidence && typeof d.evidence === 'object')
+  const consensusRows = rows.filter(d => d.decision === 'verify_panel_consensus' && !d.is_superseded)
+  const spawnRows = rows.filter(d => d.decision === 'spawn_verify')
   const out = []
   for (const [id, cards] of groups) {
     const ordered = [...cards].sort((a, b) => (a.created_at || 0) - (b.created_at || 0) || String(a.id).localeCompare(String(b.id)))
@@ -2944,8 +2978,21 @@ function computeWorkstreamPanels(wsCards, trailDecisions) {
       .filter(d => d.evidence.panel_id === id)
       .sort((a, b) => (trailMs(b.ts) ?? 0) - (trailMs(a.ts) ?? 0))[0] || null
     const recorded = row && Object.hasOwn(PANEL_SEVERITY, row.result) && row.result !== 'pending' ? row.result : null
-    let consensus = live.consensus === 'pass' && !recorded ? 'pending' : live.consensus
+    const expected = expectedPanelLanes(spawnRows.filter(d => String(d.evidence.panel_id ?? '') === id), row)
+    const liveIds = new Set(lanes.map(l => String(l.cardId)))
+    const missingLaneIds = expected.ids.filter(x => !liveIds.has(x))
+    const short = missingLaneIds.length || expected.count > lanes.length
+    // A recorded pass only vouches for the exact lane set it evaluated.
+    const stale = recorded === 'pass' && expected.recordedIds &&
+      (expected.recordedIds.size !== liveIds.size || [...liveIds].some(x => !expected.recordedIds.has(x)))
+    let consensus = live.consensus === 'pass' && (!recorded || stale) ? 'pending' : live.consensus
     if (recorded && PANEL_SEVERITY[recorded] > PANEL_SEVERITY[consensus]) consensus = recorded
+    let reason = null
+    if (short && consensus !== 'reject') {
+      consensus = 'inconclusive'
+      const n = missingLaneIds.length || expected.count - lanes.length
+      reason = `${n} expected lane(s) missing${missingLaneIds.length ? `: ${missingLaneIds.join(', ')}` : ''}`
+    }
     const hasDisagreement = live.hasDisagreement || !!row?.evidence?.has_disagreement
     let dissent = null
     if (hasDisagreement) {
@@ -2961,6 +3008,9 @@ function computeWorkstreamPanels(wsCards, trailDecisions) {
       vendors: live.vendors,
       hasDisagreement,
       dissent,
+      missingLaneIds,
+      expectedLaneCount: expected.count || null,
+      reason,
       createdAt: Math.max(0, ...ordered.map(c => c.created_at || 0))
     })
   }
@@ -2981,7 +3031,8 @@ const mixedPhases = lanes => new Set(lanes.map(l => l.phase)).size > 1
 
 function PanelStrip({ panel: p }) {
   const mixed = mixedPhases(p.lanes)
-  const label = `Verification panel ${p.id}: ${p.consensus}, ${p.decided} of ${p.lanes.length} lanes${p.hasDisagreement ? ', lanes disagree' : ''}`
+  const total = Math.max(p.lanes.length, p.expectedLaneCount || 0)
+  const label = `Verification panel ${p.id}: ${p.consensus}, ${p.decided} of ${total} lanes${p.hasDisagreement ? ', lanes disagree' : ''}${p.reason ? `, ${p.reason}` : ''}`
   const full = p.dissent ? `${p.dissent.lead}${p.dissent.quote ? `: “${p.dissent.quote}”` : ''}` : ''
   return jsxs('div', {
     className: 'fc-sb-panel',
@@ -2997,7 +3048,7 @@ function PanelStrip({ panel: p }) {
           jsx('span', { className: 'fc-sb-panel-k', title: 'Multi-vendor verification panel', children: jsx(Icon, { name: 'panel', size: 11 }) }),
           jsx('span', { className: 'fc-sb-tag', 'data-tone': PANEL_TONE[p.consensus], 'data-consensus': p.consensus, children: p.consensus }),
           jsx('span', { className: 'fc-sb-panel-id fc-sb-mono', title: p.id, children: p.id }),
-          jsx('span', { className: 'fc-sb-panel-lanes', children: `${p.decided}/${p.lanes.length} lanes` })
+          jsx('span', { className: 'fc-sb-panel-lanes', children: `${p.decided}/${total} lanes` })
         ]
       }),
       jsx('div', {
@@ -3005,6 +3056,22 @@ function PanelStrip({ panel: p }) {
         'aria-label': 'Lanes by vendor',
         children: p.lanes.map(l => jsx(VendorChip, { key: l.cardId, lane: l, mixed }))
       }),
+      p.reason
+        ? jsxs('div', {
+            className: 'fc-sb-callout',
+            'data-tone': 'warn',
+            'data-kind': 'missing',
+            role: 'note',
+            children: [
+              jsx(Icon, { name: 'attention' }),
+              jsxs('span', {
+                className: 'fc-sb-callout-body',
+                title: `${p.reason}; the panel cannot pass without every lane`,
+                children: [jsx('span', { className: 'fc-sb-kind', children: 'missing' }), p.reason]
+              })
+            ]
+          })
+        : null,
       p.hasDisagreement && p.dissent
         ? jsxs('div', {
             className: 'fc-sb-callout',
@@ -3285,7 +3352,7 @@ function panelRows(c, panel, row) {
   return [
     ...row('panel', 'Panel', [
       jsx('span', { key: 'id', className: 'fc-sb-mono', children: panel.id }),
-      jsx('span', { key: 'c', className: 'fc-sb-tag', 'data-tone': PANEL_TONE[panel.consensus], children: panel.consensus })
+      jsx('span', { key: 'c', className: 'fc-sb-tag', 'data-tone': PANEL_TONE[panel.consensus], title: panel.reason || undefined, children: panel.consensus })
     ]),
     ...(lane
       ? row('vendor', 'Vendor', [
@@ -3293,7 +3360,8 @@ function panelRows(c, panel, row) {
           jsx('span', { key: 'n', className: 'fc-sb-lane', children: `lane ${pos}/${panel.lanes.length}` })
         ])
       : []),
-    ...(peers.length ? row('peers', 'Peers', peers.map(l => jsx(VendorChip, { key: l.cardId, lane: l, mixed }))) : [])
+    ...(peers.length ? row('peers', 'Peers', peers.map(l => jsx(VendorChip, { key: l.cardId, lane: l, mixed }))) : []),
+    ...(panel.reason ? row('missing', 'Missing', panel.reason, { className: 'fc-sb-mono' }) : [])
   ]
 }
 
