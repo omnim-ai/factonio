@@ -78,7 +78,35 @@ _ADD_PARSER_RE = re.compile(r"\.add_parser\(\s*[rbuf]?[\"']([^\"']+)[\"']")
 _CLICK_RE = re.compile(r"@\s*[A-Za-z_][\w.]*\.command\(\s*(?:name\s*=\s*)?[\"']([^\"']+)[\"']")
 _MAKE_TARGET_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.-]*)\s*:(?!=)", re.MULTILINE)
 _WORKFLOW_RUN_RE = re.compile(r"^[ \t]*-?[ \t]*run:[ \t]*(?![|>\s])(.+?)[ \t]*$", re.MULTILINE)
-_CI_SKIP_PREFIXES = ("git ", "cd ", "echo ", "export ", "uv sync", "pip install", "python -m pip", "npm ci", "npm install", "apt", "sudo ")
+# Allowlist of CI `run:` commands suitable for black-box Drive verification.
+# A positive allowlist prevents provisioning, package-manager, privileged, and
+# shell-boilerplate steps from leaking into generated verification plans.
+_CI_VERIFY_RE = re.compile(
+    r"^(?:(?:[A-Z_][A-Z0-9_]*=\S+\s+)|(?:env(?:\s+-u\s+\S+)*\s+))*"
+    r"(?:pytest\b|"
+    r"python3?(?:\s+-W\s+\S+)*(?:\s+-m\s+(?:pytest|unittest|compileall|mypy|flake8|ruff|black|isort|pylint|doctest)\b|\s+(?:tools|scripts|tests)/)|"
+    r"uv\s+run\b|uvx\b|ruff\b|mypy\b|pyright\b|flake8\b|pylint\b|black\b|isort\b|"
+    r"npm\s+(?:test|run)\b|npx\b|pnpm\s+(?:test|run|exec)\b|yarn\s+(?:test|run)\b|bun\s+(?:test|run|x)\b|"
+    r"node\s+(?:--check|--test)\b|vitest\b|jest\b|playwright\b|eslint\b|tsc\b|prettier\b|"
+    r"cargo\s+(?:test|check|clippy|fmt|build)\b|go\s+(?:test|vet|build)\b|"
+    r"make(?:\s+(?:test|check|lint|verify|build))?\b|just\b|ctest\b|"
+    r"mvn\b|\./gradlew\b|gradle\b|dotnet\s+(?:test|build|format)\b|"
+    r"bundle\s+exec\b|rspec\b|mix\s+(?:test|format|credo)\b|phpunit\b|shellcheck\b|"
+    r"\./(?:scripts|tools|bin)/)",
+    re.IGNORECASE,
+)
+_CI_SETUP_SUBCMD_RE = re.compile(
+    r"(?:^|\s)(?:pip\s+install|npm\s+(?:ci|install)|uv\s+sync)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_ci_verification_command(cmd: str) -> bool:
+    """Return True only for verification/test/lint/build CI steps."""
+    text = cmd.strip()
+    if not text or not _CI_VERIFY_RE.match(text):
+        return False
+    return _CI_SETUP_SUBCMD_RE.search(text) is None
 _GITHUB_REMOTE_RE = re.compile(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
 _H2_RE = re.compile(r"^##\s+(.+?)\s*#*\s*$", re.MULTILINE)
 _FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
@@ -617,7 +645,7 @@ def _phases_for(profile: dict[str, Any]) -> dict[str, list[str]]:
     doctor += [cmd for lang, cmd in tool_checks.items() if lang in profile["stack"]]
     drive = [*cmds["test"], *cmds["lint"]]
     drive += [
-        c for c in profile["ci_commands"] if c not in drive and not c.startswith(_CI_SKIP_PREFIXES)
+        c for c in profile["ci_commands"] if c not in drive and _is_ci_verification_command(c)
     ][:10]
     return {
         "launch": [*cmds["setup"], *cmds["build"], *cmds["start"]],
