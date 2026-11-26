@@ -478,6 +478,109 @@ class TestTieredTrunkDrift(unittest.TestCase):
             self.assertFalse(any(c[:2] == ["pr", "merge"] for c in gh.calls))
 
 
+    def test_non_ascii_and_special_paths_are_not_quoted(self):
+        from factonio.repos import assess_trunk_drift, inspect_pr_gate
+
+        workflow = ".github/workflows/déploy \"x\".yml"
+        cases = [
+            ({workflow: "on: push\n"}, "workflow_rebase_required", True, [workflow]),
+            ({"café/uv.lock": "x\n", "naïve\tdir/package-lock.json": "{}\n"}, "lockfile_only", False, []),
+        ]
+        for files, policy, rebase, wf in cases:
+            with self.subTest(policy=policy), isolated_hermes_home() as home, _git_env():
+                repo = Repo(home)
+                repo.trunk(files)
+                res = assess_trunk_drift(repo.local, "origin/feat/x", fetch=True)
+                self.assertTrue(res["ok"], res)
+                self.assertEqual(res["trunk_files"], sorted(files))
+                self.assertEqual((res["policy"], res["rebase_required"], res["workflow_files"]), (policy, rebase, wf))
+
+                repo.register()
+                with mock.patch("factonio.repos._run_gh", Gh({12: _pr_node(head_branch="feat/x", head_sha=repo.head)})):
+                    gate = inspect_pr_gate("acme/sample", 12)
+                self.assertEqual(gate["trunk_drift"]["policy"], policy)
+                self.assertEqual(gate["ready_to_merge"], not rebase)
+                self.assertEqual(gate["blocker_tier"], 1 if rebase else None)
+                if rebase:
+                    self.assertEqual(gate["blockers"], [f"Trunk drift requires rebase (workflow_rebase_required): {workflow}"])
+
+    def test_fork_head_branch_colliding_with_origin_branch_fetches_pull_ref(self):
+        from factonio.repos import inspect_pr_gate
+
+        with isolated_hermes_home() as home, _git_env():
+            repo = Repo(home)
+            repo.register()
+            # Fork PR: its head lives only at refs/pull/12/head; headRefName "main" collides with origin/main.
+            _git(repo.seed, "checkout", "-q", "-b", "fork-main", "main")
+            fork_head = _commit(repo.seed, {"b.txt": "b\nfork\n"}, "fork change")
+            _git(repo.seed, "push", "-q", "origin", "fork-main:refs/pull/12/head")
+            _git(repo.seed, "checkout", "-q", "main")
+            repo.trunk({"b.txt": "b\ntrunk\n"})
+            with self.assertRaises(AssertionError):
+                _git(repo.local, "cat-file", "-e", f"{fork_head}^{{commit}}")
+
+            node = _pr_node(head_branch="main", head_sha=fork_head)
+            with mock.patch("factonio.repos._run_gh", Gh({12: node})):
+                gate = inspect_pr_gate("acme/sample", 12, fetch=True)
+            self.assertIsNotNone(gate["trunk_drift"], gate)
+            self.assertEqual(gate["trunk_drift"]["policy"], "overlap_rebase_required")
+            self.assertEqual(gate["trunk_drift"]["overlapping_files"], ["b.txt"])
+            self.assertEqual(gate["blocker_tier"], 1)
+            self.assertFalse(gate["ready_to_merge"])
+            self.assertEqual(_git(repo.local, "rev-parse", "refs/factonio/pull/12/head"), fork_head)
+
+    def test_fetch_applies_to_patch_continuity_without_trunk_drift(self):
+        from factonio.repos import inspect_pr_gate, merge_pr
+
+        with isolated_hermes_home() as home, _git_env():
+            repo = Repo(home)
+            repo.register()
+            verified = repo.head
+            _git(repo.local, "fetch", "-q", "origin")  # verified commit is local
+            repo.trunk({"c.txt": "unrelated\n"})
+            _git(repo.seed, "checkout", "-q", "feat/x")
+            _git(repo.seed, "rebase", "-q", "main")
+            rebased = _git(repo.seed, "rev-parse", "HEAD")
+            _git(repo.seed, "push", "-q", "--force", "origin", "feat/x")
+            _git(repo.seed, "checkout", "-q", "main")
+            node = _pr_node(head_branch="feat/x", head_sha=rebased)
+            views = {12: {"state": "MERGED", "mergedAt": "2026-11-26T00:00:00Z", "baseRefName": "main"}}
+
+            with mock.patch("factonio.repos._run_gh", Gh({12: node})):
+                unfetched = inspect_pr_gate("acme/sample", 12, verified_head_sha=verified, check_trunk_drift=False)
+            self.assertFalse(unfetched["patch_continuity"]["ok"])
+            self.assertIn("not available locally", unfetched["patch_continuity"]["error"])
+
+            with mock.patch("factonio.repos._run_gh", Gh({12: node})):
+                fetched = inspect_pr_gate(
+                    "acme/sample", 12, verified_head_sha=verified, check_trunk_drift=False, fetch=True,
+                )
+            self.assertIsNone(fetched["trunk_drift"])
+            self.assertTrue(fetched["patch_continuity"]["ok"], fetched["patch_continuity"])
+            self.assertTrue(fetched["patch_continuity"]["continuous"])
+
+        with isolated_hermes_home() as home, _git_env():
+            repo = Repo(home)
+            repo.register()
+            verified = repo.head
+            _git(repo.local, "fetch", "-q", "origin")
+            repo.trunk({"c.txt": "unrelated\n"})
+            _git(repo.seed, "checkout", "-q", "feat/x")
+            _git(repo.seed, "rebase", "-q", "main")
+            rebased = _git(repo.seed, "rev-parse", "HEAD")
+            _git(repo.seed, "push", "-q", "--force", "origin", "feat/x")
+            _git(repo.seed, "checkout", "-q", "main")
+            gh = Gh({12: _pr_node(head_branch="feat/x", head_sha=rebased)}, views=views)
+            with mock.patch("factonio.repos._run_gh", gh):
+                merged = merge_pr(
+                    "acme/sample", 12, expected_head_sha=verified, allow_patch_continuity=True,
+                    check_trunk_drift=False, fetch=True,
+                )
+            self.assertTrue(merged["merged"], merged)
+            self.assertEqual(merged["head_sha"], rebased)
+            self.assertTrue(merged["patch_continuity"]["continuous"])
+
+
 def _stack_prs(**overrides: dict) -> dict[int, dict]:
     prs = {
         10: _pr_node(10, head_branch="s/1", head_sha="1" * 40, base_branch="main"),
@@ -526,9 +629,20 @@ class TestStackGate(unittest.TestCase):
         self.assertEqual(res["highest_blocker_tier"], 1)
         self.assertEqual([e["pr_number"] for e in res["tiers_summary"]["tier_4"]], [10])
         self.assertEqual([e["pr_number"] for e in res["tiers_summary"]["tier_3_pending"]], [11])
-        self.assertEqual(res["lowest_pending_frontier"], 11)
+        frontier = res["lowest_pending_frontier"]
+        self.assertEqual(frontier["pr_number"], 11)
+        self.assertEqual(frontier["pending_checks"], ["ci"])
+        self.assertEqual(frontier["pending_review_automations"], [])
+        self.assertFalse(frontier["review_automation_running"])
+        self.assertEqual(
+            (frontier["head_branch"], frontier["base_branch"], frontier["head_sha"]), ("s/2", "s/1", "2" * 40),
+        )
         self.assertEqual(res["contiguous_ready_run"], [])
-        self.assertEqual(res["ceiling"], 10)
+        ceiling = res["ceiling"]
+        self.assertEqual(ceiling["pr_number"], 10)
+        self.assertEqual(ceiling["blocker_tier"], 4)
+        self.assertEqual(ceiling["blockers"], ["PR is still a draft"])
+        self.assertEqual((ceiling["head_branch"], ceiling["base_branch"], ceiling["head_sha"]), ("s/1", "main", "1" * 40))
         self.assertFalse(res["ready_to_merge"])
 
         # Pending is the lowest priority: a failed CI check above it wins next_action.
@@ -539,14 +653,25 @@ class TestStackGate(unittest.TestCase):
         with isolated_hermes_home():
             res = self._stack(prs, [10, 11, 12])
         self.assertEqual((res["next_action"]["tier"], res["next_action"]["pr_number"]), ("tier_3_failed", 12))
-        self.assertEqual(res["lowest_pending_frontier"], 10)
+        self.assertEqual(res["lowest_pending_frontier"]["pr_number"], 10)
 
         # Ready prefix then a ceiling.
         with isolated_hermes_home():
             res = self._stack(_stack_prs(p12={"reviewDecision": "CHANGES_REQUESTED"}), [10, 11, 12])
         self.assertEqual(res["contiguous_ready_run"], [10, 11])
-        self.assertEqual(res["ceiling"], 12)
+        self.assertEqual(res["ceiling"]["pr_number"], 12)
+        self.assertEqual(res["ceiling"]["blocker_tier"], 4)
+        self.assertIsNone(res["lowest_pending_frontier"])
         self.assertEqual(res["next_action"]["action"], "human_gate")
+
+        # Review automation alone makes a PR the pending frontier.
+        bot = _check("Cursor Bugbot", None, "IN_PROGRESS")
+        with isolated_hermes_home():
+            res = self._stack(_stack_prs(p11={"contexts": [_check("ci"), bot], "rollup_state": "PENDING"}), [10, 11, 12])
+        frontier = res["lowest_pending_frontier"]
+        self.assertEqual(frontier["pr_number"], 11)
+        self.assertTrue(frontier["review_automation_running"])
+        self.assertEqual(frontier["pending_review_automations"], ["Cursor Bugbot"])
 
     def test_cycle_is_detected_without_looping(self):
         prs = {
@@ -621,7 +746,14 @@ class TestCliAndTools(unittest.TestCase):
             code, out = self._cli(_stack_prs(p11={"isDraft": True}), "--json", "pr-gate", "acme/sample", "--stack", "10,11,12")
             self.assertEqual(code, 1)
             data = json.loads(out)
-            self.assertEqual(data["ceiling"], 11)
+            self.assertEqual(data["ceiling"]["pr_number"], 11)
+            self.assertEqual(data["ceiling"]["blocker_tier"], 4)
+            self.assertIsNone(data["lowest_pending_frontier"])
+
+            pending = _stack_prs(p11={"contexts": [_check("ci", None, "QUEUED")], "rollup_state": "PENDING"})
+            code, out = self._cli(pending, "pr-gate", "acme/sample", "--stack", "10,11,12")
+            self.assertEqual(code, 1)
+            self.assertIn("Ready run: #10; ceiling: #11; pending frontier: #11", out)
             self.assertEqual(data["contiguous_ready_run"], [10])
 
             code, out = self._cli(_stack_prs(), "pr-gate", "acme/sample", "--stack", "10,abc")

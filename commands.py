@@ -313,8 +313,8 @@ def _print_stack_gate(stack: dict) -> None:
     order = " -> ".join(f"#{n}" for n in stack.get("order") or [])
     print(f"{verdict}: {stack.get('repo')} stack {order}")
     run = ", ".join(f"#{n}" for n in stack.get("contiguous_ready_run") or []) or "none"
-    ceiling = stack.get("ceiling")
-    frontier = stack.get("lowest_pending_frontier")
+    ceiling = (stack.get("ceiling") or {}).get("pr_number")
+    frontier = (stack.get("lowest_pending_frontier") or {}).get("pr_number")
     print(f"  Ready run: {run}; ceiling: {f'#{ceiling}' if ceiling else 'none'}; pending frontier: "
           f"{f'#{frontier}' if frontier else 'none'}")
     for warning in stack.get("warnings") or []:

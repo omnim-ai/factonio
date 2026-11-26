@@ -765,16 +765,48 @@ def _classify_contexts(
     return passed, failed, pending, approval_gates, automations
 
 
-def _local_trunk_drift(
+def _fetch_gate_refs(
     cwd: Optional[Path],
     *,
     head_sha: Optional[str],
     head_branch: Optional[str],
     base_branch: str,
-    default_branch: str,
     pr_number: int,
     remote: str,
-    fetch: bool,
+) -> None:
+    """Best-effort fetch of ``<remote>/<base>`` and the PR head commit for local gate checks.
+
+    The head branch is tried first, but a fork PR's ``headRefName`` may collide with an unrelated
+    branch on ``remote`` (e.g. ``main``), so ``refs/pull/<n>/head`` is fetched whenever the exact
+    head commit is still missing afterwards.
+    """
+    if cwd is None:
+        return
+    try:
+        _fetch_branch(cwd, remote, _validate_default_branch(base_branch))
+        if not head_sha:
+            return
+        head = _validate_git_ref(str(head_sha), "head_sha")
+        if _verify_commit(cwd, head):
+            return
+        if head_branch:
+            try:
+                _fetch_branch(cwd, remote, _validate_default_branch(str(head_branch)))
+            except ValueError:
+                pass
+        if not _verify_commit(cwd, head):
+            _fetch_pull_head(cwd, remote, pr_number)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return
+
+
+def _local_trunk_drift(
+    cwd: Optional[Path],
+    *,
+    head_sha: Optional[str],
+    base_branch: str,
+    default_branch: str,
+    remote: str,
 ) -> Optional[dict[str, Any]]:
     """Run `assess_trunk_drift` only when the checkout resolves both `<remote>/<base>` and the PR head."""
     if cwd is None or not head_sha:
@@ -782,11 +814,6 @@ def _local_trunk_drift(
     try:
         head = _validate_git_ref(str(head_sha), "head_sha")
         base = _validate_default_branch(base_branch)
-        if fetch:
-            _fetch_branch(cwd, remote, base)
-            if not _verify_commit(cwd, head):
-                if not (head_branch and _fetch_branch(cwd, remote, str(head_branch))):
-                    _fetch_pull_head(cwd, remote, pr_number)
         if not _verify_commit(cwd, f"refs/remotes/{remote}/{base}") or not _verify_commit(cwd, head):
             return None
     except (ValueError, OSError, subprocess.SubprocessError):
@@ -900,17 +927,20 @@ def inspect_pr_gate(
     true_base = str(base_branch or default_branch)
 
     _, cwd = _registered_checkout(repo_spec) if repo_entry else (None, None)
-    trunk_drift: Optional[dict[str, Any]] = None
-    if check_trunk_drift and state_u == "OPEN":
-        trunk_drift = _local_trunk_drift(
+    want_drift = check_trunk_drift and state_u == "OPEN"
+    if fetch and (want_drift or verified_head_sha):
+        _fetch_gate_refs(
             cwd,
             head_sha=head_sha,
             head_branch=data.get("headRefName"),
             base_branch=true_base,
-            default_branch=default_branch,
             pr_number=int(pr_number),
             remote=remote,
-            fetch=fetch,
+        )
+    trunk_drift: Optional[dict[str, Any]] = None
+    if want_drift:
+        trunk_drift = _local_trunk_drift(
+            cwd, head_sha=head_sha, base_branch=true_base, default_branch=default_branch, remote=remote,
         )
     patch_continuity: Optional[dict[str, Any]] = None
     if verified_head_sha:
@@ -1121,6 +1151,7 @@ def inspect_stack_gate(
             "blockers": list(gate.get("blockers") or []),
             "pending_checks": list(checks.get("pending") or []),
             "review_automation_running": bool(gate.get("review_automation_running")),
+            "pending_review_automations": list(gate.get("pending_review_automations") or []),
             "approval_gates": list(gate.get("approval_gates") or []),
             "trunk_drift_policy": (gate.get("trunk_drift") or {}).get("policy"),
         })
@@ -1130,10 +1161,20 @@ def inspect_stack_gate(
         if not entry["ready_to_merge"]:
             break
         run.append(entry["pr_number"])
-    ceiling = prs[len(run)]["pr_number"] if len(run) < len(prs) else None
-    frontier = next(
-        (e["pr_number"] for e in prs if e["pending_checks"] or e["review_automation_running"]), None,
-    )
+    ceiling: Optional[dict[str, Any]] = None
+    if len(run) < len(prs):
+        top = prs[len(run)]
+        ceiling = {k: top[k] for k in ("pr_number", "blocker_tier", "blockers", "head_branch", "base_branch", "head_sha")}
+    frontier: Optional[dict[str, Any]] = None
+    pending_entry = next((e for e in prs if e["pending_checks"] or e["review_automation_running"]), None)
+    if pending_entry is not None:
+        frontier = {
+            k: pending_entry[k]
+            for k in (
+                "pr_number", "pending_checks", "pending_review_automations", "review_automation_running",
+                "head_branch", "base_branch", "head_sha",
+            )
+        }
     active = [key for key in _STACK_TIER_ORDER if tiers_summary[key]]
     highest = min((_STACK_TIER_NUMBER[key] for key in active), default=None)
     ready = len(run) == len(prs) and not cycle
@@ -1393,10 +1434,11 @@ def assess_trunk_drift(
         ahead = int(proc.stdout.strip() or 0)
 
         def _names(rng: str) -> set[str]:
-            out = _run_git(["diff", "--name-only", rng, "--"], cwd=cwd, timeout=60)
+            # -z: NUL-separated raw paths; without it core.quotePath C-quotes non-ASCII/special names.
+            out = _run_git(["diff", "--name-only", "-z", rng, "--"], cwd=cwd, timeout=60)
             if out.returncode != 0:
                 raise RuntimeError(_git_err(out, "diff --name-only"))
-            return {line for line in out.stdout.splitlines() if line.strip()}
+            return {p for p in out.stdout.split("\0") if p}
 
         trunk_files = _names(f"{merge_base}..{trunk_ref}")
         pr_files = _names(f"{merge_base}..{head_ref}")
