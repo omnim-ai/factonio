@@ -59,23 +59,23 @@ Factonio ships a zero-build Hermes Desktop UI (`desktop/plugin.js`) using only p
 
 ### Metrics Dashboard (`/factonio`)
 
-Track workstream throughput, Diff vs Black-Box pass rates, rework rate, post-merge escape rate, per-phase median/P90 durations, the append-only Decision Trail (filterable by repository, workstream and phase, with evidence pills and superseded ↔ superseding links), phase model assignments, and registered repositories in one place:
+Track workstream throughput, Diff vs Black-Box pass rates, rework rate, post-merge escape rate, high-rigor verification panel outcomes (with disagreements highlighted), a Trends strip of long-term `trail.db` snapshots (inline-SVG sparklines for pass rate, escape rate and throughput), per-phase median/P90 durations, the append-only Decision Trail (filterable by repository, workstream and phase, with evidence pills and superseded ↔ superseding links), phase model assignments with the configured verify panel's readiness and vendor diversity, and registered repositories in one place:
 
-![Factonio Dashboard showing KPI cards, Phase Durations, the Decision Trail ledger with evidence pills and supersede lineage, and Phase Model Configuration](docs/images/dashboard.png)
+![Factonio Dashboard showing KPI cards including Verification Panels, the Trends strip, Phase Durations, the Decision Trail ledger with evidence pills and supersede lineage, and Phase Model Configuration](docs/images/dashboard.png)
 
 ### Inline Repository Settings Editor
 
-Edit any registered repository's `default_branch`, `merge_policy`, `max_fix_rounds`, `design_provider`, or `design_approval` directly in `/factonio` — clearly distinguishing inherited global defaults (`value · global`) from per-repo overrides:
+Edit any registered repository's `default_branch`, `merge_policy`, `max_fix_rounds`, `design_provider`, `design_approval`, or `default_rigor` directly in `/factonio` — clearly distinguishing inherited global defaults (`value · global`) from per-repo overrides:
 
 ![Animated walkthrough of editing a registered repository inline on the Factonio dashboard](docs/images/demo-repo-editor.gif)
 
 ### Docked Right-Sidebar Tab & Settings
 
-Monitor active workstreams beside your chat transcript in the hideable **Factonio** tab docked next to **Files** — with live 4-stage pipeline bars, scope/status/phase filters, attention callouts, PR shortcuts, and expandable card detail drawers:
+Monitor active workstreams beside your chat transcript in the hideable **Factonio** tab docked next to **Files** — with live 4-stage pipeline bars, scope/status/phase filters, attention callouts, PR shortcuts, high-rigor verification panel strips (consensus, vendor lanes and a disagreement callout), and expandable card detail drawers:
 
 | Docked Factonio Sidebar Tab | Settings → Plugins → Factonio |
 |:---:|:---:|
-| ![Factonio Right Sidebar tab beside Files with workstream pipeline, an open card drawer listing its decisions, and per-workstream decision counts](docs/images/sidebar.png) | ![Settings Plugins Factonio landing page showing Phase Models and Agent settings](docs/images/settings.png) |
+| ![Factonio Right Sidebar tab beside Files with workstream pipeline, a verification panel strip with a disagreement callout, an open card drawer listing its panel lane and decisions, and per-workstream decision counts](docs/images/sidebar.png) | ![Settings Plugins Factonio landing page showing Phase Models and Agent settings](docs/images/settings.png) |
 
 ## Quick start
 

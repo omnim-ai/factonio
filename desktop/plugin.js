@@ -95,8 +95,8 @@ const STYLES = `
 .fc-repos th { white-space: normal; line-height: 1.25; vertical-align: bottom; }
 .fc-repos td { vertical-align: middle; }
 .fc-repos tbody tr:not(.fc-repo-ed):hover > td { background: var(--ui-row-hover-background); }
-.fc-col-repo { width: 27%; } .fc-col-branch { width: 12%; } .fc-col-merge { width: 11%; } .fc-col-rounds { width: 12%; }
-.fc-col-prov { width: 15%; } .fc-col-appr { width: 14%; } .fc-col-act { width: 9%; }
+.fc-col-repo { width: 22%; } .fc-col-branch { width: 10%; } .fc-col-merge { width: 10%; } .fc-col-rounds { width: 9%; }
+.fc-col-prov { width: 14%; } .fc-col-appr { width: 12%; } .fc-col-rigor { width: 15%; } .fc-col-act { width: 8%; }
 .fc-th-sub { display: block; font-weight: 400; font-size: 10.5px; color: var(--ui-text-secondary); }
 .fc-num, .fc-act { text-align: right !important; }
 .fc-trunc { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -135,7 +135,7 @@ select.fc-input { padding: 0 22px 0 8px; }
 @media (prefers-reduced-motion: reduce) { .fc-spin { animation: none; border-right-color: currentColor; opacity: .6; } }
 /* Factonio sidebar tab (.fc-sb-*): host theme tokens + translucent color-mix tints only. */
 .fc-sb {
-  --fc-sb-warn: #f59e0b;
+  --fc-sb-warn: var(--fc-warn);
   --fc-sb-danger-text: color-mix(in srgb, var(--dt-destructive) 72%, var(--ui-text-primary));
   --fc-sb-warn-text: color-mix(in srgb, var(--fc-sb-warn) 48%, var(--ui-text-primary));
   --fc-sb-success-text: color-mix(in srgb, var(--ui-success) 78%, var(--ui-text-primary));
@@ -409,6 +409,120 @@ button.fc-trail-pill { font: inherit; font-family: var(--dt-font-mono); font-siz
 .fc-sb-drawer .fc-sb-trail-dd { display: block; }
 .fc-sb-drawer .fc-sb-trail-dd .fc-sb-trail-list { margin-top: 1px; }
 .fc-sb-trail-none { color: var(--ui-text-tertiary); font-style: italic; font-size: 11px; }
+
+/* v0.2.0 polish — verification panels, rigor, trends (.fc-kpi*, .fc-trend*, .fc-spark*, .fc-vp*, .fc-sb-panel*, .fc-sb-vendor*): host tokens, transparent, currentColor and color-mix only. */
+.fc-page, .fc-sb {
+  --fc-warn: var(--ui-warning, var(--ui-yellow, color-mix(in srgb, var(--dt-destructive) 55%, var(--ui-success))));
+  --fc-ok-text: color-mix(in srgb, var(--ui-success) 78%, var(--ui-text-primary));
+  --fc-bad-text: color-mix(in srgb, var(--dt-destructive) 72%, var(--ui-text-primary));
+  --fc-warn-text: color-mix(in srgb, var(--fc-warn) 52%, var(--ui-text-primary));
+  --fc-info-text: color-mix(in srgb, var(--ui-accent) 70%, var(--ui-text-primary));
+}
+.fc-wrap { container-type: inline-size; }
+.fc-grid--6 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@container (max-width: 700px) { .fc-grid--6 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@container (max-width: 420px) { .fc-grid--6 { grid-template-columns: minmax(0, 1fr); } }
+.fc-kpi-vp { display: flex; flex-direction: column; min-width: 0; }
+.fc-kpi-vp[data-flag="disagree"] { border-color: color-mix(in srgb, var(--fc-warn) 55%, var(--ui-stroke-secondary)); }
+.fc-kpi-row { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 8px; }
+.fc-kpi-unit { font-size: 12px; font-weight: 400; color: var(--ui-text-secondary); margin-left: 4px; }
+.fc-kpi-flag { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 7px; border-radius: 999px; font-size: 11px; font-weight: 600; white-space: nowrap; color: var(--fc-warn-text); background: color-mix(in srgb, var(--fc-warn) 17%, transparent); border: 1px solid color-mix(in srgb, var(--fc-warn) 45%, transparent); }
+.fc-kpi-bar { display: flex; gap: 2px; height: 4px; margin-top: 8px; border-radius: 2px; overflow: hidden; }
+.fc-kpi-bar > span { min-width: 3px; border-radius: 2px; background: var(--ui-stroke-secondary); }
+.fc-kpi-bar > [data-tone="ok"] { background: var(--ui-success); }
+.fc-kpi-bar > [data-tone="bad"] { background: var(--dt-destructive); }
+.fc-kpi-bar > [data-tone="warn"] { background: var(--fc-warn); }
+.fc-kpi-bar > [data-tone="pending"] { background: repeating-linear-gradient(90deg, var(--ui-accent) 0 3px, transparent 3px 5px); }
+.fc-kpi-break { display: flex; flex-wrap: wrap; gap: 2px 8px; margin-top: 5px; font-size: 11px; color: var(--ui-text-secondary); font-variant-numeric: tabular-nums; }
+.fc-kpi-break b { font-weight: 600; color: var(--ui-text-primary); }
+.fc-kpi-break [data-tone="ok"] b { color: var(--fc-ok-text); }
+.fc-kpi-break [data-tone="bad"] b { color: var(--fc-bad-text); }
+.fc-kpi-break [data-tone="warn"] b { color: var(--fc-warn-text); }
+
+.fc-trend { margin: -4px 0 20px; }
+.fc-trend-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 12px; margin-bottom: 8px; }
+.fc-trend-head h2 { margin: 0; font-size: 13px; font-weight: 600; }
+.fc-trend-srcs { display: flex; flex-wrap: wrap; gap: 4px; }
+.fc-trend-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+@container (max-width: 700px) { .fc-trend-grid { grid-template-columns: minmax(0, 1fr); } }
+.fc-trend[data-stale="true"] .fc-trend-grid { opacity: 0.62; }
+.fc-trend > .fc-alert { margin-bottom: 8px; }
+.fc-spark { min-width: 0; display: flex; flex-direction: column; gap: 4px; padding: 10px 12px 9px; }
+.fc-spark-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; min-width: 0; }
+.fc-spark-v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.fc-spark-v small { font-size: 11px; font-weight: 400; color: var(--ui-text-secondary); margin-left: 6px; }
+.fc-spark-delta { display: inline-flex; align-items: center; gap: 3px; font-family: var(--dt-font-mono); font-size: 11px; font-weight: 600; white-space: nowrap; color: var(--ui-text-secondary); }
+.fc-spark-delta[data-tone="ok"] { color: var(--fc-ok-text); }
+.fc-spark-delta[data-tone="bad"] { color: var(--fc-bad-text); }
+.fc-spark-plot { position: relative; display: block; border-radius: 4px; cursor: crosshair; touch-action: none; }
+.fc-spark-plot:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 2px; }
+.fc-spark-svg { display: block; width: 100%; height: 56px; overflow: visible; }
+.fc-spark-base { stroke: var(--ui-stroke-tertiary); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.fc-spark-line { fill: none; stroke: var(--ui-accent); stroke-width: 1.75; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.fc-spark-line--2 { stroke: color-mix(in srgb, var(--ui-text-primary) 50%, var(--ui-text-secondary)); stroke-width: 1.4; stroke-dasharray: 3 3; }
+.fc-spark[data-metric="escape"] .fc-spark-line { stroke: var(--fc-warn); }
+.fc-spark-area { fill: color-mix(in srgb, var(--fc-warn) 14%, transparent); stroke: none; }
+.fc-spark-end { fill: var(--ui-bg-elevated); stroke: currentColor; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.fc-spark-cursor { stroke: var(--ui-stroke-primary, var(--ui-stroke-secondary)); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.fc-spark-hot { fill: currentColor; stroke: var(--ui-bg-elevated); stroke-width: 2; vector-effect: non-scaling-stroke; }
+.fc-spark-legend { display: flex; flex-wrap: wrap; gap: 2px 10px; font-size: 10.5px; color: var(--ui-text-secondary); }
+.fc-spark-legend i { display: inline-block; width: 12px; height: 0; margin-right: 4px; vertical-align: middle; border-top: 2px solid var(--ui-accent); }
+.fc-spark-legend i[data-s="2"] { border-top: 1.5px dashed color-mix(in srgb, var(--ui-text-primary) 50%, var(--ui-text-secondary)); }
+.fc-spark-read { margin-top: auto; min-height: 18px; display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; font-size: 11px; color: var(--ui-text-secondary); font-variant-numeric: tabular-nums; }
+.fc-spark-read b { font-family: var(--dt-font-mono); font-weight: 600; color: var(--ui-text-primary); }
+.fc-spark-read .fc-trail-pill { height: 18px; font-size: 10.5px; padding: 0 6px; }
+.fc-trend-skel { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+@container (max-width: 700px) { .fc-trend-skel { grid-template-columns: minmax(0, 1fr); } }
+.fc-trend-skel > div { height: 132px; box-sizing: border-box; display: flex; flex-direction: column; gap: 8px; }
+.fc-trend-skel span { display: block; height: 8px; border-radius: 4px; background: color-mix(in srgb, var(--ui-text-secondary) 20%, transparent); animation: fc-sb-pulse 1.6s ease-in-out infinite; }
+.fc-trend-skel span.fc-skel-plot { height: 56px; margin-top: auto; background: color-mix(in srgb, var(--ui-text-secondary) 10%, transparent); }
+.fc-trend-cmd { font-family: var(--dt-font-mono); font-size: 11px; padding: 2px 7px; border-radius: 5px; background: var(--ui-row-active-background); color: var(--ui-text-primary); }
+
+.fc-vp { margin-bottom: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.fc-vp-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; min-width: 0; }
+.fc-vp-title { font-size: 12px; font-weight: 600; margin-right: 2px; }
+.fc-vp-lbl { font-size: 11px; color: var(--ui-text-secondary); }
+.fc-vp-src { margin-left: auto; font-family: var(--dt-font-mono); font-size: 10.5px; color: var(--ui-text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.fc-rigor { font-weight: 600; }
+.fc-rigor[data-rigor="standard"] { border-color: var(--ui-stroke-primary, var(--ui-stroke-secondary)); color: var(--ui-text-primary); }
+.fc-rigor[data-rigor="high"] { border-color: color-mix(in srgb, var(--ui-accent) 55%, transparent); background: color-mix(in srgb, var(--ui-accent) 15%, transparent); color: var(--fc-info-text); }
+.fc-ready { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 8px 0 6px; border-radius: 999px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+.fc-ready[data-tone="ok"] { color: var(--fc-ok-text); background: color-mix(in srgb, var(--ui-success) 15%, transparent); }
+.fc-ready[data-tone="warn"] { color: var(--fc-warn-text); background: color-mix(in srgb, var(--fc-warn) 17%, transparent); }
+.fc-ready[data-tone="muted"] { color: var(--ui-text-secondary); background: var(--ui-row-active-background); }
+.fc-vp-members { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.fc-vp-member { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; height: 26px; box-sizing: border-box; padding: 0 4px 0 8px; border: 1px solid var(--ui-stroke-tertiary); border-radius: 6px; background: var(--ui-chat-surface-background); }
+.fc-vp-member .fc-mono { color: var(--ui-text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.fc-vp-idx { font-family: var(--dt-font-mono); font-size: 10px; color: var(--ui-text-secondary); }
+.fc-vendor { flex: none; display: inline-flex; align-items: center; gap: 3px; height: 18px; padding: 0 6px; border-radius: 4px; font-family: var(--dt-font-mono); font-size: 10.5px; color: var(--ui-text-secondary); background: var(--ui-row-active-background); white-space: nowrap; }
+.fc-vendor[data-dup="true"] { color: var(--fc-warn-text); background: color-mix(in srgb, var(--fc-warn) 17%, transparent); }
+.fc-vp-warn { display: flex; align-items: flex-start; gap: 7px; padding: 7px 10px; border-radius: 6px; font-size: 12px; color: var(--fc-warn-text); border: 1px solid color-mix(in srgb, var(--fc-warn) 45%, transparent); background: color-mix(in srgb, var(--fc-warn) 10%, transparent); }
+.fc-vp-warn svg { flex: none; margin-top: 2px; }
+.fc-vp-warn ul { margin: 3px 0 0; padding-left: 16px; color: var(--ui-text-secondary); font-size: 11.5px; }
+.fc-vp-empty { margin: 0; font-size: 11.5px; color: var(--ui-text-secondary); }
+.fc-vp-skel { height: 8px; width: 60%; border-radius: 4px; background: color-mix(in srgb, var(--ui-text-secondary) 20%, transparent); animation: fc-sb-pulse 1.6s ease-in-out infinite; }
+
+.fc-tag--set[data-rigor="high"] svg { flex: none; }
+
+.fc-sb-dot[data-status="inconclusive"] { background: var(--fc-warn); }
+.fc-sb-card[data-attn="warn"] { border-color: color-mix(in srgb, var(--fc-warn) 42%, var(--ui-stroke-secondary)); }
+.fc-sb-vendor { flex: none; display: inline-flex; align-items: center; gap: 3px; max-width: 100%; font-family: var(--dt-font-mono); font-size: 10px; line-height: 16px; padding: 0 5px; border-radius: 4px; border: 1px solid var(--ui-stroke-secondary); color: var(--ui-text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fc-sb-vendor[data-verdict="pass"] { color: var(--fc-ok-text); }
+.fc-sb-vendor[data-verdict="reject"] { color: var(--fc-bad-text); border-color: color-mix(in srgb, var(--dt-destructive) 40%, var(--ui-stroke-secondary)); }
+.fc-sb-vendor[data-verdict="inconclusive"] { color: var(--fc-warn-text); }
+.fc-sb-lane { color: var(--ui-text-secondary); font-family: var(--dt-font-mono); font-size: 10.5px; }
+.fc-sb-panel { margin: -2px 6px 8px; padding: 6px 7px; display: flex; flex-direction: column; gap: 5px; min-width: 0; border: 1px solid var(--ui-stroke-tertiary); border-radius: 6px; background: var(--ui-row-hover-background); }
+.fc-sb-panel[data-disagree="true"] { border-color: color-mix(in srgb, var(--fc-warn) 45%, var(--ui-stroke-tertiary)); }
+.fc-sb-panel-top { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 5px; min-width: 0; }
+.fc-sb-panel-k { flex: none; display: inline-flex; color: var(--ui-text-secondary); }
+.fc-sb-panel-id { flex: 0 1 auto; min-width: 0; font-size: 10.5px; color: var(--ui-text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fc-sb-panel-lanes { margin-left: auto; flex: none; font-family: var(--dt-font-mono); font-size: 10.5px; color: var(--ui-text-secondary); }
+.fc-sb-vendors { display: flex; flex-wrap: wrap; gap: 3px; min-width: 0; }
+.fc-sb-callout[data-kind="disagree"] .fc-sb-callout-body { -webkit-line-clamp: 4; }
+.fc-sb-callout[data-kind="disagree"] .fc-sb-callout-body q { color: var(--ui-text-primary); }
+@media (prefers-reduced-motion: reduce) {
+  .fc-trend-skel span, .fc-vp-skel { animation: none !important; }
+}
 `
 
 function fmtDur(seconds) {
@@ -539,7 +653,12 @@ function FactonioSettingsPage({ ctx }) {
 const MERGE_POLICY_OPTIONS = ['auto', 'ask']
 const DESIGN_PROVIDER_OPTIONS = ['auto', 'claude-design', 'hermes', 'off']
 const DESIGN_APPROVAL_OPTIONS = ['ask', 'auto']
-const REPO_FIELD_ORDER = ['default_branch', 'merge_policy', 'max_fix_rounds', 'design_provider', 'design_approval']
+const RIGOR_OPTIONS = [['standard', 'Standard'], ['high', 'High (multi-vendor panel)']]
+const RIGOR_HINT = {
+  standard: 'Single cross-model diff check + black-box check.',
+  high: 'Multi-vendor panel: needs ≥2 verify models from distinct vendor families; fails closed on disagreement.'
+}
+const REPO_FIELD_ORDER = ['default_branch', 'merge_policy', 'max_fix_rounds', 'design_provider', 'design_approval', 'default_rigor']
 const REPOS_QUERY_KEY = ['factonio', 'repos']
 
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`
@@ -588,7 +707,8 @@ function seedRepoDraft(repo) {
     merge_policy: String(repo.merge_policy ?? 'auto'),
     max_fix_rounds: repo.max_fix_rounds == null ? '' : String(repo.max_fix_rounds),
     design_provider: repo.design_provider ? String(repo.design_provider) : '',
-    design_approval: repo.design_approval ? String(repo.design_approval) : ''
+    design_approval: repo.design_approval ? String(repo.design_approval) : '',
+    default_rigor: repo.default_rigor ? String(repo.default_rigor) : ''
   }
 }
 
@@ -602,7 +722,8 @@ function normalizeRepoDraft(d) {
     merge_policy: String(d.merge_policy ?? ''),
     max_fix_rounds: Number.isSafeInteger(n) ? String(n) : rounds,
     design_provider: d.design_provider || null,
-    design_approval: d.design_approval || null
+    design_approval: d.design_approval || null,
+    default_rigor: d.default_rigor || null
   }
 }
 
@@ -662,6 +783,12 @@ function providerHint(draft, repo, defaults, autoResolved) {
   return ['Currently resolves to ', mono(target), '.']
 }
 
+function rigorHint(draft, defaults) {
+  const effective = draft.default_rigor || defaults?.default_rigor || 'standard'
+  const base = RIGOR_HINT[effective] || `Rigor ${effective}.`
+  return draft.default_rigor ? base : `${base} (inherited)`
+}
+
 function DesignTag({ value, effective, resolved }) {
   if (value) {
     return jsx('span', { className: 'fc-tag fc-tag--set', title: 'Repository override', children: String(value) })
@@ -670,6 +797,21 @@ function DesignTag({ value, effective, resolved }) {
     className: 'fc-tag fc-tag--inherit',
     title: resolved ? `Inherited from global default; resolves to ${resolved}` : 'Inherited from global default',
     children: [String(effective ?? '—'), ' ', jsx('span', { className: 'fc-tag-src', children: '· global' })]
+  })
+}
+
+function PanelGlyph({ size = 11 }) {
+  return jsx(Icon, { name: 'panel', size })
+}
+
+function RigorTag({ value, effective }) {
+  if (!value) return jsx(DesignTag, { value: null, effective })
+  const high = value === 'high'
+  return jsxs('span', {
+    className: 'fc-tag fc-tag--set',
+    'data-rigor': String(value),
+    title: high ? 'Repository override · multi-vendor panel' : 'Repository override',
+    children: [high ? jsx(PanelGlyph, { key: 'g' }) : null, String(value)]
   })
 }
 
@@ -698,6 +840,10 @@ function RepoRow({ repo: r, defaults, editing, busy, editorId, onEdit, buttonRef
       jsx('td', {
         'data-field': 'design_approval',
         children: jsx(DesignTag, { value: r.design_approval, effective: r.effective_design_approval ?? defaults?.design_approval })
+      }),
+      jsx('td', {
+        'data-field': 'default_rigor',
+        children: jsx(RigorTag, { value: r.default_rigor, effective: r.effective_default_rigor ?? defaults?.default_rigor ?? 'standard' })
       }),
       jsx('td', {
         className: 'fc-act',
@@ -871,7 +1017,7 @@ function RepoEditor({ ctx, repo, defaults, autoResolved, reposQ, editorId, savin
     'data-editing': 'true',
     'data-slug': repo.slug,
     children: jsx('td', {
-      colSpan: 7,
+      colSpan: 8,
       children: jsxs('form', {
         className: 'fc-ed',
         id: editorId,
@@ -927,6 +1073,22 @@ function RepoEditor({ ctx, repo, defaults, autoResolved, reposQ, editorId, savin
                 label: 'Design approval',
                 hint: 'ask pauses for your approval before build.',
                 control: select(DESIGN_APPROVAL_OPTIONS, `Inherit global (${defaults?.design_approval || 'ask'})`)
+              }),
+              field({
+                name: 'default_rigor',
+                label: 'Default rigor',
+                hint: rigorHint(draft, defaults),
+                control: props => jsx('select', {
+                  ...props,
+                  className: 'fc-input',
+                  children: [
+                    jsx('option', { key: '__inherit', value: '', children: `Inherit global (${defaults?.default_rigor || 'standard'})` }),
+                    ...RIGOR_OPTIONS.map(([v, l]) => jsx('option', { key: v, value: v, children: l })),
+                    props.value && !RIGOR_OPTIONS.some(([v]) => v === props.value)
+                      ? jsx('option', { key: props.value, value: props.value, children: props.value })
+                      : null
+                  ]
+                })
               })
             ]
           }),
@@ -1042,7 +1204,9 @@ function ReposSection({ ctx, reposQ }) {
                   'Global defaults: design provider ',
                   jsx('span', { className: 'fc-mono', children: defaults.design_provider || 'auto' }),
                   ' · design approval ',
-                  jsx('span', { className: 'fc-mono', children: defaults.design_approval || 'ask' })
+                  jsx('span', { className: 'fc-mono', children: defaults.design_approval || 'ask' }),
+                  ' · rigor ',
+                  jsx('span', { className: 'fc-mono', children: defaults.default_rigor || 'standard' })
                 ]
               })
             ]
@@ -1062,7 +1226,7 @@ function ReposSection({ ctx, reposQ }) {
         className: 'fc-table fc-repos',
         children: [
           jsxs('colgroup', {
-            children: ['fc-col-repo', 'fc-col-branch', 'fc-col-merge', 'fc-col-rounds', 'fc-col-prov', 'fc-col-appr', 'fc-col-act'].map(col)
+            children: ['fc-col-repo', 'fc-col-branch', 'fc-col-merge', 'fc-col-rounds', 'fc-col-prov', 'fc-col-appr', 'fc-col-rigor', 'fc-col-act'].map(col)
           }),
           jsx('thead', {
             children: jsxs('tr', {
@@ -1073,6 +1237,7 @@ function ReposSection({ ctx, reposQ }) {
                 jsx('th', { scope: 'col', className: 'fc-num', children: 'Max fix rounds' }),
                 jsx('th', { scope: 'col', children: 'Design provider' }),
                 jsx('th', { scope: 'col', children: 'Design approval' }),
+                jsx('th', { scope: 'col', children: 'Rigor' }),
                 jsx('th', { scope: 'col', className: 'fc-act', children: jsx('span', { className: 'fc-sr', children: 'Actions' }) })
               ]
             })
@@ -1854,6 +2019,480 @@ function CardDecisions({ card, trail }) {
   ]
 }
 
+// ---------------------------------------------------------------------------
+// Verification Panels KPI, verify_panel / rigor status, and the /metrics/history trend strip.
+// ---------------------------------------------------------------------------
+
+function VerificationPanelsKpi({ m }) {
+  const head = jsx('div', { className: 'fc-k', children: 'Verification Panels' })
+  if (!m) {
+    return jsxs('div', {
+      className: 'fc-card fc-kpi-vp',
+      children: [head, jsx('div', { className: 'fc-v', children: '—' }), jsx('div', { className: 'fc-hint', children: 'Loading' })]
+    })
+  }
+  const vp = m.verification_panels && typeof m.verification_panels === 'object' ? m.verification_panels : {}
+  const n = k => (Number.isFinite(vp[k]) ? vp[k] : 0)
+  const total = n('total')
+  if (!total) {
+    return jsxs('div', {
+      className: 'fc-card fc-kpi-vp',
+      'data-state': 'empty',
+      children: [head, jsx('div', { className: 'fc-v', children: '0' }), jsx('div', { className: 'fc-hint', children: 'No panels yet · repos with rigor high run one' })]
+    })
+  }
+  const dis = n('disagreements')
+  const parts = [['ok', 'pass', 'pass'], ['bad', 'reject', 'reject'], ['warn', 'inconclusive', 'inconcl.'], ['pending', 'pending', 'pending']]
+  return jsxs('div', {
+    className: 'fc-card fc-kpi-vp',
+    'data-flag': dis ? 'disagree' : undefined,
+    'data-state': 'populated',
+    children: [
+      head,
+      jsxs('div', {
+        className: 'fc-kpi-row',
+        children: [
+          jsxs('div', { className: 'fc-v', children: [String(total), jsx('span', { className: 'fc-kpi-unit', children: total === 1 ? 'panel' : 'panels' })] }),
+          dis
+            ? jsxs('span', { className: 'fc-kpi-flag', children: [jsx(Icon, { name: 'split', size: 11 }), plural(dis, 'disagreement', 'disagreements')] })
+            : null
+        ]
+      }),
+      jsx('div', {
+        className: 'fc-kpi-bar',
+        role: 'img',
+        'aria-label': `${n('pass')} pass, ${n('reject')} reject, ${n('inconclusive')} inconclusive, ${n('pending')} pending`,
+        children: parts.filter(([, k]) => n(k) > 0).map(([tone, k]) => jsx('span', { key: k, 'data-tone': tone, style: { flex: n(k) } }))
+      }),
+      jsx('div', {
+        className: 'fc-kpi-break',
+        children: parts.map(([tone, k, label]) => jsxs('span', {
+          key: k,
+          'data-tone': tone === 'pending' ? undefined : tone,
+          children: [jsx('b', { children: String(n(k)) }), ` ${label}`]
+        }))
+      })
+    ]
+  })
+}
+
+// GET /models `verify_panel` (config.validate_verify_panel) + `default_rigor`.
+function VerifyPanelStatus({ query }) {
+  const title = jsx('span', { className: 'fc-vp-title', children: 'Verification panel' })
+  if (query?.isError && query?.data == null) return null
+  if (query?.data == null) {
+    return jsxs('div', {
+      className: 'fc-card fc-vp',
+      'aria-busy': 'true',
+      'data-state': 'loading',
+      children: [jsx('div', { className: 'fc-vp-bar', children: title }), jsx('span', { className: 'fc-vp-skel' })]
+    })
+  }
+  const p = query.data.verify_panel
+  if (!p || typeof p !== 'object') return null
+  const entries = Array.isArray(p.entries) ? p.entries : []
+  const dups = Array.isArray(p.duplicate_vendors) ? p.duplicate_vendors : []
+  const advisories = Array.isArray(p.advisories) ? p.advisories : []
+  const rigor = query.data.default_rigor ? String(query.data.default_rigor) : null
+  const state = p.valid ? 'ready' : entries.length ? 'incomplete' : 'unconfigured'
+  const ready = {
+    ready: jsxs('span', { className: 'fc-ready', 'data-tone': 'ok', children: [jsx(Icon, { name: 'check', size: 11 }), `Ready · ${plural(p.distinct_vendor_count ?? 0, 'vendor', 'vendors')}`] }),
+    incomplete: jsxs('span', { className: 'fc-ready', 'data-tone': 'warn', children: [jsx(Icon, { name: 'attention', size: 11 }), 'Incomplete'] }),
+    unconfigured: jsxs('span', { className: 'fc-ready', 'data-tone': 'muted', children: [jsx(Icon, { name: 'dot', size: 11 }), 'Unconfigured'] })
+  }[state]
+  const members = entries.length
+    ? jsx('ul', {
+        className: 'fc-vp-members',
+        'aria-label': 'Panel members',
+        children: entries.map((e, i) => {
+          const vendor = e?.vendor ? String(e.vendor) : null
+          return jsxs('li', {
+            key: `${i}:${e?.label}`,
+            className: 'fc-vp-member',
+            children: [
+              jsx('span', { className: 'fc-vp-idx', children: String((Number.isInteger(e?.index) ? e.index : i) + 1) }),
+              jsx('span', { className: 'fc-mono', title: String(e?.label ?? ''), children: String(e?.label ?? '—') }),
+              jsx('span', { className: 'fc-vendor', 'data-dup': String(!vendor || dups.includes(vendor)), children: vendor || 'unknown' })
+            ]
+          })
+        })
+      })
+    : jsxs('p', { className: 'fc-vp-empty', children: ['No panel members. Add ≥2 models from different vendors under ', jsx('span', { className: 'fc-mono', children: 'settings.verify_panel' }), '.'] })
+  const warn = !p.valid && p.warning
+    ? jsxs('div', {
+        className: 'fc-vp-warn',
+        role: 'status',
+        children: [
+          jsx(Icon, { name: 'attention', size: 13 }),
+          jsxs('div', {
+            children: [
+              String(p.warning),
+              advisories.length ? jsx('ul', { children: advisories.map(a => jsx('li', { key: a, children: String(a) })) }) : null
+            ]
+          })
+        ]
+      })
+    : null
+  return jsxs('div', {
+    className: 'fc-card fc-vp',
+    'aria-label': 'Verification panel and rigor status',
+    'data-state': state,
+    children: [
+      jsxs('div', {
+        className: 'fc-vp-bar',
+        children: [
+          title,
+          jsx('span', { className: 'fc-vp-lbl', children: 'Default rigor' }),
+          jsx('span', { className: 'fc-tag fc-rigor', 'data-rigor': rigor || '', children: rigor || 'invalid' }),
+          ready,
+          p.source && p.source !== 'unset' ? jsx('span', { className: 'fc-vp-src', title: 'Config source', children: String(p.source) }) : null
+        ]
+      }),
+      members,
+      warn
+    ]
+  })
+}
+
+// Inline-SVG sparkline geometry. Pure helpers, exported for tests.
+const SPARK = { W: 240, H: 56, PX: 4, PT: 6, PB: 6 }
+const finiteOrNull = v => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+
+function sparkX(i, n) {
+  return n === 1 ? SPARK.W / 2 : SPARK.PX + (i * (SPARK.W - 2 * SPARK.PX)) / (n - 1)
+}
+function sparkY(v, lo, hi) {
+  return SPARK.PT + (1 - (v - lo) / (hi - lo || 1)) * (SPARK.H - SPARK.PT - SPARK.PB)
+}
+// [[x, y] | null] per snapshot; null where the value is missing.
+function sparkPoints(values, lo, hi) {
+  const n = values.length
+  return values.map((raw, i) => {
+    const v = finiteOrNull(raw)
+    return v == null ? null : [Number(sparkX(i, n).toFixed(1)), Number(sparkY(v, lo, hi).toFixed(1))]
+  })
+}
+// "M x,y L x,y …"; a missing value starts a new segment instead of bridging the gap.
+function sparkPath(points) {
+  let d = ''
+  let pen = false
+  for (const p of points) {
+    if (!p) { pen = false; continue }
+    d += `${d ? ' ' : ''}${pen ? 'L' : 'M'}${p[0]},${p[1]}`
+    pen = true
+  }
+  return d
+}
+
+const fmtCount = v => (finiteOrNull(v) == null ? '—' : String(v))
+const fmtShortDate = ts => {
+  const ms = trailMs(ts)
+  return ms == null ? '—' : new Date(ms).toLocaleDateString([], { month: 'short', day: 'numeric' })
+}
+const ptsDelta = d => `${Math.round(Math.abs(d) * 100)} pts`
+const passDomain = vals => (vals.some(v => v != null && v < 0.6) ? [0, 1] : [0.6, 1])
+const maxOf = vals => Math.max(0, ...vals.filter(v => v != null))
+
+const TREND_METRICS = [
+  {
+    metric: 'pass',
+    title: 'Verification Pass Rate',
+    a: s => finiteOrNull(s.diff_pass_rate),
+    b: s => finiteOrNull(s.blackbox_pass_rate),
+    domains: (as, bs) => { const d = passDomain([...as, ...bs]); return [d, d] },
+    upGood: true,
+    fmt: fmtPct,
+    delta: ptsDelta,
+    flat: d => Math.round(d * 100) === 0,
+    sub: s => `BB ${fmtPct(finiteOrNull(s.blackbox_pass_rate))}`,
+    legend: ['Diff check', 'Black-box'],
+    read: s => [['Diff', fmtPct(finiteOrNull(s.diff_pass_rate))], ['BB', fmtPct(finiteOrNull(s.blackbox_pass_rate))]]
+  },
+  {
+    metric: 'escape',
+    title: 'Escape Rate',
+    a: s => finiteOrNull(s.escape_rate),
+    domains: as => [[0, Math.max(0.2, maxOf(as))]],
+    upGood: false,
+    area: true,
+    fmt: fmtPct,
+    delta: ptsDelta,
+    flat: d => Math.round(d * 100) === 0,
+    read: s => [['Escape', fmtPct(finiteOrNull(s.escape_rate))]]
+  },
+  {
+    metric: 'throughput',
+    title: 'Workstreams / Throughput',
+    a: s => finiteOrNull(s.workstreams_total),
+    b: s => finiteOrNull(s.cards_done),
+    domains: (as, bs) => [[0, maxOf(as) * 1.15 || 1], [0, maxOf(bs) * 1.15 || 1]],
+    upGood: true,
+    fmt: fmtCount,
+    delta: d => String(Math.abs(d)),
+    flat: d => d === 0,
+    sub: s => `${fmtCount(finiteOrNull(s.cards_done))} cards done`,
+    legend: ['Workstreams', 'Cards done'],
+    read: s => [['WS', fmtCount(finiteOrNull(s.workstreams_total))], ['Cards', fmtCount(finiteOrNull(s.cards_done))]]
+  }
+]
+
+function SparkCard({ cfg, snaps }) {
+  const [hover, setHover] = useState(null)
+  const n = snaps.length
+  const as = snaps.map(cfg.a)
+  const bs = cfg.b ? snaps.map(cfg.b) : null
+  const [domA, domB] = cfg.domains(as, bs || [])
+  const p1 = sparkPoints(as, domA[0], domA[1])
+  const p2 = bs ? sparkPoints(bs, (domB || domA)[0], (domB || domA)[1]) : null
+  const last = snaps[n - 1]
+  const finiteA = as.filter(v => v != null)
+  const color = cfg.metric === 'escape' ? 'var(--fc-warn)' : 'var(--ui-accent)'
+  const base = SPARK.H - SPARK.PB
+
+  let tone = 'flat'
+  let deltaText = n === 1 ? 'first snapshot' : '—'
+  let arrow = null
+  if (n > 1 && finiteA.length >= 2) {
+    const d = finiteA[finiteA.length - 1] - finiteA[0]
+    if (cfg.flat(d)) deltaText = 'no change'
+    else {
+      tone = (d > 0) === cfg.upGood ? 'ok' : 'bad'
+      deltaText = `${d > 0 ? '+' : '−'}${cfg.delta(d)}`
+      arrow = jsx(Icon, { name: d > 0 ? 'up' : 'down', size: 11 })
+    }
+  }
+
+  const drawn = p1.filter(Boolean)
+  let body
+  if (n === 1) {
+    const y = p1[0] ? p1[0][1] : base
+    body = [
+      jsx('line', { key: 'base', className: 'fc-spark-base', x1: SPARK.PX, y1: y, x2: SPARK.W - SPARK.PX, y2: y, strokeDasharray: '2 3' }),
+      p1[0] ? jsx('circle', { key: 'end', className: 'fc-spark-end', cx: p1[0][0], cy: y, r: 3.5, style: { color } }) : null
+    ]
+  } else {
+    const lastPt = drawn[drawn.length - 1]
+    const idx = hover == null ? null : Math.max(0, Math.min(n - 1, hover))
+    const hot = idx == null ? null : p1[idx]
+    const hot2 = idx == null || !p2 ? null : p2[idx]
+    const cursorX = idx == null ? 0 : Number(sparkX(idx, n).toFixed(1))
+    body = [
+      jsx('line', { key: 'base', className: 'fc-spark-base', x1: SPARK.PX, y1: base, x2: SPARK.W - SPARK.PX, y2: base }),
+      cfg.area && drawn.length >= 2
+        ? jsx('path', { key: 'area', className: 'fc-spark-area', d: `${sparkPath(p1)} L${lastPt[0]},${base} L${drawn[0][0]},${base} Z` })
+        : null,
+      p2 ? jsx('path', { key: 'l2', className: 'fc-spark-line fc-spark-line--2', d: sparkPath(p2) }) : null,
+      jsx('path', { key: 'l1', className: 'fc-spark-line', d: sparkPath(p1) }),
+      lastPt ? jsx('circle', { key: 'end', className: 'fc-spark-end', cx: lastPt[0], cy: lastPt[1], r: 2.75, style: { color } }) : null,
+      jsxs('g', {
+        key: 'hover',
+        className: 'fc-spark-hover',
+        visibility: idx == null ? 'hidden' : 'visible',
+        children: [
+          jsx('line', { className: 'fc-spark-cursor', x1: cursorX, y1: SPARK.PT - 2, x2: cursorX, y2: base }),
+          hot ? jsx('circle', { key: 'h1', className: 'fc-spark-hot', cx: hot[0], cy: hot[1], r: 3.25, style: { color } }) : null,
+          hot2 ? jsx('circle', { key: 'h2', className: 'fc-spark-hot', cx: hot2[0], cy: hot2[1], r: 2.75, style: { color: 'var(--ui-text-secondary)' } }) : null
+        ]
+      })
+    ]
+  }
+
+  const readIdx = hover == null ? n - 1 : Math.max(0, Math.min(n - 1, hover))
+  const r = snaps[readIdx]
+  const label = `${cfg.title}: ${plural(n, 'snapshot', 'snapshots')}, latest ${cfg.fmt(cfg.a(last))}. Use left and right arrow keys to read each snapshot.`
+  const keys = { ArrowLeft: -1, ArrowRight: 1 }
+  return jsxs('div', {
+    className: 'fc-card fc-spark',
+    'data-metric': cfg.metric,
+    children: [
+      jsx('div', { className: 'fc-k', children: cfg.title }),
+      jsxs('div', {
+        className: 'fc-spark-top',
+        children: [
+          jsxs('div', { className: 'fc-spark-v', children: [cfg.fmt(cfg.a(last)), cfg.sub ? jsx('small', { children: cfg.sub(last) }) : null] }),
+          jsxs('span', { className: 'fc-spark-delta', 'data-tone': tone, title: 'Change vs first snapshot in window', children: [arrow, deltaText] })
+        ]
+      }),
+      jsx('div', {
+        className: 'fc-spark-plot',
+        tabIndex: 0,
+        role: 'group',
+        'aria-label': label,
+        onPointerMove: e => {
+          if (n < 2) return
+          const box = e?.currentTarget?.getBoundingClientRect?.()
+          if (!box || !box.width) return
+          const vx = ((e.clientX - box.left) / box.width) * SPARK.W
+          setHover(Math.max(0, Math.min(n - 1, Math.round(((vx - SPARK.PX) / (SPARK.W - 2 * SPARK.PX)) * (n - 1)))))
+        },
+        onPointerLeave: e => {
+          if (globalThis.document?.activeElement !== e?.currentTarget) setHover(null)
+        },
+        onFocus: () => setHover(cur => (cur == null ? n - 1 : cur)),
+        onBlur: () => setHover(null),
+        onKeyDown: e => {
+          const key = e?.key
+          let next = null
+          if (key in keys) next = (hover == null ? n - 1 : hover) + keys[key]
+          else if (key === 'Home') next = 0
+          else if (key === 'End') next = n - 1
+          else if (key === 'Escape') {
+            e?.currentTarget?.blur?.()
+            return
+          }
+          if (next == null) return
+          e?.preventDefault?.()
+          setHover(Math.max(0, Math.min(n - 1, next)))
+        },
+        children: jsx('svg', {
+          className: 'fc-spark-svg',
+          viewBox: `0 0 ${SPARK.W} ${SPARK.H}`,
+          preserveAspectRatio: 'none',
+          'aria-hidden': 'true',
+          focusable: 'false',
+          children: body
+        })
+      }),
+      cfg.legend
+        ? jsxs('div', {
+            className: 'fc-spark-legend',
+            'aria-hidden': 'true',
+            children: [
+              jsxs('span', { key: 'a', children: [jsx('i', {}), cfg.legend[0]] }),
+              jsxs('span', { key: 'b', children: [jsx('i', { 'data-s': '2' }), cfg.legend[1]] })
+            ]
+          })
+        : null,
+      jsxs('div', {
+        className: 'fc-spark-read',
+        'aria-live': 'polite',
+        children: [
+          jsx('span', { key: 'd', children: `${readIdx === n - 1 ? 'Latest · ' : ''}${fmtShortDate(r.ts)}` }),
+          r.source ? jsx('span', { key: 's', className: 'fc-trail-pill', children: String(r.source) }) : null,
+          ...cfg.read(r).map(([k, v]) => jsxs('span', { key: k, children: [`${k} `, jsx('b', { children: v })] }))
+        ]
+      })
+    ]
+  })
+}
+
+function TrendSkeleton() {
+  return jsx('div', {
+    className: 'fc-trend-skel',
+    'aria-hidden': 'true',
+    children: [0, 1, 2].map(i => jsxs('div', {
+      key: i,
+      className: 'fc-card',
+      children: [jsx('span', { style: { width: '45%' } }), jsx('span', { style: { width: '30%', height: '14px' } }), jsx('span', { className: 'fc-skel-plot' })]
+    }))
+  })
+}
+
+const HISTORY_LIMIT = 100
+
+// GET /metrics/history {snapshots, summary, filters}; `since` follows the page range.
+function MetricsTrendSection({ ctx, range }) {
+  const queryClient = useQueryClient()
+  const queryKey = ['factonio', 'metrics-history', range]
+  const query = useQuery({
+    queryKey,
+    queryFn: () => ctx.rest(`/metrics/history?since=${encodeURIComponent(range)}&limit=${HISTORY_LIMIT}`),
+    refetchInterval: 30000
+  })
+  const data = query.data
+  const hasData = data != null
+  const isError = !!query.isError
+  const raw = Array.isArray(data?.snapshots) ? data.snapshots.filter(s => s && typeof s === 'object') : []
+  const snaps = raw.map((s, i) => [s, i]).sort((a, b) => (trailMs(a[0].ts) ?? 0) - (trailMs(b[0].ts) ?? 0) || a[1] - b[1]).map(x => x[0])
+  const summary = data?.summary && typeof data.summary === 'object' ? data.summary : {}
+  const state = !hasData ? (isError ? 'error' : 'loading') : snaps.length ? 'populated' : 'empty'
+
+  let sub = null
+  let srcs = null
+  if (state === 'loading') sub = 'Loading snapshots…'
+  else if (state === 'populated') {
+    const total = Number.isFinite(summary.snapshot_count) ? summary.snapshot_count : snaps.length
+    const first = fmtShortDate(snaps[0].ts)
+    const lastD = fmtShortDate(snaps[snaps.length - 1].ts)
+    const count = total > snaps.length ? `${snaps.length} of ${total} snapshots` : plural(snaps.length, 'snapshot', 'snapshots')
+    sub = `${count} · ${first}${snaps.length > 1 && lastD !== first ? ` – ${lastD}` : ''}`
+    const bySrc = summary.by_source && typeof summary.by_source === 'object'
+      ? summary.by_source
+      : snaps.reduce((acc, s) => ({ ...acc, [s.source || 'unknown']: (acc[s.source || 'unknown'] || 0) + 1 }), {})
+    srcs = jsx('div', {
+      className: 'fc-trend-srcs',
+      'aria-label': 'Snapshots by source',
+      children: Object.entries(bySrc).map(([k, v]) => jsxs('span', { key: k, className: 'fc-trail-pill', children: [jsx('span', { className: 'fc-trail-k', children: k }), ` ${v}`] }))
+    })
+  }
+
+  let alert = null
+  if (isError) {
+    const status = describeSaveError(query.error).status
+    const updated = Number(query.dataUpdatedAt) || 0
+    const mins = updated ? Math.max(0, Math.round((Date.now() - updated) / 60000)) : null
+    alert = jsxs('div', {
+      className: 'fc-alert fc-trail-alert',
+      role: 'alert',
+      children: [
+        jsx(Icon, { name: 'attention' }),
+        jsxs('div', {
+          className: 'fc-trail-alert-body',
+          children: [
+            jsx('b', { children: status ? `Couldn’t refresh snapshots (HTTP ${status}).` : 'Couldn’t refresh snapshots.' }),
+            hasData ? ` Showing data from ${mins == null ? 'earlier' : mins < 1 ? 'just now' : `${mins} min ago`}.` : ' The history endpoint could not be loaded.'
+          ]
+        }),
+        jsxs('button', {
+          type: 'button',
+          className: 'fc-btn',
+          'data-action': 'retry-history',
+          onClick: () => retryQuery(query, queryClient, queryKey),
+          children: [jsx(Icon, { name: 'retry' }), 'Retry']
+        })
+      ]
+    })
+  }
+
+  let body = null
+  if (state === 'loading') body = jsx(TrendSkeleton, {})
+  else if (state === 'empty') {
+    body = jsxs('div', {
+      className: 'fc-trail-state',
+      'data-state': 'empty',
+      children: [
+        jsx('span', { className: 'fc-trail-state-ico', children: jsx(Icon, { name: 'trend', size: 16 }) }),
+        jsx('h3', { children: 'Snapshots appear automatically as PRs merge' }),
+        jsxs('p', { children: ['Capture one now with ', jsx('code', { className: 'fc-trend-cmd', children: 'hermes factonio metrics --snapshot' })] })
+      ]
+    })
+  } else if (state === 'populated') {
+    body = jsx('div', {
+      className: 'fc-trend-grid',
+      children: TREND_METRICS.map(cfg => jsx(SparkCard, { key: cfg.metric, cfg, snaps }))
+    })
+  }
+
+  return jsxs('section', {
+    className: 'fc-trend',
+    'aria-labelledby': 'fc-trend-h',
+    'aria-busy': state === 'loading' ? 'true' : undefined,
+    'data-state': state,
+    'data-stale': isError && hasData ? 'true' : undefined,
+    children: [
+      jsxs('div', {
+        className: 'fc-trend-head',
+        children: [
+          jsxs('div', { children: [jsx('h2', { id: 'fc-trend-h', children: 'Trends' }), sub ? jsx('p', { className: 'fc-sec-sub', children: sub }) : null] }),
+          srcs
+        ]
+      }),
+      alert,
+      body
+    ]
+  })
+}
+
 function FactonioPage({ ctx }) {
   const [range, setRange] = useState('30d')
   const metricsQ = useQuery({
@@ -1913,7 +2552,7 @@ function FactonioPage({ ctx }) {
           }),
           warn ? jsx('div', { className: 'fc-warn', children: warn }) : null,
           jsxs('div', {
-            className: 'fc-grid',
+            className: 'fc-grid fc-grid--6',
             children: [
               jsxs('div', {
                 className: 'fc-card',
@@ -1969,9 +2608,11 @@ function FactonioPage({ ctx }) {
                     children: m ? `avg runs/card (${m.rework.cards_with_rework} reworked)` : '—'
                   })
                 ]
-              })
+              }),
+              jsx(VerificationPanelsKpi, { m })
             ]
           }),
+          jsx(MetricsTrendSection, { ctx, range }),
           jsxs('div', {
             className: 'fc-sec',
             children: [
@@ -2022,6 +2663,7 @@ function FactonioPage({ ctx }) {
               }),
               jsx('p', { className: 'fc-hint', children: jsx(AuxModelsNote, {}) }),
               jsx(ModelsQueryStatus, { query: modelsQ }),
+              jsx(VerifyPanelStatus, { query: modelsQ }),
               jsx(PhaseModelsTable, { models })
             ]
           }),
@@ -2062,22 +2704,27 @@ function fmtTime(ts) {
 const stripTag = t => String(t || '').replace(/^\s*\[[^\]]+\]\s*/, '')
 const safePrUrl = pr => (pr && typeof pr.url === 'string' && /^https:\/\//i.test(pr.url)) ? pr.url : null
 
-// 'pass' | 'reject' | null — normalizes the API verdict for tones and resolution.
+// 'pass' | 'reject' | 'warn' (inconclusive) | null — normalizes the API verdict for tones and resolution.
 function verdictTone(v) {
   const s = String(v || '').toLowerCase()
   if (!s) return null
   if (REJECT_VERDICTS.has(s)) return 'reject'
   if (s === 'pass') return 'pass'
+  if (s === 'inconclusive') return 'warn'
   return null
 }
 
-// A reject is resolved once a later card of the same verify phase in the same tenant passed.
-function isUnresolvedReject(c, wsCards) {
-  if (verdictTone(c.verdict) !== 'reject') return false
-  return !wsCards.some(o => o.phase === c.phase && verdictTone(o.verdict) === 'pass' && (o.created_at || 0) > (c.created_at || 0))
+// A reject / inconclusive is resolved once a later card of the same verify phase in the same
+// tenant passed. Peer lanes of the same verification panel never resolve each other.
+function isUnresolvedVerdict(c, wsCards, tone) {
+  if (verdictTone(c.verdict) !== tone) return false
+  return !wsCards.some(o => o.phase === c.phase && verdictTone(o.verdict) === 'pass' &&
+    (o.created_at || 0) > (c.created_at || 0) && !(c.panel_id && o.panel_id === c.panel_id))
 }
-const isAttention = (c, wsCards) => c.status === 'blocked' || c.status === 'triage' || isUnresolvedReject(c, wsCards)
-const isCollapsibleDone = (c, wsCards) => c.status === 'done' && !isUnresolvedReject(c, wsCards)
+const isUnresolvedReject = (c, wsCards) => isUnresolvedVerdict(c, wsCards, 'reject')
+const isUnresolvedInconclusive = (c, wsCards) => isUnresolvedVerdict(c, wsCards, 'warn')
+const isAttention = (c, wsCards) => c.status === 'blocked' || c.status === 'triage' || isUnresolvedReject(c, wsCards) || isUnresolvedInconclusive(c, wsCards)
+const isCollapsibleDone = (c, wsCards) => c.status === 'done' && !isUnresolvedReject(c, wsCards) && !isUnresolvedInconclusive(c, wsCards)
 
 function cardRank(c, wsCards) {
   if (isAttention(c, wsCards)) return 0
@@ -2092,11 +2739,12 @@ function stageState(cs, wsCards) {
   if (cs.some(c => ACTIVE.has(c.status))) return 'queued'
   return 'done'
 }
-function stageWord(state, cs) {
+function stageWord(state, cs, wsCards = cs) {
   if (state !== 'attention') return state
   if (cs.some(c => c.status === 'blocked')) return 'blocked'
   if (cs.some(c => c.status === 'triage')) return 'triage'
-  return 'rejected'
+  if (cs.some(c => isUnresolvedReject(c, wsCards))) return 'rejected'
+  return 'inconclusive'
 }
 function mergeStates(a, b) {
   for (const s of ['attention', 'running', 'queued']) if (a === s || b === s) return s
@@ -2118,10 +2766,12 @@ function latestCard(cs) {
 // rejections still drive workstream/card attention via isAttention().
 function computePipelineStages(wsCards) {
   const node = ph => {
-    const last = latestCard(wsCards.filter(c => c.phase === ph))
-    const cs = last ? [last] : []
+    const phaseCards = wsCards.filter(c => c.phase === ph)
+    const last = latestCard(phaseCards)
+    // A verification panel's lanes run side by side: the stage reflects every lane of the newest panel.
+    const cs = !last ? [] : last.panel_id ? phaseCards.filter(c => c.panel_id === last.panel_id) : [last]
     const state = stageState(cs, wsCards)
-    return { state, word: stageWord(state, cs) }
+    return { state, word: stageWord(state, cs, wsCards) }
   }
   const define = node('define')
   const design = node('design')
@@ -2212,6 +2862,240 @@ function cardCallouts(c, wsCards) {
 }
 const domSafe = s => String(s || '').replace(/[^A-Za-z0-9_-]/g, '_')
 
+// --- verification panels (rigor=high) ------------------------------------
+// Client-side mirror of metrics.aggregate_panel_verdicts over the already-polled
+// /cards lanes (`panel_id`, `panel_vendor`, `verdict`, `status`) joined with the
+// newest `verify_panel_consensus` row from /trail. Fail closed: a recorded
+// consensus and the live lanes are combined by severity, and a pass needs the
+// orchestrator's recorded consensus.
+const PANEL_SEVERITY = { reject: 3, inconclusive: 2, pending: 1, pass: 0 }
+const PANEL_TONE = { pass: 'pass', reject: 'reject', inconclusive: 'warn', pending: 'info' }
+const PANEL_GLYPH = { pass: 'check', reject: 'x', inconclusive: 'attention', pending: 'spin' }
+const PASS_VERDICTS = new Set(['pass'])
+const knownVendor = v => {
+  const s = String(v || '').trim().toLowerCase()
+  return s && s !== 'unknown' && s !== 'none' ? s : null
+}
+
+function laneBucket(verdict) {
+  const s = String(verdict ?? '').trim().toLowerCase()
+  if (!s) return null
+  if (REJECT_VERDICTS.has(s)) return 'reject'
+  if (PASS_VERDICTS.has(s)) return 'pass'
+  return 'inconclusive'
+}
+
+function aggregatePanelLanes(lanes) {
+  const buckets = { pass: [], reject: [], inconclusive: [], pending: [] }
+  const vendors = []
+  let incomplete = false
+  for (const lane of lanes) {
+    const v = knownVendor(lane.vendor)
+    if (v && !vendors.includes(v)) vendors.push(v)
+    const complete = lane.status === 'done' && lane.bucket != null
+    if (!complete) incomplete = true
+    if (lane.bucket != null && (complete || lane.bucket !== 'pass')) buckets[lane.bucket].push(lane)
+    else buckets.pending.push(lane)
+  }
+  let consensus
+  if (buckets.reject.length) consensus = 'reject'
+  else if (buckets.inconclusive.length) consensus = 'inconclusive'
+  else if (incomplete) consensus = 'pending'
+  else if (lanes.length >= 2 && vendors.length >= 2) consensus = 'pass'
+  else consensus = 'inconclusive'
+  const decided = ['pass', 'reject', 'inconclusive'].filter(b => buckets[b].length)
+  return { consensus, buckets, vendors, hasDisagreement: decided.length > 1 }
+}
+
+// "{dissenting vendor} {verdict} vs {other vendors} {verdict}: “{dissenting summary}”"
+function panelDissent(buckets) {
+  const worst = buckets.reject.length ? 'reject' : 'inconclusive'
+  const dissent = buckets[worst]
+  const others = ['pass', 'reject', 'inconclusive'].filter(b => b !== worst && buckets[b].length)
+  if (!dissent.length || !others.length) return null
+  const names = ls => [...new Set(ls.map(l => l.vendor || 'unknown'))].join(', ')
+  const vs = others.map(b => `${names(buckets[b])} ${b}`).join(', ')
+  const quote = dissent.map(l => l.summary).find(Boolean)
+  return { lead: `${names(dissent)} ${worst} vs ${vs}`, quote: quote ? String(quote) : null }
+}
+
+const laneIdOf = l => {
+  const id = Array.isArray(l) ? l[0] : l && typeof l === 'object' ? l.task_id ?? l.id : l
+  return id == null || id === '' ? null : String(id)
+}
+const laneIdList = v => (Array.isArray(v) ? v.map(laneIdOf).filter(Boolean) : [])
+const laneCount = v => (Number.isInteger(v) && v > 0 ? v : 0)
+
+// Lanes a panel must contain before it can pass, mirroring backend summarize_panel's
+// expected_lane_ids: every lane spawn_verify recorded plus every lane a recorded consensus
+// covered. `recordedIds` is the newest consensus row's own lane set (null when unrecorded).
+function expectedPanelLanes(spawnRows, row) {
+  const ids = new Set()
+  let count = 0
+  for (const d of spawnRows) {
+    const ev = d.evidence
+    for (const l of Array.isArray(ev.panel_lanes) ? ev.panel_lanes : []) {
+      if (!l || typeof l !== 'object') continue
+      for (const k of ['verify_diff_task_id', 'verify_blackbox_task_id', 'task_id']) if (l[k]) ids.add(String(l[k]))
+    }
+    for (const id of [...laneIdList(ev.expected_lane_ids), ...laneIdList(ev.lanes)]) ids.add(id)
+    count = Math.max(count, laneCount(ev.expected_lane_count))
+  }
+  let recordedIds = null
+  if (row) {
+    const ev = row.evidence
+    const own = [...laneIdList(ev.lanes), ...laneIdList(ev.lane_fingerprint)]
+    if (own.length) recordedIds = new Set(own)
+    for (const id of [...own, ...laneIdList(ev.expected_lane_ids), ...laneIdList(ev.missing_lane_ids)]) ids.add(id)
+    count = Math.max(count, laneCount(ev.expected_lane_count), laneCount(ev.lane_count))
+  }
+  return { ids: [...ids], count: Math.max(count, ids.size), recordedIds }
+}
+
+// Panels of one workstream, newest first: [{ id, consensus, lanes, decided, vendors,
+// hasDisagreement, dissent, recorded, missingLaneIds, expectedLaneCount, reason, createdAt }].
+// `trailDecisions` are that tenant's /trail rows (any order).
+function computeWorkstreamPanels(wsCards, trailDecisions) {
+  const groups = groupBy((wsCards || []).filter(c => c && c.panel_id), c => String(c.panel_id))
+  const rows = (Array.isArray(trailDecisions) ? trailDecisions : []).filter(d => d && d.evidence && typeof d.evidence === 'object')
+  const consensusRows = rows.filter(d => d.decision === 'verify_panel_consensus' && !d.is_superseded)
+  const spawnRows = rows.filter(d => d.decision === 'spawn_verify')
+  const out = []
+  for (const [id, cards] of groups) {
+    const ordered = [...cards].sort((a, b) => (a.created_at || 0) - (b.created_at || 0) || String(a.id).localeCompare(String(b.id)))
+    const lanes = ordered.map(c => ({
+      cardId: c.id,
+      vendor: c.panel_vendor ? String(c.panel_vendor) : 'unknown',
+      model: formatPhaseModelLabel(c),
+      phase: c.phase,
+      status: c.status,
+      verdict: c.verdict ? String(c.verdict).toLowerCase() : null,
+      bucket: laneBucket(c.verdict),
+      summary: c.summary || null
+    }))
+    const live = aggregatePanelLanes(lanes)
+    const row = consensusRows
+      .filter(d => d.evidence.panel_id === id)
+      .sort((a, b) => (trailMs(b.ts) ?? 0) - (trailMs(a.ts) ?? 0))[0] || null
+    const recorded = row && Object.hasOwn(PANEL_SEVERITY, row.result) && row.result !== 'pending' ? row.result : null
+    const expected = expectedPanelLanes(spawnRows.filter(d => String(d.evidence.panel_id ?? '') === id), row)
+    const liveIds = new Set(lanes.map(l => String(l.cardId)))
+    const missingLaneIds = expected.ids.filter(x => !liveIds.has(x))
+    const short = missingLaneIds.length || expected.count > lanes.length
+    // A recorded pass only vouches for the exact lane set it evaluated.
+    const stale = recorded === 'pass' && expected.recordedIds &&
+      (expected.recordedIds.size !== liveIds.size || [...liveIds].some(x => !expected.recordedIds.has(x)))
+    let consensus = live.consensus === 'pass' && (!recorded || stale) ? 'pending' : live.consensus
+    if (recorded && PANEL_SEVERITY[recorded] > PANEL_SEVERITY[consensus]) consensus = recorded
+    let reason = null
+    if (short && consensus !== 'reject') {
+      consensus = 'inconclusive'
+      const n = missingLaneIds.length || expected.count - lanes.length
+      reason = `${n} expected lane(s) missing${missingLaneIds.length ? `: ${missingLaneIds.join(', ')}` : ''}`
+    }
+    const hasDisagreement = live.hasDisagreement || !!row?.evidence?.has_disagreement
+    let dissent = null
+    if (hasDisagreement) {
+      const summary = row?.evidence?.disagreement_summary
+      dissent = summary ? { lead: String(summary), quote: null } : panelDissent(live.buckets)
+    }
+    out.push({
+      id,
+      consensus,
+      recorded,
+      lanes,
+      decided: lanes.filter(l => l.verdict).length,
+      vendors: live.vendors,
+      hasDisagreement,
+      dissent,
+      missingLaneIds,
+      expectedLaneCount: expected.count || null,
+      reason,
+      createdAt: Math.max(0, ...ordered.map(c => c.created_at || 0))
+    })
+  }
+  return out.sort((a, b) => b.createdAt - a.createdAt || b.id.localeCompare(a.id))
+}
+
+function VendorChip({ lane, mixed }) {
+  const verdict = lane.bucket || 'pending'
+  return jsxs('span', {
+    className: 'fc-sb-vendor',
+    'data-verdict': verdict,
+    title: `${PHASE_LABEL[lane.phase] || lane.phase || 'lane'} · ${lane.model}: ${lane.verdict || 'running'}`,
+    children: [jsx(Icon, { name: PANEL_GLYPH[verdict], size: 10 }), mixed ? `${lane.vendor} · ${PHASE_LABEL[lane.phase] || lane.phase}` : lane.vendor]
+  })
+}
+
+const mixedPhases = lanes => new Set(lanes.map(l => l.phase)).size > 1
+
+function PanelStrip({ panel: p }) {
+  const mixed = mixedPhases(p.lanes)
+  const total = Math.max(p.lanes.length, p.expectedLaneCount || 0)
+  const label = `Verification panel ${p.id}: ${p.consensus}, ${p.decided} of ${total} lanes${p.hasDisagreement ? ', lanes disagree' : ''}${p.reason ? `, ${p.reason}` : ''}`
+  const full = p.dissent ? `${p.dissent.lead}${p.dissent.quote ? `: “${p.dissent.quote}”` : ''}` : ''
+  return jsxs('div', {
+    className: 'fc-sb-panel',
+    role: 'group',
+    'aria-label': label,
+    'data-panel': p.id,
+    'data-consensus': p.consensus,
+    'data-disagree': String(!!p.hasDisagreement),
+    children: [
+      jsxs('div', {
+        className: 'fc-sb-panel-top',
+        children: [
+          jsx('span', { className: 'fc-sb-panel-k', title: 'Multi-vendor verification panel', children: jsx(Icon, { name: 'panel', size: 11 }) }),
+          jsx('span', { className: 'fc-sb-tag', 'data-tone': PANEL_TONE[p.consensus], 'data-consensus': p.consensus, children: p.consensus }),
+          jsx('span', { className: 'fc-sb-panel-id fc-sb-mono', title: p.id, children: p.id }),
+          jsx('span', { className: 'fc-sb-panel-lanes', children: `${p.decided}/${total} lanes` })
+        ]
+      }),
+      jsx('div', {
+        className: 'fc-sb-vendors',
+        'aria-label': 'Lanes by vendor',
+        children: p.lanes.map(l => jsx(VendorChip, { key: l.cardId, lane: l, mixed }))
+      }),
+      p.reason
+        ? jsxs('div', {
+            className: 'fc-sb-callout',
+            'data-tone': 'warn',
+            'data-kind': 'missing',
+            role: 'note',
+            children: [
+              jsx(Icon, { name: 'attention' }),
+              jsxs('span', {
+                className: 'fc-sb-callout-body',
+                title: `${p.reason}; the panel cannot pass without every lane`,
+                children: [jsx('span', { className: 'fc-sb-kind', children: 'missing' }), p.reason]
+              })
+            ]
+          })
+        : null,
+      p.hasDisagreement && p.dissent
+        ? jsxs('div', {
+            className: 'fc-sb-callout',
+            'data-tone': 'warn',
+            'data-kind': 'disagree',
+            role: 'note',
+            children: [
+              jsx(Icon, { name: 'split' }),
+              jsxs('span', {
+                className: 'fc-sb-callout-body',
+                title: full,
+                children: [
+                  jsx('span', { className: 'fc-sb-kind', children: 'disagree' }),
+                  p.dissent.lead,
+                  p.dissent.quote ? [': ', jsx('q', { key: 'q', children: p.dissent.quote })] : null
+                ]
+              })
+            ]
+          })
+        : null
+    ]
+  })
+}
+
 function openExternalUrl(ctx, url) {
   const fallback = () => {
     try { globalThis.window?.open?.(url, '_blank', 'noopener,noreferrer') } catch { /* ignore */ }
@@ -2262,7 +3146,14 @@ const ICON = {
   trail: [['circle', { cx: 2.6, cy: 2.8, r: 1.1 }], ['circle', { cx: 2.6, cy: 9.2, r: 1.1 }], ['path', { d: 'M2.6 3.9v4.2M5.2 2.8h5M5.2 6h5M5.2 9.2h3.4' }]],
   person: [['circle', { cx: 6, cy: 4, r: 2 }], ['path', { d: 'M2.2 10.4c.4-2 1.9-3.2 3.8-3.2s3.4 1.2 3.8 3.2' }]],
   link: [['path', { d: 'M5 7 7 5' }], ['path', { d: 'M4.3 5.4 3.1 6.6a1.7 1.7 0 0 0 2.4 2.4l1.2-1.2M7.7 6.6l1.2-1.2a1.7 1.7 0 0 0-2.4-2.4L5.3 4.2' }]],
-  retry: [['path', { d: 'M9.6 5.2A3.8 3.8 0 1 0 9 8' }], ['path', { d: 'M9.8 2.4v2.9H6.9' }]]
+  retry: [['path', { d: 'M9.6 5.2A3.8 3.8 0 1 0 9 8' }], ['path', { d: 'M9.8 2.4v2.9H6.9' }]],
+  panel: [['circle', { cx: 4.4, cy: 6, r: 2.7 }], ['circle', { cx: 7.6, cy: 6, r: 2.7 }]],
+  split: [['path', { d: 'M6 10.2V6M6 6 2.9 2.4M6 6l3.1-3.6' }]],
+  up: [['path', { d: 'M6 9.6V2.6M3.4 5.2 6 2.6l2.6 2.6' }]],
+  down: [['path', { d: 'M6 2.4v7M3.4 6.8 6 9.4l2.6-2.6' }]],
+  trend: [['path', { d: 'M1.8 8.6l2.7-2.7 1.9 1.9 3.8-3.8' }], ['path', { d: 'M7.6 4h2.6v2.6' }]],
+  dot: [['circle', { cx: 6, cy: 6, r: 2, fill: 'currentColor', stroke: 'none' }]],
+  spin: [['circle', { cx: 6, cy: 6, r: 4.2, strokeDasharray: '15 11' }]]
 }
 
 function Icon({ name, size = 12, className = '' }) {
@@ -2453,7 +3344,28 @@ function Pipeline({ pipe }) {
   })
 }
 
-function CardDrawer({ card: c, id, trail }) {
+function panelRows(c, panel, row) {
+  const lane = panel.lanes.find(l => l.cardId === c.id)
+  const peers = panel.lanes.filter(l => l.cardId !== c.id)
+  const mixed = mixedPhases(panel.lanes)
+  const pos = lane ? panel.lanes.indexOf(lane) + 1 : null
+  return [
+    ...row('panel', 'Panel', [
+      jsx('span', { key: 'id', className: 'fc-sb-mono', children: panel.id }),
+      jsx('span', { key: 'c', className: 'fc-sb-tag', 'data-tone': PANEL_TONE[panel.consensus], title: panel.reason || undefined, children: panel.consensus })
+    ]),
+    ...(lane
+      ? row('vendor', 'Vendor', [
+          jsx(VendorChip, { key: 'v', lane, mixed }),
+          jsx('span', { key: 'n', className: 'fc-sb-lane', children: `lane ${pos}/${panel.lanes.length}` })
+        ])
+      : []),
+    ...(peers.length ? row('peers', 'Peers', peers.map(l => jsx(VendorChip, { key: l.cardId, lane: l, mixed }))) : []),
+    ...(panel.reason ? row('missing', 'Missing', panel.reason, { className: 'fc-sb-mono' }) : [])
+  ]
+}
+
+function CardDrawer({ card: c, id, trail, panel }) {
   const rework = c.phase === 'implement' && c.runs > 1
   const tone = verdictTone(c.verdict)
   const row = (k, label, value, extra) => [
@@ -2467,6 +3379,7 @@ function CardDrawer({ card: c, id, trail }) {
     onClick: e => e?.stopPropagation?.(),
     children: [
       ...row('model', 'Model', formatPhaseModelLabel(c), { className: 'fc-sb-mono' }),
+      ...(panel ? panelRows(c, panel, row) : []),
       ...row('runs', 'Runs', [
         jsx('span', { key: 'n', className: 'fc-sb-mono', children: String(c.runs ?? 1) }),
         rework ? jsx('span', { key: 'rw', className: 'fc-sb-tag', 'data-tone': 'warn', children: `Rework · ${c.runs} runs` }) : null
@@ -2487,8 +3400,9 @@ function CardDrawer({ card: c, id, trail }) {
   })
 }
 
-function CardRow({ ctx, card: c, wsCards, open, onToggle, trail }) {
+function CardRow({ ctx, card: c, wsCards, open, onToggle, trail, panel }) {
   const rej = isUnresolvedReject(c, wsCards)
+  const inc = !rej && isUnresolvedInconclusive(c, wsCards)
   const attn = isAttention(c, wsCards)
   const tone = verdictTone(c.verdict)
   const rework = c.phase === 'implement' && c.runs > 1
@@ -2496,13 +3410,13 @@ function CardRow({ ctx, card: c, wsCards, open, onToggle, trail }) {
   const drawerId = `fc-sb-card-${domSafe(c.id)}`
   const title = stripTag(c.title)
   const callouts = cardCallouts(c, wsCards)
-  const dotStatus = rej ? 'reject' : c.status
+  const dotStatus = rej ? 'reject' : inc ? 'inconclusive' : c.status
   const repoName = c.pr?.repo ? String(c.pr.repo).split('/').pop() : ''
   return jsxs('article', {
     className: 'fc-sb-card',
     'data-id': c.id,
     'data-open': String(open),
-    'data-attn': String(attn),
+    'data-attn': attn && inc && c.status !== 'blocked' && c.status !== 'triage' ? 'warn' : String(attn),
     // Mouse convenience: click anywhere outside the drawer/footer toggles; the
     // footer chevron button is the keyboard-accessible toggle.
     onClick: () => {
@@ -2514,8 +3428,9 @@ function CardRow({ ctx, card: c, wsCards, open, onToggle, trail }) {
       jsxs('div', {
         className: 'fc-sb-card-top',
         children: [
-          jsx('span', { className: 'fc-sb-dot', 'data-status': dotStatus, role: 'img', 'aria-label': `Status: ${rej ? 'rejected' : c.status}` }),
+          jsx('span', { className: 'fc-sb-dot', 'data-status': dotStatus, role: 'img', 'aria-label': `Status: ${rej ? 'rejected' : inc ? 'inconclusive' : c.status}` }),
           jsx('span', { className: 'fc-sb-tag', 'data-phase': c.phase, children: PHASE_LABEL[c.phase] || c.phase || 'other' }),
+          c.panel_vendor ? jsx('span', { className: 'fc-sb-vendor', 'data-panel-vendor': String(c.panel_vendor), title: 'Panel lane vendor', children: String(c.panel_vendor) }) : null,
           c.verdict ? jsx('span', { className: 'fc-sb-tag', 'data-tone': tone || undefined, 'data-verdict': c.verdict, children: String(c.verdict) }) : null,
           rework && !open ? jsx('span', { className: 'fc-sb-tag', 'data-tone': 'warn', title: `${c.runs} runs`, children: 'rework' }) : null,
           jsx('span', { className: 'fc-sb-dur', title: `Active ${fmtDur(c.active_duration_seconds)} · Wall ${fmtDur(c.elapsed_seconds)}`, children: fmtDur(dur) })
@@ -2533,7 +3448,7 @@ function CardRow({ ctx, card: c, wsCards, open, onToggle, trail }) {
           jsxs('span', { className: 'fc-sb-callout-body', children: [jsx('span', { className: 'fc-sb-kind', children: co.kind }), co.text] })
         ]
       })),
-      open ? jsx(CardDrawer, { key: 'drawer', card: c, id: drawerId, trail }) : null,
+      open ? jsx(CardDrawer, { key: 'drawer', card: c, id: drawerId, trail, panel }) : null,
       jsxs('div', {
         className: 'fc-sb-card-foot',
         children: [
@@ -2575,7 +3490,7 @@ function CardRow({ ctx, card: c, wsCards, open, onToggle, trail }) {
   })
 }
 
-function DoneGroup({ ctx, wsKey, cards, wsCards, open, onToggle, cardOpen, toggleCard, trail }) {
+function DoneGroup({ ctx, wsKey, cards, wsCards, open, onToggle, cardOpen, toggleCard, trail, panelOf }) {
   const listId = `fc-sb-done-${domSafe(wsKey)}`
   return [
     jsxs('button', {
@@ -2597,7 +3512,7 @@ function DoneGroup({ ctx, wsKey, cards, wsCards, open, onToggle, cardOpen, toggl
           key: 'done-list',
           className: 'fc-sb-done-list',
           id: listId,
-          children: cards.map(c => jsx(CardRow, { key: c.id, ctx, card: c, wsCards, open: !!cardOpen[c.id], onToggle: () => toggleCard(c.id), trail }))
+          children: cards.map(c => jsx(CardRow, { key: c.id, ctx, card: c, wsCards, open: !!cardOpen[c.id], onToggle: () => toggleCard(c.id), trail, panel: panelOf(c) }))
         })
       : null
   ]
@@ -2679,6 +3594,8 @@ function Workstream({ ctx, ws, ui }) {
   }
   const doneOpen = ui.doneOpen[key] ?? (ui.status === 'done')
   const toggleCard = id => ui.setCardOpen({ ...ui.cardOpen, [id]: !ui.cardOpen[id] })
+  const panels = computeWorkstreamPanels(ws.wsCards, ui.trail?.status === 'ready' ? ui.trail.byTenant.get(ws.tenant || '') : [])
+  const panelOf = c => (c.panel_id ? panels.find(p => p.id === String(c.panel_id)) || null : null)
   return jsxs('section', {
     ...sectionProps,
     children: [
@@ -2688,10 +3605,11 @@ function Workstream({ ctx, ws, ui }) {
         id: bodyId,
         children: [
           jsx(Pipeline, { pipe: computePipelineStages(ws.wsCards) }),
+          panels.length ? jsx(PanelStrip, { key: 'panel', panel: panels[0] }) : null,
           jsxs('div', {
             className: 'fc-sb-ws-cards',
             children: [
-              ...main.map(c => jsx(CardRow, { key: c.id, ctx, card: c, wsCards: ws.wsCards, open: !!ui.cardOpen[c.id], onToggle: () => toggleCard(c.id), trail: ui.trail })),
+              ...main.map(c => jsx(CardRow, { key: c.id, ctx, card: c, wsCards: ws.wsCards, open: !!ui.cardOpen[c.id], onToggle: () => toggleCard(c.id), trail: ui.trail, panel: panelOf(c) })),
               doneCards.length
                 ? jsx(DoneGroup, {
                     key: 'done',
@@ -2703,7 +3621,8 @@ function Workstream({ ctx, ws, ui }) {
                     onToggle: () => ui.setDoneOpen({ ...ui.doneOpen, [key]: !doneOpen }),
                     cardOpen: ui.cardOpen,
                     toggleCard,
-                    trail: ui.trail
+                    trail: ui.trail,
+                    panelOf
                   })
                 : null,
               jsx(TrailStrip, {
@@ -2943,7 +3862,7 @@ function YourTurnCard({ attrs, sessionId }) {
 }
 
 // Pure helpers exposed for clean-room tests; the host only consumes the default export.
-export { validateRepoDraft, repoDraftChanges, seedRepoDraft, describeSaveError }
+export { validateRepoDraft, repoDraftChanges, seedRepoDraft, describeSaveError, verdictTone, computeWorkstreamPanels, sparkPoints, sparkPath }
 
 export default {
   id: 'factonio',
