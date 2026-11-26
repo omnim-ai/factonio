@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
@@ -63,7 +64,48 @@ def _write_yaml(path: Path, data: dict[str, Any]) -> None:
     target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
 
-def _ensure_plugin_link(profile_dir: Path, plugin_dir: Path) -> dict[str, Any]:
+_EPHEMERAL_SEGMENTS: tuple[tuple[str, ...], ...] = (("kanban", "workspaces"), (".worktrees",), ("cache", "scratch"))
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_ephemeral_path(path: Path | str) -> bool:
+    """True for Kanban workspaces, git worktrees, and scratch dirs that are pruned after a card finishes."""
+    resolved = Path(path).expanduser().resolve()
+    for env_key in ("HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_SCRATCH_DIR"):
+        root = os.environ.get(env_key, "").strip()
+        if root and _is_within(resolved, Path(root).expanduser().resolve()):
+            return True
+    parts = resolved.parts
+    for seg in _EPHEMERAL_SEGMENTS:
+        n = len(seg)
+        if any(parts[i:i + n] == seg for i in range(len(parts) - n + 1)):
+            return True
+    return False
+
+
+def _is_isolated_profile_dir(profile_dir: Path | str) -> bool:
+    """True when the profile lives in a throwaway HERMES_HOME (system temp dir or an ephemeral path)."""
+    resolved = Path(profile_dir).expanduser().resolve()
+    return _is_within(resolved, Path(tempfile.gettempdir()).resolve()) or _is_ephemeral_path(resolved)
+
+
+def _ephemeral_link_warning(link_path: Path, target: Path) -> str:
+    return (
+        f"Refusing to point persistent worker plugin link {link_path} at ephemeral path {target}: "
+        "Kanban workspaces, .worktrees/ and scratch dirs are pruned, which would break every later worker. "
+        "Run `hermes factonio init` from a stable checkout, use an isolated HERMES_HOME for probes, "
+        "or pass --force-link (force_plugin_link=True) to override."
+    )
+
+
+def _ensure_plugin_link(profile_dir: Path, plugin_dir: Path, *, force: bool = False) -> dict[str, Any]:
     plugins_dir = profile_dir / "plugins"
     plugins_dir.mkdir(parents=True, exist_ok=True)
     link_path = plugins_dir / PLUGIN_ID
@@ -75,6 +117,20 @@ def _ensure_plugin_link(profile_dir: Path, plugin_dir: Path) -> dict[str, Any]:
                 return {"action": "unchanged", "link": str(link_path), "target": str(resolved_src)}
         except OSError:
             pass
+
+    guarded = not force and _is_ephemeral_path(resolved_src) and not _is_isolated_profile_dir(profile_dir)
+    if guarded and (link_path.is_symlink() or not link_path.exists()):
+        existing = link_path.is_symlink()
+        return {
+            "action": "preserved_ephemeral_guard" if existing else "skipped_ephemeral_guard",
+            "link": str(link_path),
+            "target": os.readlink(link_path) if existing else None,
+            "requested_target": str(resolved_src),
+            "guarded": True,
+            "warning": _ephemeral_link_warning(link_path, resolved_src),
+        }
+
+    if link_path.is_symlink():
         link_path.unlink()
     elif link_path.exists():
         # Already a real directory (e.g. direct copy); leave untouched rather than clobbering.
@@ -177,6 +233,7 @@ def init_factonio_profile(
     apply_root_config: bool = False,
     force_soul: bool = False,
     max_concurrent_workers: Optional[int] = None,
+    force_plugin_link: bool = False,
 ) -> dict[str, Any]:
     """Create or reconcile the dedicated `factonio` worker profile."""
     from hermes_cli.profiles import create_profile, get_profile_dir, profile_exists
@@ -204,7 +261,7 @@ def init_factonio_profile(
         soul_path.write_text(WORKER_SOUL_MD, encoding="utf-8")
         soul_written = True
 
-    link_info = _ensure_plugin_link(profile_dir, plugin_dir)
+    link_info = _ensure_plugin_link(profile_dir, plugin_dir, force=force_plugin_link)
     worker_cfg_info = _ensure_worker_config(profile_dir, max_concurrent_workers=workers)
     root_cfg_info = _check_or_apply_root_config(
         apply_root_config=apply_root_config,
@@ -221,6 +278,7 @@ def init_factonio_profile(
         "created": created,
         "soul_written": soul_written,
         "plugin_link": link_info,
+        "warnings": [link_info["warning"]] if link_info.get("warning") else [],
         "worker_config": worker_cfg_info,
         "root_config": root_cfg_info,
     }
@@ -299,11 +357,22 @@ def run_doctor(plugin_dir: Path) -> dict[str, Any]:
     if has_profile:
         link_path = profile_dir / "plugins" / PLUGIN_ID
         link_ok = link_path.exists()
-        checks.append({
+        link_check: dict[str, Any] = {
             "name": "worker_plugin_link",
             "ok": link_ok,
             "detail": str(link_path.resolve()) if link_ok else "missing — run `hermes factonio init`",
-        })
+        }
+        if (
+            link_path.is_symlink()
+            and _is_ephemeral_path(link_path.resolve())
+            and not _is_isolated_profile_dir(profile_dir)
+        ):
+            link_check["ephemeral"] = True
+            warnings.append(
+                f"Worker plugin link {link_path} points into ephemeral path {link_path.resolve()}; "
+                "it breaks once that workspace/worktree is pruned. Re-run `hermes factonio init` from a stable checkout."
+            )
+        checks.append(link_check)
         wcfg = _read_yaml(profile_dir / "config.yaml")
         enabled = ((wcfg.get("plugins") or {}).get("enabled") or []) if isinstance(wcfg, dict) else []
         checks.append({

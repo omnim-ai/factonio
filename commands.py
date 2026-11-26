@@ -293,6 +293,11 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         p_init.add_argument("--apply-config", action="store_true", help="Apply recommended root kanban config keys.")
         p_init.add_argument("--force", action="store_true", help="Overwrite the factonio worker SOUL.md.")
         p_init.add_argument("--workers", type=int, default=None, help="Set max concurrent workers (default: 4).")
+        p_init.add_argument(
+            "--force-link",
+            action="store_true",
+            help="Point the worker plugins/factonio link at this checkout even if it is an ephemeral worktree/workspace.",
+        )
 
         p_add = sub.add_parser("add", help="Register a GitHub repository (`owner/repo`) with Factonio.")
         p_add.add_argument("repo", help="GitHub repository ('owner/repo' or URL).")
@@ -481,13 +486,17 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                 apply_root_config=bool(args.apply_config),
                 force_soul=bool(args.force),
                 max_concurrent_workers=args.workers,
+                force_plugin_link=bool(args.force_link),
             )
             if as_json:
                 print(json.dumps(res, indent=2, default=str))
                 return
             state = "Created" if res["created"] else "Updated"
             print(f"{state} dedicated profile '{res['profile']}' at {res['profile_dir']}")
-            print(f"  Plugin link: {res['plugin_link']['action']} -> {res['plugin_link']['target']}")
+            link = res["plugin_link"]
+            print(f"  Plugin link: {link['action']} -> {link['target'] or '(not linked)'}")
+            for warning in res.get("warnings") or []:
+                print(f"  Warning: {warning}")
             if res["worker_config"]["changed"]:
                 print(f"  Worker config updated: {', '.join(res['worker_config']['changed'])}")
             pending = res["root_config"]["pending"]

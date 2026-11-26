@@ -1,0 +1,330 @@
+{
+  "schema_version": 1,
+  "repo": "omnim-ai/factonio",
+  "generated_at": "2026-11-26T05:33:33Z",
+  "base_commit": null,
+  "stack": [
+    "hermes-plugin",
+    "github-actions",
+    "python",
+    "node"
+  ],
+  "phases": {
+    "launch": [
+      "export FACTONIO_VERIFY_HOME=\"$(mktemp -d)\"",
+      "mkdir -p \"$FACTONIO_VERIFY_HOME/plugins\" && ln -s \"$PWD\" \"$FACTONIO_VERIFY_HOME/plugins/factonio\"",
+      "printf 'plugins:\\n  enabled: [factonio]\\n' > \"$FACTONIO_VERIFY_HOME/config.yaml\"",
+      "HERMES_HOME=\"$FACTONIO_VERIFY_HOME\" HERMES_KANBAN_DB=\"$FACTONIO_VERIFY_HOME/kanban.db\" hermes factonio --help"
+    ],
+    "doctor": [
+      "git --version",
+      "python3 --version",
+      "python3 -c \"import hermes_cli\"",
+      "node --version",
+      "uv --version",
+      "uvx --version"
+    ],
+    "drive": [
+      "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest discover -s tests -v'",
+      "python3 -W error -m compileall -q .",
+      "uvx ruff check --select E9,F .",
+      "node --check desktop/plugin.js",
+      "uv run --with pyyaml python tools/check_repo_integrity.py",
+      "HERMES_HOME=\"$FACTONIO_VERIFY_HOME\" HERMES_KANBAN_DB=\"$FACTONIO_VERIFY_HOME/kanban.db\" hermes factonio harness check \"$PWD\" --run-doctor --run-hooks --json",
+      "HERMES_HOME=\"$FACTONIO_VERIFY_HOME\" HERMES_KANBAN_DB=\"$FACTONIO_VERIFY_HOME/kanban.db\" hermes factonio harness audit \"$PWD\" --json",
+      "HERMES_HOME=\"$FACTONIO_VERIFY_HOME\" HERMES_KANBAN_DB=\"$FACTONIO_VERIFY_HOME/kanban.db\" hermes factonio --json models",
+      "HERMES_HOME=\"$FACTONIO_VERIFY_HOME\" HERMES_KANBAN_DB=\"$FACTONIO_VERIFY_HOME/kanban.db\" hermes factonio --json list"
+    ],
+    "evidence": [
+      "Record every command with its exit code and the last lines of stdout/stderr.",
+      "Keep the unittest summary line (`Ran N tests` / `OK`) and any FAIL/ERROR tracebacks.",
+      "Keep the `harness check` JSON (`valid`, `errors`, `hook_results`) and the `harness audit` JSON (`severity`, `drifted`).",
+      "For Desktop UI changes, capture screenshots via tools/capture_readme_media.py --qa-dir into a temp dir."
+    ],
+    "cleanup": [
+      "rm -rf \"$FACTONIO_VERIFY_HOME\" && unset FACTONIO_VERIFY_HOME",
+      "Remove any temporary checkouts, QA media directories, and scratch kanban databases created during Drive.",
+      "Never point a real ~/.hermes profile's plugins/factonio link at the checkout under test."
+    ]
+  },
+  "feature_map": [
+    {
+      "id": "plugin",
+      "surface": "Hermes plugin manifest & registration",
+      "paths": [
+        "plugin.yaml",
+        "__init__.py"
+      ],
+      "commands": [
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_plugin_registration -v'"
+      ],
+      "scenarios": [
+        "Plugin loads in an isolated HERMES_HOME and `hermes factonio --help` lists every subcommand",
+        "plugin.yaml declares every factonio_* tool and bundled skill"
+      ]
+    },
+    {
+      "id": "setup",
+      "surface": "Settings, repo registry & worker profile",
+      "paths": [
+        "config.py",
+        "profile_setup.py"
+      ],
+      "commands": [
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_profile_and_models -v'"
+      ],
+      "scenarios": [
+        "`init` is idempotent and links plugins/factonio to the checkout",
+        "`init` refuses an ephemeral (.worktrees/, kanban/workspaces/, cache/scratch/) link target on a persistent profile unless --force-link",
+        "`doctor` warns when a persistent worker plugin link points into an ephemeral path"
+      ]
+    },
+    {
+      "id": "cli",
+      "surface": "CLI",
+      "paths": [
+        "commands.py"
+      ],
+      "commands": [
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_cli_and_tools tests.test_metrics_history -v'"
+      ],
+      "scenarios": [
+        "`add` subcommand runs and exits 0 with --help",
+        "`doctor` subcommand runs and exits 0 with --help",
+        "`harness` subcommand runs and exits 0 with --help",
+        "`init` subcommand runs and exits 0 with --help",
+        "`list` subcommand runs and exits 0 with --help",
+        "`metrics` subcommand runs and exits 0 with --help",
+        "`models` subcommand runs and exits 0 with --help",
+        "`panel` subcommand runs and exits 0 with --help",
+        "`pr-gate` subcommand runs and exits 0 with --help",
+        "`remove` subcommand runs and exits 0 with --help",
+        "`restack` subcommand runs and exits 0 with --help",
+        "`status` subcommand runs and exits 0 with --help",
+        "`trail` subcommand runs and exits 0 with --help",
+        "`update` subcommand runs and exits 0 with --help",
+        "`worktrees` subcommand runs and exits 0 with --help"
+      ]
+    },
+    {
+      "id": "agent-tools",
+      "surface": "Agent tools",
+      "paths": [
+        "agent_tools.py"
+      ],
+      "commands": [
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_cli_and_tools tests.test_plugin_registration -v'"
+      ],
+      "scenarios": [
+        "Every factonio_* tool in plugin.yaml provides_tools is registered with a JSON schema"
+      ]
+    },
+    {
+      "id": "orchestrator",
+      "surface": "Workflow card spawning & verification panels",
+      "paths": [
+        "orchestrator.py"
+      ],
+      "commands": [
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_orchestrator_and_repos tests.test_verify_panel -v'"
+      ],
+      "scenarios": [
+        "Black-box cards receive holdout/ and the harness; implement/diff cards never do",
+        "rigor=high panels fail closed unless every expected lane passes"
+      ]
+    },
+    {
+      "id": "repos",
+      "surface": "PR gate, merge, stacked PRs & worktrees",
+      "paths": [
+        "repos.py"
+      ],
+      "commands": [
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_pr_gate_and_git tests.test_stacked_prs tests.test_worktree_audit -v'"
+      ],
+      "scenarios": [
+        "`pr-gate` reports live head_sha and ready_to_merge",
+        "`restack` keeps patch-id continuity",
+        "`worktrees` audit is read-only unless --prune-safe"
+      ]
+    },
+    {
+      "id": "harness",
+      "surface": "Repo-local verification harness",
+      "paths": [
+        "harness.py"
+      ],
+      "commands": [
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_verify_harness -v'"
+      ],
+      "scenarios": [
+        "`harness check \"$PWD\" --run-doctor --run-hooks --json` exits 0 with valid: true",
+        "`harness audit \"$PWD\" --json` reports severity clean without mutating .git/index",
+        "Route/CLI discovery ignores tests/, test/, spec/, __tests__/ fixtures"
+      ]
+    },
+    {
+      "id": "observability",
+      "surface": "Decision trail, metrics & watchdog",
+      "paths": [
+        "trail.py",
+        "metrics.py",
+        "watchdog.py"
+      ],
+      "commands": [
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_trail tests.test_watchdog_liveness tests.test_watchdog_metrics_api tests.test_metrics_history -v'"
+      ],
+      "scenarios": [
+        "`trail --json` lists append-only decisions",
+        "Watchdog ticks flag silent and blocked cards",
+        "`metrics --history --json` returns chronological append-only snapshots from trail.db v2 with summary.snapshot_count"
+      ]
+    },
+    {
+      "id": "dashboard-api",
+      "surface": "HTTP API",
+      "paths": [
+        "dashboard/**"
+      ],
+      "commands": [
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_watchdog_metrics_api tests.test_orchestrator_and_repos tests.test_metrics_history -v'"
+      ],
+      "scenarios": [
+        "`GET /cards` under /api/plugins/factonio responds as documented",
+        "`GET /doctor` under /api/plugins/factonio responds as documented",
+        "`GET /metrics` under /api/plugins/factonio responds as documented",
+        "`GET /metrics/history` under /api/plugins/factonio responds as documented",
+        "`GET /models` under /api/plugins/factonio responds as documented",
+        "`GET /repos` under /api/plugins/factonio responds as documented",
+        "`GET /status` under /api/plugins/factonio responds as documented",
+        "`GET /trail` under /api/plugins/factonio responds as documented",
+        "`GET /trail/{decision_id}` under /api/plugins/factonio responds as documented",
+        "`PATCH /repos/{slug}` under /api/plugins/factonio responds as documented"
+      ]
+    },
+    {
+      "id": "desktop-ui",
+      "surface": "Desktop UI",
+      "paths": [
+        "desktop/**"
+      ],
+      "commands": [
+        "node --check desktop/plugin.js",
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_desktop_plugin -v'"
+      ],
+      "scenarios": [
+        "Zero-build ESM importing only @hermes/plugin-sdk, react and react/jsx-runtime",
+        "Dashboard, sidebar and repo editor render with host theme tokens only"
+      ]
+    },
+    {
+      "id": "skills",
+      "surface": "Bundled & contributor skills",
+      "paths": [
+        "skills/**",
+        ".agents/skills/**"
+      ],
+      "commands": [
+        "uv run --with pyyaml python tools/check_repo_integrity.py"
+      ],
+      "scenarios": [
+        "Every SKILL.md has valid frontmatter and keeps the holdout/ information barrier"
+      ]
+    },
+    {
+      "id": "repo-tooling",
+      "surface": "Repo tooling, docs & CI",
+      "paths": [
+        "tools/**",
+        "docs/**",
+        ".github/**",
+        "*.md"
+      ],
+      "commands": [
+        "uv run --with pyyaml python tools/check_repo_integrity.py",
+        "uvx ruff check --select E9,F ."
+      ],
+      "scenarios": [
+        "Manifest, skill frontmatter and local doc links stay valid",
+        "README media regenerates with tools/capture_readme_media.py"
+      ]
+    },
+    {
+      "id": "tests",
+      "surface": "Tests",
+      "paths": [
+        "tests/**"
+      ],
+      "commands": [
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest discover -s tests -v'"
+      ],
+      "scenarios": [
+        "Full suite passes from any checkout or worktree directory name"
+      ]
+    }
+  ],
+  "hooks": [
+    {
+      "name": "compileall",
+      "kind": "invariant",
+      "command": "python3 -W error -m compileall -q .",
+      "optional": false,
+      "description": "Every Python file byte-compiles with warnings as errors."
+    },
+    {
+      "name": "ruff-static",
+      "kind": "invariant",
+      "command": "uvx ruff check --select E9,F .",
+      "optional": false,
+      "description": "Ruff syntax and pyflakes checks."
+    },
+    {
+      "name": "desktop-syntax",
+      "kind": "invariant",
+      "command": "node --check desktop/plugin.js",
+      "optional": false,
+      "description": "Zero-build Desktop ESM parses."
+    },
+    {
+      "name": "repo-integrity",
+      "kind": "invariant",
+      "command": "uv run --with pyyaml python tools/check_repo_integrity.py",
+      "optional": false,
+      "description": "plugin.yaml, dashboard manifest, skill frontmatter and doc links are consistent (PyYAML via uv, as in CI)."
+    }
+  ],
+  "discovered_surfaces": {
+    "routes": [
+      "GET /cards",
+      "GET /doctor",
+      "GET /metrics",
+      "GET /metrics/history",
+      "GET /models",
+      "GET /repos",
+      "GET /status",
+      "GET /trail",
+      "GET /trail/{decision_id}",
+      "PATCH /repos/{slug}"
+    ],
+    "cli_commands": [
+      "add",
+      "doctor",
+      "harness",
+      "init",
+      "list",
+      "metrics",
+      "models",
+      "panel",
+      "pr-gate",
+      "remove",
+      "restack",
+      "status",
+      "trail",
+      "update",
+      "worktrees"
+    ],
+    "entrypoints": [
+      "plugin.yaml"
+    ]
+  }
+}

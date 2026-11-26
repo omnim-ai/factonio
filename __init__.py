@@ -58,7 +58,7 @@ RETRO_BLUEPRINT_PROMPT = """Run a Factonio `/correct` retrospective. Do not chan
 
 HARNESS_AUDIT_BLUEPRINT_PROMPT = """Run a Factonio repo verification harness drift audit. Do not edit repository code or push commits.
 
-1. List registered repositories with `hermes factonio list --json`.
+1. List registered repositories with `hermes factonio --json list`.
 2. For each repo, run `hermes factonio harness audit <repo> --json` (strictly read-only: git probes use `--no-optional-locks`; the repo is never mutated).
 3. Report per repo: `severity` (`clean` | `stale` | `missing`), `uncovered_changed_files`, `stale_features`, `orphaned_globs`, `new_routes` / `removed_routes`, `new_cli_commands` / `removed_cli_commands`, and the `recommendations`.
 4. For `missing` or `stale` repos, recommend one action each: `hermes factonio harness init <repo>` (or `--force` to refresh; declared hooks are kept) followed by a reviewed commit of `.factonio/`, or a scoped `[implement]` card via `factonio_spawn_implement` when the Drive/Feature Map scenarios need human-quality edits.

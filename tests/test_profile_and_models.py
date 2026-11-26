@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
+from typing import Iterator
+from unittest import mock
 
 from tests._env import PLUGIN_ROOT, isolated_hermes_home
 
@@ -140,6 +146,174 @@ auxiliary:
             self.assertEqual((v_diff["provider"], v_diff["model"]), ("anthropic", "claude-verifier"))
             self.assertEqual((v_bb["provider"], v_bb["model"]), ("google", "gemini-tester"))
             self.assertIsNone(check_cross_model_warning(repo_slug="acme-api"))
+
+
+def _neutral_temp_base() -> str:
+    """A writable temp base outside every path the link guard treats as ephemeral."""
+    from factonio.profile_setup import _is_ephemeral_path
+
+    for cand in (tempfile.gettempdir(), "/tmp", "/var/tmp"):
+        if os.path.isdir(cand) and os.access(cand, os.W_OK) and not _is_ephemeral_path(cand):
+            return cand
+    raise unittest.SkipTest("no writable temp directory outside ephemeral paths")
+
+
+@contextlib.contextmanager
+def _persistent_profile_home() -> Iterator[Path]:
+    """isolated_hermes_home() that the guard sees as a persistent (non-temp, non-ephemeral) Hermes home."""
+    with mock.patch.object(tempfile, "tempdir", _neutral_temp_base()):
+        ctx = isolated_hermes_home()
+        home = ctx.__enter__()
+    try:
+        elsewhere = str(home.parent / "not-the-system-temp-dir")
+        env = {k: v for k, v in os.environ.items() if k != "HERMES_SCRATCH_DIR"}
+        with mock.patch("factonio.profile_setup.tempfile.gettempdir", return_value=elsewhere), \
+                mock.patch.dict(os.environ, env, clear=True):
+            yield home
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+class TestWorkerPluginLinkGuard(unittest.TestCase):
+    def _dirs(self, home: Path) -> tuple[Path, Path]:
+        stable = home.parent / "src" / "factonio"
+        ephemeral = home.parent / "src" / "factonio" / ".worktrees" / "t_abc123"
+        ephemeral.mkdir(parents=True)
+        return stable, ephemeral
+
+    def test_ephemeral_path_and_isolated_profile_detection(self):
+        from factonio.profile_setup import _is_ephemeral_path, _is_isolated_profile_dir
+
+        with isolated_hermes_home() as home:
+            self.assertTrue(_is_ephemeral_path(home / "kanban" / "workspaces" / "t_1"))
+            self.assertTrue(_is_ephemeral_path("/srv/repo/.worktrees/t_1/sub"))
+            self.assertTrue(_is_ephemeral_path("/srv/h/profiles/factonio/cache/scratch/x"))
+            custom_ws, scratch = home.parent / "boards" / "ws", home.parent / "scr"
+            with mock.patch.dict(os.environ, {
+                "HERMES_KANBAN_WORKSPACES_ROOT": str(custom_ws), "HERMES_SCRATCH_DIR": str(scratch),
+            }):
+                self.assertTrue(_is_ephemeral_path(custom_ws / "t_9"))
+                self.assertTrue(_is_ephemeral_path(scratch / "probe"))
+            self.assertFalse(_is_ephemeral_path("/srv/dev/factonio"))
+            self.assertFalse(_is_ephemeral_path("/srv/dev/my.worktrees-notes/cache"))
+            self.assertTrue(_is_isolated_profile_dir(home / "profiles" / "factonio"))
+            self.assertTrue(_is_isolated_profile_dir("/srv/repo/.worktrees/t_1/.hermes/profiles/factonio"))
+        with _persistent_profile_home() as home:
+            self.assertFalse(_is_isolated_profile_dir(home / "profiles" / "factonio"))
+
+    def test_persistent_profile_refuses_ephemeral_target_without_force(self):
+        from factonio.profile_setup import _ensure_plugin_link, init_factonio_profile
+
+        with _persistent_profile_home() as home:
+            stable, ephemeral = self._dirs(home)
+            profile_dir = home / "profiles" / "factonio"
+            link = profile_dir / "plugins" / "factonio"
+
+            fresh = init_factonio_profile(ephemeral)
+            self.assertTrue(fresh["created"])
+            self.assertEqual(fresh["plugin_link"]["action"], "skipped_ephemeral_guard")
+            self.assertTrue(fresh["plugin_link"]["guarded"])
+            self.assertIsNone(fresh["plugin_link"]["target"])
+            self.assertIn("--force-link", fresh["plugin_link"]["warning"])
+            self.assertEqual(fresh["warnings"], [fresh["plugin_link"]["warning"]])
+            self.assertFalse(link.exists() or link.is_symlink())
+            self.assertEqual(_ensure_plugin_link(profile_dir, ephemeral)["action"], "skipped_ephemeral_guard")
+
+            first = init_factonio_profile(stable)
+            self.assertEqual(first["plugin_link"]["action"], "linked")
+            self.assertEqual(first["warnings"], [])
+
+            again = init_factonio_profile(ephemeral)
+            self.assertEqual(again["plugin_link"]["action"], "preserved_ephemeral_guard")
+            self.assertTrue(again["plugin_link"]["guarded"])
+            self.assertEqual(again["plugin_link"]["requested_target"], str(ephemeral.resolve()))
+            self.assertEqual(again["warnings"], [again["plugin_link"]["warning"]])
+            self.assertEqual(link.resolve(), stable.resolve())
+
+            forced = init_factonio_profile(ephemeral, force_plugin_link=True)
+            self.assertEqual(forced["plugin_link"]["action"], "linked")
+            self.assertNotIn("guarded", forced["plugin_link"])
+            self.assertEqual(link.resolve(), ephemeral.resolve())
+
+            back = init_factonio_profile(stable)
+            self.assertEqual(back["plugin_link"]["action"], "linked")
+            self.assertEqual(link.resolve(), stable.resolve())
+
+    def test_isolated_temp_home_may_link_ephemeral_checkout(self):
+        from factonio.profile_setup import init_factonio_profile
+
+        with isolated_hermes_home() as home:
+            _, ephemeral = self._dirs(home)
+            res = init_factonio_profile(ephemeral)
+            self.assertEqual(res["plugin_link"]["action"], "linked")
+            self.assertEqual(res["warnings"], [])
+            self.assertEqual((home / "profiles" / "factonio" / "plugins" / "factonio").resolve(), ephemeral.resolve())
+
+    def test_doctor_warns_when_persistent_link_points_into_ephemeral_path(self):
+        from factonio.profile_setup import init_factonio_profile, run_doctor
+
+        with _persistent_profile_home() as home:
+            stable, ephemeral = self._dirs(home)
+            init_factonio_profile(stable)
+            doc = run_doctor(stable)
+            link_check = next(c for c in doc["checks"] if c["name"] == "worker_plugin_link")
+            self.assertTrue(link_check["ok"])
+            self.assertNotIn("ephemeral", link_check)
+            self.assertFalse(any("ephemeral path" in w for w in doc["warnings"]))
+
+            init_factonio_profile(ephemeral, force_plugin_link=True)
+            doc = run_doctor(stable)
+            link_check = next(c for c in doc["checks"] if c["name"] == "worker_plugin_link")
+            self.assertTrue(link_check["ok"])
+            self.assertIs(link_check["ephemeral"], True)
+            hits = [w for w in doc["warnings"] if "ephemeral path" in w]
+            self.assertEqual(len(hits), 1)
+            self.assertIn(str(ephemeral.resolve()), hits[0])
+
+        with isolated_hermes_home() as home:
+            _, ephemeral = self._dirs(home)
+            init_factonio_profile(ephemeral)
+            doc = run_doctor(ephemeral)
+            self.assertFalse(any("ephemeral path" in w for w in doc["warnings"]))
+
+    def test_cli_init_force_link_flag(self):
+        import argparse
+        import io
+        import json
+
+        from factonio.commands import register_cli
+
+        class _Ctx:
+            def __init__(self) -> None:
+                self.cli: dict = {}
+
+            def register_cli_command(self, name, *, help, setup_fn, handler_fn):
+                self.cli[name] = (setup_fn, handler_fn)
+
+            def __getattr__(self, name):
+                return lambda *a, **kw: None
+
+        with _persistent_profile_home() as home:
+            stable, ephemeral = self._dirs(home)
+            ctx = _Ctx()
+            register_cli(ctx, ephemeral)
+            setup_fn, handler_fn = ctx.cli["factonio"]
+            parser = argparse.ArgumentParser(prog="hermes factonio")
+            setup_fn(parser)
+
+            def run(*argv: str) -> dict:
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    handler_fn(parser.parse_args(list(argv)))
+                return json.loads(out.getvalue())
+
+            guarded = run("--json", "init")
+            self.assertEqual(guarded["plugin_link"]["action"], "skipped_ephemeral_guard")
+            forced = run("--json", "init", "--force-link")
+            self.assertEqual(forced["plugin_link"]["action"], "linked")
+            self.assertEqual(
+                (home / "profiles" / "factonio" / "plugins" / "factonio").resolve(), ephemeral.resolve()
+            )
 
 
 if __name__ == "__main__":

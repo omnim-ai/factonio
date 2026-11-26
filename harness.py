@@ -44,6 +44,8 @@ SKIP_DIRS = frozenset({
     "__pycache__", ".mypy_cache", ".ruff_cache", ".pytest_cache", ".tox", ".nox", "dist", "build",
     "target", "vendor", ".next", ".nuxt", "coverage", ".cache", "site-packages",
 })
+# Top-level test directories: their files feed the `tests` feature but never route/CLI discovery.
+_TEST_DIRS = frozenset({"tests", "test", "spec", "__tests__"})
 SCAN_EXTS = frozenset({".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".go", ".rs", ".rb"})
 SOURCE_EXTS = SCAN_EXTS | frozenset({
     ".java", ".kt", ".kts", ".swift", ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".php", ".sh",
@@ -464,7 +466,7 @@ def detect_repo_profile(repo_path: str | Path) -> dict[str, Any]:
             source_files.append(rel)
         if ext in _LANG_BY_EXT:
             add_stack(_LANG_BY_EXT[ext])
-        if ext not in SCAN_EXTS:
+        if ext not in SCAN_EXTS or ("/" in rel and rel.split("/", 1)[0] in _TEST_DIRS):
             continue
         text = _read_text(root / rel)
         if not text:
@@ -584,7 +586,7 @@ def _build_feature_map(profile: dict[str, Any]) -> list[dict[str, Any]]:
             paths = [f"*{ext}" for ext in exts]
         feat_routes = [r for r, src in profile["route_sources"].items() if src in members]
         feat_cli = [c for c, src in profile["cli_sources"].items() if src in members]
-        if top in {"tests", "test", "spec", "__tests__"}:
+        if top in _TEST_DIRS:
             surface = "Tests"
         elif feat_routes:
             surface = "HTTP API"
