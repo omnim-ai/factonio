@@ -2117,12 +2117,18 @@ def _holdout_in_command(command: str, depth: int = 0) -> Optional[str]:
             hits = _code_findings(inline[1], "implement", depth + 1, _interp_lang(verb) or "other")
             if hits:
                 return hits[0][1]
+        for path in _git_object_paths(seg):
+            if _HOLDOUT_TOKEN_RE.search(_norm_path(path)):
+                return path
         grep = _grep_parse(seg)
         skip = grep["skip"] if grep else set()
         for i, tok in enumerate(seg):
             if i in skip or i == code_idx:
                 continue
             if _HOLDOUT_TOKEN_RE.search(tok) and not _is_excluded(seg, i):
+                return tok
+            # ``git show $(git rev-parse HEAD):holdout/x`` splits into a ``:holdout/x`` word.
+            if tok.startswith(":") and any(_HOLDOUT_TOKEN_RE.search(_norm_path(p)) for p in _rev_path_suffixes(tok)):
                 return tok
     return None
 
@@ -2138,6 +2144,31 @@ def _git_subcommand(seg: list[str]) -> tuple[Optional[str], list[str]]:
         else:
             return tok, seg[i + 1:]
     return None, []
+
+
+# Subcommands whose ``a:b`` operands are refspecs/URLs, not ``<rev>:<path>`` object reads.
+_GIT_REFSPEC_SUBCOMMANDS = frozenset({"push", "fetch", "pull", "clone", "remote", "config", "submodule"})
+
+
+def _git_object_paths(seg: list[str]) -> list[str]:
+    """Path portions of Git ``<rev>:<path>`` operands (``HEAD:x``, ``:0:x``, ``:x``) in a git command.
+
+    ``git show HEAD:holdout/x`` / ``git cat-file -p HEAD:src/app.py`` read file contents from the
+    object database. Every suffix after a ``:`` is returned, so ``:0:x`` and revs that contain
+    ``:`` both yield the real path.
+    """
+    if not seg or PurePosixPath(seg[0]).name != "git":
+        return []
+    sub, rest = _git_subcommand(seg)
+    if sub is None or sub in _GIT_REFSPEC_SUBCOMMANDS:
+        return []
+    return [path for tok in rest if not tok.startswith("-") for path in _rev_path_suffixes(tok)]
+
+
+def _rev_path_suffixes(tok: str) -> list[str]:
+    if "://" in tok:
+        return []
+    return [tok[i + 1:] for i, ch in enumerate(tok) if ch == ":" and tok[i + 1:]]
 
 
 # ``gh`` global / inherited options that consume the next token (unless given as ``--opt=value``).
@@ -2323,6 +2354,7 @@ def _blackbox_command_findings(command: str, depth: int = 0) -> list[tuple[str, 
             if diffy:
                 found.append(("diff_inspection", " ".join(seg)))
                 continue
+            found.extend(("source_read", p) for p in _git_object_paths(seg) if _is_source_target(p))
         if verb == "gh" and _gh_subcommands(seg)[:2] == ["pr", "diff"]:
             found.append(("diff_inspection", " ".join(seg)))
             continue

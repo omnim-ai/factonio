@@ -2076,5 +2076,78 @@ class TestFixRound7GhGlobalOptions(unittest.TestCase):
             self.assertEqual((code, out["clean"]), (0, True), out)
 
 
+class TestFixRound8GitObjectPaths(unittest.TestCase):
+    """Fix round 8: Git ``<rev>:<path>`` operands read file contents from the object database."""
+
+    PHASES = ("implement", "design", "verify-diff")
+    LEAKS = ("git show HEAD:holdout/synthetic.md", "git show HEAD:./holdout/synthetic.md",
+             "git cat-file -p HEAD:holdout/synthetic.md", "git show :0:holdout/synthetic.md",
+             "git show origin/main:holdout/synthetic.md", "git show :holdout/synthetic.md",
+             "git --no-pager show HEAD~1:holdout", "git show $(git rev-parse HEAD):holdout/synthetic.md",
+             "bash -c 'git cat-file blob HEAD:holdout/synthetic.md'")
+    CLEAN = ("git show HEAD:README.md", "git show HEAD:.factonio/verify.md",
+             "echo 'never run git show HEAD:holdout/synthetic.md'", "git push origin HEAD:refs/heads/topic")
+    BLACKBOX_SOURCE = ("git cat-file -p HEAD:src/app.py", "git cat-file blob origin/main:./src/app.py")
+    BLACKBOX_CLEAN = ("git cat-file -p HEAD:holdout/synthetic.md", "git cat-file -p HEAD:README.md",
+                      "echo 'never run git show HEAD:src/app.py'")
+
+    def test_holdout_rev_paths_flagged_in_forbidden_phases(self):
+        from factonio.eval_skills import audit_barrier_leaks
+
+        for phase in self.PHASES:
+            for cmd in self.LEAKS:
+                with self.subTest(phase=phase, cmd=cmd):
+                    res = audit_barrier_leaks(_term(cmd), phase=phase)
+                    self.assertEqual({f["rule"] for f in res["findings"]}, {"holdout_access"}, res)
+            for cmd in self.CLEAN:
+                with self.subTest(phase=phase, control=cmd):
+                    self.assertTrue(audit_barrier_leaks(_term(cmd), phase=phase)["clean"], cmd)
+
+    def test_python_subprocess_rev_path(self):
+        from factonio.eval_skills import audit_barrier_leaks
+
+        res = audit_barrier_leaks(_code('import subprocess\nsubprocess.run(["git", "show", "HEAD:holdout/s.md"])'),
+                                  phase="design")
+        self.assertEqual({f["rule"] for f in res["findings"]}, {"holdout_access"}, res)
+
+    def test_blackbox_rev_source_reads(self):
+        from factonio.eval_skills import audit_barrier_leaks
+
+        for cmd in self.BLACKBOX_SOURCE:
+            with self.subTest(cmd=cmd):
+                res = audit_barrier_leaks(_term(cmd), phase="verify-blackbox")
+                self.assertEqual({f["rule"] for f in res["findings"]}, {"source_read"}, res)
+        for cmd in ("git show HEAD:src/app.py", "git show HEAD:README.md"):
+            with self.subTest(diff=cmd):
+                res = audit_barrier_leaks(_term(cmd), phase="verify-blackbox")
+                self.assertEqual({f["rule"] for f in res["findings"]}, {"diff_inspection"}, res)
+        for cmd in self.BLACKBOX_CLEAN:
+            with self.subTest(control=cmd):
+                self.assertTrue(audit_barrier_leaks(_term(cmd), phase="verify-blackbox")["clean"], cmd)
+
+    def test_ab_and_standalone_cli(self):
+        with isolated_hermes_home() as home:
+            for phase in self.PHASES:
+                for cmd in self.LEAKS[:4]:
+                    with self.subTest(phase=phase, cmd=cmd):
+                        res = _forced_judge_term_ab(cmd, phase)
+                        self.assertEqual([res["key"][s] for s in res["disqualified"]], ["subject"], res)
+                        self.assertNotEqual(res["winner_label"], "subject", res)
+                        code, out = _standalone_transcript_audit(_term(cmd), home, phase)
+                        self.assertEqual((code, out["clean"]), (1, False), out)
+                        self.assertEqual([f["rule"] for f in out["results"][0]["findings"]], ["holdout_access"])
+                for cmd in self.CLEAN[:3]:
+                    with self.subTest(phase=phase, control=cmd):
+                        res = _forced_judge_term_ab(cmd, phase)
+                        self.assertEqual((res["disqualified"], res["winner_label"]), ([], "subject"))
+                        code, out = _standalone_transcript_audit(_term(cmd), home, phase)
+                        self.assertEqual((code, out["clean"]), (0, True), out)
+            cmd = self.BLACKBOX_SOURCE[0]
+            res = _forced_judge_term_ab(cmd, "verify-blackbox")
+            self.assertEqual([res["key"][s] for s in res["disqualified"]], ["subject"], res)
+            code, out = _standalone_transcript_audit(_term(cmd), home, "verify-blackbox")
+            self.assertEqual((code, [f["rule"] for f in out["results"][0]["findings"]]), (1, ["source_read"]), out)
+
+
 if __name__ == "__main__":
     unittest.main()
