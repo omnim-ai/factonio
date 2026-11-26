@@ -607,9 +607,12 @@ def _bare_model_name(model: str) -> str:
 def check_cross_model_warning(*, repo_slug: Optional[str] = None) -> Optional[str]:
     """Return a non-blocking warning when Verification is not independent of Implementation.
 
-    Warns on the exact same model (including the same model reached through a router such
-    as ``openrouter``), and on different models from the same vendor/model family, since
-    same-family reviewers share blind spots.
+    Warns on the exact same model (including the same model reached through a multi-vendor
+    router such as ``nous`` or ``openrouter``), and on different models from the same
+    vendor/model family, since same-family reviewers share blind spots. A single multi-vendor
+    router provider (e.g. ``nous``, ``openrouter``, ``vertex``, ``bedrock``) satisfies
+    cross-vendor independence when Implementation and Verification pick models from different
+    vendor families (e.g. ``anthropic/...`` vs ``openai/...`` or ``google/...``).
     """
     impl = resolve_phase_model("implement", repo_slug=repo_slug)
     verify = resolve_phase_model("verify", repo_slug=repo_slug)
@@ -620,7 +623,9 @@ def check_cross_model_warning(*, repo_slug: Optional[str] = None) -> Optional[st
         label = _model_label(impl) if same_exact else f"{_model_label(impl)} vs {_model_label(verify)}"
         return (
             f"Verification uses the same model as Implementation ({label}). "
-            "Configure `factonio_verify` in `hermes model` (Auxiliary Models) for cross-model independence."
+            "Configure `factonio_verify` in `hermes model` (Auxiliary Models) with a model from a "
+            "different vendor family for cross-model independence (multi-vendor routers such as "
+            "`nous`, `openrouter`, `vertex`, or `bedrock` can supply both on a single provider)."
         )
     impl_vendor = infer_model_vendor(impl.get("provider"), impl.get("model"))
     verify_vendor = infer_model_vendor(verify.get("provider"), verify.get("model"))
@@ -628,7 +633,8 @@ def check_cross_model_warning(*, repo_slug: Optional[str] = None) -> Optional[st
         return (
             f"Verification ({_model_label(verify)}) and Implementation ({_model_label(impl)}) use the same "
             f"vendor/model family ({impl_vendor}). Configure `factonio_verify` in `hermes model` (Auxiliary Models) "
-            "with a model from a different vendor for cross-model independence."
+            "with a model from a different vendor family for cross-model independence (multi-vendor routers such as "
+            "`nous`, `openrouter`, `vertex`, or `bedrock` can supply both on a single provider)."
         )
     return None
 
@@ -684,11 +690,29 @@ _VENDOR_ALIASES: dict[str, str] = {
     "minimax": "minimax",
     "microsoft": "microsoft",
     "phi": "microsoft",
+    "xiaomi": "xiaomi",
+    "mimo": "xiaomi",
+    "tencent": "tencent",
+    "hunyuan": "tencent",
+    "hy3": "tencent",
+    "hy4": "tencent",
+    "stepfun": "stepfun",
+    "step": "stepfun",
+    "nvidia": "nvidia",
+    "nemotron": "nvidia",
+    "sakana": "sakana",
+    "fugu": "sakana",
+    "upstage": "upstage",
+    "solar": "upstage",
+    "arcee": "arcee",
+    "trinity": "arcee",
 }
 
 # Providers that front many vendors; the model id (not the provider) identifies the family.
 _ROUTER_PROVIDERS: frozenset[str] = frozenset(
     {
+        "nous",
+        "nous-portal",
         "openrouter",
         "vertex",
         "vertex-ai",
@@ -696,6 +720,7 @@ _ROUTER_PROVIDERS: frozenset[str] = frozenset(
         "google-vertex",
         "bedrock",
         "aws-bedrock",
+        "azure-foundry",
         "together",
         "fireworks",
         "groq",
@@ -703,6 +728,16 @@ _ROUTER_PROVIDERS: frozenset[str] = frozenset(
         "huggingface",
         "nebius",
         "nvidia",
+        "kilocode",
+        "gmi",
+        "novita",
+        "opencode-go",
+        "opencode-zen",
+        "chutes",
+        "cerebras",
+        "sambanova",
+        "siliconflow",
+        "portkey",
         "ollama",
         "lmstudio",
         "litellm",
@@ -736,8 +771,8 @@ def _vendor_from_token(token: str) -> Optional[str]:
 def infer_model_vendor(provider: Optional[str], model: Optional[str]) -> Optional[str]:
     """Infer the vendor/model family (e.g. ``anthropic``, ``openai``, ``google``) of a model.
 
-    The model id is inspected first so multi-vendor routers (``openrouter``, ``vertex``,
-    ``bedrock``, ...) resolve to the underlying family (``anthropic/claude-...``,
+    The model id is inspected first so multi-vendor routers (``nous``, ``openrouter``,
+    ``vertex``, ``bedrock``, ...) resolve to the underlying family (``anthropic/claude-...``,
     ``us.anthropic.claude-...``, ``gemini-2.5-pro``). The provider is used only when the
     model id is not recognizable and the provider is a first-party vendor. Returns ``None``
     when the family cannot be determined.
@@ -919,7 +954,7 @@ def validate_verify_panel(raw_entries: Any, *, source: str = "override") -> dict
             warning = (
                 f"rigor=high requires at least 2 distinct known vendor families; {known}the vendor of "
                 f"{', '.join(unknown)} could not be inferred ({source}). Use vendor-prefixed model ids "
-                "(e.g. `openrouter/anthropic/...`)."
+                "(e.g. `nous/anthropic/...`, `nous/openai/...`, or `openrouter/google/...`)."
             )
         else:
             warning = (

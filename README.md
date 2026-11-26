@@ -112,8 +112,10 @@ Factonio registers five native Hermes Auxiliary Model slots:
 | `factonio_define` | Definition | Strong reasoning/planning model |
 | `factonio_design` | Phase 1b Design (optional) | UI/frontend-capable model |
 | `factonio_implement` | Implementation | Fast, accurate coding model |
-| `factonio_verify` | Diff + Black-Box Verification | **Different provider/model from Implementation** for cross-model independence |
+| `factonio_verify` | Diff + Black-Box Verification | **Different vendor family from Implementation** for cross-model independence (e.g. Claude vs GPT or Gemini) |
 | `factonio_watchdog` | Ambiguous stall triage (optional) | Low-cost fast model |
+
+> **Single-provider multi-vendor routers work out of the box:** If you use **Nous Portal (`nous`)**, **OpenRouter (`openrouter`)**, **Vertex (`vertex`)**, **Bedrock (`bedrock`)**, or another multi-vendor router, you do **not** need a second chat provider for cross-vendor verification or `rigor="high"` panels — simply pick models from different vendor families on that same provider (for example `nous` with `anthropic/claude-...` for `factonio_implement` and `nous` with `openai/gpt-...` or `google/gemini-...` for `factonio_verify`).
 
 Set them in `hermes model` → **Auxiliary Models** or Hermes Desktop **Settings → Model → Auxiliary**, then verify the resolved matrix:
 
