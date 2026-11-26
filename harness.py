@@ -11,7 +11,6 @@ drift (`doc_drift` / `harness_gap` / `product_regression`), and audits drift rea
 
 from __future__ import annotations
 
-import difflib
 import json
 import math
 import os
@@ -1673,6 +1672,10 @@ _ENV_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 
 
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "busybox"})
+_SHELL_LONG_VALUE_OPTS = frozenset({"--rcfile", "--init-file"})
+_SH_ARGS_HEAD = "_"  # placeholder command carrying `sh -c SCRIPT` positional arguments ($0, $1, ...)
+# Builtins whose assignments set the environment of every later command, like a bare `VAR=val` command.
+_ENV_BUILTINS = frozenset({"export", "declare", "typeset", "local", "readonly"})
 _SHELL_PUNCT = frozenset("();<>|&\n")
 _MAX_SHELL_DEPTH = 4
 
@@ -1898,6 +1901,8 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
                     break
                 j += 1
                 if opt.startswith("--"):
+                    if opt in _SHELL_LONG_VALUE_OPTS and j < len(tokens):
+                        j += 1  # `bash --rcfile FILE -c ...`: the option takes the next word
                     continue
                 has_c = has_c or "c" in opt[1:]
                 if opt[-1] in ("o", "O") and j < len(tokens):
@@ -1906,7 +1911,12 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
                 j += 1
             if has_c and j < len(tokens):
                 out.extend([";", *_unwrap_shell_scripts(_split_shell(tokens[j]), depth + 1), ";"])
-                i = j + 1
+                # `sh -c SCRIPT $0 $1...`: the script reads them as "$0"/"$@", so they are scanned as arguments
+                # of a non-exempt placeholder command rather than letting `$0` pose as an exempt command head.
+                end = next((k for k in range(j + 1, len(tokens)) if _is_shell_op(tokens[k])), len(tokens))
+                if end > j + 1:
+                    out.extend([_SH_ARGS_HEAD, *tokens[j + 1:end]])
+                at_head, i = False, end
                 continue
         out.append(tok)
         at_head = False
@@ -2003,7 +2013,7 @@ def _shell_args_start(seg: list[str], i: int) -> int:
     while i < len(seg) and seg[i][:1] in ("-", "+") and len(seg[i]) > 1 and seg[i] != "--":
         if _is_gate_flag(seg[i]):
             return i
-        i += 2 if seg[i][-1] in ("o", "O") else 1
+        i += 2 if seg[i][-1] in ("o", "O") or seg[i] in _SHELL_LONG_VALUE_OPTS else 1
     if i < len(seg) and seg[i] == "--":
         i += 1
     return i + 1
@@ -2047,13 +2057,40 @@ def _regen_flags(tokens: list[str]) -> set[str]:
     return found
 
 
-_Occurrences = dict[str, list[tuple[str, Optional[float]]]]
+# A finite threshold as (value, given in `%`); a percentage is stored as its ratio (`5%` -> 0.05).
+_Threshold = tuple[float, bool]
+_Occurrences = dict[str, list[tuple[str, Optional[_Threshold]]]]
+
+
+def _parse_threshold(raw: str) -> Optional[_Threshold]:
+    pct = raw.endswith("%")
+    try:
+        value = float(raw[:-1] if pct else raw)
+    except ValueError:
+        return None
+    if not math.isfinite(value):
+        return None
+    return (value / 100.0, True) if pct else (value, False)
+
+
+def _fmt_threshold(t: _Threshold) -> str:
+    return f"{t[0] * 100:g}%" if t[1] else f"{t[0]:g}"
+
+
+def _unit_ambiguous(a: _Threshold, b: _Threshold) -> bool:
+    """`%` against a plain number above 1 (pixels, or a 0-100 scale?) has no safe ordering; a plain number in
+    [0, 1] is a ratio comparable with a percentage."""
+    return a[1] != b[1] and (b if a[1] else a)[0] > 1.0
+
+
+def _looser(live: _Threshold, base: _Threshold) -> bool:
+    return _unit_ambiguous(live, base) or live[0] > base[0]
 
 
 def _threshold_occurrences(tokens: list[str]) -> tuple[_Occurrences, set[int]]:
-    """Every threshold-like option/assignment in command order as ``(raw, finite value or None)`` plus the token
-    indexes they occupy; nothing is overwritten, so a loosened, removed or non-finite earlier occurrence cannot
-    hide behind a later one."""
+    """Every threshold-like option/assignment in command order as ``(raw, finite threshold or None)`` plus the
+    token indexes they occupy; nothing is overwritten, so a loosened, removed or non-finite earlier occurrence
+    cannot hide behind a later one."""
     found: _Occurrences = {}
     used: set[int] = set()
     for i, tok in enumerate(tokens):
@@ -2072,13 +2109,7 @@ def _threshold_occurrences(tokens: list[str]) -> tuple[_Occurrences, set[int]]:
         if not key or not _THRESHOLD_KEY_RE.search(key):
             continue
         raw = val.strip()
-        try:
-            parsed: Optional[float] = float(raw.rstrip("%"))
-        except ValueError:
-            parsed = None
-        if parsed is not None and not math.isfinite(parsed):
-            parsed = None
-        found.setdefault(key.lower().replace("_", "-"), []).append((raw, parsed))
+        found.setdefault(key.lower().replace("_", "-"), []).append((raw, _parse_threshold(raw)))
         used |= span
     return found, used
 
@@ -2093,27 +2124,40 @@ def _threshold_segments(tokens: list[str]) -> list[tuple[tuple[str, ...], _Occur
     return out
 
 
-def _compare_thresholds(key: str, base_vals: list[float], live_vals: list[float], where: str) -> list[str]:
+def _compare_thresholds(key: str, base_vals: list[_Threshold], live_vals: list[_Threshold],
+                        where: str) -> list[str]:
     """Reasons ``live_vals`` loosen ``base_vals`` (positional, with any extra occurrence capped by the base max)."""
     if not base_vals:
         return []
-    base_s, live_s = ", ".join(f"{v:g}" for v in base_vals), ", ".join(f"{v:g}" for v in live_vals)
+    base_s, live_s = ", ".join(map(_fmt_threshold, base_vals)), ", ".join(map(_fmt_threshold, live_vals))
     if not live_vals:
         return [f"removes threshold `{key}={base_s}`{where} (falls back to the tool default)"]
     reasons: list[str] = []
     if len(live_vals) < len(base_vals):
         reasons.append(f"removes {len(base_vals) - len(live_vals)} of {len(base_vals)} `{key}` threshold(s) "
                        f"({base_s} -> {live_s}){where}")
-    if max(live_vals) > max(base_vals) or any(c > b for b, c in zip(base_vals, live_vals)):
+    top = max(base_vals, key=lambda t: t[0])
+    pairs = [*zip(base_vals, live_vals), *((top, c) for c in live_vals[len(base_vals):])]
+    if any(_unit_ambiguous(c, b) for b, c in pairs):
+        reasons.append(f"changes threshold `{key}` unit from {base_s} to {live_s}{where} (`%` against a plain "
+                       "value above 1 cannot be ordered)")
+    elif any(c[0] > b[0] for b, c in pairs):
         reasons.append(f"loosens threshold `{key}` from {base_s} to {live_s}{where}")
     return reasons
 
 
+def _is_env_modifier(sig: tuple[str, ...]) -> bool:
+    """A bare `VAR=val`, `export`/`declare`/... or `sh -c` argument segment: it feeds every check rather than
+    being an independent check with its own bar."""
+    return not sig or sig[0] == _SH_ARGS_HEAD or _system_name(sig[0]) in _ENV_BUILTINS
+
+
 def _threshold_loosening(base_tokens: list[str], live_tokens: list[str]) -> list[str]:
-    """Threshold loosening, aligning base and live simple commands by normalized signature: a matched command
-    must keep every threshold at or below its base value, while thresholds of commands that no longer match
-    (renamed, restructured, removed) are pooled and may not shrink in count, rise above the base max, or rise
-    positionally. A brand-new command may carry its own threshold; a non-finite one is always loosening."""
+    """Threshold loosening, aligning base and live simple commands: first by identical signature (in any order),
+    then a single edited command or a unique target (executable + positional words) on each side. Each aligned
+    pair keeps every threshold at or below its base value; a still-ambiguous mapping fails closed when any live
+    threshold exceeds the strictest unaligned base one, so budgets never transfer between targets. Environment
+    assignments are compared globally; a brand-new command (every base command aligned) may carry its own bar."""
     reasons: list[str] = []
     base_segs, live_segs = _threshold_segments(base_tokens), _threshold_segments(live_tokens)
 
@@ -2126,44 +2170,79 @@ def _threshold_loosening(base_tokens: list[str], live_tokens: list[str]) -> list
                 else:
                     reasons.append(f"sets non-finite or unparseable threshold `{key}={raw}`")
 
-    def finite(occ: _Occurrences, key: str) -> list[float]:
+    def finite(occ: _Occurrences, key: str) -> list[_Threshold]:
         return [v for _, v in occ.get(key, []) if v is not None]
 
-    matcher = difflib.SequenceMatcher(None, [sig for sig, _ in base_segs], [sig for sig, _ in live_segs],
-                                      autojunk=False)
-    matched_base: set[int] = set()
-    matched_live: set[int] = set()
-    for block in matcher.get_matching_blocks():
-        for k in range(block.size):
-            bi, li = block.a + k, block.b + k
-            matched_base.add(bi)
-            matched_live.add(li)
-            (sig, b_occ), (_, l_occ) = base_segs[bi], live_segs[li]
-            where = f" in `{' '.join(sig)[:80]}`"
-            for key in sorted({*b_occ, *l_occ}):
-                b_vals, l_vals = finite(b_occ, key), finite(l_occ, key)
-                if not b_vals and any(v > 0 for v in l_vals) and not any(v is None for _, v in b_occ.get(key, [])):
-                    reasons.append(f"adds loosening threshold `{key}={max(l_vals):g}`{where}")
-                reasons.extend(_compare_thresholds(key, b_vals, l_vals, where))
+    def pooled(segs: list[tuple[tuple[str, ...], _Occurrences]], idxs: list[int]) -> dict[str, list[_Threshold]]:
+        out: dict[str, list[_Threshold]] = {}
+        for idx in idxs:
+            for key in segs[idx][1]:
+                out.setdefault(key, []).extend(finite(segs[idx][1], key))
+        return out
 
-    pool_base: dict[str, list[float]] = {}
-    pool_live: dict[str, list[float]] = {}
-    for idx, (_, occ) in enumerate(base_segs):
-        if idx not in matched_base:
-            for key in occ:
-                pool_base.setdefault(key, []).extend(finite(occ, key))
-    for idx, (_, occ) in enumerate(live_segs):
-        if idx not in matched_live:
-            for key in occ:
-                pool_live.setdefault(key, []).extend(finite(occ, key))
-    for key in sorted(pool_base):
-        reasons.extend(_compare_thresholds(key, pool_base[key], pool_live.get(key, []), " in a changed command"))
-    if len(matched_base) < len(base_segs):
-        # A base command was edited (even by an unrelated `--verbose`), so a threshold it never set is new
-        # tolerance on an existing check, not a brand-new check's own bar.
-        for key in sorted(set(pool_live) - set(pool_base)):
-            if any(v > 0 for v in pool_live[key]):
-                reasons.append(f"adds loosening threshold `{key}={max(pool_live[key]):g}` in a changed command")
+    def compare_pair(bi: int, li: int) -> None:
+        (sig, b_occ), (_, l_occ) = base_segs[bi], live_segs[li]
+        where = f" in `{' '.join(sig)[:80]}`"
+        for key in sorted({*b_occ, *l_occ}):
+            b_vals, l_vals = finite(b_occ, key), finite(l_occ, key)
+            if not b_vals and any(v[0] > 0 for v in l_vals) and not any(v is None for _, v in b_occ.get(key, [])):
+                reasons.append(f"adds loosening threshold `{key}={_fmt_threshold(max(l_vals))}`{where}")
+            reasons.extend(_compare_thresholds(key, b_vals, l_vals, where))
+
+    def ident(sig: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(t for t in sig if not t.startswith("-"))
+
+    base_env = [k for k, (sig, _) in enumerate(base_segs) if _is_env_modifier(sig)]
+    live_env = [k for k, (sig, _) in enumerate(live_segs) if _is_env_modifier(sig)]
+    unmatched_base: list[int] = []
+    unmatched_live = [k for k in range(len(live_segs)) if k not in live_env]
+    for bi in (k for k in range(len(base_segs)) if k not in base_env):
+        li = next((li for li in unmatched_live if live_segs[li][0] == base_segs[bi][0]), None)
+        if li is None:
+            unmatched_base.append(bi)
+        else:
+            unmatched_live.remove(li)
+            compare_pair(bi, li)
+    for bi in list(unmatched_base):
+        target = ident(base_segs[bi][0])
+        cands = [li for li in unmatched_live if ident(live_segs[li][0]) == target]
+        rivals = [b for b in unmatched_base if ident(base_segs[b][0]) == target]
+        if len(cands) == 1 and len(rivals) == 1:
+            unmatched_base.remove(bi)
+            unmatched_live.remove(cands[0])
+            compare_pair(bi, cands[0])
+    if len(unmatched_base) == 1 and len(unmatched_live) == 1:
+        compare_pair(unmatched_base[0], unmatched_live[0])
+    elif unmatched_base:
+        pool_base, pool_live = pooled(base_segs, unmatched_base), pooled(live_segs, unmatched_live)
+        where = " in a changed command"
+        for key in sorted({*pool_base, *pool_live}):
+            b_vals, l_vals = pool_base.get(key, []), pool_live.get(key, [])
+            if not l_vals or len(l_vals) < len(b_vals):
+                reasons.extend(_compare_thresholds(key, b_vals, l_vals, where))
+            elif b_vals:
+                strictest = min(b_vals, key=lambda t: t[0])
+                if any(_looser(c, strictest) for c in l_vals):
+                    reasons.append(f"ambiguous threshold/command mutation: `{key}` "
+                                   f"{', '.join(map(_fmt_threshold, l_vals))} exceeds the strictest base "
+                                   f"{_fmt_threshold(strictest)}{where} (cannot align edited commands by target)")
+            elif any(v[0] > 0 for v in l_vals):
+                reasons.append(f"adds loosening threshold `{key}={_fmt_threshold(max(l_vals))}`{where}")
+
+    env_base, env_live = pooled(base_segs, base_env), pooled(live_segs, live_env)
+    all_base = pooled(base_segs, list(range(len(base_segs))))
+    where = " in a shell environment assignment"
+    for key in sorted({*env_base, *env_live}):
+        b_vals, l_vals = sorted(env_base.get(key, [])), sorted(env_live.get(key, []))
+        if b_vals:
+            reasons.extend(_compare_thresholds(key, b_vals, l_vals, where))
+            continue
+        ref = all_base.get(key)
+        strictest = min(ref, key=lambda t: t[0]) if ref else None
+        bad = [c for c in l_vals if (_looser(c, strictest) if strictest else c[0] > 0)]
+        if bad:
+            reasons.append(f"adds loosening threshold `{key}={_fmt_threshold(max(bad))}`{where} "
+                           "(applies to every later command)")
     return reasons
 
 

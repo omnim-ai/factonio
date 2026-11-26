@@ -2761,5 +2761,130 @@ class TestFixRound6ChangedCommandThresholdsFallbacksPathsAndRedirects(unittest.T
             self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
 
 
+
+class TestFixRound7TargetAwareThresholdsUnitsEnvAndShellArgs(unittest.TestCase):
+    """Thresholds never transfer between edited/reordered targets, `%` keeps its unit, environment assignments are
+    never exempt as new checks, and `sh -c SCRIPT $0 ARGS` / `bash --rcfile FILE -c` are parsed POSIX-correctly."""
+
+    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_cases = TestFixRound4CompoundThresholdsAndShortFlags._assert_cases
+
+    _PIXELS = ("import sys\n"
+               "diff = {'a': 0.25, 'b': 0.0}[sys.argv[1]]\n"
+               "sys.exit(1 if diff > float(sys.argv[sys.argv.index('--threshold') + 1]) else 0)\n")
+    _PERCENT = ("import sys\n"
+                "raw = sys.argv[sys.argv.index('--threshold') + 1]\n"
+                "t = float(raw[:-1]) / 100 if raw.endswith('%') else float(raw)\n"
+                "sys.exit(1 if 0.25 > t else 0)\n")
+    _ENV = "import os, sys\nsys.exit(1 if 0.25 > float(os.environ.get('THRESHOLD', '0.01')) else 0)\n"
+    _REGEN = "import sys\nsys.exit(0 if '-u' in sys.argv else 1)\n"
+
+    def _assert_end_to_end(self, script: str, base: Any, loosening: list[Any], clean: list[Any], *,
+                           base_fails: bool = True) -> None:
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo = self._visual_repo(home, base, name="svc")
+            for name in ("pixels.py", "check.py"):
+                _write(repo, name, script)
+            _commit_all(repo, "visual check script")
+            committed = check_harness(str(repo), run_hooks=True)
+            self.assertEqual(committed["hook_results"]["failed_required"], ["pixels"] if base_fails else [])
+            for live in loosening:
+                with self.subTest(live=live):
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(chk["hook_results"]["failed_required"], [], chk["hook_results"])
+                    self.assertFalse(chk["valid"])
+                    self.assertTrue(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+                    audit = audit_harness(str(repo))
+                    self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("stale", True))
+            for live in clean:
+                with self.subTest(clean=live):
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo))
+                    self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+
+    def test_thresholds_keep_target_identity_across_edited_reordered_commands(self):
+        a, b = "python3 pixels.py a", "python3 pixels.py b"
+        base = f"{a} --threshold 0.01 && {b} --threshold 0.9"
+        self._assert_cases({
+            "edited + reordered budget swap": (base, f"{b} --verbose --threshold 0.01 && {a} --verbose --threshold 0.5",
+                                               True),
+            "exact reorder": (base, f"{b} --threshold 0.9 && {a} --threshold 0.01", False),
+            "edited + reordered tightening": (base, f"{b} --verbose --threshold 0.5 && {a} --verbose "
+                                                    "--threshold 0.005", False),
+            "single edited command tightened": ("python3 check.py --threshold 0.05",
+                                                "python3 check.py --verbose --threshold 0.01", False),
+            "ambiguous renamed targets": (base, "x --threshold 0.01 && y --threshold 0.5", True),
+            "ambiguous renamed targets same strictest": (base, "x --threshold 0.01 && y --threshold 0.01", False),
+            "target removed among edits": (base, f"{b} --verbose --threshold 0.9", True),
+        })
+        self._assert_end_to_end(self._PIXELS, base,
+                                [f"{b} --verbose --threshold 0.01 && {a} --verbose --threshold 0.5"],
+                                [f"{b} --threshold 0.9 && {a} --threshold 0.01"])
+
+    def test_percentage_thresholds_keep_their_unit(self):
+        cmd = "python3 check.py --threshold"
+        cases = {
+            "1% -> 0.5": ("1%", "0.5", True),
+            "0.5 -> 10%": ("0.5", "10%", False),
+            "1% -> 5%": ("1%", "5%", True),
+            "10% -> 5%": ("10%", "5%", False),
+            "0.01 -> 2%": ("0.01", "2%", True),
+            "1% -> 0.005": ("1%", "0.005", False),
+            "1% -> 5 ambiguous unit": ("1%", "5", True),
+            "5 -> 1% ambiguous unit": ("5", "1%", True),
+            "5% unchanged": ("5%", "5%", False),
+        }
+        self._assert_cases({k: (f"{cmd} {b}", f"{cmd} {l}", x) for k, (b, l, x) in cases.items()})
+        from factonio.harness import _visual_hook_loosening
+
+        unit = _visual_hook_loosening({"command": f"{cmd} 1%"}, {"command": f"{cmd} 5"})
+        self.assertTrue(any("changes threshold `threshold` unit from 1% to 5" in r for r in unit), unit)
+        self._assert_end_to_end(self._PERCENT, f"{cmd} 1%", [f"{cmd} 0.5", f"{cmd} 5"], [f"{cmd} 0.005"])
+        self._assert_end_to_end(self._PERCENT, f"{cmd} 0.5", [f"{cmd} 60%"], [f"{cmd} 30%", f"{cmd} 0.5"],
+                                base_fails=False)
+
+    def test_environment_assignments_are_never_exempt_as_new_checks(self):
+        check = "python3 check.py"
+        loosening = [f"export THRESHOLD=0.5; {check}", f"export THRESHOLD=0.5 && {check}",
+                     f"THRESHOLD=0.5; export THRESHOLD; {check}", f"declare -x THRESHOLD=0.5; {check}"]
+        cases = {live: (check, live, True) for live in loosening}
+        cases.update({
+            "typeset MAX_DIFF": (check, f"typeset -x MAX_DIFF=3; {check}", True),
+            "export beside command threshold": (f"{check} --threshold 0.01",
+                                                f"export THRESHOLD=0.5; {check} --threshold 0.01", True),
+            "env assignment raised": (f"THRESHOLD=0.01; {check}", f"export THRESHOLD=0.5; {check}", True),
+            "env assignment kept": (f"THRESHOLD=0.01; {check}", f"export THRESHOLD=0.01; {check}", False),
+            "export zero": (check, f"export THRESHOLD=0; {check}", False),
+            "export unrelated": (check, f"export CI=1; {check}", False),
+            "unchanged": (check, check, False),
+        })
+        self._assert_cases(cases)
+        # `declare` is a bash builtin; hooks run under /bin/sh (dash on Debian/Ubuntu), so only POSIX forms execute.
+        self._assert_end_to_end(self._ENV, check, loosening[:3], [f"export THRESHOLD=0; {check}", check])
+
+    def test_sh_c_positional_args_and_shell_value_options(self):
+        script = 'python3 check.py "$@"'
+        loosening: list[Any] = [
+            f"sh -c '{script}' sh -u", f"bash -c '{script}' bash -u", ["sh", "-c", script, "sh", "-u"],
+            f"sh -c '{script}' python3 -u", f"sh -c '{script}' diff -u", f"sh -c '{script}' env -u -u",
+            "bash --rcfile /dev/null -c 'python3 check.py -u'", "bash --init-file /dev/null -c 'python3 check.py -u'",
+        ]
+        cases: dict[str, tuple[Any, Any, bool]] = {json.dumps(live): ("python3 check.py", live, True)
+                                                   for live in loosening}
+        cases.update({
+            "sh -c $0 only": ("python3 check.py", f"sh -c '{script}' sh", False),
+            "rcfile python3 -u": ("python3 check.py", "bash --rcfile /dev/null -c 'python3 -u check.py'", False),
+            "sh -c then &&": ("python3 check.py", "sh -c 'python3 check.py' && true", False),
+        })
+        self._assert_cases(cases)
+        self._assert_end_to_end(self._REGEN, "python3 check.py",
+                                [f"sh -c '{script}' sh -u", "bash --rcfile /dev/null -c 'python3 check.py -u'"],
+                                [f"sh -c '{script}' sh"])
+
+
 if __name__ == "__main__":
     unittest.main()
