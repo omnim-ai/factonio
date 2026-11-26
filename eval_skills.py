@@ -50,7 +50,11 @@ _HOLDOUT_PHASES = frozenset({"implement", "design", "verify-diff"})
 _AMBIGUOUS_ALIASES = frozenset({"command", "hermes", "meta", "nova", "phi", "palm", "azure", "nous"})
 _AMBIGUOUS_ROUTERS = frozenset({"together", "custom", "vertex", "nvidia", "vercel"})
 _TAIL = r"(?:[-_.:@/][A-Za-z0-9](?:[\w.:@/+-]*[A-Za-z0-9])?)?"
-_LEFT = r"(?<![A-Za-z0-9_])"
+# JSON-serialized transcripts carry newlines/tabs as the two characters `\n` / `\t`, so a
+# token right after one of those escapes still starts a word.
+_ESC_LEFT = r"(?<=\\[nrt])"
+_LEFT = r"(?:(?<![A-Za-z0-9_])|" + _ESC_LEFT + ")"
+_WORD_LEFT = r"(?:(?<![\w])|" + _ESC_LEFT + ")"
 _RIGHT = r"(?![A-Za-z0-9_])"
 
 
@@ -84,7 +88,8 @@ REDACTION_PLACEHOLDERS = {
 
 _LABEL_CONTEXT = (
     "candidate", "option", "variant", "version", "arm", "label", "run", "model", "skill",
-    "response", "answer", "submission", "transcript", "agent", "worker", "approach", "solution",
+    "response", "answer", "submission", "transcript", "agent", "worker", "approach", "solution", "branch",
+    "output",
 )
 
 
@@ -98,7 +103,7 @@ def _short_label_res(labels: list[str]) -> list[re.Pattern[str]]:
     # word ("Candidate A", "variant: B", "candidate_a"), when quoted/bracketed ("A", (B), [A]),
     # or as a line-leading speaker header ("A: ...", "**B:**").
     alt = _alt(labels)
-    context = r"(?<![\w])(?i:" + "|".join(_LABEL_CONTEXT) + r")s?"
+    context = _WORD_LEFT + r"(?i:" + "|".join(_LABEL_CONTEXT) + r")s?"
     return [
         re.compile(
             r"(?P<pre>" + context + r"[ \t_:#=-]{0,3})(?:" + alt + r")(?![\w])"
@@ -148,7 +153,7 @@ def sanitize_transcript(payload: Any, *, extra_labels: Optional[Any] = None) -> 
     long_labels = [x for x in labels if not _is_weak_label(x)]
     short_labels = [x for x in labels if _is_weak_label(x)]
     if long_labels:
-        label_re = re.compile(r"(?<![\w])(?:" + _alt(long_labels) + r")(?![\w])", re.IGNORECASE)
+        label_re = re.compile(_WORD_LEFT + r"(?:" + _alt(long_labels) + r")(?![\w])", re.IGNORECASE)
         text = apply("candidate_label", label_re, text)
     if short_labels:
         for pattern in _short_label_res(short_labels):
@@ -348,7 +353,7 @@ _READ_VERBS = frozenset(
 )
 _GREP_VERBS = frozenset({"grep", "egrep", "fgrep", "rg", "ag", "ack"})
 _GREP_OPTS_WITH_VALUE = frozenset({"-g", "--glob", "-t", "--type", "-A", "-B", "-C", "-m", "--max-count", "-f"})
-_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ash", "ksh"})
 _WRAPPERS = frozenset({"sudo", "command", "time", "nohup", "exec", "builtin", "xargs"})
 _GIT_OPTS_WITH_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"})
 _COMMAND_TOOL_HINTS = ("terminal", "shell", "bash", "exec", "run_command", "command")
@@ -800,6 +805,40 @@ def _interpreter_code_at(seg: list[str]) -> Optional[tuple[int, str]]:
     return None
 
 
+_SHELL_OPTS_WITH_VALUE = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"})
+
+
+def _shell_command_string_at(seg: list[str]) -> Optional[tuple[int, str]]:
+    """``(argv index, program)`` of `bash -c CMD`, `bash -lc CMD`, `sh -e -c CMD`, `zsh -o x -c CMD`.
+
+    Any short option cluster before ``--`` that contains ``c`` (`-c`, `-lc`, `-ec`, `-xc`)
+    makes the first non-option operand the command string; `-o` / `+o` consume a value.
+    """
+    if not seg or PurePosixPath(seg[0]).name not in _SHELLS:
+        return None
+    has_c = False
+    i = 1
+    while i < len(seg):
+        tok = seg[i]
+        if tok == "--":
+            i += 1
+            break
+        if tok in _SHELL_OPTS_WITH_VALUE:
+            i += 2
+            continue
+        if tok.startswith("--") or (tok.startswith("+") and len(tok) > 1):
+            i += 1
+            continue
+        if tok.startswith("-") and len(tok) > 1:
+            has_c = has_c or "c" in tok[1:]
+            i += 1
+            continue
+        break
+    if has_c and i < len(seg):
+        return i, seg[i]
+    return None
+
+
 def _interpreter_code(seg: list[str]) -> Optional[str]:
     """Inline program text of `python3 -c CODE`, `node -e CODE`, `deno eval CODE`, ... or ``None``."""
     found = _interpreter_code_at(seg)
@@ -1051,7 +1090,46 @@ def _merge_envs(*envs: _Env) -> _Env:
 
 
 def _value_order(value: Any) -> tuple[int, str]:
-    return (1, repr(value)) if isinstance(value, tuple) else (0, value)
+    if isinstance(value, str):
+        return (0, value)
+    return (1, repr(value)) if isinstance(value, tuple) else (2, repr(value))
+
+
+class _StaticDict:
+    """A statically known ``dict`` with string keys: ``key -> every value it may hold``.
+
+    An empty value set marks a key whose value is unknown.
+    """
+
+    __slots__ = ("items",)
+
+    def __init__(self, items: Any) -> None:
+        self.items: tuple[tuple[str, frozenset[Any]], ...] = tuple(sorted((k, frozenset(v)) for k, v in items))
+
+    def get(self, names: tuple[str, ...]) -> Optional[frozenset[Any]]:
+        for key, values in self.items:
+            if key in names:
+                return values
+        return None
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _StaticDict) and other.items == self.items
+
+    def __hash__(self) -> int:
+        return hash(self.items)
+
+    def __repr__(self) -> str:
+        return f"_StaticDict({dict((k, sorted(v, key=_value_order)) for k, v in self.items)!r})"
+
+
+class _Known(ast.expr):
+    """Synthetic expression standing for a set of resolved values (strings and argv tuples)."""
+
+    _fields = ()
+
+    def __init__(self, values: Any) -> None:
+        super().__init__()
+        self.values = frozenset(values)
 
 
 def _bounded(values: Any) -> set[Any]:
@@ -1138,6 +1216,13 @@ class _PyCodeScan:
                     self.aliases[al.asname or al.name] = f"{node.module}.{al.name}"
         self.escaped: set[str] = {n for node in ast.walk(tree) if isinstance(node, (ast.Global, ast.Nonlocal))
                                   for n in node.names}
+        # A dict variable is trusted for ``**name`` only when ``**name`` is its sole use: any other
+        # load (``opts['k'] = v``, ``opts.update(...)``, ``alias = opts``) may mutate it.
+        unpacked = {id(kw.value) for node in ast.walk(tree) if isinstance(node, ast.Call)
+                    for kw in node.keywords if kw.arg is None and isinstance(kw.value, ast.Name)}
+        self.unsafe_dicts: set[str] = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+                                       and isinstance(node.ctx, ast.Load) and id(node) not in unpacked}
+        self.unsafe_dicts |= self.escaped
         # A function that mutates a free list in place (``cmd.append(...)``) may run before any use.
         for fn in ast.walk(tree):
             if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
@@ -1205,6 +1290,8 @@ class _PyCodeScan:
         """Every static string ``node`` may evaluate to under ``env`` (empty: unknown)."""
         if node is None or depth > 12:
             return set()
+        if isinstance(node, _Known):
+            return {v for v in node.values if isinstance(v, str)}
         if isinstance(node, ast.Constant):
             if isinstance(node.value, bytes):
                 return {node.value.decode("utf-8", "replace")}
@@ -1264,6 +1351,8 @@ class _PyCodeScan:
         """Every static list/tuple of strings ``node`` may evaluate to (empty: unknown)."""
         if node is None or depth > 12:
             return set()
+        if isinstance(node, _Known):
+            return {v for v in node.values if isinstance(v, tuple)}
         if isinstance(node, (ast.List, ast.Tuple)):
             parts: list[set[_Seq]] = []
             for elt in node.elts:
@@ -1315,14 +1404,65 @@ class _PyCodeScan:
                 out.add(joined)
         return out
 
-    @staticmethod
-    def arg(call: ast.Call, index: Optional[int], *names: str) -> Optional[ast.expr]:
+    def dicts(self, node: Optional[ast.expr], env: _Env, depth: int = 0) -> set[_StaticDict]:
+        """Every static string-keyed dict ``node`` may evaluate to (empty: unknown)."""
+        if node is None or depth > 12:
+            return set()
+        if isinstance(node, ast.Dict):
+            if not all(isinstance(k, ast.Constant) and isinstance(k.value, str) for k in node.keys):
+                return set()  # ``{**other, ...}`` or a computed key
+            return {_StaticDict((k.value, self._values(v, env)) for k, v in zip(node.keys, node.values))}
+        if isinstance(node, ast.Call) and self.callee(node.func) == "dict":
+            if node.args or any(kw.arg is None for kw in node.keywords):
+                return set()
+            return {_StaticDict((kw.arg, self._values(kw.value, env)) for kw in node.keywords)}
+        if isinstance(node, ast.Name):
+            if node.id in self.unsafe_dicts:
+                return set()
+            return {v for v in self._name_values(node.id, env) if isinstance(v, _StaticDict)}
+        if isinstance(node, ast.IfExp):
+            body, orelse = self.dicts(node.body, env, depth + 1), self.dicts(node.orelse, env, depth + 1)
+            return _bounded(body | orelse) if body and orelse else set()
+        return set()
+
+    def arg(self, call: ast.Call, index: Optional[int], *names: str, env: Optional[_Env] = None,
+            default: Optional[str] = None) -> Optional[ast.expr]:
+        """The argument passed as keyword ``names`` / position ``index``, or through ``**mapping``.
+
+        A statically known ``**{...}`` / ``**opts`` supplies its keys like explicit keywords
+        (``default`` joins the values when some binding omits the key). An unknown mapping, or a
+        known key with an unknown value, returns ``None`` so callers fall back to the omitted-
+        argument default (content search at the repo root, read mode).
+        """
         for kw in call.keywords:
             if kw.arg in names:
                 return kw.value
         if index is not None and index < len(call.args) and not isinstance(call.args[index], ast.Starred):
             return call.args[index]
-        return None
+        unpacks = [kw.value for kw in call.keywords if kw.arg is None]
+        if not unpacks:
+            return None
+        values: set[Any] = set()
+        omitted = True
+        for expr in unpacks:
+            options = self.dicts(expr, env or {})
+            if not options:
+                return None
+            lacks = False
+            for option in options:
+                found = option.get(names)
+                if found is None:
+                    lacks = True
+                elif not found:
+                    return None
+                else:
+                    values |= found
+            omitted = omitted and lacks
+        if not values:
+            return None
+        if omitted and default is not None:
+            values.add(default)
+        return _Known(values)
 
     # --- bindings --------------------------------------------------------------------------
 
@@ -1342,8 +1482,8 @@ class _PyCodeScan:
                     env.pop(n.id, None)
 
     def _values(self, node: ast.expr, env: _Env) -> set[Any]:
-        """Static strings and string sequences ``node`` may evaluate to."""
-        return _bounded(self.statics(node, env) | self.seqs(node, env))
+        """Static strings, string sequences and string-keyed dicts ``node`` may evaluate to."""
+        return _bounded(self.statics(node, env) | self.seqs(node, env) | self.dicts(node, env))
 
     def _pairs(self, target: ast.expr, value: ast.expr, env: _Env) -> list[tuple[ast.expr, set[Any]]]:
         if (isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List))
@@ -1668,33 +1808,36 @@ class _PyCodeScan:
             if how == "var":
                 cmds = self.commands(ast.List(elts=list(node.args[at:]), ctx=ast.Load()), env)
             else:
-                cmds = self.commands(self.arg(node, at, "command", "cmd", "args", "argv"), env)
+                cmds = self.commands(self.arg(node, at, "command", "cmd", "args", "argv", env=env), env)
             for cmd in sorted(cmds):
                 if cmd:
                     self._emit("commands", node, cmd)
         elif name in _PY_EVAL_CALLS:
-            for src in sorted(self.statics(self.arg(node, 0, "source"), env)):
+            for src in sorted(self.statics(self.arg(node, 0, "source", env=env), env)):
                 if src:
                     self._emit("codes", node, src)
         elif name in _PY_READ_CALLS:
             kind = "reads"
-            if name in _PY_MODE_OPENS and self._write_only(self.arg(node, _PY_MODE_OPENS[name], "mode"), env):
+            if name in _PY_MODE_OPENS and self._write_only(
+                    self.arg(node, _PY_MODE_OPENS[name], "mode", env=env, default="r"), env):
                 kind = "writes"
-            for path in sorted(self.statics(self.arg(node, 0, *_PATH_ARG_NAMES), env)):
+            for path in sorted(self.statics(self.arg(node, 0, *_PATH_ARG_NAMES, env=env), env)):
                 self._emit(kind, node, (path, False))
         elif name in _PY_CONTENT_SEARCH_CALLS:
-            targets = self.statics(self.arg(node, 1 if name == "search_files" else None, "target"), env) or {"content"}
+            sf = name == "search_files"
+            target_node = self.arg(node, 1 if sf else None, "target", env=env, default="content")
+            targets = self.statics(target_node, env) or {"content"}
             if any(t.strip().lower() != "files" for t in targets):
-                root_node = self.arg(node, 2 if name == "search_files" else None, "path", "paths", "dir", "directory")
+                root_node = self.arg(node, 2 if sf else None, "path", "paths", "dir", "directory", env=env, default=".")
                 roots = self.statics(root_node, env)
-                globs = sorted(self.statics(self.arg(node, 3 if name == "search_files" else None,
-                                                     "file_glob", "glob", "include"), env) - {""})
+                globs = sorted(self.statics(self.arg(node, 3 if sf else None, "file_glob", "glob", "include", env=env),
+                                            env) - {""})
                 if root_node is None:
                     self._emit("searches", node, ([], globs))
                 for root in sorted(roots):
                     self._emit("searches", node, ([root], globs))
         elif name in _PY_LISTING_TOOLS:
-            for path in sorted(self.statics(self.arg(node, None, "path", "paths", "dir", "directory"), env)):
+            for path in sorted(self.statics(self.arg(node, None, "path", "paths", "dir", "directory", env=env), env)):
                 self._emit("reads", node, (path, True))
         if name in _PY_FS_CALLS or name.startswith("shutil."):
             for a in [*node.args, *(k.value for k in node.keywords)]:
@@ -1702,7 +1845,7 @@ class _PyCodeScan:
                     self._emit("fs", node, lit)
         func = node.func
         if isinstance(func, ast.Attribute) and func.attr in ("open", *_PY_PATH_READ_METHODS) and self.pathish(func.value):
-            kind = "writes" if func.attr == "open" and self._write_only(self.arg(node, 0, "mode"), env) else "reads"
+            kind = "writes" if func.attr == "open" and self._write_only(self.arg(node, 0, "mode", env=env, default="r"), env) else "reads"
             for path in sorted(self.statics(func.value, env)):
                 self._emit(kind, node, (path, False))
         self._mutate(node, env)
@@ -1792,9 +1935,14 @@ def _holdout_in_command(command: str, depth: int = 0) -> Optional[str]:
         verb = PurePosixPath(seg[0]).name
         if verb in ("echo", "printf", "true", ":"):
             continue
-        inline = _interpreter_code_at(seg)
+        shell = _shell_command_string_at(seg)
+        if shell is not None and depth < 3:
+            hit = _holdout_in_command(shell[1], depth + 1)
+            if hit:
+                return hit
+        inline = shell or _interpreter_code_at(seg)
         code_idx = inline[0] if inline else None
-        if inline is not None and depth < 3:
+        if inline is not None and shell is None and depth < 3:
             hits = _code_findings(inline[1], "implement", depth + 1, _interp_lang(verb) or "other")
             if hits:
                 return hits[0][1]
@@ -1802,11 +1950,6 @@ def _holdout_in_command(command: str, depth: int = 0) -> Optional[str]:
         skip = grep["skip"] if grep else set()
         for i, tok in enumerate(seg):
             if i in skip or i == code_idx:
-                continue
-            if verb in _SHELLS and i > 0 and seg[i - 1] == "-c" and depth < 3:
-                hit = _holdout_in_command(tok, depth + 1)
-                if hit:
-                    return hit
                 continue
             if _HOLDOUT_TOKEN_RE.search(tok) and not _is_excluded(seg, i):
                 return tok
@@ -1965,10 +2108,12 @@ def _blackbox_command_findings(command: str, depth: int = 0) -> list[tuple[str, 
         if not seg:
             continue
         verb = PurePosixPath(seg[0]).name
-        if verb in _SHELLS and "-c" in seg and depth < 3:
-            ci = seg.index("-c")
-            if ci + 1 < len(seg):
-                found.extend(_blackbox_command_findings(seg[ci + 1], depth + 1))
+        shell = _shell_command_string_at(seg)
+        if shell is not None:
+            if depth < 3:
+                found.extend(_blackbox_command_findings(shell[1], depth + 1))
+            # Operands after the command string become "$0", "$1", ... of that program.
+            found.extend(("source_read", tok) for tok in seg[shell[0] + 1:] if _is_source_target(tok))
             continue
         code = _interpreter_code(seg)
         if code is not None:

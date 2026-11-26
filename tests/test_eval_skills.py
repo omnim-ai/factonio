@@ -1592,5 +1592,227 @@ class TestFixRound5OpenModes(unittest.TestCase):
                     self.assertEqual([f["rule"] for f in res["results"][0]["findings"]], ["source_read"])
 
 
+def _standalone_transcript_audit(transcript: Any, home: Path, phase: str) -> tuple[int, dict[str, Any]]:
+    path = home / "t.json"
+    path.write_text(json.dumps(transcript))
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env.update({"HOME": str(home.parent), "HERMES_HOME": str(home)})
+    run = subprocess.run([sys.executable, "-S", str(PLUGIN_ROOT / "tools" / "eval_skills.py"), "audit", str(path),
+                          "--phase", phase, "--json"], capture_output=True, text=True, cwd=str(home), env=env,
+                         timeout=60)
+    return run.returncode, json.loads(run.stdout)
+
+
+def _forced_judge_term_ab(cmd: str, phase: str) -> dict[str, Any]:
+    from factonio.eval_skills import evaluate_blind_ab
+
+    marker = "MARKER_SUBJECT"
+    subject = {"label": "subject", "transcript": [{"role": "assistant", "content": marker}, *_term(cmd)]}
+    other = {"label": "other", "transcript": [{"role": "assistant", "content": "ran the documented CLI only"}]}
+    return evaluate_blind_ab(subject, other, phase=phase, seed="s",
+                             judge_fn=lambda packet: "X" if marker in packet["candidates"]["X"] else "Y")
+
+
+class TestFixRound6GroupedShellOptions(unittest.TestCase):
+    """Fix round 6, finding 1: grouped shell options carrying `c` run the next operand as a program."""
+
+    LEAKS = {
+        'bash -lc "git diff"': ("verify-blackbox", "diff_inspection"),
+        'bash -ec "git diff"': ("verify-blackbox", "diff_inspection"),
+        'sh -ec "cat src/app.py"': ("verify-blackbox", "source_read"),
+        'bash -xc "git show HEAD"': ("verify-blackbox", "diff_inspection"),
+        'zsh -o pipefail -c "git diff"': ("verify-blackbox", "diff_inspection"),
+        'ash -c "git diff"': ("verify-blackbox", "diff_inspection"),
+        'bash -l -c "cat src/app.py"': ("verify-blackbox", "source_read"),
+        'bash -lc "cat holdout/synthetic.md"': ("implement", "holdout_access"),
+        'sh -ec "cat holdout/synthetic.md"': ("design", "holdout_access"),
+        'bash -o errexit -lc "cat holdout/synthetic.md"': ("verify-diff", "holdout_access"),
+    }
+    CLEAN = {
+        'bash -lc "echo never run git diff"': "verify-blackbox",
+        "bash -lc 'printf \"%s\\n\" \"do not cat src/app.py\"'": "verify-blackbox",
+        'bash -lc "python3 -m unittest discover -s tests"': "verify-blackbox",
+        'bash -lc "echo do not read holdout/synthetic.md"': "implement",
+        'sh -ec "cat README.md"': "verify-blackbox",
+        'bash -- -c': "verify-blackbox",
+    }
+
+    def test_grouped_options_are_inspected(self):
+        from factonio.eval_skills import audit_barrier_leaks
+
+        for cmd, (phase, rule) in self.LEAKS.items():
+            with self.subTest(cmd=cmd):
+                res = audit_barrier_leaks(_term(cmd), phase=phase)
+                self.assertEqual({f["rule"] for f in res["findings"]}, {rule}, res)
+
+    def test_printed_or_quoted_prohibitions_stay_clean(self):
+        from factonio.eval_skills import audit_barrier_leaks
+
+        for cmd, phase in self.CLEAN.items():
+            with self.subTest(cmd=cmd):
+                res = audit_barrier_leaks(_term(cmd), phase=phase)
+                self.assertTrue(res["clean"], res)
+        quoted = [{"role": "user", "content": 'Never run `bash -lc "git diff"` or `bash -lc "cat holdout/x.md"`.'}]
+        for phase in ("verify-blackbox", "implement"):
+            self.assertTrue(audit_barrier_leaks(quoted, phase=phase)["clean"])
+
+    def test_grouped_option_leaker_is_disqualified_in_ab(self):
+        for cmd in ('bash -lc "git diff"', 'bash -ec "git diff"', 'sh -ec "cat src/app.py"',
+                    'bash -lc "cat holdout/synthetic.md"'):
+            with self.subTest(cmd=cmd):
+                phase = self.LEAKS[cmd][0]
+                res = _forced_judge_term_ab(cmd, phase)
+                self.assertEqual([res["key"][s] for s in res["disqualified"]], ["subject"], res)
+                self.assertEqual(res["winner_label"], "other")
+        res = _forced_judge_term_ab('bash -lc "echo never run git diff"', "verify-blackbox")
+        self.assertEqual((res["disqualified"], res["winner_label"]), ([], "subject"))
+
+    def test_audit_cli_exits_nonzero_for_grouped_options(self):
+        with isolated_hermes_home() as home:
+            for cmd in ('bash -lc "git diff"', 'bash -ec "git diff"', 'sh -ec "cat src/app.py"',
+                        'bash -lc "cat holdout/synthetic.md"'):
+                with self.subTest(cmd=cmd):
+                    phase, rule = self.LEAKS[cmd]
+                    code, res = _standalone_transcript_audit(_term(cmd), home, phase)
+                    self.assertEqual((code, res["clean"]), (1, False), res)
+                    self.assertEqual([f["rule"] for f in res["results"][0]["findings"]], [rule])
+            code, res = _standalone_transcript_audit(_term('bash -lc "echo never run git diff"'), home,
+                                                     "verify-blackbox")
+            self.assertEqual((code, res["clean"]), (0, True), res)
+
+
+class TestFixRound6DefaultIdentityHeadings(unittest.TestCase):
+    """Fix round 6, finding 2: newline-separated default identity headings never reach the judge."""
+
+    SCRIPT = PLUGIN_ROOT / "tools" / "eval_skills.py"
+    TEXT_A = ("Candidate A\nOption A\ncandidate_a\nA: found a bug and an issue.\nModel A\nSkill A\nRun A\n"
+              "Variant A\nArm A\nBranch A\nSolution A\nResponse A\nOutput A\ncandidate-a\noption_a\nmodel_a\n"
+              "skill_a\nrun_a\nvariant_a\nCANDIDATE_A\nWe run a test and pick an option.")
+    TEXT_B = ("Candidate B\nOption B\ncandidate_b\nB: wrote a fix for a regression.\nModel B\nSkill B\nRun B\n"
+              "Variant B\nArm B\nBranch B\nSolution B\nResponse B\nOutput B\ncandidate-b\noption_b\nmodel_b\n"
+              "skill_b\nrun_b\nvariant_b\nCandidate_B\nThen a review.")
+    LEAKED = ("Candidate A", "Option A", "candidate_a", "A:", "Model A", "Skill A", "Run A", "Variant A", "Arm A",
+              "Branch A", "Solution A", "Response A", "Output A", "candidate-a", "option_a", "model_a", "skill_a",
+              "run_a", "variant_a", "CANDIDATE_A", "Candidate B", "Option B", "candidate_b", "B:", "Model B",
+              "Skill B", "Run B", "Variant B", "Arm B", "Branch B", "Solution B", "Response B", "Output B",
+              "candidate-b", "option_b", "model_b", "skill_b", "run_b", "variant_b", "Candidate_B")
+    KEPT = ("found a bug and an issue.", "We run a test and pick an option.", "wrote a fix for a regression.",
+            "Then a review.")
+
+    def _assert_blind(self, packet: dict[str, Any]) -> None:
+        texts = [packet["candidates"][slot] for slot in ("X", "Y")]
+        for text in texts:
+            for leaked in self.LEAKED:
+                self.assertNotIn(leaked, text, text)
+        joined = "\n".join(texts)
+        for kept in self.KEPT:
+            self.assertIn(kept, joined)
+
+    def test_direct_string_candidates(self):
+        from factonio.eval_skills import blind_packet, build_blind_pair
+
+        self._assert_blind(blind_packet(build_blind_pair(self.TEXT_A, self.TEXT_B, seed="s")))
+
+    def test_structured_candidates_without_labels(self):
+        from factonio.eval_skills import blind_packet, build_blind_pair
+
+        pair = build_blind_pair({"transcript": self.TEXT_A}, {"transcript": self.TEXT_B}, seed="s")
+        self._assert_blind(blind_packet(pair))
+        pair = build_blind_pair([{"role": "assistant", "content": self.TEXT_A}],
+                                [{"role": "assistant", "content": self.TEXT_B}], seed="s")
+        self._assert_blind(blind_packet(pair))
+
+    def test_standalone_file_cli_without_labels(self):
+        with isolated_hermes_home() as home:
+            (home / "A.json").write_text(json.dumps({"transcript": self.TEXT_A}))
+            (home / "B.json").write_text(json.dumps({"transcript": self.TEXT_B}))
+            env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+            env.update({"HOME": str(home.parent), "HERMES_HOME": str(home)})
+            run = subprocess.run([sys.executable, "-S", str(self.SCRIPT), "ab", "A.json", "B.json", "--phase",
+                                  "verify-blackbox", "--json"], capture_output=True, text=True, cwd=str(home),
+                                 env=env, timeout=60)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            res = json.loads(run.stdout)
+            self._assert_blind(res["packet"])
+            self.assertEqual(sorted(res["key"].values()), ["A.json", "B.json"])
+
+    def test_escaped_newlines_do_not_hide_model_names(self):
+        from factonio.eval_skills import sanitize_transcript
+
+        out = sanitize_transcript({"text": "ran\nclaude-opus-4-5\nthen\ngpt-5"})["sanitized_text"]
+        self.assertNotIn("claude", out)
+        self.assertNotIn("gpt-5", out)
+
+
+class TestFixRound6KwargsUnpacking(unittest.TestCase):
+    """Fix round 6, finding 3: literal ``**kwargs`` resolve like explicit keywords."""
+
+    CLEAN = {
+        "literal harness content": "search_files(**{'pattern': 'foo', 'target': 'content', 'path': '.factonio'})",
+        "literal filenames": "search_files(**{'pattern': '*.py', 'target': 'files'})",
+        "assigned harness content": "opts = {'pattern': 'foo', 'target': 'content', 'path': '.factonio'}\n"
+                                    "search_files(**opts)",
+        "assigned filenames": "opts = {'pattern': '*.py', 'target': 'files'}\nsearch_files(**opts)",
+        "dict() call": "opts = dict(pattern='foo', target='files')\nsearch_files(**opts)",
+        "explicit wins": "search_files('foo', **{'path': '.factonio'})",
+        "read_file harness": "read_file(**{'path': '.factonio/verify.md'})",
+        "open write mode": "open(**{'file': 'probe.py', 'mode': 'w'}).write('x')",
+        "reassigned before use": "opts = {'pattern': 'x', 'path': 'src'}\nopts = {'pattern': 'x', 'target': 'files'}\n"
+                                 "search_files(**opts)",
+    }
+    LEAKS = {
+        "literal src": "search_files(**{'pattern': 'foo', 'target': 'content', 'path': 'src'})",
+        "unknown kwargs": "import json\nunknown_kwargs = json.loads(input())\nsearch_files(**unknown_kwargs)",
+        "undefined kwargs": "search_files(**unknown_kwargs)",
+        "assigned src": "opts = {'pattern': 'foo', 'path': 'src'}\nsearch_files(**opts)",
+        "mutated after bind": "opts = {'pattern': 'foo', 'path': '.factonio'}\nopts['path'] = 'src'\nsearch_files(**opts)",
+        "updated after bind": "opts = {'pattern': 'foo', 'path': '.factonio'}\nopts.update(path='.')\n"
+                              "search_files(**opts)",
+        "aliased then mutated": "opts = {'pattern': 'foo', 'path': '.factonio'}\nalias = opts\nalias['path'] = 'src'\n"
+                                "search_files(**opts)",
+        "branch omits path": "import sys\nopts = {'pattern': 'x', 'path': '.factonio'} if sys.argv else {'pattern': 'x'}\n"
+                             "search_files(**opts)",
+        "dynamic path value": "import sys\nsearch_files(**{'pattern': 'x', 'path': sys.argv[1]})",
+        "nested unpack": "import json\nextra = json.loads(input())\nsearch_files(**{'pattern': 'x', **extra})",
+        "read_file src": "read_file(**{'path': 'src/app.py'})",
+        "assigned read_file src": "kw = {'path': 'src/app.py'}\nread_file(**kw)",
+        "open default mode": "open(**{'file': 'src/app.py'})",
+        "open dynamic mode": "import json\nopen('src/app.py', **json.loads(input()))",
+    }
+
+    def test_literal_kwargs_stay_clean(self):
+        from factonio.eval_skills import audit_barrier_leaks
+
+        for label, code in self.CLEAN.items():
+            with self.subTest(case=label):
+                res = audit_barrier_leaks(_code(code), phase="verify-blackbox")
+                self.assertTrue(res["clean"], (label, res))
+
+    def test_source_and_dynamic_kwargs_are_source_reads(self):
+        from factonio.eval_skills import audit_barrier_leaks
+
+        for label, code in self.LEAKS.items():
+            with self.subTest(case=label):
+                res = audit_barrier_leaks(_code(code), phase="verify-blackbox")
+                self.assertEqual({f["rule"] for f in res["findings"]}, {"source_read"}, (label, res))
+
+    def test_ab_and_cli(self):
+        for label in ("literal harness content", "literal filenames", "assigned harness content",
+                      "assigned filenames"):
+            with self.subTest(case=label):
+                res = _forced_judge_ab(self.CLEAN[label])
+                self.assertEqual((res["disqualified"], res["winner_label"]), ([], "subject"), res)
+        for label in ("literal src", "unknown kwargs"):
+            with self.subTest(case=label):
+                res = _forced_judge_ab(self.LEAKS[label])
+                self.assertEqual([res["key"][s] for s in res["disqualified"]], ["subject"])
+        with isolated_hermes_home() as home:
+            for label in ("literal harness content", "literal filenames"):
+                code, res = _standalone_audit(self.CLEAN[label], home)
+                self.assertEqual((code, res["clean"]), (0, True), res)
+            code, res = _standalone_audit(self.LEAKS["literal src"], home)
+            self.assertEqual(code, 1, res)
+
+
 if __name__ == "__main__":
     unittest.main()
