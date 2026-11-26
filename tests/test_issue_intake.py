@@ -1338,7 +1338,23 @@ class TestNestedClosingReferences(unittest.TestCase):
 _MALFORMED_PR_NODES = (None, 1, "invalid", {"title": "missing number"}, {"number": True}, {"number": 0},
                        {"number": "9"}, {"number": 9, "title": 5}, {"number": 9, "body": ["x"]})
 _MALFORMED_REF_NODES = (None, 1, "bad", {"number": True}, {"number": 0}, {"number": "7"}, {},
-                        {"number": 7, "repository": "acme/sample"})
+                        {"number": 7, "repository": "acme/sample"}, {"number": 7, "url": None},
+                        {"number": 7, "repository": {"nameWithOwner": None}},
+                        {"number": 7, "repository": {"nameWithOwner": ["acme/sample"]}})
+# GitHub types PullRequest.title / body as String! ("" when empty): null, absent or non-string is malformed.
+_BAD_TITLE_BODY = (("title", None), ("title", _MISSING), ("body", None), ("body", _MISSING), ("title", 5),
+                   ("body", False), ("body", {"text": "Fixes #2"}))
+_BAD_OPTIONAL_PR_FIELDS = (("url", None), ("headRefOid", 5), ("headRefName", None), ("baseRefName", []),
+                           ("isDraft", None), ("isDraft", "false"))
+
+
+def _with_field(node: dict[str, Any], key: str, value: Any) -> dict[str, Any]:
+    node = dict(node)
+    if value is _MISSING:
+        node.pop(key, None)
+    else:
+        node[key] = value
+    return node
 _DONE = {"hasNextPage": False, "endCursor": None}
 
 
@@ -1378,7 +1394,19 @@ class TestMalformedGraphqlNodes(unittest.TestCase):
                 for bad in _MALFORMED_REF_NODES]
         out += [(f"refs container {conn!r}", _pr_payload([_pr_node(conn)]))
                 for conn in (_MISSING, None, [], "bad", {"pageInfo": dict(_DONE)}, {"nodes": {}, "pageInfo": dict(_DONE)})]
+        empty_refs = {"nodes": [], "pageInfo": dict(_DONE)}
+        out += [(f"pr {key}={'<missing>' if value is _MISSING else repr(value)}",
+                 _pr_payload([_with_field(_pr_node(empty_refs), key, value)]))
+                for key, value in (*_BAD_TITLE_BODY, *_BAD_OPTIONAL_PR_FIELDS)]
         return out
+
+    def _second_page_fakes(self, key: str, value: Any) -> FakeGh:
+        """Open PRs served 100 per page; the malformed node is the only PR on outer page 2."""
+        prs = [{"number": n, "title": f"Change {n}", "body": "", "headRefOid": OTHER, "url": f"u{n}"}
+               for n in range(100, 200)]
+        prs.append(_with_field({"number": 300, "title": "Fix", "body": "", "headRefOid": HEAD, "url": "u300"},
+                               key, value))
+        return FakeGh(self._issues(), prs)
 
     def test_triage_list_and_single_issue_fail_closed(self):
         from factonio import issues
@@ -1409,11 +1437,54 @@ class TestMalformedGraphqlNodes(unittest.TestCase):
                     self._assert_blocked(res, f"follow-up {bad!r} {kwargs}")
                     self.assertIn("#500", res["pr_dedup_reason"])
 
+    def test_null_or_missing_title_body_on_outer_page_two_fails_closed(self):
+        from factonio import issues
+        from factonio.agent_tools import register_tools
+
+        with isolated_hermes_home():
+            run = TestToolCliAndBlueprint()._cli()
+            ctx = _FakeCtx()
+            register_tools(ctx)
+            handler = ctx.tools["factonio_triage_issues"]["handler"]
+            for key, value in _BAD_TITLE_BODY:
+                label = f"page 2 {key}={'<missing>' if value is _MISSING else repr(value)}"
+                gh = self._second_page_fakes(key, value)
+                with mock.patch.object(issues, "_run_gh", gh):
+                    for kwargs in ({}, {"issue_number": 2}):
+                        self._assert_blocked(issues.triage_repo_issues("acme/sample", record_trail=False, **kwargs),
+                                             f"{label} {kwargs}")
+                    for argv in (("issues", "acme/sample", "--json"),
+                                 ("issues", "acme/sample", "--issue", "2", "--json")):
+                        code, out, err = run(*argv)
+                        self.assertEqual(code, 0, (label, argv, err))
+                        self._assert_blocked(json.loads(out), f"{label} {argv}")
+                    for args in ({"repo": "acme/sample", "action": "triage"},
+                                 {"repo": "acme/sample", "action": "triage", "issue_number": 2}):
+                        self._assert_blocked(json.loads(handler(args)), f"tool {label} {args}")
+                self.assertTrue(any("cursor=100" in a for call in gh.calls for a in call), label)
+
+    def test_empty_string_title_body_stay_ready_on_both_pages(self):
+        from factonio import issues
+
+        with isolated_hermes_home():
+            for title in ("Fix bug", ""):
+                gh = self._second_page_fakes("title", title)
+                with mock.patch.object(issues, "_run_gh", gh):
+                    for kwargs in ({}, {"issue_number": 2}):
+                        res = issues.triage_repo_issues("acme/sample", record_trail=False, **kwargs)
+                        self.assertIs(res["pr_dedup_truncated"], False, (title, kwargs))
+                        self.assertIsNone(res["pr_dedup_reason"])
+                        for item in res["issues"]:
+                            self.assertEqual((item["disposition"], item["automate"]), ("ready", True), (title, kwargs))
+
     def test_valid_empty_and_null_fields_stay_ready(self):
         from factonio import issues
 
         with isolated_hermes_home():
-            for payload in (_pr_payload([]), _pr_payload([_pr_node({"nodes": [], "pageInfo": dict(_DONE)}, body=None)]),
+            for payload in (_pr_payload([]),
+                            _pr_payload([_pr_node({"nodes": [], "pageInfo": dict(_DONE)}, title="Fix bug", body="")]),
+                            _pr_payload([_pr_node({"nodes": [], "pageInfo": dict(_DONE)}, title="", body="",
+                                                  isDraft=True, headRefName="fix", baseRefName="main")]),
                             _pr_payload([_pr_node({"nodes": [{"number": 77, "repository": None}],
                                                    "pageInfo": dict(_DONE)})])):
                 with mock.patch.object(issues, "_run_gh", FakeGh(self._issues(), pr_list=payload)):

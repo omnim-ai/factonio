@@ -989,17 +989,37 @@ def _positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def _str_if_present(node: Mapping[str, Any], key: str) -> bool:
+    return key not in node or isinstance(node[key], str)
+
+
 def _valid_closing_ref(ref: Any) -> bool:
-    """A `closingIssuesReferences` node is an object with a positive integer `number` and an object (or null)
-    `repository`; anything else means the reference list cannot be trusted."""
-    return isinstance(ref, Mapping) and _positive_int(ref.get("number")) and (
-        ref.get("repository") is None or isinstance(ref.get("repository"), Mapping))
+    """A `closingIssuesReferences` node is an object with a positive integer `number`, a string `url` when
+    present, and an object (or null) `repository` whose `nameWithOwner` is a string when present; anything else
+    means the reference list cannot be trusted. A null `repository` is tolerated because it can only widen the
+    same-repo link match (routing to verify_existing_fix), never hide a link."""
+    if not isinstance(ref, Mapping) or not _positive_int(ref.get("number")) or not _str_if_present(ref, "url"):
+        return False
+    repo = ref.get("repository")
+    return repo is None or (isinstance(repo, Mapping) and _str_if_present(repo, "nameWithOwner"))
+
+
+_OPEN_PR_OPTIONAL_STR_FIELDS = ("url", "headRefName", "headRefOid", "baseRefName")
 
 
 def _valid_open_pr_node(node: Any) -> bool:
-    """An open-PR node is an object with a positive integer `number` and string (or null) `title` / `body`."""
-    return isinstance(node, dict) and _positive_int(node.get("number")) and all(
-        node.get(key) is None or isinstance(node.get(key), str) for key in ("title", "body"))
+    """An open-PR node is an object with a positive integer `number` and string `title` / `body`.
+
+    GitHub types `PullRequest.title` / `body` as `String!` (`""` when empty), so a null, missing or non-string
+    title/body is a malformed response: closing keywords in it could not be checked, and dedup must fail closed.
+    The informational `url` / `head*` / `baseRefName` fields must be strings and `isDraft` a boolean when present."""
+    if not isinstance(node, dict) or not _positive_int(node.get("number")):
+        return False
+    if not all(isinstance(node.get(key), str) for key in ("title", "body")):
+        return False
+    if not all(_str_if_present(node, key) for key in _OPEN_PR_OPTIONAL_STR_FIELDS):
+        return False
+    return "isDraft" not in node or isinstance(node["isDraft"], bool)
 
 
 def _closing_refs_page(conn: Any) -> Optional[tuple[list[Mapping[str, Any]], Optional[str]]]:
