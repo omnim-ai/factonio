@@ -26,6 +26,7 @@ Factonio adapts engineering patterns and instruction text from the third-party p
   - tiered fix-round re-verification and a cross-model pre-handoff audit of the `show-me-your-work` trail (`skills/orchestrator/SKILL.md`, `trail.py` `audit_trail_evidence`, `hermes factonio trail --audit`).
   - `/correct` Rule-to-Enforcer ledger with forced ladder promotion, rule pruning, and 1-commit-per-class hardening cards (`RETRO_BLUEPRINT_PROMPT` in `__init__.py`).
   - first-tick silent-start liveness check (`watchdog.py` `silent_start`, `initial_progress_minutes`).
+  - PR shipping gate: owner-approval gates separated from CI, review-automation waits, single flake rerun, bot review triage with safe file-based replies and an ask-by-default risk boundary, tiered trunk drift, a stack-wide tier-major gate, and bottom-up stacked merge ordering (`repos.py` `inspect_pr_gate` / `inspect_stack_gate` / `merge_pr`, `factonio_pr_gate`, `factonio_merge_pr`, `hermes factonio pr-gate --stack`, `skills/implement/SKILL.md`, `skills/orchestrator/SKILL.md`).
 
 ```text
 MIT License
