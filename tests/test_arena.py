@@ -561,6 +561,122 @@ class TestArenaFixRound1(unittest.TestCase):
                           _get_task(res["judge_task_id"]).body)
 
 
+class TestArenaFixRound2(unittest.TestCase):
+    def _assert_no_deferred_judge(self, res: dict[str, Any], before: bytes) -> None:
+        self.assertEqual(_task_count(), 2)
+        self.assertEqual(Path(res["manifest_path"]).read_bytes(), before)
+        self.assertEqual(_trail_rows("spawn_arena_judge"), [])
+
+    def _assert_retry_spawns_full_judge(self, res: dict[str, Any]) -> None:
+        from factonio.arena import evaluate_arena
+
+        ev = evaluate_arena(arena_id=res["arena_id"], spawn_judge=True, judge_model=GOOGLE_JUDGE,
+                            strict_cross_vendor=True)
+        self.assertTrue(ev["spawned_judge"], ev)
+        self.assertEqual((ev["judge"]["vendor"], ev["judge"]["cross_vendor"]), ("google", True))
+        self.assertEqual(_task_count(), 3)
+        manifest = _manifest(res)
+        self.assertEqual(manifest["judge"]["task_id"], ev["judge"]["task_id"])
+        self.assertEqual(manifest["judge"]["label"], GOOGLE_JUDGE)
+        self.assertTrue(manifest["strict_cross_vendor"])
+        rows = _trail_rows("spawn_arena_judge", res["tenant"])
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["evidence"]["strict_cross_vendor"])
+
+    def test_deferred_judge_manifest_write_failure_rolls_back_the_judge_card(self):
+        from unittest import mock
+
+        from factonio import arena
+        from factonio.arena import evaluate_arena
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            res = _spawn(auto_judge=False, judge_model="vertex/gemini-2.5-flash")
+            _finish_candidates(res)
+            before = Path(res["manifest_path"]).read_bytes()
+            with mock.patch.object(arena, "_write_json_atomic", side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    evaluate_arena(arena_id=res["arena_id"], spawn_judge=True, judge_model=GOOGLE_JUDGE,
+                                   strict_cross_vendor=True)
+            self._assert_no_deferred_judge(res, before)
+            self.assertIsNone(evaluate_arena(arena_id=res["arena_id"])["judge"])
+            self._assert_retry_spawns_full_judge(res)
+
+    def test_deferred_judge_read_only_arena_dir_rolls_back_and_cli_reports_json_error(self):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root ignores directory permissions")
+        with isolated_hermes_home() as home:
+            _register(home)
+            res = _spawn(auto_judge=False)
+            _finish_candidates(res)
+            arena_dir = Path(res["arena_dir"])
+            before = Path(res["manifest_path"]).read_bytes()
+            run = _cli()
+            arena_dir.chmod(0o500)
+            try:
+                code, out, err = run("arena", "status", "--arena-id", res["arena_id"], "--spawn-judge",
+                                     "--judge-model", GOOGLE_JUDGE, "--strict-cross-vendor", "--json")
+            finally:
+                arena_dir.chmod(0o700)
+            self.assertEqual(code, 1)
+            payload = json.loads(out)
+            self.assertFalse(payload["ok"])
+            self.assertIn("Permission denied", payload["error"])
+            self.assertNotIn("Traceback", err)
+            self._assert_no_deferred_judge(res, before)
+            self._assert_retry_spawns_full_judge(res)
+
+    def test_failed_or_cancelled_judge_needs_attention(self):
+        from factonio.arena import evaluate_arena
+
+        for state in ("failed", "cancelled"):
+            with self.subTest(state=state), isolated_hermes_home() as home:
+                _register(home)
+                res = _spawn()
+                _finish_candidates(res)
+                _set_status(res["judge_task_id"], state)
+                ev = evaluate_arena(arena_id=res["arena_id"])
+                self.assertEqual(ev["status"], "needs_attention")
+                self.assertFalse(ev["synthesized"])
+                self.assertTrue(any(res["judge_task_id"] in a and f"'{state}'" in a for a in ev["advisories"]),
+                                ev["advisories"])
+
+    def test_unreadable_canonical_artifact_fails_closed(self):
+        from unittest import mock
+
+        from factonio import arena
+        from factonio.arena import _canonical_changed, evaluate_arena
+        from factonio.orchestrator import spec_file_path
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            tenant = "acme-svc-unreadable"
+            canonical = spec_file_path(tenant)
+            canonical.parent.mkdir(parents=True, exist_ok=True)
+            canonical.write_text("# Old canonical\n", encoding="utf-8")
+            res = _spawn(tenant=tenant)
+            _finish_candidates(res)
+            _complete(res["judge_task_id"], None)
+            # A newer mtime alone must not count as synthesis when the content cannot be read.
+            future = canonical.stat().st_mtime_ns + 3600 * 1_000_000_000
+            os.utime(canonical, ns=(future, future))
+            manifest = _manifest(res)
+
+            with mock.patch.object(arena, "_sha256", return_value=None):
+                self.assertFalse(_canonical_changed(canonical, manifest))
+                self.assertFalse(evaluate_arena(arena_id=res["arena_id"])["synthesized"])
+
+            if not (hasattr(os, "geteuid") and os.geteuid() == 0):
+                canonical.chmod(0o000)
+                try:
+                    self.assertFalse(_canonical_changed(canonical, manifest))
+                    ev = evaluate_arena(arena_id=res["arena_id"])
+                finally:
+                    canonical.chmod(0o600)
+                self.assertFalse(ev["synthesized"])
+                self.assertEqual(ev["status"], "needs_attention")
+
+
 class TestArenaToolsAndCli(unittest.TestCase):
     def test_tools(self):
         with isolated_hermes_home() as home:

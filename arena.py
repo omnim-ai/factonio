@@ -77,13 +77,12 @@ def _stamp(arena_id: str, *, role: str, target: str, vendor: Any, model: Any, sl
     )
 
 
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+def _write_bytes_atomic(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2, sort_keys=True, default=str)
-            fh.write("\n")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
@@ -93,6 +92,11 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    text = json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n"
+    _write_bytes_atomic(path, text.encode("utf-8"))
 
 
 def _diversity_error(panel: dict[str, Any]) -> str:
@@ -737,9 +741,13 @@ def _canonical_changed(path: Path, manifest: dict[str, Any]) -> bool:
         mtime_ns = int(path.stat().st_mtime_ns)
     except OSError:
         return False
+    digest = _sha256(path)
+    if digest is None:
+        # An unreadable canonical artifact cannot prove it was synthesized; fail closed.
+        return False
     if baseline and not baseline.get("existed"):
         return True
-    if baseline.get("sha256") and _sha256(path) != baseline["sha256"]:
+    if baseline.get("sha256") and digest != baseline["sha256"]:
         return True
     return mtime_ns > max(int(baseline.get("mtime_ns") or 0), _created_ns(manifest))
 
@@ -848,39 +856,62 @@ def evaluate_arena(
 
             effective_session_id = _resolve_calling_session_id(session_id)
             judge_key = f"arena:{aid}:judge"
-            with connect_closing(board=board) as conn:
-                with write_txn(conn):
-                    existing = conn.execute(
-                        "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' LIMIT 1", (judge_key,)
-                    ).fetchone()
-                    judge_id = _create_judge_card(
-                        conn,
-                        target=target,
-                        arena_id=aid,
-                        judge=judge,
-                        candidates=cand_meta,
-                        repo=repo,
-                        tenant=arena_tenant,
-                        manifest_path=manifest_path,
-                        request=str(manifest.get("request") or manifest.get("title") or "").strip(),
-                        short_title=str(manifest.get("title") or "arena"),
-                        session_id=effective_session_id,
-                        board=board,
-                    )
-                    row = conn.execute("SELECT status, model_override FROM tasks WHERE id = ?", (judge_id,)).fetchone()
-                created = existing is None
-                if created:
-                    _auto_subscribe_task(conn, judge_id, session_id=effective_session_id)
+            try:
+                prior_manifest: Optional[bytes] = manifest_path.read_bytes()
+            except OSError:
+                prior_manifest = None
+            updated_manifest: Optional[dict[str, Any]] = None
+            committed = False
+            try:
+                with connect_closing(board=board) as conn:
+                    # The manifest write happens inside the judge card's transaction so a failed write
+                    # rolls the card back: kanban.db and manifest.json must never diverge.
+                    with write_txn(conn):
+                        existing = conn.execute(
+                            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' LIMIT 1", (judge_key,)
+                        ).fetchone()
+                        judge_id = _create_judge_card(
+                            conn,
+                            target=target,
+                            arena_id=aid,
+                            judge=judge,
+                            candidates=cand_meta,
+                            repo=repo,
+                            tenant=arena_tenant,
+                            manifest_path=manifest_path,
+                            request=str(manifest.get("request") or manifest.get("title") or "").strip(),
+                            short_title=str(manifest.get("title") or "arena"),
+                            session_id=effective_session_id,
+                            board=board,
+                        )
+                        row = conn.execute("SELECT status, model_override FROM tasks WHERE id = ?", (judge_id,)).fetchone()
+                        if existing is None:
+                            updated_manifest = {
+                                **manifest,
+                                "judge": {
+                                    **{k: judge[k] for k in ("provider", "model", "label", "vendor", "source", "cross_vendor")},
+                                    "task_id": judge_id,
+                                },
+                                "strict_cross_vendor": effective_strict,
+                            }
+                            _write_json_atomic(manifest_path, updated_manifest)
+                    committed = True
+                    created = existing is None
+                    if created:
+                        _auto_subscribe_task(conn, judge_id, session_id=effective_session_id)
+            except BaseException:
+                if not committed and updated_manifest is not None and prior_manifest is not None:
+                    try:
+                        if manifest_path.read_bytes() != prior_manifest:
+                            _write_bytes_atomic(manifest_path, prior_manifest)
+                    except OSError:
+                        pass
+                raise
             judge_row = {"id": judge_id, "status": str(row[0]) if row else "unknown", "model_override": row[1] if row else None}
-            if created:
+            if created and updated_manifest is not None:
                 if judge.get("advisory"):
                     advisories.append(judge["advisory"])
-                manifest["judge"] = {
-                    **{k: judge[k] for k in ("provider", "model", "label", "vendor", "source", "cross_vendor")},
-                    "task_id": judge_id,
-                }
-                manifest["strict_cross_vendor"] = effective_strict
-                _write_json_atomic(manifest_path, manifest)
+                manifest = updated_manifest
                 record_transition(
                     "spawn_arena_judge",
                     tenant=arena_tenant,
@@ -938,11 +969,18 @@ def evaluate_arena(
                 f"Judge is done but the canonical artifact {canonical_info['path']} is unchanged since before the arena was spawned."
             )
 
+    judge_failed = bool(judge_out and judge_out["status"] in _FAILED)
+    if judge_failed:
+        advisories.append(
+            f"Judge card {judge_out['task_id']} ended in terminal state '{judge_out['status']}'; "
+            "re-run or replace it before synthesis."
+        )
+
     if synthesized:
         status = "synthesized"
     elif not all_present or db_error:
         status = "degraded"
-    elif any_failed:
+    elif any_failed or judge_failed:
         status = "needs_attention"
     elif any(c["status"] in _STUCK for c in candidates) or (judge_out and judge_out["status"] in _STUCK):
         status = "blocked"

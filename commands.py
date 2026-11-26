@@ -381,7 +381,7 @@ def _handle_arena(args: Any, as_json: bool) -> None:
                 judge_model=args.judge_model,
                 strict_cross_vendor=bool(args.strict_cross_vendor),
             )
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         res = {"ok": False, "error": str(exc)}
     if as_json:
         print(json.dumps({"action": args.action, **res}, indent=2, default=str))
