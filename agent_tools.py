@@ -585,12 +585,14 @@ def register_tools(ctx: Any) -> None:
                     dry_run=bool(args.get("dry_run", False)),
                     tenant=ctx_args["tenant"] or None,
                     card_id=ctx_args["card_id"] or None,
+                    prove=bool(args.get("prove", False)),
                 )
             elif action == "check":
                 res = check_harness(
                     repo,
                     run_doctor=bool(args.get("run_doctor", False)),
                     run_hooks=bool(args.get("run_hooks", False)),
+                    base_ref=args.get("base_ref") or None,
                 )
             elif action == "show":
                 res = show_harness(repo)
@@ -611,9 +613,12 @@ def register_tools(ctx: Any) -> None:
                 "Manage a repository's git-tracked verification harness under `.factonio/` (`verify.md` "
                 "Launch/Doctor/Drive/Evidence/Cleanup playbook + Feature Map + Hooks, and `harness.json` schema v1). "
                 "action=init auto-detects stack/routes/CLI and writes it (refuses to overwrite unless force; dry_run "
-                "previews); check validates it (optionally running Doctor commands and hooks); show returns it; audit "
+                "previews; prove runs Doctor, required hooks and an evidence-survival probe and fails closed with "
+                "rollback); check validates it (optionally running Doctor commands and hooks) and fails when required "
+                "hooks or Doctor commands were removed/downgraded vs base_ref (default HEAD); show returns it; audit "
                 "reports read-only drift (uncovered changed files, stale features, new/removed routes and CLI "
-                "commands, orphaned globs). Black-Box Verification cards receive the harness automatically."
+                "commands, orphaned globs, gate_loosening) with a drift_classification (clean, doc_drift, "
+                "harness_gap, product_regression). Black-Box Verification cards receive the harness automatically."
             ),
             "parameters": {
                 "type": "object",
@@ -622,6 +627,12 @@ def register_tools(ctx: Any) -> None:
                     "repo": {"type": "string", "description": "Registered repo slug, 'owner/repo', or local checkout path."},
                     "force": {"type": "boolean", "default": False, "description": "init: overwrite an existing harness."},
                     "dry_run": {"type": "boolean", "default": False, "description": "init: return generated content without writing."},
+                    "prove": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "init: prove the harness (Doctor + required hooks + evidence survives cleanup); "
+                        "on failure nothing is left written and ok is false.",
+                    },
                     "hooks": {
                         "type": "array",
                         "description": "init: hooks to declare (kept from an existing harness when omitted).",
@@ -637,7 +648,12 @@ def register_tools(ctx: Any) -> None:
                             "required": ["name", "kind", "command"],
                         },
                     },
-                    "base_ref": {"type": "string", "description": "audit: compare against this git ref instead of harness.json base_commit."},
+                    "base_ref": {
+                        "type": "string",
+                        "description": "audit: compare against this git ref instead of harness.json base_commit; "
+                        "check: fail when required hooks/Doctor commands committed at this ref (default HEAD) were "
+                        "removed or downgraded.",
+                    },
                     "run_doctor": {"type": "boolean", "default": False, "description": "check: also run the Doctor commands."},
                     "run_hooks": {"type": "boolean", "default": False, "description": "check: also run declared hooks."},
                     "tenant": {"type": "string", "description": "Workstream tenant for the decision trail (defaults to the worker's tenant)."},

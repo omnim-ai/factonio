@@ -56,14 +56,17 @@ RETRO_BLUEPRINT_PROMPT = """Run a Factonio `/correct` retrospective. Do not chan
 7. Deliver a decision-ready handoff: plain language, the key table or chart first, then one recommendation per class with its evidence and risk."""
 
 
-HARNESS_AUDIT_BLUEPRINT_PROMPT = """Run a Factonio repo verification harness drift audit. Do not edit repository code or push commits.
+HARNESS_AUDIT_BLUEPRINT_PROMPT = """Run a Factonio repo verification harness live pass: a drift audit plus a live gate check. Do not edit repository code or push commits.
 
 1. List registered repositories with `hermes factonio --json list`.
-2. For each repo, run `hermes factonio harness audit <repo> --json` (strictly read-only: git probes use `--no-optional-locks`; the repo is never mutated).
-3. Report per repo: `severity` (`clean` | `stale` | `missing`), `uncovered_changed_files`, `stale_features`, `orphaned_globs`, `new_routes` / `removed_routes`, `new_cli_commands` / `removed_cli_commands`, and the `recommendations`.
-4. For `missing` or `stale` repos, recommend one action each: `hermes factonio harness init <repo>` (or `--force` to refresh; declared hooks are kept) followed by a reviewed commit of `.factonio/`, or a scoped `[implement]` card via `factonio_spawn_implement` when the Drive/Feature Map scenarios need human-quality edits.
-5. Log one `factonio_log_decision` row per drifted repo (phase `harness`, decision `harness_drift`, evidence = the audit counts and base commit).
-6. Deliver a short, decision-ready summary: a table of repos x severity first, then the recommendations."""
+2. For each repo, run `hermes factonio harness audit <repo> --json` (strictly read-only: git probes use `--no-optional-locks`; the repo is never mutated) and then the live pass `hermes factonio harness check <repo> --run-doctor --run-hooks --json` (Doctor commands + every declared hook, failing on any required hook or Doctor command removed/downgraded since `HEAD`).
+3. Report per repo: `severity` (`clean` | `stale` | `missing`), `uncovered_changed_files`, `stale_features`, `orphaned_globs`, `new_routes` / `removed_routes`, `new_cli_commands` / `removed_cli_commands`, `gate_loosening` (`removed_required_hooks`, `downgraded_hooks`, `removed_doctor_commands`), the check's `valid` / `errors` / failing hooks, and the `recommendations`.
+4. Classify every repo with the 3-way drift rubric (the audit's `drift_classification` plus the check results; priority `product_regression` > `harness_gap` > `doc_drift` > `clean`) and recommend exactly the matching action:
+   - `doc_drift` (the `.factonio/` playbook no longer describes the repo: missing/stale harness, section errors, dead globs, loosened gates) -> fix `.factonio/`: `hermes factonio harness init <repo> --force` (declared hooks are kept; add `--prove`) or a scoped `[implement]` card via `factonio_spawn_implement` for human-quality Drive/Feature Map edits, followed by a reviewed commit. Restore removed or downgraded required gates; never drop them.
+   - `harness_gap` (the harness is broken or a gate could not run: malformed `harness.json` / unsupported `schema_version`, Doctor failure, hook timeout, command not found) -> fix the harness helper or environment (repair the manifest, prerequisites, hook command paths, timeouts) so the gate runs again; do not touch product code and do not weaken the gate.
+   - `product_regression` (a required hook ran and failed) -> report the product bug (a scoped `[implement]` fix card). Never edit `.factonio/` to paper over broken product behavior: do not remove, downgrade to optional, or loosen the failing hook.
+5. Log one `factonio_log_decision` row per non-clean repo (phase `harness`, decision `harness_drift`, result = the classification, evidence = the audit counts, failing hooks, gate_loosening findings and base commit).
+6. Deliver a short, decision-ready summary: a table of repos x severity x classification first, then the recommended actions."""
 
 
 def _parse_frontmatter(skill_md: Path) -> tuple[str, dict[str, Any]]:

@@ -198,6 +198,46 @@ class TestBundledSkillRigorAndAttribution(unittest.TestCase):
         ), "verify-blackbox skill")
         self.assertIn("Never run `git diff`, `git show`, `gh pr diff`, or read implementation source files", text)
 
+    def test_verify_blackbox_user_pov_and_verified_unreachable_rule(self):
+        text = self._read("skills/verify-blackbox/SKILL.md")
+        self._assert_all_in(text, (
+            "**Drive from the user's point of view.**",
+            "**Fresh state:**",
+            "**Real entrypoints only:**",
+            "**Observe, don't assume:**",
+            "**Common gotchas:**",
+            "**Live harness pass:**",
+            "`gate_loosening`",
+            "**`verified-unreachable` reporting rule:**",
+            '`verdict: "inconclusive"`, never `pass`',
+            "outranked by `reject`",
+        ), "verify-blackbox skill")
+        rule = text.split("**`verified-unreachable` reporting rule:**", 1)[1].split("\n", 1)[0]
+        self.assertIn("`disclosed_limits`", rule)
+        # The user-POV step precedes scenario execution, and the rule sits in the verdict section.
+        self.assertLess(text.index("**Drive from the user's point of view.**"), text.index("Execute every holdout scenario"))
+        self.assertLess(text.index("### 3. Record Verdict"), text.index("**`verified-unreachable` reporting rule:**"))
+
+    def test_harness_audit_blueprint_live_pass_rubric(self):
+        import factonio
+
+        prompt = factonio.HARNESS_AUDIT_BLUEPRINT_PROMPT
+        self._assert_all_in(prompt, (
+            "hermes factonio harness audit <repo> --json",
+            "hermes factonio harness check <repo> --run-doctor --run-hooks --json",
+            "`doc_drift`",
+            "`harness_gap`",
+            "`product_regression`",
+            "`product_regression` > `harness_gap` > `doc_drift` > `clean`",
+            "fix `.factonio/`",
+            "fix the harness helper or environment",
+            "Never edit `.factonio/` to paper over broken product behavior",
+            "gate_loosening",
+        ), "harness-audit blueprint")
+        rubric = prompt.split("3-way drift rubric", 1)[1]
+        order = [rubric.index(f"   - `{k}`") for k in ("doc_drift", "harness_gap", "product_regression")]
+        self.assertEqual(order, sorted(order))
+
     def test_orchestrator_merge_gate_rigor(self):
         text = self._read("skills/orchestrator/SKILL.md")
         self._assert_all_in(text, (

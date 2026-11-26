@@ -49,8 +49,14 @@ This barrier is the entire reason Black-Box Verification runs in an isolated car
 2. Read every scenario file inside the card's `holdout/` directory.
 3. Build or start the application using the documented command or `run_hint`.
    - **Repo verification harness:** when the card has a `## Repo Verification Harness` section (or the checkout contains `.factonio/verify.md`), run its stages in order: `Launch -> Doctor -> Drive -> Evidence -> Cleanup`. A failing Doctor command means the environment is not ready (fix it or report `inconclusive`, never `pass`). Run every declared hook (`visual_diff`, `invariant`, `custom`) from the checkout, or `hermes factonio harness check . --run-doctor --run-hooks --json`: a failing required hook is a `reject`; a failing or unrunnable optional hook goes under `disclosed_limits`.
-4. Execute every holdout scenario and acceptance check, capturing exact commands, exit codes, stdout/stderr, HTTP responses, or browser observations. When an Approved Design directory is linked, render the built UI in a browser and compare visual hierarchy, states, and layout fidelity against the approved design previews.
-5. Shut down any temporary server processes you started before finishing.
+   - **Live harness pass:** also run `hermes factonio harness check . --run-doctor --run-hooks --json` and `hermes factonio harness audit . --json` and read their classification: a required hook that runs and fails is a product failure (`reject`); a gate that cannot run (Doctor failure, hook timeout, command not found) is a harness gap (fix the environment or report `inconclusive`); `gate_loosening` findings (required hooks removed or downgraded to optional, Doctor commands dropped) mean the PR weakened its own gates, so report them as findings and never treat the loosened harness as the bar to `pass`.
+4. **Drive from the user's point of view.** Before each scenario, establish the preconditions a real user or caller would have, and avoid the gotchas that make a probe lie:
+   - **Fresh state:** start from a clean checkout and an isolated `HERMES_HOME`, never from state left by a previous scenario, a cached build, or your own earlier probe.
+   - **Real entrypoints only:** use the documented CLI, HTTP API, or UI a user would touch, with the documented flags; do not import internals or call private helpers to "reach" a behavior.
+   - **Observe, don't assume:** confirm exit codes, response bodies, files on disk, and rendered UI yourself. A command that prints nothing is not a pass until you check its exit code and side effects.
+   - **Common gotchas:** inherited env vars (`HERMES_HOME`, `HERMES_KANBAN_DB`, proxies), stale `PATH` entries, missing `--json`, relative paths resolved from the wrong directory, timezones/clocks, and pagination or truncation hiding later rows.
+5. Execute every holdout scenario and acceptance check, capturing exact commands, exit codes, stdout/stderr, HTTP responses, or browser observations. When an Approved Design directory is linked, render the built UI in a browser and compare visual hierarchy, states, and layout fidelity against the approved design previews.
+6. Shut down any temporary server processes you started before finishing.
 
 ### 3. Record Verdict
 
@@ -66,6 +72,7 @@ Every Black-Box card ends in exactly one of three verdicts:
 - Return `verdict: "reject"` if any scenario fails, crashes, or disagrees with expected observable behavior. A failure outranks unrunnable scenarios: report `reject`, not `inconclusive`. Describe failures purely in terms of **inputs, observed behavior, and expected behavior** — never quote hidden holdout filenames or full holdout scripts if they would let an implementer hardcode answers; summarize the failing behavioral contract instead.
 - Return `verdict: "inconclusive"` when required scenarios could not run. `inconclusive` must never silently pass: do not round it up to `pass`, do not omit it from `summary`, and list **every** skipped or unrunnable surface, scenario, or check under `disclosed_limits` with the exact reason and the command or step that failed to run.
 - Any verdict with a non-empty `disclosed_limits` must mention those limits in the card `summary`.
+- **`verified-unreachable` reporting rule:** when you prove (with a concrete command and its observed output) that a required surface or scenario cannot be reached from the user's point of view in this environment (service down, credential absent, platform unsupported, no browser), record it in `disclosed_limits` as `verified-unreachable: <scenario or surface> — <command> -> <observed output>`. A `verified-unreachable` required scenario makes the verdict `verdict: "inconclusive"`, never `pass`, however strong the remaining evidence. It is outranked by `reject`: if any runnable scenario failed, the verdict is `reject` and the `verified-unreachable` entries stay listed under `disclosed_limits`. "I did not try" is not `verified-unreachable`; run the probe first.
 
 ## Output Format
 
@@ -81,7 +88,7 @@ Complete the card with `kanban_complete` using a concise `summary` and this `met
   "scenarios_run": 3,
   "scenarios_passed": 3,
   "disclosed_limits": [
-    "Payment webhook scenario not run: STRIPE_TEST_KEY unavailable in worker environment (`curl -X POST .../webhook` returned 401)."
+    "verified-unreachable: payment webhook scenario — `curl -X POST .../webhook` -> 401 (STRIPE_TEST_KEY unavailable in worker environment)."
   ],
   "findings": []
 }
