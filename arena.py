@@ -9,6 +9,7 @@ hand-grafts the canonical `spec.md` (+ `holdout/`) or `design/` from every candi
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -50,6 +51,9 @@ ARENA_ID_RE = re.compile(r"^ar_[0-9a-f]{6,32}$")
 MANIFEST_NAME = "manifest.json"
 _DONE = "done"
 _STUCK = frozenset({"blocked", "triage"})
+# Terminal non-done candidate states: cards gone from the board vs. cards that ended without output.
+_GONE = frozenset({"missing", "archived"})
+_FAILED = frozenset({"failed", "cancelled"})
 _SLOT_SAFE_RE = re.compile(r"[^a-z0-9-]+")
 
 
@@ -103,6 +107,11 @@ def _diversity_error(panel: dict[str, Any]) -> str:
     )
 
 
+def _normalize_provider(provider: Any) -> Optional[str]:
+    text = str(provider or "").strip()
+    return None if not text or text.lower() == "auto" else text
+
+
 def _resolve_judge(
     *,
     repo_slug: str,
@@ -110,8 +119,15 @@ def _resolve_judge(
     judge_model: Any,
     candidate_vendors: set[str],
     strict_cross_vendor: bool,
+    has_unknown_candidate: bool = False,
+    saved_judge: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Pick the judge model and enforce (``strict``) or advise on cross-vendor independence."""
+    """Pick the judge model and enforce (``strict``) or advise on cross-vendor independence.
+
+    Precedence: explicit ``judge_model`` > the ``saved_judge`` persisted in the arena manifest >
+    the repo/aux ``<target>`` then ``verify`` phase models. Independence is only provable when every
+    candidate vendor is known, so an unknown-vendor candidate makes ``cross_vendor`` false.
+    """
     entry: Optional[dict[str, Any]] = None
     source = "unset"
     if judge_model not in (None, "", {}):
@@ -119,13 +135,18 @@ def _resolve_judge(
         if entry is None:
             raise ValueError(f"judge_model must name a model ('provider/model', 'model', or {{model: ...}}); got {judge_model!r}")
         source = "override"
+    elif saved_judge and str(saved_judge.get("model") or "").strip():
+        entry = _normalize_panel_entry(
+            {"provider": saved_judge.get("provider"), "model": saved_judge.get("model")}, source="manifest", index=0
+        )
+        source = "manifest"
     else:
         options: list[tuple[dict[str, Any], str]] = []
         for phase in (target, "verify"):
             resolved = resolve_phase_model(phase, repo_slug=repo_slug)
             if not resolved.get("model"):
                 continue
-            provider = resolved.get("provider") or None
+            provider = _normalize_provider(resolved.get("provider"))
             model = str(resolved["model"])
             options.append((
                 {
@@ -140,17 +161,22 @@ def _resolve_judge(
         chosen = (distinct or options or [None])[0]
         if chosen is not None:
             entry, source = chosen
+    if entry is not None:
+        provider = _normalize_provider(entry.get("provider"))
+        entry = {**entry, "provider": provider, "label": f"{provider}/{entry['model']}" if provider else str(entry["model"])}
 
     vendor = (entry or {}).get("vendor")
-    cross_vendor = bool(vendor) and vendor not in candidate_vendors
+    cross_vendor = bool(vendor) and vendor not in candidate_vendors and not has_unknown_candidate
     advisory: Optional[str] = None
     if not cross_vendor:
         if not entry:
             reason = "no judge model is configured (it would run on the worker profile default)"
         elif not vendor:
             reason = f"the vendor of judge model {entry['label']} could not be inferred"
-        else:
+        elif vendor in candidate_vendors:
             reason = f"judge model {entry['label']} shares vendor family {vendor} with a candidate"
+        else:
+            reason = "a candidate's vendor family could not be inferred, so judge independence is unprovable"
         if strict_cross_vendor:
             raise ValueError(
                 f"strict_cross_vendor: {reason}; candidates span {', '.join(sorted(candidate_vendors))}. "
@@ -265,7 +291,10 @@ def _judge_body(
         barrier = ""
         canonical_path = str(canonical_spec)
     else:
-        outputs = f"- Spec: `{canonical_spec}`\n- Canonical design output directory: `{canonical_design}`\n"
+        outputs = (
+            f"- Spec: `{canonical_spec}`\n- Canonical design output directory: `{canonical_design}`\n"
+            f"- Design provider: `hermes` (pure-Hermes synthesis on this judge's own model)\n"
+        )
         canonical = f"`{canonical_design}/DESIGN.md` plus the grafted static HTML previews and screenshots under `{canonical_design}`"
         skill = "factonio:design"
         barrier = (
@@ -355,6 +384,33 @@ def _create_judge_card(
     )
 
 
+def _canonical_artifact_path(tenant: str, target: str) -> Path:
+    runs = _runs_root() / _safe_tenant(tenant)
+    return runs / "spec.md" if target == "define" else runs / "design" / "DESIGN.md"
+
+
+def _sha256(path: Path) -> Optional[str]:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _canonical_baseline(path: Path) -> dict[str, Any]:
+    """Pre-arena state of the canonical artifact, so a stale pre-existing file never reads as synthesized."""
+    try:
+        st = path.stat()
+    except OSError:
+        return {"existed": False, "size": None, "mtime_ns": None, "sha256": None}
+    if not path.is_file():
+        return {"existed": False, "size": None, "mtime_ns": None, "sha256": None}
+    return {"existed": True, "size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns), "sha256": _sha256(path)}
+
+
 def spawn_arena(
     repo_spec: str,
     tenant: Optional[str],
@@ -402,6 +458,7 @@ def spawn_arena(
         judge_model=judge_model,
         candidate_vendors=candidate_vendors,
         strict_cross_vendor=bool(strict_cross_vendor),
+        has_unknown_candidate=any(not e.get("vendor") for e in panel["entries"]),
     )
 
     short_title = single_line(title or request_text.splitlines()[0])[:72].strip() or "arena"
@@ -413,120 +470,131 @@ def spawn_arena(
     full_repo = str(repo["repo"])
     repo_path = str(repo["path"])
 
-    candidates: list[dict[str, Any]] = []
-    for idx, entry in enumerate(panel["entries"], start=1):
-        slot = _slot_name(idx, entry.get("vendor"))
-        slot_dir = arena_dir / "candidates" / slot
-        cand: dict[str, Any] = {
-            "slot": slot,
-            "vendor": entry.get("vendor"),
-            "provider": entry.get("provider"),
-            "model": entry["model"],
-            "label": entry["label"],
-            "dir": str(slot_dir),
-        }
-        if canon_target == "define":
-            cand["spec_path"] = str(slot_dir / "spec.md")
-            cand["holdout_dir"] = str(slot_dir / "holdout")
-            (slot_dir / "holdout").mkdir(parents=True, exist_ok=True)
-        else:
-            cand["design_dir"] = str(slot_dir / "design")
-            (slot_dir / "design").mkdir(parents=True, exist_ok=True)
-        candidates.append(cand)
+    created_at_ns = time.time_ns()
+    canonical: dict[str, Any] = {"spec_path": str(canonical_spec)}
+    if canon_target == "define":
+        canonical["holdout_dir"] = str(holdout_dir_path(tenant))
+    else:
+        canonical["design_dir"] = str(design_dir_path(tenant))
+    canonical_baseline = _canonical_baseline(_canonical_artifact_path(tenant, canon_target))
 
     advisories = list(panel.get("advisories") or [])
     if judge.get("advisory"):
         advisories.append(judge["advisory"])
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import write_txn
 
     effective_session_id = _resolve_calling_session_id(session_id)
-    all_subscribed = True
     judge_task_id: Optional[str] = None
+    candidates: list[dict[str, Any]] = []
+    committed = False
     try:
+        for idx, entry in enumerate(panel["entries"], start=1):
+            slot = _slot_name(idx, entry.get("vendor"))
+            slot_dir = arena_dir / "candidates" / slot
+            cand: dict[str, Any] = {
+                "slot": slot,
+                "vendor": entry.get("vendor"),
+                "provider": entry.get("provider"),
+                "model": entry["model"],
+                "label": entry["label"],
+                "dir": str(slot_dir),
+            }
+            if canon_target == "define":
+                cand["spec_path"] = str(slot_dir / "spec.md")
+                cand["holdout_dir"] = str(slot_dir / "holdout")
+                (slot_dir / "holdout").mkdir(parents=True, exist_ok=True)
+            else:
+                cand["design_dir"] = str(slot_dir / "design")
+                (slot_dir / "design").mkdir(parents=True, exist_ok=True)
+            candidates.append(cand)
+
         with connect_closing(board=board) as conn:
-            for cand in candidates:
-                body = _candidate_body(
-                    target=canon_target,
-                    arena_id=arena_id,
-                    cand=cand,
-                    full_repo=full_repo,
-                    repo_path=repo_path,
-                    tenant=tenant,
-                    arena_dir=arena_dir,
-                    request=request_text,
-                    canonical_spec=canonical_spec,
-                )
-                vendor_tag = _stamp_token(cand["vendor"], "unknown")
-                cand["task_id"] = kb.create_task(
-                    conn,
-                    title=f"[{canon_target}] [arena:{vendor_tag}] {short_title}"[:120],
-                    body=body,
-                    assignee=WORKER_PROFILE,
-                    created_by=PLUGIN_ID,
-                    workspace_kind="dir",
-                    workspace_path=repo_path,
-                    project_id="",
-                    tenant=tenant,
-                    parents=list(parents or []),
-                    idempotency_key=f"arena:{arena_id}:{cand['slot']}",
-                    skills=[f"factonio:{canon_target}"],
-                    model_override=cand["model"],
-                    provider_override=cand.get("provider") or None,
-                    goal_mode=True,
-                    session_id=effective_session_id,
-                    board=board,
-                    completion_contract="local-only",
-                )
-                all_subscribed = _auto_subscribe_task(conn, cand["task_id"], session_id=effective_session_id) and all_subscribed
-            if auto_judge:
-                judge_task_id = _create_judge_card(
-                    conn,
-                    target=canon_target,
-                    arena_id=arena_id,
-                    judge=judge,
-                    candidates=candidates,
-                    repo=repo,
-                    tenant=tenant,
-                    manifest_path=manifest_path,
-                    request=request_text,
-                    short_title=short_title,
-                    session_id=effective_session_id,
-                    board=board,
-                )
-                all_subscribed = _auto_subscribe_task(conn, judge_task_id, session_id=effective_session_id) and all_subscribed
+            # One outer transaction: a failure on any card, or on the manifest write below, rolls
+            # back every card so the dispatcher never sees a partial arena.
+            with write_txn(conn):
+                for cand in candidates:
+                    body = _candidate_body(
+                        target=canon_target,
+                        arena_id=arena_id,
+                        cand=cand,
+                        full_repo=full_repo,
+                        repo_path=repo_path,
+                        tenant=tenant,
+                        arena_dir=arena_dir,
+                        request=request_text,
+                        canonical_spec=canonical_spec,
+                    )
+                    vendor_tag = _stamp_token(cand["vendor"], "unknown")
+                    cand["task_id"] = kb.create_task(
+                        conn,
+                        title=f"[{canon_target}] [arena:{vendor_tag}] {short_title}"[:120],
+                        body=body,
+                        assignee=WORKER_PROFILE,
+                        created_by=PLUGIN_ID,
+                        workspace_kind="dir",
+                        workspace_path=repo_path,
+                        project_id="",
+                        tenant=tenant,
+                        parents=list(parents or []),
+                        idempotency_key=f"arena:{arena_id}:{cand['slot']}",
+                        skills=[f"factonio:{canon_target}"],
+                        model_override=cand["model"],
+                        provider_override=cand.get("provider") or None,
+                        goal_mode=True,
+                        session_id=effective_session_id,
+                        board=board,
+                        completion_contract="local-only",
+                    )
+                if auto_judge:
+                    judge_task_id = _create_judge_card(
+                        conn,
+                        target=canon_target,
+                        arena_id=arena_id,
+                        judge=judge,
+                        candidates=candidates,
+                        repo=repo,
+                        tenant=tenant,
+                        manifest_path=manifest_path,
+                        request=request_text,
+                        short_title=short_title,
+                        session_id=effective_session_id,
+                        board=board,
+                    )
+                judge_info = {k: judge[k] for k in ("provider", "model", "label", "vendor", "source", "cross_vendor")}
+                judge_info["task_id"] = judge_task_id
+                manifest = {
+                    "arena_id": arena_id,
+                    "tenant": tenant,
+                    "repo": full_repo,
+                    "repo_slug": slug,
+                    "target": canon_target,
+                    "title": short_title,
+                    "request": request_text,
+                    "created_at": created_at_ns // 1_000_000_000,
+                    "created_at_ns": created_at_ns,
+                    "panel_source": panel["source"],
+                    "vendors": list(panel["vendors"]),
+                    "strict_cross_vendor": bool(strict_cross_vendor),
+                    "parents": list(parents or []),
+                    "candidates": candidates,
+                    "judge": judge_info,
+                    "canonical": canonical,
+                    "canonical_baseline": canonical_baseline,
+                    "advisories": advisories,
+                }
+                _write_json_atomic(manifest_path, manifest)
+            committed = True
+            # Notify subscriptions open their own (non-nestable) write transaction, so they run
+            # after the cards are committed; a failed subscription only reports subscribed=false.
+            all_subscribed = True
+            for task_id in [c["task_id"] for c in candidates] + ([judge_task_id] if judge_task_id else []):
+                all_subscribed = _auto_subscribe_task(conn, task_id, session_id=effective_session_id) and all_subscribed
     except BaseException:
-        # Only directories no card points at are safe to remove; created cards keep theirs.
-        if not any(c.get("task_id") for c in candidates):
+        if not committed:
             shutil.rmtree(arena_dir, ignore_errors=True)
         raise
-
-    canonical: dict[str, Any] = {"spec_path": str(canonical_spec)}
-    if canon_target == "define":
-        canonical["holdout_dir"] = str(holdout_dir_path(tenant))
-    else:
-        canonical["design_dir"] = str(design_dir_path(tenant))
-    judge_info = {k: judge[k] for k in ("provider", "model", "label", "vendor", "source", "cross_vendor")}
-    judge_info["task_id"] = judge_task_id
-    manifest = {
-        "arena_id": arena_id,
-        "tenant": tenant,
-        "repo": full_repo,
-        "repo_slug": slug,
-        "target": canon_target,
-        "title": short_title,
-        "request": request_text,
-        "created_at": int(time.time()),
-        "panel_source": panel["source"],
-        "vendors": list(panel["vendors"]),
-        "strict_cross_vendor": bool(strict_cross_vendor),
-        "parents": list(parents or []),
-        "candidates": candidates,
-        "judge": judge_info,
-        "canonical": canonical,
-        "advisories": advisories,
-    }
-    _write_json_atomic(manifest_path, manifest)
 
     record_transition(
         "spawn_arena",
@@ -597,17 +665,32 @@ def _find_manifest(arena_id: Optional[str], tenant: Optional[str]) -> tuple[Opti
         return None, f"No arena found for {arena_id}."
     if not tenant:
         return None, "Pass arena_id and/or tenant to select an arena."
-    newest: tuple[int, str, Optional[Path]] = (-1, "", None)
+    newest: Optional[tuple[tuple[int, int, str], Path]] = None
     for path in (root / _safe_tenant(tenant) / "arena").glob(f"ar_*/{MANIFEST_NAME}"):
         data = _load_manifest(path)
         if data is None:
             continue
-        key = (int(data.get("created_at") or 0), str(data.get("arena_id")), path)
-        if key[:2] > newest[:2]:
-            newest = key
-    if newest[2] is None:
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            mtime_ns = 0
+        key = (_created_ns(data), int(mtime_ns), str(data.get("arena_id")))
+        if newest is None or key > newest[0]:
+            newest = (key, path)
+    if newest is None:
         return None, f"No arena found for tenant={tenant}."
-    return newest[2], None
+    return newest[1], None
+
+
+def _created_ns(manifest: dict[str, Any]) -> int:
+    for key, scale in (("created_at_ns", 1), ("created_at", 1_000_000_000)):
+        try:
+            value = int(manifest.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value * scale
+    return 0
 
 
 def _read_tasks(db_path: Path, ids: list[str], arena_id: str) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], Optional[str]]:
@@ -644,6 +727,21 @@ def _file_info(path: Path) -> dict[str, Any]:
     except OSError:
         exists, size = False, 0
     return {"path": str(path), "exists": exists, "size_bytes": size}
+
+
+def _canonical_changed(path: Path, manifest: dict[str, Any]) -> bool:
+    """True when the canonical artifact was written after the arena was spawned."""
+    raw = manifest.get("canonical_baseline")
+    baseline: dict[str, Any] = raw if isinstance(raw, dict) else {}
+    try:
+        mtime_ns = int(path.stat().st_mtime_ns)
+    except OSError:
+        return False
+    if baseline and not baseline.get("existed"):
+        return True
+    if baseline.get("sha256") and _sha256(path) != baseline["sha256"]:
+        return True
+    return mtime_ns > max(int(baseline.get("mtime_ns") or 0), _created_ns(manifest))
 
 
 def _count_files(directory: Path) -> int:
@@ -700,6 +798,10 @@ def evaluate_arena(
         has_artifact = artifact["exists"] and artifact["size_bytes"] > 0
         if status == "missing":
             advisories.append(f"Candidate {c.get('slot')} card {c.get('task_id')} is missing from kanban.db.")
+        elif status in _GONE:
+            advisories.append(f"Candidate {c.get('slot')} card {c.get('task_id')} is {status}; the arena cannot be synthesized without it.")
+        elif status in _FAILED:
+            advisories.append(f"Candidate {c.get('slot')} card {c.get('task_id')} ended {status}; re-run or replace it before synthesis.")
         elif status == _DONE and not has_artifact:
             advisories.append(f"Candidate {c.get('slot')} is done but its artifact {artifact['path']} is missing or empty.")
         candidates.append({
@@ -718,76 +820,90 @@ def evaluate_arena(
     judge_row: Optional[dict[str, Any]] = next((r for r in judge_rows if r["id"] == manifest_judge.get("task_id")), None)
     judge_row = judge_row or (judge_rows[-1] if judge_rows else None)
 
-    runs = _runs_root() / _safe_tenant(arena_tenant)
-    if target == "define":
-        canonical_info = _file_info(runs / "spec.md")
-    else:
-        canonical_info = _file_info(runs / "design" / "DESIGN.md")
-    canonical_exists = bool(canonical_info["exists"] and canonical_info["size_bytes"] > 0)
+    all_present = bool(cand_meta) and all(c["status"] not in _GONE for c in candidates)
+    any_failed = any(c["status"] in _FAILED for c in candidates)
 
     spawned_judge = False
-    all_present = bool(cand_meta) and all(c["status"] != "missing" for c in candidates)
     if spawn_judge and judge_row is None:
-        if db_error or not all_present:
-            advisories.append("Judge not spawned: every candidate card must exist in kanban.db first.")
+        if db_error or not all_present or any_failed:
+            advisories.append(
+                "Judge not spawned: every candidate card must exist in kanban.db and none may be archived, failed or cancelled."
+            )
         else:
             repo = get_repo(str(manifest.get("repo_slug") or manifest.get("repo") or ""))
             if repo is None:
                 return {"ok": False, "error": f"Repository {manifest.get('repo')!r} is no longer registered.", "arena_id": aid}
+            effective_strict = bool(strict_cross_vendor) or bool(manifest.get("strict_cross_vendor"))
             vendors = {str(c["vendor"]) for c in cand_meta if c.get("vendor")}
             judge = _resolve_judge(
                 repo_slug=str(repo["slug"]),
                 target=target,
                 judge_model=judge_model if judge_model not in (None, "", {}) else None,
                 candidate_vendors=vendors,
-                strict_cross_vendor=bool(strict_cross_vendor),
+                strict_cross_vendor=effective_strict,
+                has_unknown_candidate=any(not c.get("vendor") for c in cand_meta),
+                saved_judge=manifest_judge,
             )
-            if judge.get("advisory"):
-                advisories.append(judge["advisory"])
-            from hermes_cli.kanban_db_connect import connect_closing
+            from hermes_cli.kanban_db_connect import connect_closing, write_txn
 
             effective_session_id = _resolve_calling_session_id(session_id)
+            judge_key = f"arena:{aid}:judge"
             with connect_closing(board=board) as conn:
-                judge_id = _create_judge_card(
-                    conn,
-                    target=target,
-                    arena_id=aid,
-                    judge=judge,
-                    candidates=cand_meta,
-                    repo=repo,
+                with write_txn(conn):
+                    existing = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' LIMIT 1", (judge_key,)
+                    ).fetchone()
+                    judge_id = _create_judge_card(
+                        conn,
+                        target=target,
+                        arena_id=aid,
+                        judge=judge,
+                        candidates=cand_meta,
+                        repo=repo,
+                        tenant=arena_tenant,
+                        manifest_path=manifest_path,
+                        request=str(manifest.get("request") or manifest.get("title") or "").strip(),
+                        short_title=str(manifest.get("title") or "arena"),
+                        session_id=effective_session_id,
+                        board=board,
+                    )
+                    row = conn.execute("SELECT status, model_override FROM tasks WHERE id = ?", (judge_id,)).fetchone()
+                created = existing is None
+                if created:
+                    _auto_subscribe_task(conn, judge_id, session_id=effective_session_id)
+            judge_row = {"id": judge_id, "status": str(row[0]) if row else "unknown", "model_override": row[1] if row else None}
+            if created:
+                if judge.get("advisory"):
+                    advisories.append(judge["advisory"])
+                manifest["judge"] = {
+                    **{k: judge[k] for k in ("provider", "model", "label", "vendor", "source", "cross_vendor")},
+                    "task_id": judge_id,
+                }
+                manifest["strict_cross_vendor"] = effective_strict
+                _write_json_atomic(manifest_path, manifest)
+                record_transition(
+                    "spawn_arena_judge",
                     tenant=arena_tenant,
-                    manifest_path=manifest_path,
-                    request=str(manifest.get("request") or manifest.get("title") or "").strip(),
-                    short_title=str(manifest.get("title") or "arena"),
-                    session_id=effective_session_id,
-                    board=board,
+                    repo_slug=str(repo["slug"]),
+                    phase=target,
+                    card_id=judge_id,
+                    why=f"Arena {aid} judge spawned on demand",
+                    evidence={
+                        "arena_id": aid,
+                        "judge_task_id": judge_id,
+                        "candidate_task_ids": ids,
+                        "judge_vendor": judge.get("vendor"),
+                        "judge_model": judge.get("label"),
+                        "judge_source": judge.get("source"),
+                        "judge_cross_vendor": judge["cross_vendor"],
+                        "strict_cross_vendor": effective_strict,
+                    },
+                    result="spawned",
                 )
-                _auto_subscribe_task(conn, judge_id, session_id=effective_session_id)
-            manifest["judge"] = {
-                **{k: judge[k] for k in ("provider", "model", "label", "vendor", "source", "cross_vendor")},
-                "task_id": judge_id,
-            }
-            _write_json_atomic(manifest_path, manifest)
-            record_transition(
-                "spawn_arena_judge",
-                tenant=arena_tenant,
-                repo_slug=str(repo["slug"]),
-                phase=target,
-                card_id=judge_id,
-                why=f"Arena {aid} judge spawned on demand",
-                evidence={
-                    "arena_id": aid,
-                    "judge_task_id": judge_id,
-                    "candidate_task_ids": ids,
-                    "judge_vendor": judge.get("vendor"),
-                    "judge_cross_vendor": judge["cross_vendor"],
-                    "strict_cross_vendor": bool(strict_cross_vendor),
-                },
-                result="spawned",
-            )
-            spawned_judge = True
-            manifest_judge = manifest["judge"]
-            judge_row = {"id": judge_id, "status": "todo"}
+                spawned_judge = True
+                manifest_judge = manifest["judge"]
+            else:
+                advisories.append(f"Judge card {judge_id} already exists; not spawning another.")
     elif spawn_judge:
         advisories.append(f"Judge card {judge_row['id']} already exists; not spawning another.")
 
@@ -804,18 +920,33 @@ def evaluate_arena(
     elif manifest_judge.get("task_id"):
         advisories.append(f"Judge card {manifest_judge['task_id']} is missing from kanban.db.")
 
+    canonical_path = _canonical_artifact_path(arena_tenant, target)
+    canonical_info = _file_info(canonical_path)
+    canonical_exists = bool(canonical_info["exists"] and canonical_info["size_bytes"] > 0)
+    canonical_fresh = canonical_exists and _canonical_changed(canonical_path, manifest)
+
     ready = bool(candidates) and all(c["artifact_ready"] for c in candidates)
-    synthesized = bool(judge_out and judge_out["status"] == _DONE and canonical_exists)
-    if judge_out and judge_out["status"] == _DONE and not canonical_exists:
-        advisories.append(f"Judge is done but the canonical artifact {canonical_info['path']} is missing or empty.")
+    judge_done = bool(judge_out and judge_out["status"] == _DONE)
+    synthesized = bool(ready and all_present and not any_failed and not db_error and judge_done and canonical_fresh)
+    if judge_done and not synthesized:
+        if not (ready and all_present and not any_failed):
+            advisories.append("Judge is done but not every candidate finished with a non-empty artifact; the synthesis is not trusted.")
+        if not canonical_exists:
+            advisories.append(f"Judge is done but the canonical artifact {canonical_info['path']} is missing or empty.")
+        elif not canonical_fresh:
+            advisories.append(
+                f"Judge is done but the canonical artifact {canonical_info['path']} is unchanged since before the arena was spawned."
+            )
 
     if synthesized:
         status = "synthesized"
     elif not all_present or db_error:
         status = "degraded"
+    elif any_failed:
+        status = "needs_attention"
     elif any(c["status"] in _STUCK for c in candidates) or (judge_out and judge_out["status"] in _STUCK):
         status = "blocked"
-    elif judge_out and judge_out["status"] == _DONE:
+    elif judge_done:
         status = "needs_attention"
     elif not all(c["status"] == _DONE for c in candidates):
         status = "candidates_in_progress"

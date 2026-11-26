@@ -339,6 +339,228 @@ class TestEvaluateArena(unittest.TestCase):
             self.assertFalse(missing.parent.exists())
 
 
+def _set_status(task_id: str, status: str) -> None:
+    from hermes_cli.kanban_db_connect import connect_closing
+
+    with connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+
+
+def _manifest(res: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(Path(res["manifest_path"]).read_text(encoding="utf-8"))
+
+
+def _finish_candidates(res: dict[str, Any], *, write: bool = True) -> None:
+    for cand in res["candidates"]:
+        if write:
+            path = Path(cand["spec_path"]) if "spec_path" in cand else Path(cand["design_dir"]) / "DESIGN.md"
+            path.write_text(f"# {cand['slot']}\n", encoding="utf-8")
+        _complete(cand["task_id"], None)
+
+
+class TestArenaFixRound1(unittest.TestCase):
+    def test_deferred_judge_reuses_saved_model_and_strict_policy(self):
+        from factonio.arena import evaluate_arena
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            res = _spawn(auto_judge=False, strict_cross_vendor=True)
+            ev = evaluate_arena(arena_id=res["arena_id"], spawn_judge=True)
+            self.assertTrue(ev["spawned_judge"])
+            task = _get_task(ev["judge"]["task_id"])
+            self.assertEqual((task.provider_override, task.model_override), ("google", "gemini-2.5-pro"))
+            manifest = _manifest(res)
+            self.assertEqual(manifest["judge"]["label"], GOOGLE_JUDGE)
+            self.assertEqual(manifest["judge"]["source"], "manifest")
+            self.assertTrue(manifest["judge"]["cross_vendor"])
+            self.assertTrue(manifest["strict_cross_vendor"])
+            ev_row = _trail_rows("spawn_arena_judge", res["tenant"])[0]["evidence"]
+            self.assertTrue(ev_row["strict_cross_vendor"])
+            self.assertEqual(ev_row["judge_model"], GOOGLE_JUDGE)
+
+    def test_deferred_judge_on_strict_arena_rejects_overlap_without_repeating_flag(self):
+        from factonio.arena import evaluate_arena
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            res = _spawn(auto_judge=False, strict_cross_vendor=True)
+            with self.assertRaisesRegex(ValueError, "shares vendor family anthropic"):
+                evaluate_arena(arena_id=res["arena_id"], spawn_judge=True, judge_model="anthropic/claude-haiku-4-5")
+            self.assertEqual(_task_count(), 2)
+            self.assertEqual(_trail_rows("spawn_arena_judge", res["tenant"]), [])
+            self.assertTrue(_manifest(res)["strict_cross_vendor"])
+            self.assertEqual(_manifest(res)["judge"]["label"], GOOGLE_JUDGE)
+
+    def test_unknown_vendor_candidate_is_never_cross_vendor(self):
+        with isolated_hermes_home() as home:
+            _register(home)
+            models = TWO_VENDORS + ["mystery-model-x"]
+            with self.assertRaisesRegex(ValueError, "could not be inferred"):
+                _spawn(candidate_models=models, strict_cross_vendor=True)
+            self.assertEqual((_task_count(), _arena_dirs(home)), (0, []))
+            res = _spawn(candidate_models=models)
+            self.assertFalse(res["judge"]["cross_vendor"])
+            self.assertTrue(any("not provably cross-vendor" in a for a in res["advisories"]))
+
+    def test_partial_spawn_failure_rolls_back_every_card_and_directory(self):
+        from unittest import mock
+
+        from hermes_cli import kanban_db as kb
+
+        real = kb.create_task
+        for fail_at in (2, 3):
+            calls = {"n": 0}
+
+            def flaky(*args: Any, **kwargs: Any) -> str:
+                calls["n"] += 1
+                if calls["n"] == fail_at:
+                    raise sqlite3.OperationalError("disk I/O error")
+                return real(*args, **kwargs)
+
+            with self.subTest(fail_at=fail_at), isolated_hermes_home() as home:
+                _register(home)
+                with mock.patch.object(kb, "create_task", side_effect=flaky):
+                    with self.assertRaises(sqlite3.OperationalError):
+                        _spawn()
+                self.assertEqual(_task_count(), 0)
+                self.assertEqual(_arena_dirs(home), [])
+                self.assertEqual(_trail_rows("spawn_arena"), [])
+
+    def test_manifest_write_failure_rolls_back_cards(self):
+        from unittest import mock
+
+        from factonio import arena
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            with mock.patch.object(arena, "_write_json_atomic", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    _spawn()
+            self.assertEqual((_task_count(), _arena_dirs(home)), (0, []))
+
+    def test_no_false_synthesis_with_unfinished_or_missing_candidate_artifacts(self):
+        from factonio.arena import evaluate_arena
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            res = _spawn()
+            Path(res["canonical"]["spec_path"]).write_text("# Canonical\n", encoding="utf-8")
+            _set_status(res["judge_task_id"], "done")
+            ev = evaluate_arena(arena_id=res["arena_id"])
+            self.assertFalse(ev["synthesized"])
+            self.assertEqual(ev["status"], "needs_attention")
+            self.assertTrue(any("not every candidate finished" in a for a in ev["advisories"]))
+
+            _finish_candidates(res, write=False)
+            ev = evaluate_arena(arena_id=res["arena_id"])
+            self.assertFalse(ev["synthesized"])
+            self.assertEqual(ev["status"], "needs_attention")
+
+            for cand in res["candidates"]:
+                Path(cand["spec_path"]).write_text("spec", encoding="utf-8")
+            ev = evaluate_arena(arena_id=res["arena_id"])
+            self.assertEqual((ev["status"], ev["synthesized"]), ("synthesized", True))
+
+    def test_stale_pre_existing_canonical_artifact_is_not_synthesized(self):
+        from factonio.arena import evaluate_arena
+        from factonio.orchestrator import design_dir_path, spec_file_path
+
+        for target in ("define", "design"):
+            with self.subTest(target=target), isolated_hermes_home() as home:
+                _register(home)
+                tenant = f"acme-svc-stale-{target}"
+                canonical = spec_file_path(tenant) if target == "define" else design_dir_path(tenant) / "DESIGN.md"
+                canonical.parent.mkdir(parents=True, exist_ok=True)
+                canonical.write_text("# Old canonical\n", encoding="utf-8")
+                old = canonical.stat().st_mtime_ns - 3600 * 1_000_000_000
+                os.utime(canonical, ns=(old, old))
+
+                res = _spawn(target=target, tenant=tenant)
+                baseline = _manifest(res)["canonical_baseline"]
+                self.assertTrue(baseline["existed"])
+                self.assertEqual(baseline["sha256"], hashlib.sha256(b"# Old canonical\n").hexdigest())
+                _finish_candidates(res)
+                _complete(res["judge_task_id"], None)
+                ev = evaluate_arena(arena_id=res["arena_id"])
+                self.assertFalse(ev["synthesized"])
+                self.assertEqual(ev["status"], "needs_attention")
+                self.assertTrue(any("unchanged since before the arena" in a for a in ev["advisories"]))
+
+                canonical.write_text("# Grafted canonical\n", encoding="utf-8")
+                ev = evaluate_arena(arena_id=res["arena_id"])
+                self.assertEqual((ev["status"], ev["synthesized"]), ("synthesized", True))
+
+    def test_archived_failed_or_cancelled_candidates_are_terminal(self):
+        from factonio.arena import evaluate_arena
+
+        for state, expected in (("archived", "degraded"), ("failed", "needs_attention"), ("cancelled", "needs_attention")):
+            with self.subTest(state=state), isolated_hermes_home() as home:
+                _register(home)
+                res = _spawn(auto_judge=False)
+                c1, c2 = res["candidates"]
+                Path(c1["spec_path"]).write_text("spec", encoding="utf-8")
+                _complete(c1["task_id"], None)
+                _set_status(c2["task_id"], state)
+                ev = evaluate_arena(arena_id=res["arena_id"])
+                self.assertEqual(ev["status"], expected)
+                self.assertFalse(ev["ready_for_synthesis"])
+                self.assertTrue(any(c2["slot"] in a and state in a for a in ev["advisories"]))
+
+                ev = evaluate_arena(arena_id=res["arena_id"], spawn_judge=True)
+                self.assertFalse(ev["spawned_judge"])
+                self.assertIsNone(ev["judge"])
+                self.assertTrue(any("Judge not spawned" in a for a in ev["advisories"]))
+                self.assertEqual(_task_count(), 2)
+
+    def test_spawn_judge_reports_actual_ready_status(self):
+        from factonio.arena import evaluate_arena
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            res = _spawn(auto_judge=False)
+            _finish_candidates(res)
+            ev = evaluate_arena(arena_id=res["arena_id"], spawn_judge=True)
+            self.assertTrue(ev["spawned_judge"])
+            self.assertEqual(ev["judge"]["status"], "ready")
+            self.assertEqual(_get_task(ev["judge"]["task_id"]).status, "ready")
+
+    def test_same_second_tenant_lookup_is_deterministic(self):
+        from factonio.arena import evaluate_arena
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            first = _spawn(auto_judge=False)
+            second = _spawn(auto_judge=False)
+            for res, ns in ((first, 2_000_000_000_500), (second, 2_000_000_000_100)):
+                manifest = _manifest(res)
+                manifest.update(created_at=2000, created_at_ns=ns)
+                Path(res["manifest_path"]).write_text(json.dumps(manifest), encoding="utf-8")
+            os.utime(first["manifest_path"], ns=(1, 1))
+            for _ in range(3):
+                self.assertEqual(evaluate_arena(tenant="acme-svc-arena")["arena_id"], first["arena_id"])
+            self.assertGreater(_manifest(second)["created_at_ns"], 0)
+
+    def test_auto_provider_is_stripped_from_judge(self):
+        with isolated_hermes_home() as home:
+            _register(home)
+            _set_repo_field("acme-svc", models={"define": {"provider": "auto", "model": "gemini-2.5-pro"}})
+            for judge_model in (None, "auto/gemini-2.5-pro", {"provider": "AUTO", "model": "gemini-2.5-pro"}):
+                with self.subTest(judge_model=judge_model):
+                    res = _spawn(tenant=None, judge_model=judge_model)
+                    self.assertIsNone(res["judge"]["provider"])
+                    self.assertEqual(res["judge"]["label"], "gemini-2.5-pro")
+                    task = _get_task(res["judge_task_id"])
+                    self.assertIsNone(task.provider_override)
+                    self.assertEqual(task.model_override, "gemini-2.5-pro")
+
+    def test_design_judge_body_names_hermes_provider(self):
+        with isolated_hermes_home() as home:
+            _register(home)
+            res = _spawn(target="design")
+            self.assertIn("- Design provider: `hermes` (pure-Hermes synthesis on this judge's own model)",
+                          _get_task(res["judge_task_id"]).body)
+
+
 class TestArenaToolsAndCli(unittest.TestCase):
     def test_tools(self):
         with isolated_hermes_home() as home:
