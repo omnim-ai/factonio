@@ -30,6 +30,7 @@ Factonio adapts engineering patterns and instruction text from the third-party p
 - Wave 5 adapted patterns:
   - workstream modes: behavior-preserving `refactor`, `perf` with the `benchmark-checklist` (7 pre-optimization questions and 7 measurement mantras), and a read-only forensic `investigate` mode (`orchestrator.py` `WORKSTREAM_KINDS` / `BENCHMARK_PRE_OPT_QUESTIONS` / `BENCHMARK_MEASUREMENT_MANTRAS` / `investigation_report_path`, `factonio_start`, `hermes factonio start`, `skills/define/SKILL.md`, `skills/verify-diff/SKILL.md`, `skills/orchestrator/SKILL.md`).
   - `/arena` competing-candidate fan-out: opt-in parallel Definition or Design candidates across distinct vendor families with an independent judge that hand-grafts one canonical synthesis from every candidate's strengths and risks (`arena.py` `spawn_arena` / `evaluate_arena`, `factonio_spawn_arena`, `factonio_evaluate_arena`, `hermes factonio arena`, `skills/orchestrator/SKILL.md` §1b).
+  - institutional memory, crash pickup, and core principles: read-only cross-workstream recall of escapes, superseded dead ends, rejects/blocks, and related decisions injected into Definition cards (`trail.py` `recall_decisions` / `render_recall_markdown`, `orchestrator.py` `start_workstream`, `hermes factonio trail --recall`), the crash-pickup protocol, the "No is an acceptable answer" pushback rule, and the *Build the Lever* / *Idempotency* / *Minimize Reader Load* principles (`skills/define/SKILL.md`, `skills/implement/SKILL.md`, `skills/orchestrator/SKILL.md`).
 
 ```text
 MIT License

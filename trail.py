@@ -18,6 +18,7 @@ import sqlite3
 import stat
 import threading
 import time
+import unicodedata
 import uuid
 from collections import Counter
 from contextlib import closing, contextmanager
@@ -25,7 +26,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, TypeVar
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, TypeVar, Union
 
 try:
     import fcntl
@@ -1479,3 +1480,463 @@ def render_metric_snapshots_text(rows: list[Mapping[str, Any]]) -> str:
             f"panels={r.get('panels_total')} decisions={r.get('trail_decisions_total')}"
         )
     return "\n".join(lines)
+
+
+
+# --- trail --recall: read-only cross-workstream institutional memory ---------------------------
+
+RECALL_CATEGORIES = ("escapes", "superseded", "rejects_and_blocks", "keyword")
+RECALL_DEFAULT_LIMIT = 12
+RECALL_MAX_LIMIT = 100
+# Newest rows considered per sweep; keeps recall O(1) in trail size on long-lived factories.
+_RECALL_SCAN_ROWS = 5000
+_RECALL_REJECT_RESULTS = frozenset(
+    {"reject", "rejected", "blocked", "needs_input", "escalated", "inconclusive", "conflict", "proof_failed",
+     "fail", "failed"}
+)
+_RECALL_STOPWORDS = frozenset(
+    "about after again also because before being between both could does doing from have into just like make "
+    "more most only other over same should some such than that their them then there these they this those "
+    "through under until very what when where which while will with would your feature request issue please "
+    "factonio".split()
+)
+_RECALL_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_]{3,}")
+# Recall text can be injected into Definition cards: never echo holdout paths or scenario names.
+# Matching runs after NFKC folding with format/control characters removed, so zero-width joiners,
+# full-width letters or "hold-out" spellings cannot smuggle a reference past the barrier.
+# Whitespace-interleaved spellings ("hol\tdout/x") count only when followed by a path separator, so
+# prose such as "hold out for review" stays readable.
+_HOLDOUT_RE = re.compile(
+    r"hold[_./\\-]*outs?|h\s*o\s*l\s*d[\s_./\\-]*o\s*u\s*t\s*s?\s*[/\\]", re.IGNORECASE
+)
+_HOLDOUT_REDACTED = "[redacted]"
+_RECALL_FIELD_CHARS = 240
+
+
+def _recall_terms(query: Optional[str]) -> list[str]:
+    seen: list[str] = []
+    for tok in _RECALL_TOKEN_RE.findall(str(query or "").lower().replace("-", "_")):
+        for part in [tok, *tok.split("_")]:
+            if len(part) >= 4 and part not in _RECALL_STOPWORDS and part not in seen:
+                seen.append(part)
+    return seen[:24]
+
+
+# Default-ignorable code points outside the ``C*`` categories (variation selectors, fillers, joiners).
+_RECALL_INVISIBLE = frozenset(
+    [0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x3164, 0xFFA0, *range(0x180B, 0x1810), *range(0xFE00, 0xFE10),
+     *range(0xE0100, 0xE01F0)]
+)
+
+
+# Complete terminal escape sequences (7-bit ESC and 8-bit C1 forms). Deleting only the ESC byte
+# would leave printable parameters (``ho[31mldout``) splitting the marker the matcher looks for.
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]|\x9b[0-?]*[ -/]*[@-~]"  # CSI
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\|$)|\x9d[^\x07\x9c]*(?:\x07|\x9c|$)"  # OSC
+    r"|\x1b[PX^_][^\x1b]*(?:\x1b\\|$)|[\x90\x98\x9e\x9f][^\x9c]*(?:\x9c|$)"  # DCS/SOS/PM/APC
+    r"|\x1b[ -/]*[0-~]"  # other ESC sequences (two-byte Fe/Fp/Fs, nF charset designations)
+)
+# Bytes that introduce or terminate escape sequences; kept until sequences are stripped.
+_ANSI_SYNTAX = frozenset("\x07\x1b\x90\x98\x9b\x9c\x9d\x9e\x9f")
+
+
+def _recall_drop_controls(text: str, keep: frozenset = frozenset()) -> str:
+    out = []
+    for ch in text:
+        if ch in keep:
+            out.append(ch)
+        elif ch in "\t\n\r":
+            out.append(" " if not keep else ch)
+        elif unicodedata.category(ch) in ("Zl", "Zp"):
+            out.append(" ")
+        elif unicodedata.category(ch).startswith("C") or ord(ch) in _RECALL_INVISIBLE:
+            continue
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _recall_strip_ansi(text: str) -> str:
+    # Repeat until stable: removing one sequence (or an interleaved NUL) can complete another.
+    prev = None
+    while prev != text:
+        prev = text
+        text = _ANSI_ESCAPE_RE.sub("", _recall_drop_controls(text, _ANSI_SYNTAX))
+    return text
+
+
+def _recall_fold(text: str) -> str:
+    """Strip terminal escape sequences, NFKC-fold, delete control/format/invisible characters, and
+    turn whitespace controls into spaces.
+
+    Deleting (not spacing) ``h\\x00o\\x1bldout`` rejoins the word, and stripping whole sequences
+    rejoins ``ho\\x1b[31mldout``, so the redactor and the barrier both see ``holdout``.
+    """
+    text = _recall_strip_ansi(str(text))
+    text = _recall_strip_ansi(unicodedata.normalize("NFKC", text))
+    return _recall_drop_controls(text)
+
+
+def _recall_fold_plain(text: str) -> str:
+    """Fold without sequence stripping (only deletes ESC/C1 bytes); matched alongside ``_recall_fold``."""
+    return _recall_drop_controls(unicodedata.normalize("NFKC", str(text)))
+
+
+def _recall_has_holdout(text: str, folded: Optional[str] = None) -> bool:
+    # Fail closed if EITHER reading names holdout: stripping a sequence must never hide a marker
+    # that byte-deletion alone would have exposed (e.g. an unterminated OSC swallowing the path).
+    folded = _recall_fold(text) if folded is None else folded
+    return bool(_HOLDOUT_RE.search(folded) or _HOLDOUT_RE.search(_recall_fold_plain(text)))
+
+
+def _recall_redact_text(text: str) -> str:
+    """Fold ``text``; if it references holdout anywhere, replace the WHOLE string.
+
+    Partial substitution cannot know where a path ends (quoted paths may contain spaces), so any
+    trailing fragment could be a scenario name: fail closed on the entire field or line.
+    """
+    folded = _recall_fold(text)
+    return _HOLDOUT_REDACTED if _recall_has_holdout(text, folded) else folded
+
+
+def contains_holdout_reference(text: Any) -> bool:
+    """True when ``text`` mentions a holdout path or name (after the same folding the redactor uses)."""
+    return _recall_has_holdout(str(text or ""))
+
+
+def _recall_is_holdout_key(key: Any) -> bool:
+    return _recall_has_holdout(str(key))
+
+
+def _recall_scrub(value: Any) -> Any:
+    """Recursively redact holdout references from every string (and drop holdout-named keys)."""
+    if isinstance(value, str):
+        return _recall_redact_text(value)
+    if isinstance(value, Mapping):
+        return {
+            _recall_redact_text(str(k)): _recall_scrub(v) for k, v in value.items() if not _recall_is_holdout_key(k)
+        }
+    if isinstance(value, (list, tuple)):
+        return [_recall_scrub(v) for v in value]
+    return value
+
+
+def _recall_clip(value: Any, limit: int = _RECALL_FIELD_CHARS) -> str:
+    text = " ".join(_recall_redact_text(str(value if value is not None else "")).split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _recall_brief(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Every emitted string field is folded, single-lined, clipped and holdout-redacted."""
+    return {
+        "id": _recall_clip(row["id"], 80),
+        "ts": _recall_clip(row["ts"], 40),
+        "tenant": _recall_clip(row["tenant"], 120),
+        "phase": _recall_clip(row["phase"], 60),
+        "card_id": _recall_clip(row["card_id"], 80),
+        "decision": _recall_clip(row["decision"]),
+        "why": _recall_clip(row["why"]),
+        "result": _recall_clip(row["result"]),
+    }
+
+
+def _empty_recall(filters: dict[str, Any], terms: list[str]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "count": 0,
+        "items": [],
+        "counts": {c: 0 for c in RECALL_CATEGORIES},
+        "scanned": 0,
+        "query_terms": terms,
+        "filters": filters,
+    }
+
+
+def _recall_repo_inputs(repo: Union[str, Iterable[str], None]) -> list[str]:
+    values = [repo] if isinstance(repo, str) or repo is None else list(repo)
+    return list(dict.fromkeys(str(v).strip() for v in values if v is not None and str(v).strip()))
+
+
+def _recall_repo_keys(aliases: list[str]) -> set[str]:
+    """Lower-cased identifiers that name the same repository as ``aliases`` (``owner/repo`` <-> slug)."""
+    keys: set[str] = set()
+    for raw in aliases:
+        keys.update({raw, _resolve_repo_slug(raw)})
+        try:
+            from .config import get_repo
+
+            entry = get_repo(raw)
+        except Exception:  # registry unreadable: fall back to the literal identifiers
+            entry = None
+        if entry:
+            keys.update(str(entry.get(k) or "") for k in ("slug", "repo"))
+        try:
+            from .repos import normalize_repo
+
+            keys.update(normalize_repo(raw))
+        except ValueError:  # a bare slug is not an owner/repo spec; already covered above
+            pass
+    return {k.strip().lower() for k in keys if k and k.strip()}
+
+
+def recall_decisions(
+    *,
+    repo: Union[str, Iterable[str], None] = None,
+    query: Optional[str] = None,
+    exclude_tenant: Optional[str] = None,
+    limit: Any = RECALL_DEFAULT_LIMIT,
+    db_path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Sweep prior decisions for institutional memory relevant to a new workstream.
+
+    Strictly read-only: an absent `trail.db` yields an empty ``ok`` result and is never created or
+    migrated; a path that is not a readable regular SQLite store fails closed with ``ok=False,
+    items=[]`` and an ``error``. Rows from ``exclude_tenant`` (the workstream being started) are
+    skipped. Each row lands in at most one category, checked in this order:
+
+    - ``superseded``: a corrected dead end, carrying its latest superseding ``correction``.
+    - ``escapes``: escaped regressions (``escape`` phase or an ``escape*`` decision).
+    - ``rejects_and_blocks``: active rows whose ``result`` rejected, blocked, or escalated.
+    - ``keyword``: other active rows sharing a term with ``query``.
+
+    Within a category rows matching ``query`` rank first, then newest first; categories are
+    interleaved round-robin so one noisy kind cannot crowd out the rest, and the total is capped at
+    ``limit`` (1..100). A supersession chain (``A <- B <- C``, branching or even cyclic) is shown once,
+    on its oldest scanned row, with ``corrections`` listing the chain's current (never-superseded)
+    corrections newest first (``correction`` is the newest); intermediate links are never presented
+    as current. ``repo`` is one identifier or several aliases of the same repository; ``owner/repo``
+    and its registered (or derived) slug match each other, case-insensitively, while distinct
+    repositories stay isolated. Only rows inside the requested ``repo`` and outside ``exclude_tenant`` are ever
+    emitted, inline corrections included; when every current correction is out of scope the item
+    carries ``correction_out_of_scope: true`` and no correction content. Every emitted string is
+    single-lined, clipped, and any ``holdout`` reference is redacted. Returns
+    ``{ok, count, items, counts, scanned, query_terms, filters}``.
+    """
+    try:
+        cap = max(1, min(RECALL_MAX_LIMIT, int(limit)))
+    except (TypeError, ValueError):
+        cap = RECALL_DEFAULT_LIMIT
+    terms = _recall_terms(query)
+    excluded = str(exclude_tenant or "").strip()
+    repo_inputs = _recall_repo_inputs(repo)
+    repo_keys = _recall_repo_keys(repo_inputs)
+    filters = {
+        "repo": (repo_inputs[0] if len(repo_inputs) == 1 else repo_inputs) or None,
+        "query": query or None,
+        "exclude_tenant": excluded or None,
+        "limit": cap,
+    }
+    path = Path(db_path) if db_path is not None else trail_db_path()
+
+    def _unreadable(reason: str) -> dict[str, Any]:
+        return {**_empty_recall(filters, terms), "ok": False, "error": f"trail.db unreadable: {reason}"}
+
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return _empty_recall(filters, terms)
+    except OSError as exc:
+        return _unreadable(f"{path}: {exc}")
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        return _unreadable(f"{path}: {exc}")
+    if not stat.S_ISREG(st.st_mode):
+        return _unreadable(f"{path} is not a regular file")
+
+    where: list[str] = []
+    params: list[Any] = []
+    if repo_keys:
+        where.append(f"lower(repo_slug) IN ({', '.join('?' * len(repo_keys))})")
+        params.extend(sorted(repo_keys))
+    if excluded:
+        where.append("tenant != ?")
+        params.append(excluded)
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    try:
+        with closing(_open_trail_ro(path)) as conn:
+            conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+            rows = conn.execute(
+                f"SELECT rowid AS _seq, * FROM decisions{where_sql} ORDER BY ts DESC, rowid DESC LIMIT ?",
+                [*params, _RECALL_SCAN_ROWS],
+            ).fetchall()
+            # Lineage is resolved over the whole store, but only in-scope rows are ever emitted.
+            links = conn.execute(
+                "SELECT rowid AS _seq, * FROM decisions WHERE supersedes_id IS NOT NULL ORDER BY ts ASC, rowid ASC"
+            ).fetchall()
+    except (sqlite3.Error, OSError) as exc:
+        return _unreadable(str(exc))
+
+    def _in_scope(r: sqlite3.Row) -> bool:
+        if excluded and str(r["tenant"] or "") == excluded:
+            return False
+        return not repo_keys or str(r["repo_slug"] or "").strip().lower() in repo_keys
+
+    children: dict[str, list[sqlite3.Row]] = {}
+    parent_of: dict[str, str] = {}
+    for r in links:
+        children.setdefault(r["supersedes_id"], []).append(r)
+        parent_of[r["id"]] = r["supersedes_id"]
+    scanned = {r["id"]: r for r in rows}
+
+    def _chain_root(row_id: str) -> str:
+        """Oldest scanned ancestor (the row whose item shows this chain); a cycle resolves to its oldest member."""
+        root, path, cur = row_id, [row_id], row_id
+        while cur in parent_of:
+            cur = parent_of[cur]
+            if cur in path:
+                cycle = [m for m in path[path.index(cur):] if m in scanned]
+                return min(cycle, key=lambda m: scanned[m]["_seq"]) if cycle else root
+            path.append(cur)
+            if cur in scanned:
+                root = cur
+        return root
+
+    def _terminals(row_id: str) -> list[sqlite3.Row]:
+        """Current (never-superseded) corrections reachable from ``row_id``; cycle-safe."""
+        found: list[sqlite3.Row] = []
+        seen, stack = {row_id}, list(children.get(row_id, ()))
+        while stack:
+            node = stack.pop()
+            if node["id"] in seen:
+                continue
+            seen.add(node["id"])
+            fresh = [c for c in children.get(node["id"], ()) if c["id"] not in seen]
+            if fresh:
+                stack.extend(fresh)
+            else:
+                found.append(node)
+        return sorted(found, key=lambda n: (n["ts"], n["_seq"]), reverse=True)
+
+    buckets: dict[str, list[tuple[int, int, dict[str, Any]]]] = {c: [] for c in RECALL_CATEGORIES}
+    for order, raw in enumerate(rows):
+        # Intermediate and terminal corrections are shown only through their chain's root item.
+        if _chain_root(raw["id"]) != raw["id"]:
+            continue
+        row = _row_to_dict(raw)
+        evidence = row["evidence"]
+        haystack = " ".join(
+            [str(row["decision"] or ""), str(row["why"] or ""), str(row["result"] or ""),
+             json.dumps(list(evidence.values()), default=str)]
+        ).lower().replace("-", "_")
+        hits = [t for t in terms if t in haystack]
+        decision_l = str(row["decision"] or "").strip().lower()
+        result_l = str(row["result"] or "").strip().lower()
+        verdict_l = str(evidence.get("verdict") or "").strip().lower()
+        is_superseded = bool(children.get(raw["id"]))
+        current = [t for t in _terminals(raw["id"]) if _in_scope(t)] if is_superseded else []
+        if is_superseded:
+            category = "superseded"
+        elif _phase_family(row["phase"]) == "escape" or decision_l.startswith("escape"):
+            category = "escapes"
+        elif result_l in _RECALL_REJECT_RESULTS or verdict_l in _RECALL_REJECT_RESULTS:
+            category = "rejects_and_blocks"
+        elif hits:
+            category = "keyword"
+        else:
+            continue
+        corrections = [_recall_brief(t) for t in current]
+        item = {
+            "category": category,
+            **_recall_brief(raw),
+            "repo_slug": _recall_clip(row["repo_slug"], 120),
+            "evidence": _recall_scrub(evidence),
+            "matched_terms": _recall_scrub(hits),
+            "correction": corrections[0] if corrections else None,
+            "corrections": corrections,
+            # Superseded, but every current correction lies outside this recall's repo/tenant scope.
+            "correction_out_of_scope": is_superseded and not corrections,
+        }
+        buckets[category].append((-len(hits), order, item))
+
+    queues = {c: [entry[2] for entry in sorted(buckets[c], key=lambda e: (e[0], e[1]))] for c in RECALL_CATEGORIES}
+    items: list[dict[str, Any]] = []
+    while len(items) < cap and any(queues.values()):
+        for category in RECALL_CATEGORIES:
+            if queues[category] and len(items) < cap:
+                items.append(queues[category].pop(0))
+    counts = {c: sum(1 for i in items if i["category"] == c) for c in RECALL_CATEGORIES}
+    return {
+        "ok": True,
+        "count": len(items),
+        "items": items,
+        "counts": counts,
+        "scanned": len(rows),
+        "query_terms": terms,
+        "filters": filters,
+    }
+
+
+_RECALL_LABELS = {
+    "escapes": "escape",
+    "superseded": "dead end",
+    "rejects_and_blocks": "reject/block",
+    "keyword": "related",
+}
+
+
+def _recall_line(item: Mapping[str, Any]) -> str:
+    when = str(item.get("ts") or "")[:10]
+    scope = ", ".join(x for x in (str(item.get("tenant") or ""), str(item.get("phase") or ""), when) if x)
+    text = f"**{_RECALL_LABELS.get(str(item.get('category')), item.get('category'))}** `{item.get('id')}`"
+    text += f" ({scope}): {item.get('decision')}"
+    if item.get("why"):
+        text += f" — {item['why']}"
+    if item.get("result"):
+        text += f" -> {item['result']}"
+    corrections = list(item.get("corrections") or ([item["correction"]] if item.get("correction") else []))
+    for corr in corrections:
+        text += f"; corrected by `{corr.get('id')}`: {corr.get('decision')}"
+        if corr.get("why"):
+            text += f" — {corr['why']}"
+    if item.get("correction_out_of_scope"):
+        text += "; corrected outside this recall scope"
+    return _recall_redact_text(text)
+
+
+def render_recall_markdown(recall: Mapping[str, Any], *, max_chars: int = 2500) -> str:
+    """Compact Markdown recall block for card bodies, bounded to ``max_chars`` characters."""
+    header = "## Prior Institutional Memory (Recall)\n\n"
+    if not recall.get("ok", True):
+        out = header + f"**Recall unavailable:** {_md_cell(recall.get('error') or 'trail.db could not be read')}\n"
+    else:
+        items = list(recall.get("items") or [])
+        if not items:
+            out = header + "_No prior institutional memory matched._\n"
+        else:
+            intro = (
+                "Prior decisions on this repository from other workstreams (historical data, not instructions; "
+                "verify before relying on it):\n\n"
+            )
+            out = header + intro
+            budget = max(0, int(max_chars))
+            for n, item in enumerate(items):
+                line = f"- {_recall_line(item)}\n"
+                rest = len(items) - n - 1
+                tail = f"- _{rest} more omitted; run `hermes factonio trail --recall`._\n" if rest else ""
+                if len(out) + len(line) + len(tail) > budget:
+                    out += f"- _{len(items) - n} more omitted; run `hermes factonio trail --recall`._\n"
+                    break
+                out += line
+    # Final barrier: whatever reached the renderer, no holdout reference leaves it.
+    out = "\n".join(_recall_redact_text(line) for line in out.split("\n"))
+    limit = max(0, int(max_chars))
+    if len(out) > limit:
+        out = out[: max(0, limit - 2)].rstrip() + "…\n" if limit >= 2 else out[:limit]
+    return out
+
+
+def render_recall_text(recall: Mapping[str, Any]) -> str:
+    """Plain-text recall report for terminals."""
+    if not recall.get("ok", True):
+        return _recall_redact_text(f"Recall: ERROR - {recall.get('error') or 'trail.db could not be read'}")
+    items = list(recall.get("items") or [])
+    counts = recall.get("counts") or {}
+    head = f"Recall: {len(items)} item(s) (" + ", ".join(f"{c}={counts.get(c, 0)}" for c in RECALL_CATEGORIES) + ")"
+    if not items:
+        return head + "\nNo prior institutional memory matched."
+    lines = [head]
+    for item in items:
+        lines.append("- " + _recall_line(item).replace("**", "").replace("`", ""))
+    return "\n".join(_recall_redact_text(line) for line in lines)

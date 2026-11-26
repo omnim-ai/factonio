@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 import time
@@ -24,7 +25,15 @@ from .config import (
 from .harness import HARNESS_DIR_NAME, HOOK_KINDS, REQUIRED_SECTIONS, VERIFY_MD_NAME, discover_harness
 from .metrics import aggregate_panel_verdicts as aggregate_panel_verdicts  # public re-export
 from .metrics import capture_metrics_snapshot, load_panel_lanes, summarize_panel, thread_cards
-from .trail import query_decisions, record_transition
+from .trail import (
+    contains_holdout_reference,
+    query_decisions,
+    recall_decisions,
+    record_transition,
+    render_recall_markdown,
+)
+
+logger = logging.getLogger("factonio.orchestrator")
 
 _SLUG_RE = re.compile(r"[^a-z0-9-]+")
 
@@ -238,6 +247,29 @@ def _completion_contract_for_repo(repo: dict[str, Any]) -> str:
     return "local-only"
 
 
+RECALL_SECTION_MAX_CHARS = 2000
+
+
+def _definition_recall(repo_ids: list[str], request: str, tenant: str) -> tuple[str, int]:
+    """Best-effort read-only recall block for a Definition card; ``("", 0)`` on no match or error.
+
+    ``repo_ids`` carries every identifier of the registered repository (``owner/repo`` and slug), since
+    decisions may have been logged under either.
+    """
+    try:
+        recall = recall_decisions(repo=repo_ids, query=request, exclude_tenant=tenant, limit=8)
+        if not recall.get("ok") or not recall.get("items"):
+            return "", 0
+        section = render_recall_markdown(recall, max_chars=RECALL_SECTION_MAX_CHARS)
+        if contains_holdout_reference(section):  # information barrier: fail closed, never inject
+            logger.warning("factonio recall dropped for %s: holdout reference survived redaction", tenant)
+            return "", 0
+        return section, len(recall["items"])
+    except Exception as exc:  # recall is advisory: it must never block starting a workstream
+        logger.warning("factonio recall skipped for %s: %s", tenant, exc)
+        return "", 0
+
+
 def start_workstream(
     repo_spec: str,
     request: str,
@@ -283,6 +315,7 @@ def start_workstream(
     mode_section = mode_contract_section(canon_kind, report_path=report_path)
 
     go_direct = skip_define or canon_kind == "quick"
+    recall_count = 0
     phase = "implement" if go_direct else "define"
     model_info = _phase_model_kwargs(phase, slug)
 
@@ -359,6 +392,9 @@ def start_workstream(
                 card_body += "\n" + mode_section
             if escaped_from:
                 card_body += "\n" + verification_gap_section(str(escaped_from))
+        recall_section, recall_count = _definition_recall([full_repo, slug], request, tenant)
+        if recall_section:
+            card_body += "\n" + recall_section
         skill_name = "factonio:define"
         goal_mode = True
         workspace_kind = "dir"
@@ -433,6 +469,7 @@ def start_workstream(
         "kind": canon_kind,
         "read_only": read_only,
         "report_path": str(report_path) if report_path is not None else None,
+        "recall_count": recall_count,
     }
 
 

@@ -25,6 +25,7 @@ Coordinate software delivery on registered GitHub repositories across Definition
 
 1. Confirm the target repository is registered using `factonio_status`. If missing, register it with `factonio_add_repo`.
 2. Ask at most one concise batch of clarifying questions if scope, acceptance criteria, or constraints are genuinely ambiguous.
+   - **"No is an acceptable answer":** when a request is unsafe, already solved, contradicted by prior decisions, or not worth its cost, push back with evidence and a recommended alternative before starting a workstream; do not start one just because it was asked.
 3. If the user asks to change a registered repository's settings (merge policy, max fix rounds, default branch, design provider/approval), call `factonio_update_repo(repo, <only the fields to change>)` (CLI: `hermes factonio update <repo> --merge-policy ask ...`). Pass `"inherit"` for `design_provider`/`design_approval` to clear the per-repo override and fall back to the global default. Do not re-run `factonio_add_repo` just to edit settings.
 4. Choose the entry path:
    - **Feature (`kind="feature"`):** Definition -> optional Phase 1b Design (when `has_ui: true` or requested) -> parallel Implementation -> parallel Verification -> Merge.
@@ -110,6 +111,7 @@ Opt-in only: use it when the user asks for competing proposals, or the approach 
 - Log your own judgment calls with `factonio_log_decision`: forks between approaches, pivots, Attack the Premise probes, unblock decisions, and merge countersigns. Put checkable facts (PR, SHA, patch-id, test counts, command) in `evidence`.
 - Rows are immutable. To correct a decision, log a new row with `supersedes_id` set to the old id; never re-log as if the old one did not happen.
 - Read it back with `hermes factonio trail --tenant <t> --markdown` when writing summaries or handoffs.
+- **Pre-workstream recall:** `factonio_start` automatically injects a bounded `## Prior Institutional Memory (Recall)` section (escapes, superseded dead ends, rejects/blocks, keyword-relevant decisions from other workstreams on the repo) into Definition cards and returns `recall_count`. Before intake on a contested or repeated request, run `hermes factonio trail --recall --repo <repo> --query "<request>"` yourself.
 - **Pre-handoff trail audit (multi-PR and `rigor: "high"` runs):** before a Human Handoff or final summary on a workstream with more than one PR or any `rigor: "high"` panel, run `hermes factonio trail --audit --tenant <t> --json` (read-only; exit `1` means findings). Ideally have a model from a different vendor family than the one that logged the decisions review the result. Any `missing_evidence`, `weak_evidence`, `unclosed_escalation`, or `gate_loosening` finding goes in an **Attention** section at the top of the handoff with the decision ids; either fix it first (log the missing evidence as a superseding row, close the escalation) or say plainly why it stays open. Never describe a run with audit findings as clean.
 
 ## Human Handoffs (Ketchup)
@@ -129,6 +131,7 @@ Every time you stop to ask the user for a decision (design approval, `merge_poli
 - **Stale HEAD on merge:** If commits landed after Verification passed, check `git patch-id` continuity first (Merge Gate step 4); re-run `factonio_spawn_verify` on the new `head_sha` unless the patch-id is identical.
 - **Merge reported but PR not `MERGED`:** Treat as queued; do not mark the workstream done until live readback shows `MERGED`.
 - **Unregistered repo or missing `gh` auth:** Stop and report the exact prerequisite command (`hermes factonio add owner/repo` or `gh auth login`).
+- **Crash pickup (reclaimed or crashed card):** before respawning, inspect the card's runs and comments, its worktree branch, and any open PR. Respawn with a note telling the worker to resume coherent progress (`factonio:implement` §1b) or, when state is corrupted or circular, to cold-restart from the base branch while reusing the existing PR. Never spawn a duplicate card or PR for the same unit.
 
 ## Example
 
