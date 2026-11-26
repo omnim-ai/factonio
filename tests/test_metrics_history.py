@@ -283,9 +283,9 @@ class TestSnapshotStore(unittest.TestCase):
                     if calls["n"] == 1:
                         raise sqlite3.OperationalError("database is locked")
 
-            def flaky_connect(db_path=None):
+            def flaky_connect(db_path=None, **kwargs):
                 calls["n"] += 1
-                return _FlakyConn(real_connect(db_path))
+                return _FlakyConn(real_connect(db_path, **kwargs))
 
             with mock.patch.object(trail, "_connect", side_effect=flaky_connect):
                 snap = trail.record_metric_snapshot(
@@ -750,6 +750,197 @@ class TestHistoryApiAndCli(unittest.TestCase):
             code, out, _ = run("metrics", "--json")
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(out)["history"]["snapshot_count"], 0)
+
+
+_FLOCK_HOLDER = """
+import fcntl, sys
+fh = open(sys.argv[1], "a")
+fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+print("locked", flush=True)
+sys.stdin.read()
+"""
+
+
+def _make_rollback_v1_store(db: Path) -> None:
+    """A pre-WAL v1 store (rollback journal), where an EXCLUSIVE transaction also blocks readers."""
+    from factonio import trail
+
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.closing(sqlite3.connect(str(db))) as conn:
+        conn.executescript(trail._SCHEMA_SQL)
+        conn.execute(_V1_META, ("1",))
+        conn.commit()
+
+
+@contextlib.contextmanager
+def _exclusive_txn(db: Path):
+    conn = sqlite3.connect(str(db), isolation_level=None)
+    try:
+        conn.execute("BEGIN EXCLUSIVE")
+        yield conn
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+@contextlib.contextmanager
+def _flock_held_by_child(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen([sys.executable, "-c", _FLOCK_HOLDER, str(lock_path)],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "locked"
+        yield proc
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=10)
+        proc.stdout.close()
+
+
+@unittest.skipIf(sys.platform == "win32", "POSIX flock")
+class TestBestEffortLockBudget(unittest.TestCase):
+    def test_held_trail_lock_never_stalls_capture_or_confirmed_merge(self):
+        from factonio import trail
+        from factonio.metrics import capture_metrics_snapshot
+        from factonio.repos import merge_pr
+        from tests.test_pr_gate_and_git import HEAD_SHA, FakeGh, _pr
+
+        with isolated_hermes_home() as home, _no_worker_env():
+            _register(home, "acme/sample")
+            _seed_kanban_db(home / "kanban.db", time.time())
+            db = trail.trail_db_path()
+            self.assertFalse(db.exists())
+            merged = FakeGh(_pr(), readback={"state": "MERGED", "mergedAt": "2026-11-25T12:00:00Z", "baseRefName": "main"})
+            with _flock_held_by_child(db.with_name(db.name + ".lock")):
+                start = time.monotonic()
+                with self.assertLogs("factonio.metrics", level="WARNING"):
+                    snap = capture_metrics_snapshot(source="merge", repo_slug="acme-sample", tenant="t1")
+                self.assertLess(time.monotonic() - start, 2.0)
+                self.assertIsNone(snap)
+
+                start = time.monotonic()
+                with mock.patch("factonio.repos._run_gh", merged), self.assertLogs("factonio.metrics", level="WARNING"):
+                    res = merge_pr("acme/sample", 12, expected_head_sha=HEAD_SHA, tenant="t1")
+                self.assertLess(time.monotonic() - start, 2.0)
+                self.assertTrue(res["merged"])
+                self.assertIsNone(res["metrics_snapshot_id"])
+
+                # Durable writes still wait for the lock, but only up to a bounded deadline.
+                with mock.patch.object(trail, "_DURABLE_DEADLINE_S", 0.3):
+                    start = time.monotonic()
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                        trail.log_decision("durable_but_bounded", tenant="t1")
+                    self.assertLess(time.monotonic() - start, 2.0)
+
+            self.assertIsNotNone(capture_metrics_snapshot(source="merge", tenant="t1"))
+            # Once the store is initialized, a held init lock no longer matters at all.
+            with _flock_held_by_child(db.with_name(db.name + ".lock")):
+                start = time.monotonic()
+                self.assertIsNotNone(capture_metrics_snapshot(source="merge", tenant="t1"))
+                self.assertLess(time.monotonic() - start, 2.0)
+            self.assertEqual(len(trail.query_metric_snapshots()), 2)
+
+    def test_sqlite_exclusive_lock_degrades_capture_within_budget(self):
+        from factonio import trail
+        from factonio.metrics import capture_metrics_snapshot
+
+        with isolated_hermes_home() as home:
+            _seed_kanban_db(home / "kanban.db", time.time())
+            wal = home / "wal" / "trail.db"
+            trail.log_decision("seed", db_path=wal)
+            rollback = home / "rollback" / "trail.db"
+            _make_rollback_v1_store(rollback)
+            for db in (wal, rollback):
+                with _exclusive_txn(db), self.assertLogs("factonio.metrics", level="WARNING"):
+                    start = time.monotonic()
+                    snap = capture_metrics_snapshot(home / "kanban.db", source="merge", trail_db=db)
+                    elapsed = time.monotonic() - start
+                self.assertIsNone(snap, db)
+                self.assertLess(elapsed, 2.0, db)
+                self.assertIsNotNone(capture_metrics_snapshot(home / "kanban.db", source="merge", trail_db=db), db)
+
+    def test_snapshot_write_runs_a_single_retry_loop(self):
+        from factonio import trail
+
+        with isolated_hermes_home() as home:
+            db = home / "rollback" / "trail.db"
+            _make_rollback_v1_store(db)
+            real_open = trail._open
+            calls = []
+
+            def spy(path):
+                calls.append(path)
+                return real_open(path)
+
+            with _exclusive_txn(db), mock.patch.object(trail, "_BUSY_TIMEOUT_MS", 5), \
+                    mock.patch.object(trail, "_open", side_effect=spy):
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    trail.record_metric_snapshot(_snapshot_metrics(), db_path=db)
+                self.assertEqual(len(calls), trail._RETRY_ATTEMPTS)
+                calls.clear()
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    trail.log_decision("blocked", db_path=db)
+                self.assertEqual(len(calls), trail._RETRY_ATTEMPTS)
+            self.assertEqual(trail.record_metric_snapshot(_snapshot_metrics(), db_path=db)["source"], "manual")
+
+
+class TestHistoryContractFixes(unittest.TestCase):
+    def test_history_summary_reports_snapshot_count_independent_of_limit(self):
+        from factonio import trail
+
+        with isolated_hermes_home() as home, _no_worker_env():
+            _register(home, "acme/api")
+            client = _api_client("factonio_test_history_count")
+            base = "/api/plugins/factonio/metrics/history"
+            run = _cli()
+            self.assertEqual(client.get(base).json()["summary"]["snapshot_count"], 0)
+            self.assertEqual(trail.metrics_history_payload()["summary"]["snapshot_count"], 0)
+            code, out, _ = run("metrics", "--history", "--json")
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(out)["summary"]["snapshot_count"], 0)
+
+            for i in range(5):
+                trail.record_metric_snapshot(_snapshot_metrics(cards_total=i), source="merge", tenant="t1")
+            trail.record_metric_snapshot(_snapshot_metrics(), source="retro", tenant="t2")
+
+            api = client.get(base, params={"tenant": "t1", "limit": 2}).json()
+            self.assertEqual(len(api["snapshots"]), 2)
+            self.assertEqual((api["summary"]["snapshot_count"], api["summary"]["total"]), (5, 5))
+            payload = trail.metrics_history_payload(tenant="t1", limit=2)
+            self.assertEqual((len(payload["snapshots"]), payload["summary"]["snapshot_count"]), (2, 5))
+            self.assertEqual(trail.metrics_history_payload(limit=2)["summary"]["snapshot_count"], 6)
+            code, out, _ = run("metrics", "--history", "--json", "--tenant", "t1", "--limit", "2")
+            self.assertEqual(code, 0)
+            cli = json.loads(out)
+            self.assertEqual((len(cli["snapshots"]), cli["summary"]["snapshot_count"]), (2, 5))
+
+    def test_out_of_range_iso_offsets_are_rejected_cleanly(self):
+        from factonio import trail
+
+        boundary = ("0001-01-01T00:00:00+02:00", "9999-12-31T23:59:59-02:00")
+        with isolated_hermes_home() as home, _no_worker_env():
+            _register(home, "acme/api")
+            trail.record_metric_snapshot(_snapshot_metrics())
+            client = _api_client("factonio_test_history_overflow")
+            run = _cli()
+            for since in (*boundary, "99999999999d"):
+                with self.assertRaisesRegex(ValueError, "Invalid since"):
+                    trail.resolve_since(since)
+                res = client.get("/api/plugins/factonio/metrics/history", params={"since": since})
+                self.assertEqual(res.status_code, 422, since)
+                self.assertIn("Invalid since", res.json()["detail"])
+                code, out, err = run("metrics", "--history", "--since", since)
+                self.assertEqual(code, 1, since)
+                self.assertIn("Invalid since", err)
+                self.assertNotIn("Traceback", out + err)
+                code, out, _ = run("metrics", "--history", "--since", since, "--json")
+                self.assertEqual(code, 1)
+                self.assertFalse(json.loads(out)["ok"])
+            for ts in boundary:
+                with self.assertRaisesRegex(ValueError, "Invalid ts"):
+                    trail.record_metric_snapshot(_snapshot_metrics(), ts=ts)
+            self.assertEqual(trail.resolve_since("0001-01-01T00:00:00Z"), "0001-01-01T00:00:00.000000Z")
+            self.assertEqual(len(trail.query_metric_snapshots()), 1)
 
 
 if __name__ == "__main__":

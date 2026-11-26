@@ -240,6 +240,7 @@ def _handle_metrics(args: Any, as_json: bool) -> None:
             repo_slug=args.repo,
             tenant=args.tenant,
             extra={"trigger": "cli"},
+            lock_budget_s=None,
         )
         if snapshot is None:
             _metrics_fail("could not capture a metrics snapshot (trail.db unavailable; see logs)", as_json)

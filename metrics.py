@@ -8,13 +8,19 @@ import re
 import sqlite3
 import statistics
 import time
-from contextlib import closing
+from contextlib import closing, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from .config import WORKER_PROFILE, get_root_hermes_home_path
-from .trail import record_metric_snapshot, summarize_metric_snapshots, summarize_trail
+from .trail import (
+    BEST_EFFORT_BUDGET_S,
+    best_effort,
+    record_metric_snapshot,
+    summarize_metric_snapshots,
+    summarize_trail,
+)
 
 logger = logging.getLogger("factonio.metrics")
 
@@ -612,30 +618,36 @@ def capture_metrics_snapshot(
     scope_to_tenant: bool = False,
     extra: Optional[Mapping[str, Any]] = None,
     trail_db: Optional[Path] = None,
+    lock_budget_s: Optional[float] = BEST_EFFORT_BUDGET_S,
 ) -> Optional[dict[str, Any]]:
     """Best-effort: compute metrics and append them to `trail.db` `metric_snapshots`.
 
     Metrics are factory-wide (``scope_to_tenant=False``) so milestone trends stay cumulative,
     while ``repo_slug`` / ``tenant`` tag the triggering scope for filtering. Returns the stored
     snapshot, or ``None`` on any failure; it never raises, so it cannot break factory execution.
+    Every `trail.db` read and write here shares one ``lock_budget_s`` wall-clock budget, so lock
+    contention skips the snapshot instead of stalling the caller; ``None`` (an explicit capture)
+    keeps the bounded durable retry semantics instead.
     """
+    budget = best_effort(lock_budget_s) if lock_budget_s is not None else nullcontext()
     try:
-        kanban = Path(db_path) if db_path is not None else default_kanban_db_path()
-        metrics = compute_metrics(
-            kanban,
-            range_key=range_key,
-            tenant=tenant if scope_to_tenant and tenant else None,
-            trail_db=trail_db,
-        )
-        return record_metric_snapshot(
-            metrics,
-            source=source,
-            range_key=range_key,
-            repo_slug=repo_slug,
-            tenant=tenant,
-            extra=extra,
-            db_path=trail_db,
-        )
+        with budget:
+            kanban = Path(db_path) if db_path is not None else default_kanban_db_path()
+            metrics = compute_metrics(
+                kanban,
+                range_key=range_key,
+                tenant=tenant if scope_to_tenant and tenant else None,
+                trail_db=trail_db,
+            )
+            return record_metric_snapshot(
+                metrics,
+                source=source,
+                range_key=range_key,
+                repo_slug=repo_slug,
+                tenant=tenant,
+                extra=extra,
+                db_path=trail_db,
+            )
     except Exception as exc:
         logger.warning("factonio metrics: failed to capture %s snapshot: %s", source, exc)
         return None

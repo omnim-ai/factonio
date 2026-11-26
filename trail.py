@@ -19,6 +19,8 @@ import time
 import uuid
 from collections import Counter
 from contextlib import closing, contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, TypeVar
@@ -40,8 +42,23 @@ _BUSY_TIMEOUT_MS = 5000
 _RETRY_ATTEMPTS = 8
 _RETRY_BASE_DELAY = 0.02
 _RETRY_MAX_DELAY = 0.5
+# Wall-clock cap for one durable operation (all retries, lock waits and busy waits together).
+_DURABLE_DEADLINE_S = 30.0
+# Best-effort telemetry (milestone snapshot capture) must never stall the factory step it rides on.
+BEST_EFFORT_BUDGET_S = 0.75
+_BEST_EFFORT_BUSY_TIMEOUT_MS = 100
+_LOCK_POLL_S = 0.01
 _INIT_LOCK = threading.Lock()
 _T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class _Budget:
+    deadline: float
+    busy_timeout_ms: int
+
+
+_BUDGET: ContextVar[Optional[_Budget]] = ContextVar("factonio_trail_budget", default=None)
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -235,17 +252,69 @@ def _is_transient(exc: BaseException) -> bool:
     return "locked" in msg or "busy" in msg
 
 
+def _locked(what: str) -> sqlite3.OperationalError:
+    # Phrased like SQLITE_BUSY so callers and `_is_transient` treat it as lock contention.
+    return sqlite3.OperationalError(f"database is locked ({what})")
+
+
+@contextmanager
+def _deadline_scope(seconds: float, busy_timeout_ms: int) -> Iterator[_Budget]:
+    """Bound every trail.db lock/busy wait in this context; an enclosing tighter budget wins."""
+    outer = _BUDGET.get()
+    budget = _Budget(time.monotonic() + max(0.0, seconds), max(1, int(busy_timeout_ms)))
+    if outer is not None:
+        budget = _Budget(min(outer.deadline, budget.deadline), min(outer.busy_timeout_ms, budget.busy_timeout_ms))
+    token = _BUDGET.set(budget)
+    try:
+        yield budget
+    finally:
+        _BUDGET.reset(token)
+
+
+def best_effort(seconds: float = BEST_EFFORT_BUDGET_S) -> Any:
+    """Context manager: trail.db access inside gives up (``database is locked``) after ``seconds``.
+
+    Used by optional telemetry so a held `trail.db.lock` or a long SQLite write transaction
+    degrades to a skipped snapshot instead of stalling a merge, panel consensus or retro log.
+    """
+    return _deadline_scope(seconds, _BEST_EFFORT_BUSY_TIMEOUT_MS)
+
+
+def _remaining() -> float:
+    budget = _BUDGET.get()
+    return float("inf") if budget is None else budget.deadline - time.monotonic()
+
+
+def _busy_timeout_ms() -> int:
+    budget = _BUDGET.get()
+    if budget is None:
+        return _BUSY_TIMEOUT_MS
+    remaining_ms = int(_remaining() * 1000)
+    if remaining_ms <= 0:
+        raise _locked("trail.db lock budget exhausted")
+    return max(1, min(budget.busy_timeout_ms, remaining_ms))
+
+
 def _with_retry(op: Callable[[], _T]) -> _T:
-    """Run ``op``, retrying transient lock contention with jittered exponential backoff."""
-    delay = _RETRY_BASE_DELAY
-    for attempt in range(_RETRY_ATTEMPTS):
-        try:
-            return op()
-        except sqlite3.OperationalError as exc:
-            if not _is_transient(exc) or attempt == _RETRY_ATTEMPTS - 1:
-                raise
-            time.sleep(delay * (0.5 + random.random()))
-            delay = min(delay * 2, _RETRY_MAX_DELAY)
+    """Run ``op``, retrying transient lock contention with jittered exponential backoff.
+
+    The single retry loop for an operation: ``op`` itself must not retry. Attempts are capped by
+    `_RETRY_ATTEMPTS` and by a wall-clock deadline (the active budget, else `_DURABLE_DEADLINE_S`)
+    that also bounds every lock and busy wait inside ``op``.
+    """
+    with _deadline_scope(_DURABLE_DEADLINE_S, _BUSY_TIMEOUT_MS):
+        delay = _RETRY_BASE_DELAY
+        for attempt in range(_RETRY_ATTEMPTS):
+            try:
+                return op()
+            except sqlite3.OperationalError as exc:
+                if not _is_transient(exc) or attempt == _RETRY_ATTEMPTS - 1:
+                    raise
+                pause = delay * (0.5 + random.random())
+                if pause >= _remaining():
+                    raise
+                time.sleep(pause)
+                delay = min(delay * 2, _RETRY_MAX_DELAY)
     raise AssertionError("unreachable")
 
 
@@ -255,17 +324,31 @@ def _init_guard(path: Path) -> Iterator[None]:
 
     Switching a fresh file to WAL needs an exclusive lock and SQLite does not always
     invoke the busy handler for it, so racing first writers would otherwise fail fast.
+    Both locks are polled only until the active deadline, never waited on indefinitely.
     """
-    with _INIT_LOCK:
+    remaining = _remaining()
+    if not _INIT_LOCK.acquire(timeout=-1 if remaining == float("inf") else max(0.0, remaining)):
+        raise _locked("trail.db init lock timeout")
+    try:
         if fcntl is None:
             yield
             return
         with open(path.with_name(path.name + ".lock"), "a") as fh:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            while True:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = _remaining()
+                    if remaining <= 0:
+                        raise _locked("trail.db.lock timeout") from None
+                    time.sleep(min(_LOCK_POLL_S, remaining))
             try:
                 yield
             finally:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        _INIT_LOCK.release()
 
 
 def _schema_version(conn: sqlite3.Connection) -> int:
@@ -301,12 +384,26 @@ def _migrate(conn: sqlite3.Connection) -> None:
         raise
 
 
+def _initialized(conn: sqlite3.Connection) -> bool:
+    """Already WAL at the current schema version: no exclusive init step (or init lock) needed."""
+    try:
+        wal = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal"
+        return wal and _schema_version(conn) >= int(SCHEMA_VERSION)
+    except sqlite3.OperationalError as exc:
+        if _is_transient(exc):
+            raise
+        return False  # e.g. no schema_meta table yet
+
+
 def _open(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(path), timeout=_BUSY_TIMEOUT_MS / 1000)
+    busy_ms = _busy_timeout_ms()
+    conn = sqlite3.connect(str(path), timeout=busy_ms / 1000)
     try:
         conn.row_factory = sqlite3.Row
-        conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        conn.execute(f"PRAGMA busy_timeout={busy_ms}")
         conn.execute("PRAGMA foreign_keys=ON")
+        if _initialized(conn):
+            return conn
         with _init_guard(path):
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA_SQL)
@@ -317,11 +414,14 @@ def _open(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
-    """Open (creating if needed) the trail store with WAL, busy timeout, and FK enforcement."""
+def _connect(db_path: Optional[Path] = None, *, retry: bool = True) -> sqlite3.Connection:
+    """Open (creating if needed) the trail store with WAL, busy timeout, and FK enforcement.
+
+    Pass ``retry=False`` from inside an operation that already runs under `_with_retry`.
+    """
     path = Path(db_path) if db_path is not None else trail_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    return _with_retry(lambda: _open(path))
+    return _with_retry(lambda: _open(path)) if retry else _open(path)
 
 
 def _resolve_repo_slug(repo: Optional[str]) -> str:
@@ -436,7 +536,7 @@ def log_decision(
     )
 
     def _append() -> dict[str, Any]:
-        with closing(_connect(db_path)) as conn:
+        with closing(_connect(db_path, retry=False)) as conn:
             if sup is not None:
                 if conn.execute("SELECT 1 FROM decisions WHERE id = ?", (sup,)).fetchone() is None:
                     raise ValueError(f"supersedes_id {sup!r} does not reference an existing decision")
@@ -695,11 +795,18 @@ def _iso(dt: datetime) -> str:
 
 
 def _parse_iso(value: str) -> datetime:
+    """Parse ISO-8601 as an aware UTC datetime; ``ValueError`` for anything unrepresentable."""
     text = value.strip()
     if text.endswith(("Z", "z")):
         text = text[:-1] + "+00:00"
     dt = datetime.fromisoformat(text)
-    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    try:
+        # Offsets at 0001-01-01 / 9999-12-31 fall outside datetime's range once shifted to UTC.
+        return dt.astimezone(timezone.utc)
+    except OverflowError:
+        raise ValueError(f"timestamp {value!r} is out of range in UTC") from None
 
 
 def resolve_since(since: Any, *, now: Optional[datetime] = None) -> Optional[str]:
@@ -713,12 +820,12 @@ def resolve_since(since: Any, *, now: Optional[datetime] = None) -> Optional[str
     if not text or text.lower() == "all":
         return None
     rel = _SINCE_REL_RE.match(text.lower())
-    if rel:
-        base = now if now is not None else datetime.now(timezone.utc)
-        return _iso(base - timedelta(days=int(rel.group(1))))
     try:
+        if rel:
+            base = now if now is not None else datetime.now(timezone.utc)
+            return _iso(base - timedelta(days=int(rel.group(1))))
         return _iso(_parse_iso(text))
-    except ValueError:
+    except (ValueError, OverflowError):
         raise ValueError(
             f"Invalid since {since!r}: expected 7d, 30d, 90d, all, or an ISO-8601 timestamp"
         ) from None
@@ -833,7 +940,10 @@ def record_metric_snapshot(
         raise ValueError("extra must be a JSON object (mapping)")
     metrics_obj = dict(metrics or {})
     kpis = flatten_metrics(metrics_obj)
-    stamp = _iso(_parse_iso(ts)) if ts else _now_iso()
+    try:
+        stamp = _iso(_parse_iso(str(ts))) if ts else _now_iso()
+    except ValueError:
+        raise ValueError(f"Invalid ts {ts!r}: expected an ISO-8601 timestamp") from None
     rk = _clean_text(range_key if range_key is not None else metrics_obj.get("range"), "all")
     payload_json = json.dumps({"metrics": metrics_obj, "extra": dict(extra or {})}, sort_keys=True, default=str)
     row_id = f"ms_{uuid.uuid4().hex[:12]}"
@@ -851,7 +961,7 @@ def record_metric_snapshot(
     marks = ", ".join("?" for _ in SNAPSHOT_COLUMNS)
 
     def _append() -> dict[str, Any]:
-        with closing(_connect(db_path)) as conn:
+        with closing(_connect(db_path, retry=False)) as conn:
             # Idempotent under retry: a commit that landed before a transient error is not duplicated.
             if conn.execute("SELECT 1 FROM metric_snapshots WHERE id = ?", (row_id,)).fetchone() is None:
                 conn.execute(
@@ -926,6 +1036,7 @@ def query_metric_snapshots(
 def _empty_snapshot_summary() -> dict[str, Any]:
     return {
         "total": 0,
+        "snapshot_count": 0,
         "first_ts": None,
         "latest_ts": None,
         "by_source": {},
@@ -963,6 +1074,7 @@ def summarize_metric_snapshots(
         ).fetchone()
     return {
         "total": len(rows),
+        "snapshot_count": len(rows),
         "first_ts": min(r["ts"] for r in rows),
         "latest_ts": max(r["ts"] for r in rows),
         "by_source": dict(sorted(Counter(r["source"] or "unknown" for r in rows).items())),
