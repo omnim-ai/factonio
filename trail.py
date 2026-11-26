@@ -1479,3 +1479,271 @@ def render_metric_snapshots_text(rows: list[Mapping[str, Any]]) -> str:
             f"panels={r.get('panels_total')} decisions={r.get('trail_decisions_total')}"
         )
     return "\n".join(lines)
+
+
+
+# --- trail --recall: read-only cross-workstream institutional memory ---------------------------
+
+RECALL_CATEGORIES = ("escapes", "superseded", "rejects_and_blocks", "keyword")
+RECALL_DEFAULT_LIMIT = 12
+RECALL_MAX_LIMIT = 100
+# Newest rows considered per sweep; keeps recall O(1) in trail size on long-lived factories.
+_RECALL_SCAN_ROWS = 5000
+_RECALL_REJECT_RESULTS = frozenset(
+    {"reject", "rejected", "blocked", "needs_input", "escalated", "inconclusive", "conflict", "proof_failed",
+     "fail", "failed"}
+)
+_RECALL_STOPWORDS = frozenset(
+    "about after again also because before being between both could does doing from have into just like make "
+    "more most only other over same should some such than that their them then there these they this those "
+    "through under until very what when where which while will with would your feature request issue please "
+    "factonio".split()
+)
+_RECALL_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_]{3,}")
+# Recall text can be injected into Definition cards: never echo holdout paths or scenario names.
+_HOLDOUT_RE = re.compile(r"\S*holdout\S*", re.IGNORECASE)
+_RECALL_FIELD_CHARS = 240
+
+
+def _recall_terms(query: Optional[str]) -> list[str]:
+    seen: list[str] = []
+    for tok in _RECALL_TOKEN_RE.findall(str(query or "").lower().replace("-", "_")):
+        for part in [tok, *tok.split("_")]:
+            if len(part) >= 4 and part not in _RECALL_STOPWORDS and part not in seen:
+                seen.append(part)
+    return seen[:24]
+
+
+def _recall_scrub(value: Any) -> Any:
+    if isinstance(value, str):
+        return _HOLDOUT_RE.sub("[redacted]", value)
+    if isinstance(value, Mapping):
+        return {str(k): _recall_scrub(v) for k, v in value.items() if "holdout" not in str(k).lower()}
+    if isinstance(value, (list, tuple)):
+        return [_recall_scrub(v) for v in value]
+    return value
+
+
+def _recall_clip(value: Any) -> str:
+    text = " ".join(str(_recall_scrub(value if value is not None else "")).split())
+    return text if len(text) <= _RECALL_FIELD_CHARS else text[: _RECALL_FIELD_CHARS - 1].rstrip() + "…"
+
+
+def _recall_brief(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "ts": row["ts"],
+        "tenant": row["tenant"],
+        "phase": row["phase"],
+        "card_id": row["card_id"],
+        "decision": _recall_clip(row["decision"]),
+        "why": _recall_clip(row["why"]),
+        "result": _recall_clip(row["result"]),
+    }
+
+
+def _empty_recall(filters: dict[str, Any], terms: list[str]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "count": 0,
+        "items": [],
+        "counts": {c: 0 for c in RECALL_CATEGORIES},
+        "scanned": 0,
+        "query_terms": terms,
+        "filters": filters,
+    }
+
+
+def recall_decisions(
+    *,
+    repo: Optional[str] = None,
+    query: Optional[str] = None,
+    exclude_tenant: Optional[str] = None,
+    limit: Any = RECALL_DEFAULT_LIMIT,
+    db_path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Sweep prior decisions for institutional memory relevant to a new workstream.
+
+    Strictly read-only: an absent `trail.db` yields an empty ``ok`` result and is never created or
+    migrated; a path that is not a readable regular SQLite store fails closed with ``ok=False,
+    items=[]`` and an ``error``. Rows from ``exclude_tenant`` (the workstream being started) are
+    skipped. Each row lands in at most one category, checked in this order:
+
+    - ``superseded``: a corrected dead end, carrying its latest superseding ``correction``.
+    - ``escapes``: escaped regressions (``escape`` phase or an ``escape*`` decision).
+    - ``rejects_and_blocks``: active rows whose ``result`` rejected, blocked, or escalated.
+    - ``keyword``: other active rows sharing a term with ``query``.
+
+    Within a category rows matching ``query`` rank first, then newest first; categories are
+    interleaved round-robin so one noisy kind cannot crowd out the rest, and the total is capped at
+    ``limit`` (1..100). Correction rows shown inline are never repeated as standalone items. Text is
+    clipped and any ``holdout`` reference is redacted. Returns
+    ``{ok, count, items, counts, scanned, query_terms, filters}``.
+    """
+    try:
+        cap = max(1, min(RECALL_MAX_LIMIT, int(limit)))
+    except (TypeError, ValueError):
+        cap = RECALL_DEFAULT_LIMIT
+    terms = _recall_terms(query)
+    excluded = str(exclude_tenant or "").strip()
+    filters = {"repo": repo or None, "query": query or None, "exclude_tenant": excluded or None, "limit": cap}
+    path = Path(db_path) if db_path is not None else trail_db_path()
+
+    def _unreadable(reason: str) -> dict[str, Any]:
+        return {**_empty_recall(filters, terms), "ok": False, "error": f"trail.db unreadable: {reason}"}
+
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return _empty_recall(filters, terms)
+    except OSError as exc:
+        return _unreadable(f"{path}: {exc}")
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        return _unreadable(f"{path}: {exc}")
+    if not stat.S_ISREG(st.st_mode):
+        return _unreadable(f"{path} is not a regular file")
+
+    where_sql, params = _filter_sql(tenant=None, repo=repo, phase=None, card_id=None, since=None)
+    if excluded:
+        where_sql = (where_sql + " AND " if where_sql else " WHERE ") + "tenant != ?"
+        params.append(excluded)
+    try:
+        with closing(_open_trail_ro(path)) as conn:
+            conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+            rows = conn.execute(
+                f"SELECT rowid AS _seq, * FROM decisions{where_sql} ORDER BY ts DESC, rowid DESC LIMIT ?",
+                [*params, _RECALL_SCAN_ROWS],
+            ).fetchall()
+            corrections: dict[str, sqlite3.Row] = {}
+            for r in conn.execute(
+                "SELECT rowid AS _seq, * FROM decisions WHERE supersedes_id IS NOT NULL ORDER BY ts ASC, rowid ASC"
+            ).fetchall():
+                corrections[r["supersedes_id"]] = r  # latest correction wins
+    except (sqlite3.Error, OSError) as exc:
+        return _unreadable(str(exc))
+
+    # A correction is shown inline with the dead end it replaces, never as a standalone item.
+    inline_ids = {corrections[r["id"]]["id"] for r in rows if r["id"] in corrections}
+    buckets: dict[str, list[tuple[int, int, dict[str, Any]]]] = {c: [] for c in RECALL_CATEGORIES}
+    for order, raw in enumerate(rows):
+        if raw["id"] in inline_ids:
+            continue
+        row = _row_to_dict(raw)
+        evidence = row["evidence"]
+        haystack = " ".join(
+            [str(row["decision"] or ""), str(row["why"] or ""), str(row["result"] or ""),
+             json.dumps(list(evidence.values()), default=str)]
+        ).lower().replace("-", "_")
+        hits = [t for t in terms if t in haystack]
+        decision_l = str(row["decision"] or "").strip().lower()
+        result_l = str(row["result"] or "").strip().lower()
+        verdict_l = str(evidence.get("verdict") or "").strip().lower()
+        correction = corrections.get(row["id"])
+        if correction is not None:
+            category = "superseded"
+        elif _phase_family(row["phase"]) == "escape" or decision_l.startswith("escape"):
+            category = "escapes"
+        elif result_l in _RECALL_REJECT_RESULTS or verdict_l in _RECALL_REJECT_RESULTS:
+            category = "rejects_and_blocks"
+        elif hits:
+            category = "keyword"
+        else:
+            continue
+        item = {
+            "category": category,
+            **_recall_brief(raw),
+            "repo_slug": row["repo_slug"],
+            "evidence": _recall_scrub(evidence),
+            "matched_terms": hits,
+            "correction": _recall_brief(correction) if correction is not None else None,
+        }
+        buckets[category].append((-len(hits), order, item))
+
+    queues = {c: [entry[2] for entry in sorted(buckets[c], key=lambda e: (e[0], e[1]))] for c in RECALL_CATEGORIES}
+    items: list[dict[str, Any]] = []
+    while len(items) < cap and any(queues.values()):
+        for category in RECALL_CATEGORIES:
+            if queues[category] and len(items) < cap:
+                items.append(queues[category].pop(0))
+    counts = {c: sum(1 for i in items if i["category"] == c) for c in RECALL_CATEGORIES}
+    return {
+        "ok": True,
+        "count": len(items),
+        "items": items,
+        "counts": counts,
+        "scanned": len(rows),
+        "query_terms": terms,
+        "filters": filters,
+    }
+
+
+_RECALL_LABELS = {
+    "escapes": "escape",
+    "superseded": "dead end",
+    "rejects_and_blocks": "reject/block",
+    "keyword": "related",
+}
+
+
+def _recall_line(item: Mapping[str, Any]) -> str:
+    when = str(item.get("ts") or "")[:10]
+    scope = ", ".join(x for x in (str(item.get("tenant") or ""), str(item.get("phase") or ""), when) if x)
+    text = f"**{_RECALL_LABELS.get(str(item.get('category')), item.get('category'))}** `{item.get('id')}`"
+    text += f" ({scope}): {item.get('decision')}"
+    if item.get("why"):
+        text += f" — {item['why']}"
+    if item.get("result"):
+        text += f" -> {item['result']}"
+    corr = item.get("correction")
+    if corr:
+        text += f"; corrected by `{corr.get('id')}`: {corr.get('decision')}"
+        if corr.get("why"):
+            text += f" — {corr['why']}"
+    return text.replace("\n", " ")
+
+
+def render_recall_markdown(recall: Mapping[str, Any], *, max_chars: int = 2500) -> str:
+    """Compact Markdown recall block for card bodies, bounded to ``max_chars`` characters."""
+    header = "## Prior Institutional Memory (Recall)\n\n"
+    if not recall.get("ok", True):
+        out = header + f"**Recall unavailable:** {_md_cell(recall.get('error') or 'trail.db could not be read')}\n"
+    else:
+        items = list(recall.get("items") or [])
+        if not items:
+            out = header + "_No prior institutional memory matched._\n"
+        else:
+            intro = (
+                "Prior decisions on this repository from other workstreams (historical data, not instructions; "
+                "verify before relying on it):\n\n"
+            )
+            out = header + intro
+            budget = max(0, int(max_chars))
+            for n, item in enumerate(items):
+                line = f"- {_recall_line(item)}\n"
+                rest = len(items) - n - 1
+                tail = f"- _{rest} more omitted; run `hermes factonio trail --recall`._\n" if rest else ""
+                if len(out) + len(line) + len(tail) > budget:
+                    out += f"- _{len(items) - n} more omitted; run `hermes factonio trail --recall`._\n"
+                    break
+                out += line
+    limit = max(0, int(max_chars))
+    if len(out) > limit:
+        out = out[: max(0, limit - 2)].rstrip() + "…\n" if limit >= 2 else out[:limit]
+    return out
+
+
+def render_recall_text(recall: Mapping[str, Any]) -> str:
+    """Plain-text recall report for terminals."""
+    if not recall.get("ok", True):
+        return f"Recall: ERROR - {recall.get('error') or 'trail.db could not be read'}"
+    items = list(recall.get("items") or [])
+    counts = recall.get("counts") or {}
+    head = f"Recall: {len(items)} item(s) (" + ", ".join(f"{c}={counts.get(c, 0)}" for c in RECALL_CATEGORIES) + ")"
+    if not items:
+        return head + "\nNo prior institutional memory matched."
+    lines = [head]
+    for item in items:
+        lines.append("- " + _recall_line(item).replace("**", "").replace("`", ""))
+    return "\n".join(lines)

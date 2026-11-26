@@ -34,7 +34,11 @@ from .repos import (
     update_repo,
 )
 from .trail import (
+    RECALL_DEFAULT_LIMIT,
     audit_trail_evidence,
+    recall_decisions,
+    render_recall_markdown,
+    render_recall_text,
     render_trail_audit_markdown,
     render_trail_audit_text,
     metrics_history_payload,
@@ -560,7 +564,9 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         p_trail.add_argument("--repo", default=None, help="Filter by repo slug or 'owner/repo'.")
         p_trail.add_argument("--phase", default=None, help="Filter by phase (define, design, implement, verify, gate, merge, escape, ...).")
         p_trail.add_argument("--card", dest="card_id", default=None, help="Filter by Kanban card id.")
-        p_trail.add_argument("--limit", type=int, default=50, help="Max decisions to show, newest first (default: 50).")
+        p_trail.add_argument(
+            "--limit", type=int, default=None, help="Max decisions to show, newest first (default: 50; --recall: 12)."
+        )
         p_trail.add_argument("--markdown", action="store_true", help="Render a Markdown table (for PRs, retros, handoffs).")
         p_trail.add_argument(
             "--audit",
@@ -568,6 +574,13 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             help="Read-only pre-handoff evidence audit over every matching active decision "
             "(exit 0 when clean, 1 when findings exist).",
         )
+        p_trail.add_argument(
+            "--recall",
+            action="store_true",
+            help="Read-only cross-workstream recall: prior escapes, superseded dead ends, rejects/blocks, "
+            "and --query-relevant decisions (scope with --repo; --tenant is excluded).",
+        )
+        p_trail.add_argument("--query", default=None, help="recall: free-text request to match relevant decisions.")
         p_trail.add_argument(
             "--json",
             action="store_true",
@@ -1000,6 +1013,24 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             return
 
         if cmd == "trail":
+            if getattr(args, "recall", False):
+                if getattr(args, "audit", False):
+                    _metrics_fail("--recall and --audit are mutually exclusive", as_json)
+                recall = recall_decisions(
+                    repo=args.repo,
+                    query=args.query,
+                    exclude_tenant=args.tenant,
+                    limit=args.limit if args.limit is not None else RECALL_DEFAULT_LIMIT,
+                )
+                if as_json:
+                    print(json.dumps(recall, indent=2, default=str))
+                elif args.markdown:
+                    print(render_recall_markdown(recall), end="")
+                else:
+                    print(render_recall_text(recall))
+                if not recall.get("ok"):
+                    sys.exit(1)
+                return
             if getattr(args, "audit", False):
                 audit = audit_trail_evidence(
                     tenant=args.tenant, repo=args.repo, phase=args.phase, card_id=args.card_id
@@ -1018,7 +1049,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                 repo=args.repo,
                 phase=args.phase,
                 card_id=args.card_id,
-                limit=args.limit,
+                limit=args.limit if args.limit is not None else 50,
             )
             if as_json:
                 print(json.dumps(payload, indent=2, default=str))
