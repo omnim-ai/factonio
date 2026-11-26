@@ -293,7 +293,13 @@ class TestBundledSkillRigorAndAttribution(unittest.TestCase):
             "--stack 12,13,14",
             "`contiguous_ready_run`",
             "`allow_stacked_merge: true`",
+            "**Rebase escalation cap:**",
+            "**3rd rebase on the same PR**",
+            "stop rebasing and escalate to the user",
+            "**Merge-result check on disjoint drift:**",
         ), "orchestrator merge gate")
+        drift = gate.split("**Tiered trunk drift:**", 1)[1].split("5. **Stacked PRs:**", 1)[0]
+        self.assertIn("**Rebase escalation cap:**", drift, "rebase cap must live under Tiered trunk drift")
 
     def test_verify_diff_gate_integrity_must_kill_ladder_and_dropped(self):
         text = self._read("skills/verify-diff/SKILL.md")
