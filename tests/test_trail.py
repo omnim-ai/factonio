@@ -874,6 +874,30 @@ class TestTrailAudit(unittest.TestCase):
                                       evidence={"pr_number": 30}, result="blocked")
             self.assertEqual(self._kinds(trail.audit_trail_evidence())["unclosed_escalation"], {late["id"]})
 
+    def test_malformed_pr_numbers_are_treated_as_absent_without_crashing_audit(self):
+        from factonio import trail
+
+        for bad in ("²", "9" * 5000, "١٢", " 0 ", "-3"):
+            with self.subTest(pr_number=bad[:8]), isolated_hermes_home():
+                esc = trail.log_decision("pr_gate", tenant="w", phase="gate", card_id="t_g", why="CI red",
+                                         evidence={"pr_number": bad}, result="blocked")
+                trail.log_decision("merge_pr", tenant="w", phase="merge", card_id="t_m", why="merged",
+                                   evidence={"gate": {"pr_number": bad}}, result="merged")
+                audit = trail.audit_trail_evidence()
+                self.assertTrue(audit["ok"])
+                self.assertEqual(audit["counts"]["unclosed_escalation"], 1)
+                self.assertEqual(self._kinds(audit)["unclosed_escalation"], {esc["id"]})
+
+        # A malformed resolver in an unrelated tenant must not break a scoped audit.
+        with isolated_hermes_home():
+            trail.log_decision("merge_pr", tenant="w", phase="merge", card_id="t_m", why="merged",
+                               evidence={"pr_number": "²"}, result="merged")
+            esc = trail.log_decision("pr_gate", tenant="other", phase="gate", card_id="t_o", why="CI red",
+                                     evidence={"pr_number": 5}, result="blocked")
+            audit = trail.audit_trail_evidence(tenant="other")
+            self.assertTrue(audit["ok"])
+            self.assertEqual(self._kinds(audit)["unclosed_escalation"], {esc["id"]})
+
     def test_non_enacting_rows_flag_only_explicit_override_keys(self):
         from factonio import trail
 

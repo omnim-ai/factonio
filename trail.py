@@ -861,8 +861,18 @@ def _evidence_pr_number(evidence: Any) -> Optional[int]:
             continue
         if isinstance(value, int) and value > 0:
             return value
-        if isinstance(value, str) and value.strip().isdigit() and int(value) > 0:
-            return int(value)
+        if isinstance(value, str):
+            # Evidence is arbitrary logged JSON: accept only short ASCII decimals so
+            # Unicode digits ('²') or overlong strings can never raise inside int().
+            text = value.strip()
+            if not (text.isascii() and text.isdigit() and len(text) <= 18):
+                continue
+            try:
+                number = int(text)
+            except ValueError:
+                continue
+            if number > 0:
+                return number
     return None
 
 
