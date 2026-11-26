@@ -316,5 +316,98 @@ class TestWorkerPluginLinkGuard(unittest.TestCase):
             )
 
 
+class TestMultiVendorRouterInference(unittest.TestCase):
+    def test_nous_and_hermes_routers_infer_underlying_vendor_families(self):
+        from factonio.config import infer_model_vendor
+
+        cases = [
+            (("nous", "anthropic/claude-opus-5.5"), "anthropic"),
+            (("nous", "openai/gpt-6.2-sol"), "openai"),
+            (("nous", "google/gemini-4-neon"), "google"),
+            (("nous", "x-ai/grok-4.7"), "xai"),
+            (("nous", "deepseek/deepseek-v4-pro"), "deepseek"),
+            (("nous", "qwen/qwen3.8-max-0902"), "qwen"),
+            (("nous", "moonshotai/kimi-k3"), "moonshot"),
+            (("nous", "minimax/minimax-m3"), "minimax"),
+            (("nous", "z-ai/glm-5.3"), "zhipu"),
+            (("nous", "xiaomi/mimo-v2.6-pro"), "xiaomi"),
+            (("nous", "tencent/hy4-preview"), "tencent"),
+            (("nous", "stepfun/step-3.7-flash"), "stepfun"),
+            (("nous", "nvidia/nemotron-3-super-120b-a12b"), "nvidia"),
+            (("nous", "meta/muse-spark-1.3"), "meta"),
+            (("nous", "sakana/fugu-ultra"), "sakana"),
+            (("nous", "upstage/solar-pro4"), "upstage"),
+            (("nous", "nousresearch/hermes-4-405b"), "nous"),
+            # Unknown/stealth models routed via Nous Portal must NOT falsely collapse to "nous".
+            (("nous", "stealth/space-bunny-alpha"), None),
+            (("nous-portal", "mystery-model"), None),
+            # Other Hermes multi-vendor routers.
+            (("kilocode", "anthropic/claude-opus-4.6"), "anthropic"),
+            (("kilocode", "openai/gpt-5.4"), "openai"),
+            (("kilocode", "mystery-model"), None),
+            (("gmi", "zai-org/GLM-5.1-FP8"), "zhipu"),
+            (("novita", "deepseek/deepseek-v3-0324"), "deepseek"),
+            (("opencode-zen", "x-preview-f-free"), None),
+            (("azure-foundry", "mystery-model"), None),
+            (("arcee", "trinity-large-thinking"), "arcee"),
+        ]
+        for (provider, model), expected in cases:
+            with self.subTest(provider=provider, model=model):
+                self.assertEqual(infer_model_vendor(provider, model), expected)
+
+    def test_nous_single_provider_cross_vendor_verification_and_panel(self):
+        from factonio.config import check_cross_model_warning, save_settings, validate_verify_panel
+
+        with isolated_hermes_home() as home:
+            def configure(implement: dict[str, str], verify: dict[str, str]) -> None:
+                save_settings({"repos": {"acme-api": {
+                    "slug": "acme-api", "repo": "acme/api", "path": str(home / "acme-api"),
+                    "models": {"implement": implement, "verify": verify},
+                }}})
+
+            # Different vendor families on the single `nous` provider => NO cross-model warning.
+            for impl_model, verify_model in (
+                ("anthropic/claude-opus-5.5", "openai/gpt-6.2-sol"),
+                ("anthropic/claude-opus-5.5", "google/gemini-4-neon"),
+                ("xiaomi/mimo-v2.6-pro", "tencent/hy4-preview"),
+                ("stealth/space-bunny-alpha", "stealth/space-bunny-beta"),
+            ):
+                with self.subTest(impl_model=impl_model, verify_model=verify_model):
+                    configure(
+                        {"provider": "nous", "model": impl_model},
+                        {"provider": "nous", "model": verify_model},
+                    )
+                    self.assertIsNone(check_cross_model_warning(repo_slug="acme-api"))
+
+            # Same vendor family on `nous` still warns and notes single-provider routers work.
+            configure(
+                {"provider": "nous", "model": "anthropic/claude-opus-5.5"},
+                {"provider": "nous", "model": "anthropic/claude-sonnet-5.5"},
+            )
+            warn = check_cross_model_warning(repo_slug="acme-api")
+            self.assertIsNotNone(warn)
+            self.assertIn("same vendor/model family (anthropic)", warn or "")
+            self.assertIn("`nous`", warn or "")
+
+        # High-rigor verify panel on a single `nous` provider with distinct vendor families passes.
+        ok_panel = validate_verify_panel(
+            ["nous/anthropic/claude-opus-5.5", "nous/openai/gpt-6.2-sol", "nous/google/gemini-4-neon"],
+            source="settings.verify_panel",
+        )
+        self.assertTrue(ok_panel["valid"])
+        self.assertEqual(ok_panel["vendors"], ["anthropic", "openai", "google"])
+        self.assertIsNone(ok_panel["warning"])
+
+        # Unknown/stealth models via `nous` fail closed rather than collapsing to vendor "nous".
+        bad_panel = validate_verify_panel(
+            ["nous/stealth/model-a", "nous/stealth/model-b"],
+            source="settings.verify_panel",
+        )
+        self.assertFalse(bad_panel["valid"])
+        self.assertEqual(bad_panel["vendors"], [])
+        self.assertEqual(len(bad_panel["unknown_vendor_models"]), 2)
+        self.assertIn("nous/anthropic/...", bad_panel["warning"] or "")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,7 +6,7 @@ This file describes how to run and observe the software; it is not implementatio
 
 - Schema: `.factonio/harness.json` (schema_version 1)
 - Detected stack: hermes-plugin, github-actions, python, node
-- Generated at: 2026-11-26T15:20:00Z from `fix/ci-verify-allowlist`
+- Generated at: 2026-11-26T15:40:00Z from `fix/nous-multivendor-router`
 
 ## Launch
 
