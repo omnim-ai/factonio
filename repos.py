@@ -25,6 +25,7 @@ from .config import (
     list_repos,
     load_settings,
     repos_store_lock,
+    resolve_publish_policy,
     save_settings,
     single_line,
 )
@@ -270,12 +271,8 @@ def add_repo(
     else:
         policy = _validate_merge_policy(settings.get("default_merge_policy") or "auto")
 
-    if publish_policy is not None:
-        publish = _validate_publish_policy(publish_policy)
-    elif existing.get("publish_policy"):
-        publish = _validate_publish_policy(existing["publish_policy"])
-    else:
-        publish = _validate_publish_policy(settings.get("default_publish_policy") or "auto")
+    # Only a missing key inherits the global default; a persisted null/"" fails closed here.
+    publish = resolve_publish_policy(repo=existing, override=publish_policy)
 
     if max_fix_rounds is not None:
         rounds = _validate_max_fix_rounds(max_fix_rounds)
@@ -333,8 +330,8 @@ def add_repo(
         existing = raw_existing if isinstance(raw_existing, dict) else {}
         if merge_policy is None and existing.get("merge_policy"):
             policy = str(existing["merge_policy"])
-        if publish_policy is None and existing.get("publish_policy"):
-            publish = _validate_publish_policy(existing["publish_policy"])
+        if publish_policy is None and "publish_policy" in existing:
+            publish = resolve_publish_policy(repo=existing)
         if max_fix_rounds is None and existing.get("max_fix_rounds") is not None:
             rounds = existing["max_fix_rounds"]
         entry = _build_added_entry(
@@ -1284,9 +1281,15 @@ def _validate_git_ref(value: Any, field: str = "ref") -> str:
 
 def _validate_remote(value: Any) -> str:
     remote = _validate_git_ref(value, "remote")
-    if "/" in remote or ".." in remote:
+    if any(ch in remote for ch in "/\\:") or ".." in remote:
         raise ValueError(f"remote must be a plain remote name; got {value!r}")
     return remote
+
+
+def _is_configured_remote(cwd: Path, remote: str) -> bool:
+    """True only when ``remote`` is a named remote in ``cwd``'s git config (not a path or URL)."""
+    proc = _run_git(["remote"], cwd=cwd)
+    return proc.returncode == 0 and remote in (proc.stdout or "").split()
 
 
 def _sync_local_default_branch(repo_path: Path, branch: str) -> tuple[bool, str]:
@@ -1825,10 +1828,12 @@ def publish_pr(
         return finish("refused", "invalid_input", str(exc))
 
     if body_file is not None:
+        if not (isinstance(body_file, str) and body_file.strip()):
+            return finish("refused", "invalid_input", f"body_file must be a non-empty path; got {_echo(body_file)!r}")
         try:
-            body_text = Path(str(body_file)).expanduser().read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            return finish("refused", "body_file_unreadable", f"cannot read body_file {str(body_file)!r}: {exc}")
+            body_text = Path(body_file).expanduser().read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            return finish("refused", "body_file_unreadable", f"cannot read body_file {body_file[:200]!r}: {exc}")
     else:
         body_text = body or ""
 
@@ -1871,6 +1876,16 @@ def publish_pr(
         return finish(
             "refused", "head_drift",
             f"HEAD drift: refs/heads/{clean_branch} is at {local_head}, expected verified {sha}",
+        )
+
+    try:
+        configured = _is_configured_remote(cwd, clean_remote)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return finish("refused", "git_unavailable", f"cannot list git remotes: {exc}")
+    if not configured:
+        return finish(
+            "refused", "unknown_remote",
+            f"remote {clean_remote!r} is not a configured git remote in {cwd}; refusing to push",
         )
 
     try:

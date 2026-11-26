@@ -14,6 +14,7 @@ from .config import (
     check_cross_model_warning,
     list_repos,
     resolve_all_phase_models,
+    resolve_default_publish_policy,
     resolve_publish_policy,
     resolve_rigor,
     resolve_verify_panel,
@@ -56,7 +57,23 @@ def _publish_policy_label(repo: dict[str, Any]) -> str:
     try:
         return resolve_publish_policy(repo=repo)
     except ValueError:
-        return f"invalid({repo.get('publish_policy')!r})"
+        return "invalid"
+
+
+def _publish_policy_errors(repos: dict[str, Any]) -> list[str]:
+    """Every persisted publish-policy problem (global default and per-repo, ``null``/``""`` included)."""
+    errors: list[str] = []
+    try:
+        resolve_default_publish_policy()
+    except ValueError as exc:
+        errors.append(str(exc))
+    for slug, r in sorted(repos.items()):
+        if isinstance(r, dict) and "publish_policy" in r:
+            try:
+                resolve_publish_policy(repo={**r, "slug": r.get("slug") or slug})
+            except ValueError as exc:
+                errors.append(str(exc))
+    return errors
 
 
 def _print_result(data: dict[str, Any], as_json: bool) -> None:
@@ -762,14 +779,21 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             return
 
         if cmd == "add":
-            res = add_repo(
-                args.repo,
-                local_path=args.local_path,
-                merge_policy=args.merge_policy,
-                max_fix_rounds=args.max_fix_rounds,
-                clone=not bool(args.no_clone),
-                publish_policy=getattr(args, "publish_policy", None),
-            )
+            try:
+                res = add_repo(
+                    args.repo,
+                    local_path=args.local_path,
+                    merge_policy=args.merge_policy,
+                    max_fix_rounds=args.max_fix_rounds,
+                    clone=not bool(args.no_clone),
+                    publish_policy=getattr(args, "publish_policy", None),
+                )
+            except ValueError as exc:
+                if as_json:
+                    print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+                else:
+                    print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
             if as_json:
                 print(json.dumps(res, indent=2, default=str))
                 return
@@ -830,11 +854,21 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
 
         if cmd == "list":
             repos = list_repos()
+            policy_errors = _publish_policy_errors(repos)
             if as_json:
-                print(json.dumps({"repos": repos}, indent=2, default=str))
+                payload: dict[str, Any] = {"repos": repos}
+                if policy_errors:
+                    payload.update(ok=False, errors=policy_errors)
+                print(json.dumps(payload, indent=2, default=str))
+                if policy_errors:
+                    sys.exit(1)
                 return
             if not repos:
                 print("No repositories registered. Run: hermes factonio add owner/repo")
+                for err in policy_errors:
+                    print(f"Error: {err}", file=sys.stderr)
+                if policy_errors:
+                    sys.exit(1)
                 return
             for slug, r in sorted(repos.items()):
                 tags = [
@@ -851,6 +885,10 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                     tags.append(f"rigor={r['default_rigor']}")
                 print(f"- {slug}: {r.get('repo')} ({r.get('path')}) [{' '.join(tags)}]")
             print("\nEdit settings with: hermes factonio update <repo> --merge-policy ... (see --help)")
+            if policy_errors:
+                for err in policy_errors:
+                    print(f"Error: {err}", file=sys.stderr)
+                sys.exit(1)
             return
 
         if cmd == "models":

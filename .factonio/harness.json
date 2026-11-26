@@ -80,7 +80,7 @@
         "`init` refuses an ephemeral (.worktrees/, kanban/workspaces/, cache/scratch/) link target on a persistent profile unless --force-link",
         "`doctor` warns when a persistent worker plugin link points into an ephemeral path",
         "`resolve_initial_progress_minutes` caps the silent-start window at the phase stale threshold and `0` disables it",
-        "`resolve_publish_policy` resolves override -> repos.<slug>.publish_policy -> settings.default_publish_policy -> auto and raises on invalid values"
+        "`resolve_publish_policy` resolves override -> repos.<slug>.publish_policy -> settings.default_publish_policy -> auto; only an omitted key inherits, while invalid, explicit null or empty values (config.yaml or repos.json) raise ValueError"
       ]
     },
     {
@@ -114,7 +114,7 @@
         "`trail --audit` exits 0 when clean and 1 with findings, with `--json` / `--markdown` and tenant/repo/phase/card filters",
         "`start <repo> <request> --kind feature|bug|quick|refactor|perf|investigate --json` starts a workstream with additive kind / read_only / report_path; `--kind investigate --skip-define` exits 1 without creating a card",
         "`trail --recall --repo <repo> [--query Q] [--limit N] --json` / `--markdown` returns read-only deduplicated escapes / superseded / rejects_and_blocks / keyword recall excluding --tenant, never creating trail.db, and exits 1 when trail.db is unreadable",
-        "`publish-pr <repo> <branch> --expected-head-sha <sha> --title <t> --json` exits 0 only when the PR is published and 1 on refusal/error (`--json` accepted before or after the subcommand); `add` / `update --publish-policy auto|ask` persist the policy and `list` prints `publish=<policy>`"
+        "`publish-pr <repo> <branch> --expected-head-sha <sha> --title <t> --json` exits 0 only when the PR is published and 1 on refusal/error (`--json` accepted before or after the subcommand); `add` / `update --publish-policy auto|ask` persist the policy and `list` prints `publish=<policy>`; `add` and `list` exit 1 on a persisted null/empty/invalid publish_policy or default_publish_policy"
       ]
     },
     {
@@ -131,7 +131,7 @@
         "factonio_bootstrap_verify accepts prove (init) and base_ref (check/audit)",
         "Refused merge/gate trail rows never carry override hints (allow_stacked_merge) in why; only real overrides read as gate_loosening in trail --audit (tests.test_pr_gate_hardening.TestMergeTrailAudit)",
         "factonio_start `kind` enum equals WORKSTREAM_KINDS (feature, bug, quick, refactor, perf, investigate)",
-        "factonio_publish_pr delegates to repos.publish_pr; factonio_add_repo / factonio_update_repo accept publish_policy auto|ask"
+        "factonio_publish_pr passes raw arguments to repos.publish_pr (no coercion; title=None, empty base_branch/remote and missing keys are refused); factonio_add_repo / factonio_update_repo accept publish_policy auto|ask"
       ]
     },
     {
@@ -188,7 +188,7 @@
         "Merging a stacked PR is refused unless allow_stacked_merge; a rebased head merges only with allow_patch_continuity and an identical patch-id",
         "`restack` keeps patch-id continuity",
         "`worktrees` audit is read-only unless --prune-safe",
-        "`publish_pr` refuses (no git push, no gh call, refused publish_pr trail row) on invalid input, unregistered repo, missing checkout, branch == base, missing refs/heads/<branch> or HEAD drift; otherwise pushes `<expected_head_sha>:refs/heads/<branch>`, opens the PR via a temporary --body-file that is always removed, and reports published only after `gh pr view` confirms head and base"
+        "`publish_pr` refuses (no git push, no gh call, refused publish_pr trail row) on invalid input (including SCP-style/path remotes and unreadable or NUL body_file), unregistered repo, missing checkout, branch == base, missing refs/heads/<branch>, HEAD drift or a remote not configured in the checkout; otherwise pushes `<expected_head_sha>:refs/heads/<branch>`, opens the PR via a temporary --body-file that is always removed, and reports published only after `gh pr view` confirms head and base"
       ]
     },
     {

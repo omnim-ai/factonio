@@ -176,6 +176,36 @@ class TestPublishPolicyConfig(unittest.TestCase):
                 resolve_publish_policy()
 
 
+    def test_explicit_null_or_empty_fails_closed_but_missing_key_inherits(self):
+        from factonio.config import list_repos, resolve_publish_policy, save_settings
+
+        with isolated_hermes_home() as home:
+            for bad in (None, "", "  "):
+                with self.subTest(repo_value=bad), self.assertRaises(ValueError):
+                    resolve_publish_policy(repo={"slug": "x", "publish_policy": bad})
+            _register_stub(home, publish_policy="ask")
+            for bad in (None, ""):
+                with self.subTest(repos_json=bad):
+                    repos = list_repos()
+                    repos["acme-sample"]["publish_policy"] = bad
+                    save_settings({"repos": repos})
+                    self.assertIn("publish_policy", _store(home)["acme-sample"])
+                    with self.assertRaises(ValueError):
+                        resolve_publish_policy(repo_slug="acme-sample")
+                    self.assertEqual(resolve_publish_policy(repo_slug="acme-sample", override="ask"), "ask")
+
+            for bad in (None, ""):
+                with self.subTest(config_yaml=bad):
+                    save_settings({"default_publish_policy": bad})
+                    with self.assertRaises(ValueError):
+                        resolve_publish_policy()
+                    with self.assertRaises(ValueError):
+                        resolve_publish_policy(repo={"slug": "legacy"})
+                    self.assertEqual(resolve_publish_policy(repo={"publish_policy": "ask"}), "ask")
+            save_settings({"default_publish_policy": "ask"})
+            self.assertEqual(resolve_publish_policy(repo={"slug": "legacy"}), "ask")
+
+
 class TestRepoPublishPolicy(unittest.TestCase):
     def test_validator_and_editable_fields(self):
         from factonio.repos import _CLEARABLE_REPO_FIELDS, EDITABLE_REPO_FIELDS, _validate_publish_policy
@@ -211,6 +241,35 @@ class TestRepoPublishPolicy(unittest.TestCase):
             gh.assert_not_called()
             self.assertFalse(local.exists())
             self.assertFalse((home / "plugin-data" / "factonio" / "repos.json").exists())
+
+    def test_add_fails_closed_on_persisted_null_or_empty(self):
+        from factonio.config import list_repos, save_settings
+
+        for bad in (None, ""):
+            with self.subTest(config_yaml=bad), isolated_hermes_home() as home:
+                save_settings({"default_publish_policy": bad})
+                with self.assertRaises(ValueError):
+                    _register_stub(home)
+                self.assertFalse((home / "plugin-data" / "factonio" / "repos.json").exists())
+                self.assertEqual(_register_stub(home, publish_policy="ask")["repo"]["publish_policy"], "ask")
+
+            with self.subTest(repos_json=bad), isolated_hermes_home() as home:
+                _register_stub(home, publish_policy="ask")
+                repos = list_repos()
+                repos["acme-sample"]["publish_policy"] = bad
+                save_settings({"repos": repos})
+                before = _store(home)
+                with self.assertRaises(ValueError):
+                    _register_stub(home)
+                self.assertEqual(_store(home), before)
+                self.assertEqual(_register_stub(home, publish_policy="auto")["repo"]["publish_policy"], "auto")
+
+        with isolated_hermes_home() as home:
+            _register_stub(home, publish_policy="ask")
+            repos = list_repos()
+            repos["acme-sample"].pop("publish_policy")
+            save_settings({"repos": repos, "default_publish_policy": "ask"})
+            self.assertEqual(_register_stub(home)["repo"]["publish_policy"], "ask")
 
     def test_update_publish_policy(self):
         from factonio.repos import update_repo
@@ -326,6 +385,8 @@ class TestPublishPr(unittest.TestCase):
             save_settings({"repos": repos})
             body = home / "b.md"
             body.write_text("x", encoding="utf-8")
+            evil = fx.local / "evil.git"
+            _git(fx.local, "init", "-q", "--bare", str(evil))
             cases = {
                 "short sha": ({"expected_head_sha": fx.sha[:12]}, "expected_head_sha"),
                 "non-hex sha": ({"expected_head_sha": "g" * 40}, "expected_head_sha"),
@@ -335,6 +396,13 @@ class TestPublishPr(unittest.TestCase):
                 "missing body_file": ({"body": None, "body_file": str(home / "missing.md")}, "body_file"),
                 "bad branch": ({"branch": "-x"}, "branch must not start"),
                 "bad remote": ({"remote": "a/b"}, "remote"),
+                "scp remote": ({"remote": "attacker@evil.com:exfil.git"}, "plain remote name"),
+                "backslash remote": ({"remote": "a\\b"}, "plain remote name"),
+                "empty remote": ({"remote": ""}, "remote"),
+                "unconfigured local bare remote": ({"remote": "evil.git"}, "not a configured git remote"),
+                "body_file NUL": ({"body": None, "body_file": "brief\x00.md"}, "body_file"),
+                "empty body_file": ({"body": None, "body_file": "  "}, "body_file"),
+                "non-string body_file": ({"body": None, "body_file": 7}, "body_file"),
                 "bad base": ({"base_branch": "a..b"}, "base_branch must not contain"),
                 "branch is base": ({"branch": "main", "expected_head_sha": fx.base_sha}, "target base"),
                 "unregistered": ({"repo": "nope/missing"}, "not registered"),
@@ -353,6 +421,7 @@ class TestPublishPr(unittest.TestCase):
                     self.assertEqual(gh.calls, [])
                     self.assertFalse(any(c[:1] == ["push"] for c in git_calls), git_calls)
             self.assertIsNone(fx.origin_ref("feat/x"))
+            self.assertEqual(_git(evil, "for-each-ref"), "")
             rows = _publish_rows()
             self.assertEqual(len(rows), len(cases))
             self.assertEqual({r["result"] for r in rows}, {"refused"})
@@ -374,8 +443,10 @@ class TestPublishPr(unittest.TestCase):
     def test_push_failure_is_error_without_gh(self):
         with isolated_hermes_home() as home, _git_env():
             fx = PublishFixture(home)
+            _git(fx.local, "remote", "set-url", "origin", str(home / "missing-origin.git"))
             gh = FakeGh(head=fx.sha)
-            res, _ = self._publish(fx, gh, remote="nosuchremote")
+            res, git_calls = self._publish(fx, gh)
+            self.assertIn(["push", "origin", f"{fx.sha}:refs/heads/feat/x"], git_calls)
             self.assertFalse(res["ok"])
             self.assertFalse(res["refused"])
             self.assertEqual((res["pushed"], res["created"], res["published"]), (False, False, False))
@@ -493,6 +564,41 @@ class TestPublishToolAndCli(unittest.TestCase):
             ("a" * 40, "T", "B", True, "origin", "ten", "t_worker", "worker"),
         )
 
+    def test_publish_tool_passes_raw_input_so_publish_pr_refuses(self):
+        from factonio.agent_tools import register_tools
+
+        ctx = _Ctx()
+        register_tools(ctx)
+        handler = ctx.tools["factonio_publish_pr"]["handler"]
+        good = {"repo": "acme/sample", "branch": "feat/x", "expected_head_sha": "a" * 40, "title": "T"}
+        cases = {
+            "title None": ({**good, "title": None}, "title"),
+            "empty base_branch": ({**good, "base_branch": ""}, "base_branch"),
+            "empty remote": ({**good, "remote": ""}, "remote"),
+            "missing repo": ({k: v for k, v in good.items() if k != "repo"}, "repo"),
+            "missing branch": ({k: v for k, v in good.items() if k != "branch"}, "branch"),
+            "missing sha": ({k: v for k, v in good.items() if k != "expected_head_sha"}, "expected_head_sha"),
+            "missing title": ({k: v for k, v in good.items() if k != "title"}, "title"),
+        }
+        with isolated_hermes_home(), mock.patch("factonio.repos._run_gh") as gh, \
+                mock.patch("factonio.repos._run_git") as git:
+            for name, (args, needle) in cases.items():
+                with self.subTest(case=name):
+                    res = json.loads(handler(args))
+                    self.assertEqual((res["ok"], res["refused"], res["published"], res["pushed"], res["created"]),
+                                     (False, True, False, False, False), res)
+                    self.assertIn(needle, res["error"])
+            gh.assert_not_called()
+            git.assert_not_called()
+            rows = _publish_rows()
+            self.assertEqual(len(rows), len(cases))
+            self.assertEqual({r["result"] for r in rows}, {"refused"})
+
+        with mock.patch("factonio.agent_tools.publish_pr", return_value={"ok": False}) as pub:
+            handler(dict(good))
+        kw = pub.call_args.kwargs
+        self.assertEqual((kw["base_branch"], kw["remote"]), (None, "origin"))
+
     def test_add_and_update_tools_persist_publish_policy(self):
         from factonio.agent_tools import register_tools
 
@@ -545,6 +651,46 @@ class TestPublishToolAndCli(unittest.TestCase):
             save_settings({"repos": repos, "default_publish_policy": "ask"})
             code, out, _ = _run_cli("list")
             self.assertIn("publish=ask", out)
+
+    def test_cli_add_and_list_fail_closed_on_null_or_empty_policy(self):
+        from factonio.config import list_repos, save_settings
+
+        stub_remote = {"repo": "acme/sample", "url": "https://github.com/acme/sample", "default_branch": "main",
+                       "required_checks": [], "has_required_checks": False}
+        for bad in (None, ""):
+            with self.subTest(config_yaml=bad), isolated_hermes_home() as home, \
+                    mock.patch("factonio.repos.inspect_github_repo", return_value=stub_remote):
+                local = home / "dev" / "sample"
+                (local / ".git").mkdir(parents=True)
+                save_settings({"default_publish_policy": bad})
+                code, out, _ = _run_cli("--json", "add", "acme/sample", "--path", str(local), "--no-clone")
+                self.assertEqual(code, 1, out)
+                self.assertIn("default_publish_policy", json.loads(out)["error"])
+                self.assertFalse((home / "plugin-data" / "factonio" / "repos.json").exists())
+                code, out, err = _run_cli("list")
+                self.assertEqual(code, 1)
+                self.assertIn("default_publish_policy", err)
+
+            with self.subTest(repos_json=bad), isolated_hermes_home() as home, \
+                    mock.patch("factonio.repos.inspect_github_repo", return_value=stub_remote):
+                local = home / "dev" / "sample"
+                (local / ".git").mkdir(parents=True)
+                self.assertEqual(_run_cli("add", "acme/sample", "--path", str(local), "--no-clone")[0], 0)
+                repos = list_repos()
+                repos["acme-sample"]["publish_policy"] = bad
+                save_settings({"repos": repos})
+                code, out, err = _run_cli("list")
+                self.assertEqual(code, 1)
+                self.assertNotIn("publish=auto", out)
+                self.assertIn("publish=invalid", out)
+                self.assertIn("repos.acme-sample.publish_policy", err)
+                code, out, _ = _run_cli("--json", "list")
+                self.assertEqual(code, 1)
+                self.assertFalse(json.loads(out)["ok"])
+                code, out, err = _run_cli("add", "acme/sample", "--path", str(local), "--no-clone")
+                self.assertEqual(code, 1, out)
+                self.assertIn("publish_policy", err)
+                self.assertEqual(_store(home)["acme-sample"]["publish_policy"], bad)
 
     def test_cli_publish_pr_exit_codes_and_json_placement(self):
         code, out, _ = _run_cli("publish-pr", "--help")

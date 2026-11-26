@@ -823,16 +823,17 @@ def register_tools(ctx: Any) -> None:
     def handle_publish_pr(args: dict[str, Any], **kwargs: Any) -> str:
         try:
             ctx_args = _trail_context(args)
+            # Pass raw values: publish_pr validates and records a refused trail row for bad input.
             res = publish_pr(
-                str(args["repo"]),
-                str(args["branch"]),
-                expected_head_sha=str(args["expected_head_sha"]),
-                title=str(args["title"]),
+                args.get("repo"),
+                args.get("branch"),
+                expected_head_sha=args.get("expected_head_sha"),
+                title=args.get("title"),
                 body=args.get("body"),
                 body_file=args.get("body_file"),
-                base_branch=args.get("base_branch") or None,
+                base_branch=args["base_branch"] if "base_branch" in args else None,
                 draft=bool(args.get("draft", False)),
-                remote=str(args.get("remote") or "origin"),
+                remote=args["remote"] if "remote" in args else "origin",
                 tenant=ctx_args["tenant"] or None,
                 card_id=ctx_args["card_id"] or None,
                 actor=ctx_args["actor"],
