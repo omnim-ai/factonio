@@ -987,7 +987,7 @@ def _shell_block(command: str) -> str:
 
 
 def _local_target_lines(local: dict[str, str]) -> str:
-    # The `Local branch target:` stamp is parsed by metrics._extract_local_target; keep the format stable.
+    # The `Local branch target:` stamp is parsed by metrics._local_target_from_body; keep the format stable.
     return (
         f"- Local branch target: `{local['branch']}` (base=`{local['base_branch']}`, head=`{local['head_sha']}`)\n"
         f"- Pull Request: none (unpublished local branch; publish later with `factonio_publish_pr`)\n"

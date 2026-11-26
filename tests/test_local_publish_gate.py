@@ -705,6 +705,61 @@ class TestLocalTargetMetrics(unittest.TestCase):
         self.assertIsNone(pr)
         self.assertEqual((local["branch"], local["source"]), ("feat/x", "metadata"))
 
+    def _assert_local_handoff_wins(self, home: Path, tenant: str, task_id: str, branch: str, phantom: str) -> None:
+        from factonio.metrics import thread_cards
+        from factonio.orchestrator import workstream_status
+
+        _complete(task_id, None, branch=branch, base_branch="main", head_sha=SHA,
+                  pr_title="Fix widget", pr_body="## Why\nx", repo="acme/svc")
+        want = {"repo": "acme/svc", "branch": branch, "base_branch": "main", "head_sha": SHA, "source": "metadata"}
+        card = next(c for c in thread_cards(home / "kanban.db", tenant=tenant)["cards"] if c["id"] == task_id)
+        self.assertIsNone(card["pr"])
+        self.assertEqual(card["local_target"], want)
+        status_card = next(c for c in workstream_status(tenant=tenant)["cards"] if c["id"] == task_id)
+        self.assertIsNone(status_card["pr"])
+        self.assertEqual(status_card["local_target"], want)
+        code, text, err = _cli()("status", "--tenant", tenant)
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"[acme/svc@{branch}]", text)
+        self.assertNotIn(phantom, text)
+
+    def test_structured_local_handoff_beats_issue_ref_in_body(self):
+        from factonio.orchestrator import start_workstream
+
+        with isolated_hermes_home() as home:
+            _register(home, publish_policy="ask")
+            res = start_workstream("acme/svc", "Fix widget", kind="quick", issue_number=42)
+            self.assertIn("- GitHub Issue: acme/svc#42", _get_task(res["task_id"]).body)
+            self._assert_local_handoff_wins(home, res["tenant"], res["task_id"], "factonio/fix-42", "[acme/svc#42]")
+
+    def test_structured_local_handoff_beats_stack_parent_pr_in_body(self):
+        from factonio.orchestrator import spawn_implementation_card
+
+        with isolated_hermes_home() as home:
+            _register(home, publish_policy="ask")
+            res = spawn_implementation_card("acme/svc", "t-stk", "Unit 2", "Next", base_branch="feat/u1",
+                                            stack_parent_pr=12)
+            self.assertIn("- Stack parent PR: `acme/svc#12`", _get_task(res["task_id"]).body)
+            self._assert_local_handoff_wins(home, "t-stk", res["task_id"], "factonio/u2", "[acme/svc#12]")
+
+    def test_body_pr_ref_fallback_only_without_structured_target(self):
+        from factonio.metrics import _card_targets
+
+        task = {"title": "[implement] Unit", "body": "- GitHub Issue: acme/svc#42",
+                "skills": json.dumps(["factonio:implement"])}
+        local_run = {"metadata": json.dumps({"branch": "feat/x", "head_sha": SHA, "repo": "acme/svc"})}
+        pr_run = {"metadata": json.dumps({"pr_number": 7, "repo": "acme/svc"})}
+        pr, local = _card_targets(task, [])
+        self.assertEqual((pr["number"], local), (42, None))
+        pr, local = _card_targets(task, [{"metadata": json.dumps({"summary_only": True})}])
+        self.assertEqual((pr["number"], local), (42, None))
+        pr, local = _card_targets(task, [local_run])
+        self.assertEqual((pr, local["branch"]), (None, "feat/x"))
+        pr, local = _card_targets(task, [local_run, pr_run])
+        self.assertEqual((pr["number"], local), (7, None))
+        pr, local = _card_targets(task, [pr_run, local_run])
+        self.assertEqual((pr, local["branch"]), (None, "feat/x"))
+
     def test_status_json_after_subcommand(self):
         with isolated_hermes_home() as home:
             _register(home, publish_policy="ask")

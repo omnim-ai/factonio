@@ -373,8 +373,12 @@ def _local_target_from_body(body: Any) -> Optional[dict[str, Any]]:
     }
 
 
+def _has_pr_metadata(meta: Mapping[str, Any]) -> bool:
+    return bool(meta.get("pr_number") or meta.get("published_pr") or meta.get("pr_url"))
+
+
 def _local_target_from_metadata(meta: Mapping[str, Any]) -> Optional[dict[str, Any]]:
-    if meta.get("pr_number") or meta.get("published_pr") or meta.get("pr_url"):
+    if _has_pr_metadata(meta):
         return None
     branch, sha = meta.get("branch"), meta.get("head_sha")
     if not (isinstance(branch, str) and branch.strip() and isinstance(sha, str)):
@@ -406,7 +410,7 @@ def _extract_local_target(task: dict[str, Any], runs: list[dict[str, Any]]) -> O
         return stamped
     for run in reversed(runs):
         meta = _parse_json_dict(run.get("metadata"))
-        if meta.get("pr_number") or meta.get("published_pr") or meta.get("pr_url"):
+        if _has_pr_metadata(meta):
             return None
         found = _local_target_from_metadata(meta)
         if found is not None:
@@ -419,15 +423,23 @@ def _card_targets(task: dict[str, Any], runs: list[dict[str, Any]]) -> tuple[Opt
 
     A stamped local card has no PR, even if its branch name looks like ``a/b#1``. Verification cards
     only ever take their target from the orchestrator stamp: worker-reported ``branch`` / ``head_sha``
-    metadata on a PR-target lane must never turn it into a local-branch lane.
+    metadata on a PR-target lane must never turn it into a local-branch lane. Otherwise the newest run
+    carrying a structured target (PR or local handoff) wins; free-text ``owner/repo#N`` mentions in the
+    title/body/result (e.g. ``- GitHub Issue:`` or ``- Stack parent PR:`` lines) are only a fallback.
     """
     stamped = _local_target_from_body(task.get("body"))
     if stamped is not None:
         return None, stamped
-    pr = _extract_pr_ref(task, runs)
-    if pr is not None or classify_phase(task) in _VERIFY_PHASES:
-        return pr, None
-    return None, _extract_local_target(task, runs)
+    if classify_phase(task) in _VERIFY_PHASES:
+        return _extract_pr_ref(task, runs), None
+    for run in reversed(runs):
+        meta = _parse_json_dict(run.get("metadata"))
+        if _has_pr_metadata(meta):
+            return _extract_pr_ref(task, runs), None
+        local = _local_target_from_metadata(meta)
+        if local is not None:
+            return None, local
+    return _pr_ref_from_text(task), None
 
 
 def _panel_lane(task: dict[str, Any], runs: list[dict[str, Any]], tag: dict[str, str]) -> dict[str, Any]:
@@ -612,7 +624,10 @@ def _extract_pr_ref(task: dict[str, Any], runs: list[dict[str, Any]]) -> Optiona
                 "number": int(pr_num),
                 "url": f"https://github.com/{pr_repo}/pull/{int(pr_num)}",
             }
+    return _pr_ref_from_text(task)
 
+
+def _pr_ref_from_text(task: dict[str, Any]) -> Optional[dict[str, Any]]:
     blob = f"{task.get('title') or ''}\n{task.get('body') or ''}\n{task.get('result') or ''}"
     m_url = _PR_URL_RE.search(blob)
     if m_url:

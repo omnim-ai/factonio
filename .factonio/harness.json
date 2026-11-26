@@ -293,7 +293,7 @@
         "`recall_decisions(repo=)` treats owner/repo and its registered or derived slug (or a list of aliases) as one repository, case-insensitively, while distinct repositories such as scope/one and scope/two stay isolated",
         "`recall_decisions` fails closed on the whole field: any emitted string or evidence value referencing holdout becomes exactly [redacted] (no trailing words or path suffix), while prose such as \"hold out for review\" is left untouched",
         "`contains_holdout_reference` strips complete ANSI CSI/OSC/DCS/C1 escape sequences before matching and also matches the byte-deleted reading, so escape sequences can neither split nor swallow the holdout marker",
-        "metrics `_extract_local_target` surfaces additive `local_target` (repo, branch, base_branch, head_sha) on panel lanes, panel summaries and thread cards from the orchestrator `Local branch target:` stamp (stamped cards never yield a phantom PR ref) or a PR-less full-SHA completion handoff on non-verification cards (a newer PR-publishing run hides earlier local handoffs; PR-target lanes never match `branch` filters)"
+        "metrics `_card_targets` surfaces additive `local_target` (repo, branch, base_branch, head_sha) on panel lanes, panel summaries and thread cards from the orchestrator `Local branch target:` stamp (stamped cards never yield a phantom PR ref) or a PR-less full-SHA completion handoff on non-verification cards (a newer PR-publishing run hides earlier local handoffs; a structured local handoff beats `- GitHub Issue:` / `- Stack parent PR:` body refs, which are only a fallback; PR-target lanes never match `branch` filters)"
       ]
     },
     {
