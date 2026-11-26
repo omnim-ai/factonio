@@ -150,8 +150,8 @@
       "scenarios": [
         "`pr-gate` reports live head_sha and ready_to_merge",
         "`pr-gate` reports owner-approval checks as Tier 4 approval_gates (never Tier 3 CI failures) and pending review automation",
-        "`pr-gate --stack 12,13,14` gates a stack root-to-tip in tier-major order with contiguous_ready_run, ceiling and next_action",
-        "Rebase-required trunk drift (overlap or .github/workflows/) is a Tier 1 blocker; clean, disjoint and lockfile_only are not",
+        "`pr-gate --stack 12,13,14` gates a stack root-to-tip in tier-major order with contiguous_ready_run, ceiling and lowest_pending_frontier objects (with pr_number), and next_action",
+        "Rebase-required trunk drift (overlap or .github/workflows/, including non-ASCII paths) is a Tier 1 blocker; clean, disjoint and lockfile_only are not; fetch=True fetches the exact head (refs/pull/<n>/head fallback) for drift and patch continuity",
         "Merging a stacked PR is refused unless allow_stacked_merge; a rebased head merges only with allow_patch_continuity and an identical patch-id",
         "`restack` keeps patch-id continuity",
         "`worktrees` audit is read-only unless --prune-safe"
