@@ -1504,7 +1504,11 @@ _RECALL_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_]{3,}")
 # Recall text can be injected into Definition cards: never echo holdout paths or scenario names.
 # Matching runs after NFKC folding with format/control characters removed, so zero-width joiners,
 # full-width letters or "hold-out" spellings cannot smuggle a reference past the barrier.
-_HOLDOUT_RE = re.compile(r"\S*hold[\s_./\\-]*outs?\S*", re.IGNORECASE)
+# Whitespace-interleaved spellings ("hol\tdout/x") count only when followed by a path separator, so
+# prose such as "hold out for review" stays readable.
+_HOLDOUT_RE = re.compile(
+    r"hold[_./\\-]*outs?|h\s*o\s*l\s*d[\s_./\\-]*o\s*u\s*t\s*s?\s*[/\\]", re.IGNORECASE
+)
 _HOLDOUT_REDACTED = "[redacted]"
 _RECALL_FIELD_CHARS = 240
 
@@ -1547,7 +1551,13 @@ def _recall_fold(text: str) -> str:
 
 
 def _recall_redact_text(text: str) -> str:
-    return _HOLDOUT_RE.sub(_HOLDOUT_REDACTED, _recall_fold(text))
+    """Fold ``text``; if it references holdout anywhere, replace the WHOLE string.
+
+    Partial substitution cannot know where a path ends (quoted paths may contain spaces), so any
+    trailing fragment could be a scenario name: fail closed on the entire field or line.
+    """
+    folded = _recall_fold(text)
+    return _HOLDOUT_REDACTED if _HOLDOUT_RE.search(folded) else folded
 
 
 def contains_holdout_reference(text: Any) -> bool:

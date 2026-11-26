@@ -253,16 +253,19 @@ class TestRecallSelection(unittest.TestCase):
         with isolated_hermes_home():
             trail.log_decision("verify_blackbox", tenant="old-a", repo_slug="acme-sample", phase="verify",
                                why="Login form failed", result="reject")
-            trail.log_decision("verify_blackbox", tenant="old-b", repo_slug="acme-sample", phase="verify",
-                               why="Pagination off by one, see /runs/x/holdout/02-edge.md", result="reject",
-                               evidence={"holdout_dir": "/runs/x/holdout", "note": "holdout/02-edge.md failed"})
+            leaky = trail.log_decision("verify_blackbox", tenant="old-b", repo_slug="acme-sample", phase="verify",
+                                       why="Pagination off by one, see /runs/x/holdout/02-edge.md", result="reject",
+                                       evidence={"holdout_dir": "/runs/x/holdout", "note": "holdout/02-edge.md failed"})
             trail.log_decision("verify_blackbox", tenant="old-c", repo_slug="acme-sample", phase="verify",
                                why="Unrelated newest reject", result="reject")
             res = trail.recall_decisions(repo="acme-sample", query="Fix pagination", limit=3)
-            self.assertIn("Pagination", res["items"][0]["why"])
+            self.assertEqual(res["items"][0]["id"], leaky["id"])
             blob = json.dumps(res) + trail.render_recall_markdown(res) + trail.render_recall_text(res)
             self.assertNotIn("holdout", blob.replace('"query"', ""))
-            self.assertIn("[redacted]", res["items"][0]["why"])
+            self.assertNotIn("02-edge", blob)
+            # Fail closed: the whole field is withheld, not just the path token.
+            self.assertEqual(res["items"][0]["why"], "[redacted]")
+            self.assertEqual(res["items"][0]["evidence"], {"note": "[redacted]"})
 
 
 class TestRecallRenderers(unittest.TestCase):
@@ -689,6 +692,85 @@ class TestRecallControlObfuscation(unittest.TestCase):
 
         self.assertEqual(trail._recall_fold("a\tb\nc\r\nd\x00e\u200bf"), "a b c  def")
         self.assertFalse(trail.contains_holdout_reference("hold the line; check out main"))
+
+
+class TestRecallSpacedHoldoutPaths(unittest.TestCase):
+    """Paths with spaces must not leave scenario-name suffixes behind after redaction."""
+
+    PATHS = (
+        '"/runs/old/holdout/01 secret-scenario-name.md"',
+        '"/synthetic/holdout/private cases/forbidden-scenario.md"',
+        "/runs/old/holdout/01 secret-scenario-name.md",
+        "/synthetic/holdout/private cases/forbidden-scenario.md",
+        "hol\tdout/tab-probe.md",
+        "h o l d o u t/tab-probe.md",
+    )
+    FRAGMENTS = ("secret-scenario-name", "forbidden-scenario", "private cases", "tab-probe", "holdout")
+
+    def _assert_clean(self, text: str) -> None:
+        from factonio import trail
+
+        for needle in self.FRAGMENTS:
+            self.assertNotIn(needle, text)
+        self.assertFalse(trail.contains_holdout_reference(text))
+
+    def test_detection_covers_spaced_markers_but_not_prose(self):
+        from factonio import trail
+
+        for path in self.PATHS:
+            self.assertTrue(trail.contains_holdout_reference(f"see {path}"), repr(path))
+        for prose in ("hold out for review", "Hold out until CI is green", "hold the line; check out main"):
+            self.assertFalse(trail.contains_holdout_reference(prose), prose)
+            self.assertEqual(trail._recall_redact_text(prose), prose)
+        self.assertEqual(trail._recall_redact_text('Review "/a/holdout/b c.md" before retry'), "[redacted]")
+
+    def test_spaced_paths_never_reach_recall_or_definition_card(self):
+        from factonio import trail
+        from factonio.orchestrator import start_workstream
+
+        for path in self.PATHS:
+            with self.subTest(path=repr(path)), isolated_hermes_home() as home:
+                _register(home)
+                esc = trail.log_decision(
+                    "escaped_regression", tenant="acme-old", repo_slug="acme-sample", phase="escape",
+                    why=f"Review {path} before retry", result=f"Failed scenario at {path}",
+                    evidence={"note": f"caching failed at {path} today", "ok": "hold out for review"},
+                )
+                a = trail.log_decision("pick_cache", tenant="acme-old", repo_slug="acme-sample", phase="define",
+                                       why="caching via memcached", result="adopted")
+                trail.log_decision("pick_cache", tenant="acme-old", repo_slug="acme-sample", phase="define",
+                                   why=f"caching via sqlite; see {path} for why", result="adopted",
+                                   supersedes_id=a["id"])
+                res = trail.recall_decisions(repo="acme-sample", query="caching")
+                self.assertEqual(res["count"], 2, res)
+                self._assert_clean(_blob(res))
+                item = next(i for i in res["items"] if i["id"] == esc["id"])
+                self.assertEqual((item["why"], item["result"]), ("[redacted]", "[redacted]"))
+                self.assertEqual(item["evidence"], {"note": "[redacted]", "ok": "hold out for review"})
+                run = _cli()
+                for fmt in ("--json", "--markdown"):
+                    code, out = run("trail", "--recall", "--repo", "acme/sample", fmt)
+                    self.assertEqual(code, 0, out)
+                    self.assertIn(a["id"], out)
+                    self.assertIn(esc["id"], out)
+                    self._assert_clean(out)
+                started = start_workstream("acme/sample", "Add caching", kind="feature", issue_number=5)
+                self.assertEqual(started["recall_count"], 2)
+                body = _task(started["task_id"]).body
+                section = body.split("## Prior Institutional Memory (Recall)", 1)[1]
+                self.assertIn(a["id"], section)
+                self.assertIn(esc["id"], section)
+                self._assert_clean(section)
+
+    def test_renderer_withholds_whole_line_for_unscrubbed_items(self):
+        from factonio import trail
+
+        recall = {"ok": True, "items": [{"category": "escapes", "id": "d1", "decision": "x",
+                                         "why": 'Review "/runs/holdout/01 secret-scenario-name.md" now'}],
+                  "counts": {"escapes": 1}}
+        for out in (trail.render_recall_markdown(recall), trail.render_recall_text(recall)):
+            self.assertIn("[redacted]", out)
+            self._assert_clean(out)
 
 
 class TestRecallRepoAliases(unittest.TestCase):
