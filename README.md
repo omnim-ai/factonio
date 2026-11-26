@@ -163,6 +163,7 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 | `hermes factonio harness init\|check\|show\|audit <repo> [--force] [--dry-run] [--base REF] [--run-doctor] [--run-hooks] [--json]` | Bootstrap, validate, show, or read-only drift-audit the repo's `.factonio/verify.md` + `harness.json` black-box verification harness (`audit` exits non-zero when `stale` or `missing`) |
 | `hermes factonio restack <repo> [pr_number] [--parent-pr N] [--from-branch B] [--new-base B] [--old-base-sha SHA] [--verified-sha SHA] [--no-push] [--no-retarget] [--dry-run] [--json]` | Rebase a stacked PR (or every open child of a parent) onto its new base in a throwaway worktree and report `git patch-id` verdict continuity |
 | `hermes factonio trail [--tenant T] [--repo R] [--phase P] [--card ID] [--limit N] [--markdown] [--json]` | Show the append-only decision trail (`trail.db`) as text, a Markdown table, or the `{decisions, summary, filters}` JSON contract |
+| `hermes factonio metrics [--range 7d\|30d\|90d\|all] [--tenant T] [--repo R] [--history] [--snapshot] [--source S] [--since S] [--limit N] [--json]` | Show factory KPIs; `--snapshot` appends a factory-wide snapshot to `trail.db`; `--history` lists long-term snapshots oldest -> newest as `{snapshots, summary, filters}` |
 
 </details>
 
@@ -183,7 +184,7 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 - `factonio_restack_pr` — after a parent PR lands, rebase its child PR(s) onto the new base, push with `--force-with-lease`, retarget, and report whether verification verdicts carry over (`verdict_continuous`)
 - `factonio_log_decision` — append a decision (fork, pivot, Attack the Premise probe, gate countersign) to the append-only `trail.db`; correct one by logging a new row with `supersedes_id`
 
-Factory transitions (start, escape, design/implement/verify spawns, PR gate and merge outcomes) are recorded in `<HERMES_HOME>/plugin-data/factonio/trail.db` automatically and served at `GET /api/plugins/factonio/trail?tenant=&repo=&phase=&card_id=&limit=` (single rows at `GET /api/plugins/factonio/trail/{decision_id}`).
+Factory transitions (start, escape, design/implement/verify spawns, PR gate and merge outcomes) are recorded in `<HERMES_HOME>/plugin-data/factonio/trail.db` automatically and served at `GET /api/plugins/factonio/trail?tenant=&repo=&phase=&card_id=&limit=` (single rows at `GET /api/plugins/factonio/trail/{decision_id}`). Merges, terminal verification panel consensus, and `retro` decisions also append a factory KPI snapshot to `trail.db` (schema v2 `metric_snapshots`), so trends survive `kanban.db` resets; read them at `GET /api/plugins/factonio/metrics/history?repo=&tenant=&source=&since=7d|30d|90d|all|<ISO-8601>&limit=` or with `hermes factonio metrics --history`.
 
 </details>
 

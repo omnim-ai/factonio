@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -178,6 +179,24 @@ def metrics(
         return _metrics.compute_metrics(_kanban_db(), range_key=range, tenant=tenant)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/metrics/history")
+def metrics_history(
+    repo: Optional[str] = Query(None),
+    tenant: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),
+    since: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    profile: Optional[str] = Query(None),
+):
+    """Long-term `trail.db` metric snapshots, oldest -> newest: `{snapshots, summary, filters}`."""
+    try:
+        return _trail.metrics_history_payload(tenant=tenant, repo=repo, source=source, since=since, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise HTTPException(status_code=503, detail=f"trail.db metric history unavailable: {exc}") from exc
 
 
 @router.get("/cards")

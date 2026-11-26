@@ -96,7 +96,7 @@ class TestTrailStore(unittest.TestCase):
                 self.assertEqual(conn.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
                 self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
                 meta = dict(conn.execute("SELECT key, value FROM schema_meta").fetchall())
-                self.assertEqual(meta["schema_version"], "1")
+                self.assertEqual(meta["schema_version"], "2")
                 cols = [r[1] for r in conn.execute("PRAGMA table_info(decisions)").fetchall()]
                 self.assertEqual(
                     cols,
@@ -104,7 +104,10 @@ class TestTrailStore(unittest.TestCase):
                      "evidence_json", "result", "supersedes_id"],
                 )
                 triggers = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
-                self.assertEqual(triggers, {"trg_decisions_no_update", "trg_decisions_no_delete"})
+                self.assertEqual(triggers, {
+                    "trg_decisions_no_update", "trg_decisions_no_delete",
+                    "trg_metric_snapshots_no_update", "trg_metric_snapshots_no_delete",
+                })
                 indexed = set()
                 for (idx,) in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='decisions' AND sql IS NOT NULL"

@@ -1,9 +1,10 @@
 """Append-only SQLite decision trail (`<root HERMES_HOME>/plugin-data/factonio/trail.db`).
 
-`trail.db` is Factonio's own SQLite home: `schema_meta` versions the store so future
-metrics tables can be added without touching Hermes's `kanban.db`. The `decisions`
-table is append-only, enforced by SQLite triggers; a correction is a new row whose
-`supersedes_id` points at the row it replaces.
+`trail.db` is Factonio's own SQLite home: `schema_meta` versions the store so metrics
+tables live here without touching Hermes's `kanban.db`. The `decisions` table is
+append-only, enforced by SQLite triggers; a correction is a new row whose
+`supersedes_id` points at the row it replaces. Schema v2 adds the equally append-only
+`metric_snapshots` time series, so factory KPIs survive `kanban.db` archival or reset.
 """
 
 from __future__ import annotations
@@ -11,13 +12,16 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import sqlite3
 import threading
 import time
 import uuid
 from collections import Counter
 from contextlib import closing, contextmanager
-from datetime import datetime, timezone
+from contextvars import ContextVar
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, TypeVar
 
@@ -30,7 +34,7 @@ from .config import PLUGIN_ID, get_root_hermes_home_path
 
 logger = logging.getLogger("factonio.trail")
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 1000
 
@@ -38,8 +42,23 @@ _BUSY_TIMEOUT_MS = 5000
 _RETRY_ATTEMPTS = 8
 _RETRY_BASE_DELAY = 0.02
 _RETRY_MAX_DELAY = 0.5
+# Wall-clock cap for one durable operation (all retries, lock waits and busy waits together).
+_DURABLE_DEADLINE_S = 30.0
+# Best-effort telemetry (milestone snapshot capture) must never stall the factory step it rides on.
+BEST_EFFORT_BUDGET_S = 0.75
+_BEST_EFFORT_BUSY_TIMEOUT_MS = 100
+_LOCK_POLL_S = 0.01
 _INIT_LOCK = threading.Lock()
 _T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class _Budget:
+    deadline: float
+    busy_timeout_ms: int
+
+
+_BUDGET: ContextVar[Optional[_Budget]] = ContextVar("factonio_trail_budget", default=None)
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -81,6 +100,125 @@ BEGIN
 END;
 """
 
+_SNAPSHOT_INT_COLUMNS = (
+    "workstreams_total",
+    "cards_total",
+    "cards_done",
+    "cards_active",
+    "cards_blocked",
+    "diff_pass",
+    "diff_reject",
+    "diff_inconclusive",
+    "blackbox_pass",
+    "blackbox_reject",
+    "blackbox_inconclusive",
+    "escape_count",
+    "verified_total",
+    "rework_cards",
+    "panels_total",
+    "panels_pass",
+    "panels_reject",
+    "panels_inconclusive",
+    "panels_pending",
+    "panels_disagreements",
+    "trail_decisions_total",
+)
+_SNAPSHOT_REAL_COLUMNS = (
+    "diff_pass_rate",
+    "blackbox_pass_rate",
+    "first_pass_rate",
+    "escape_rate",
+    "avg_runs_per_implement_card",
+    "median_define_s",
+    "median_design_s",
+    "median_implement_s",
+    "median_verify_diff_s",
+    "median_verify_blackbox_s",
+)
+# Physical column order of `metric_snapshots` (and the key order of returned snapshot rows).
+SNAPSHOT_COLUMNS = (
+    "id",
+    "ts",
+    "source",
+    "range_key",
+    "repo_slug",
+    "tenant",
+    "workstreams_total",
+    "cards_total",
+    "cards_done",
+    "cards_active",
+    "cards_blocked",
+    "diff_pass",
+    "diff_reject",
+    "diff_inconclusive",
+    "diff_pass_rate",
+    "blackbox_pass",
+    "blackbox_reject",
+    "blackbox_inconclusive",
+    "blackbox_pass_rate",
+    "first_pass_rate",
+    "escape_count",
+    "verified_total",
+    "escape_rate",
+    "rework_cards",
+    "avg_runs_per_implement_card",
+    "median_define_s",
+    "median_design_s",
+    "median_implement_s",
+    "median_verify_diff_s",
+    "median_verify_blackbox_s",
+    "panels_total",
+    "panels_pass",
+    "panels_reject",
+    "panels_inconclusive",
+    "panels_pending",
+    "panels_disagreements",
+    "trail_decisions_total",
+    "payload_json",
+)
+SNAPSHOT_KPI_COLUMNS = tuple(c for c in SNAPSHOT_COLUMNS if c in _SNAPSHOT_INT_COLUMNS or c in _SNAPSHOT_REAL_COLUMNS)
+
+
+def _snapshot_column_ddl(name: str) -> str:
+    if name == "id":
+        return "id TEXT PRIMARY KEY"
+    if name == "ts":
+        return "ts TEXT NOT NULL"
+    if name == "source":
+        return "source TEXT NOT NULL DEFAULT 'manual'"
+    if name == "range_key":
+        return "range_key TEXT NOT NULL DEFAULT 'all'"
+    if name in ("repo_slug", "tenant"):
+        return f"{name} TEXT NOT NULL DEFAULT ''"
+    if name == "payload_json":
+        return "payload_json TEXT NOT NULL DEFAULT '{}'"
+    if name in _SNAPSHOT_INT_COLUMNS:
+        return f"{name} INTEGER NOT NULL DEFAULT 0"
+    return f"{name} REAL NULL"
+
+
+# Applied in one transaction by the v1 -> v2 migration; every statement is idempotent.
+_MIGRATION_V2_STATEMENTS = (
+    "CREATE TABLE IF NOT EXISTS metric_snapshots (\n    "
+    + ",\n    ".join(_snapshot_column_ddl(c) for c in SNAPSHOT_COLUMNS)
+    + "\n)",
+    "CREATE INDEX IF NOT EXISTS idx_metric_snapshots_ts ON metric_snapshots(ts)",
+    "CREATE INDEX IF NOT EXISTS idx_metric_snapshots_repo_ts ON metric_snapshots(repo_slug, ts)",
+    "CREATE INDEX IF NOT EXISTS idx_metric_snapshots_tenant_ts ON metric_snapshots(tenant, ts)",
+    "CREATE INDEX IF NOT EXISTS idx_metric_snapshots_source_ts ON metric_snapshots(source, ts)",
+    """CREATE TRIGGER IF NOT EXISTS trg_metric_snapshots_no_update
+BEFORE UPDATE ON metric_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'metric_snapshots is append-only: UPDATE is not allowed');
+END""",
+    """CREATE TRIGGER IF NOT EXISTS trg_metric_snapshots_no_delete
+BEFORE DELETE ON metric_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'metric_snapshots is append-only: DELETE is not allowed');
+END""",
+)
+_MIGRATION_V2_SQL = ";\n\n".join(_MIGRATION_V2_STATEMENTS) + ";\n"
+
 _COLUMNS = (
     "id",
     "ts",
@@ -114,17 +252,69 @@ def _is_transient(exc: BaseException) -> bool:
     return "locked" in msg or "busy" in msg
 
 
+def _locked(what: str) -> sqlite3.OperationalError:
+    # Phrased like SQLITE_BUSY so callers and `_is_transient` treat it as lock contention.
+    return sqlite3.OperationalError(f"database is locked ({what})")
+
+
+@contextmanager
+def _deadline_scope(seconds: float, busy_timeout_ms: int) -> Iterator[_Budget]:
+    """Bound every trail.db lock/busy wait in this context; an enclosing tighter budget wins."""
+    outer = _BUDGET.get()
+    budget = _Budget(time.monotonic() + max(0.0, seconds), max(1, int(busy_timeout_ms)))
+    if outer is not None:
+        budget = _Budget(min(outer.deadline, budget.deadline), min(outer.busy_timeout_ms, budget.busy_timeout_ms))
+    token = _BUDGET.set(budget)
+    try:
+        yield budget
+    finally:
+        _BUDGET.reset(token)
+
+
+def best_effort(seconds: float = BEST_EFFORT_BUDGET_S) -> Any:
+    """Context manager: trail.db access inside gives up (``database is locked``) after ``seconds``.
+
+    Used by optional telemetry so a held `trail.db.lock` or a long SQLite write transaction
+    degrades to a skipped snapshot instead of stalling a merge, panel consensus or retro log.
+    """
+    return _deadline_scope(seconds, _BEST_EFFORT_BUSY_TIMEOUT_MS)
+
+
+def _remaining() -> float:
+    budget = _BUDGET.get()
+    return float("inf") if budget is None else budget.deadline - time.monotonic()
+
+
+def _busy_timeout_ms() -> int:
+    budget = _BUDGET.get()
+    if budget is None:
+        return _BUSY_TIMEOUT_MS
+    remaining_ms = int(_remaining() * 1000)
+    if remaining_ms <= 0:
+        raise _locked("trail.db lock budget exhausted")
+    return max(1, min(budget.busy_timeout_ms, remaining_ms))
+
+
 def _with_retry(op: Callable[[], _T]) -> _T:
-    """Run ``op``, retrying transient lock contention with jittered exponential backoff."""
-    delay = _RETRY_BASE_DELAY
-    for attempt in range(_RETRY_ATTEMPTS):
-        try:
-            return op()
-        except sqlite3.OperationalError as exc:
-            if not _is_transient(exc) or attempt == _RETRY_ATTEMPTS - 1:
-                raise
-            time.sleep(delay * (0.5 + random.random()))
-            delay = min(delay * 2, _RETRY_MAX_DELAY)
+    """Run ``op``, retrying transient lock contention with jittered exponential backoff.
+
+    The single retry loop for an operation: ``op`` itself must not retry. Attempts are capped by
+    `_RETRY_ATTEMPTS` and by a wall-clock deadline (the active budget, else `_DURABLE_DEADLINE_S`)
+    that also bounds every lock and busy wait inside ``op``.
+    """
+    with _deadline_scope(_DURABLE_DEADLINE_S, _BUSY_TIMEOUT_MS):
+        delay = _RETRY_BASE_DELAY
+        for attempt in range(_RETRY_ATTEMPTS):
+            try:
+                return op()
+            except sqlite3.OperationalError as exc:
+                if not _is_transient(exc) or attempt == _RETRY_ATTEMPTS - 1:
+                    raise
+                pause = delay * (0.5 + random.random())
+                if pause >= _remaining():
+                    raise
+                time.sleep(pause)
+                delay = min(delay * 2, _RETRY_MAX_DELAY)
     raise AssertionError("unreachable")
 
 
@@ -134,44 +324,104 @@ def _init_guard(path: Path) -> Iterator[None]:
 
     Switching a fresh file to WAL needs an exclusive lock and SQLite does not always
     invoke the busy handler for it, so racing first writers would otherwise fail fast.
+    Both locks are polled only until the active deadline, never waited on indefinitely.
     """
-    with _INIT_LOCK:
+    remaining = _remaining()
+    if not _INIT_LOCK.acquire(timeout=-1 if remaining == float("inf") else max(0.0, remaining)):
+        raise _locked("trail.db init lock timeout")
+    try:
         if fcntl is None:
             yield
             return
         with open(path.with_name(path.name + ".lock"), "a") as fh:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            while True:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = _remaining()
+                    if remaining <= 0:
+                        raise _locked("trail.db.lock timeout") from None
+                    time.sleep(min(_LOCK_POLL_S, remaining))
             try:
                 yield
             finally:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        _INIT_LOCK.release()
+
+
+def _schema_version(conn: sqlite3.Connection) -> int:
+    """Stored `schema_meta.schema_version` as an integer; missing or unparseable is ``0``."""
+    row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
+    try:
+        return int(str(row[0]).strip()) if row is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring the store up to `SCHEMA_VERSION` (v1 -> v2) atomically; never downgrade a newer store."""
+    target = int(SCHEMA_VERSION)
+    if _schema_version(conn) >= target:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Re-read under the write lock: another (non-flock) writer may have migrated meanwhile.
+        if _schema_version(conn) < target:
+            for stmt in _MIGRATION_V2_STATEMENTS:
+                conn.execute(stmt)
+            conn.execute(
+                """
+                INSERT INTO schema_meta(key, value, updated_at) VALUES ('schema_version', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (SCHEMA_VERSION, _now_iso()),
+            )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _initialized(conn: sqlite3.Connection) -> bool:
+    """Already WAL at the current schema version: no exclusive init step (or init lock) needed."""
+    try:
+        wal = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal"
+        return wal and _schema_version(conn) >= int(SCHEMA_VERSION)
+    except sqlite3.OperationalError as exc:
+        if _is_transient(exc):
+            raise
+        return False  # e.g. no schema_meta table yet
 
 
 def _open(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(path), timeout=_BUSY_TIMEOUT_MS / 1000)
+    busy_ms = _busy_timeout_ms()
+    conn = sqlite3.connect(str(path), timeout=busy_ms / 1000)
     try:
         conn.row_factory = sqlite3.Row
-        conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        conn.execute(f"PRAGMA busy_timeout={busy_ms}")
         conn.execute("PRAGMA foreign_keys=ON")
+        if _initialized(conn):
+            return conn
         with _init_guard(path):
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA_SQL)
-            conn.execute(
-                "INSERT OR IGNORE INTO schema_meta(key, value, updated_at) VALUES ('schema_version', ?, ?)",
-                (SCHEMA_VERSION, _now_iso()),
-            )
-            conn.commit()
+            _migrate(conn)
     except BaseException:
         conn.close()
         raise
     return conn
 
 
-def _connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
-    """Open (creating if needed) the trail store with WAL, busy timeout, and FK enforcement."""
+def _connect(db_path: Optional[Path] = None, *, retry: bool = True) -> sqlite3.Connection:
+    """Open (creating if needed) the trail store with WAL, busy timeout, and FK enforcement.
+
+    Pass ``retry=False`` from inside an operation that already runs under `_with_retry`.
+    """
     path = Path(db_path) if db_path is not None else trail_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    return _with_retry(lambda: _open(path))
+    return _with_retry(lambda: _open(path)) if retry else _open(path)
 
 
 def _resolve_repo_slug(repo: Optional[str]) -> str:
@@ -286,7 +536,7 @@ def log_decision(
     )
 
     def _append() -> dict[str, Any]:
-        with closing(_connect(db_path)) as conn:
+        with closing(_connect(db_path, retry=False)) as conn:
             if sup is not None:
                 if conn.execute("SELECT 1 FROM decisions WHERE id = ?", (sup,)).fetchone() is None:
                     raise ValueError(f"supersedes_id {sup!r} does not reference an existing decision")
@@ -532,3 +782,353 @@ def render_trail_markdown(rows: list[Mapping[str, Any]]) -> str:
             + " |"
         )
     return header + "\n".join(out) + "\n"
+
+
+# --- metric_snapshots (schema v2): append-only long-term factory KPI time series -------------
+
+_SINCE_REL_RE = re.compile(r"^(\d{1,5})d$")
+_SNAPSHOT_TEXT_MAX = 200
+
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _parse_iso(value: str) -> datetime:
+    """Parse ISO-8601 as an aware UTC datetime; ``ValueError`` for anything unrepresentable."""
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    try:
+        # Offsets at 0001-01-01 / 9999-12-31 fall outside datetime's range once shifted to UTC.
+        return dt.astimezone(timezone.utc)
+    except OverflowError:
+        raise ValueError(f"timestamp {value!r} is out of range in UTC") from None
+
+
+def resolve_since(since: Any, *, now: Optional[datetime] = None) -> Optional[str]:
+    """Resolve ``since`` (``7d``/``30d``/``90d``/``<N>d``, ``all``, or ISO-8601) to a UTC `ts` bound.
+
+    ``None``, ``""`` and ``all`` mean unbounded (``None``). Raises ``ValueError`` otherwise.
+    """
+    if since is None:
+        return None
+    text = str(since).strip()
+    if not text or text.lower() == "all":
+        return None
+    rel = _SINCE_REL_RE.match(text.lower())
+    try:
+        if rel:
+            base = now if now is not None else datetime.now(timezone.utc)
+            return _iso(base - timedelta(days=int(rel.group(1))))
+        return _iso(_parse_iso(text))
+    except (ValueError, OverflowError):
+        raise ValueError(
+            f"Invalid since {since!r}: expected 7d, 30d, 90d, all, or an ISO-8601 timestamp"
+        ) from None
+
+
+def _num(value: Any, kind: type) -> Any:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return kind(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def flatten_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """Map a `compute_metrics` result onto the typed `metric_snapshots` KPI columns.
+
+    Top-level keys that already name a KPI column take precedence, so callers may pass
+    pre-flattened values. Missing counts are ``0``; missing rates/durations are ``None``.
+    """
+    m = metrics if isinstance(metrics, Mapping) else {}
+
+    def sub(*keys: str) -> Mapping[str, Any]:
+        node: Any = m
+        for key in keys:
+            node = node.get(key) if isinstance(node, Mapping) else None
+        return node if isinstance(node, Mapping) else {}
+
+    totals, rework, escapes = sub("totals"), sub("rework"), sub("escapes")
+    diff, bb = sub("verification", "diff"), sub("verification", "blackbox")
+    panels, trail_block = sub("verification_panels"), sub("trail")
+    raw: dict[str, Any] = {
+        "workstreams_total": totals.get("workstreams"),
+        "cards_total": totals.get("cards"),
+        "cards_done": totals.get("done"),
+        "cards_active": totals.get("running"),
+        "cards_blocked": totals.get("blocked"),
+        "diff_pass": diff.get("pass"),
+        "diff_reject": diff.get("reject"),
+        "diff_inconclusive": diff.get("inconclusive"),
+        "diff_pass_rate": diff.get("pass_rate"),
+        "blackbox_pass": bb.get("pass"),
+        "blackbox_reject": bb.get("reject"),
+        "blackbox_inconclusive": bb.get("inconclusive"),
+        "blackbox_pass_rate": bb.get("pass_rate"),
+        "first_pass_rate": rework.get("first_pass_rate"),
+        "escape_count": escapes.get("count"),
+        "verified_total": escapes.get("verified_total"),
+        "escape_rate": escapes.get("escape_rate"),
+        "rework_cards": rework.get("cards_with_rework"),
+        "avg_runs_per_implement_card": rework.get("avg_runs_per_implement_card"),
+        "panels_total": panels.get("total"),
+        "panels_pass": panels.get("pass"),
+        "panels_reject": panels.get("reject"),
+        "panels_inconclusive": panels.get("inconclusive"),
+        "panels_pending": panels.get("pending"),
+        "panels_disagreements": panels.get("disagreements"),
+        "trail_decisions_total": trail_block.get("decision_count"),
+    }
+    for phase in ("define", "design", "implement", "verify-diff", "verify-blackbox"):
+        raw[f"median_{phase.replace('-', '_')}_s"] = sub("phases", phase).get("median_seconds")
+    for key in SNAPSHOT_KPI_COLUMNS:
+        if key in m:
+            raw[key] = m[key]
+    out: dict[str, Any] = {}
+    for key in SNAPSHOT_KPI_COLUMNS:
+        if key in _SNAPSHOT_INT_COLUMNS:
+            out[key] = max(0, _num(raw.get(key), int) or 0)
+        else:
+            out[key] = _num(raw.get(key), float)
+    return out
+
+
+def _snapshot_to_dict(row: sqlite3.Row, *, include_payload: bool = True) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key in SNAPSHOT_COLUMNS:
+        if key != "payload_json":
+            out[key] = row[key]
+    if include_payload:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except ValueError:
+            payload = {}
+        out["payload"] = payload if isinstance(payload, dict) else {"value": payload}
+    return out
+
+
+def _clean_text(value: Any, default: str = "") -> str:
+    return (str(value).strip() if value is not None else "")[:_SNAPSHOT_TEXT_MAX] or default
+
+
+def record_metric_snapshot(
+    metrics: Optional[Mapping[str, Any]] = None,
+    *,
+    source: str = "manual",
+    range_key: Optional[str] = None,
+    repo_slug: Optional[str] = None,
+    tenant: Optional[str] = None,
+    extra: Optional[Mapping[str, Any]] = None,
+    ts: Optional[str] = None,
+    db_path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Append one point-in-time KPI snapshot and return it (with parsed ``payload``).
+
+    ``metrics`` is a `compute_metrics` result (stored whole in ``payload_json.metrics``);
+    ``extra`` is free-form trigger context (``payload_json.extra``). ``ts`` (ISO-8601) defaults
+    to now. Raises ``ValueError`` for non-mapping input or an invalid ``ts``.
+    """
+    if metrics is not None and not isinstance(metrics, Mapping):
+        raise ValueError("metrics must be a mapping (a compute_metrics result)")
+    if extra is not None and not isinstance(extra, Mapping):
+        raise ValueError("extra must be a JSON object (mapping)")
+    metrics_obj = dict(metrics or {})
+    kpis = flatten_metrics(metrics_obj)
+    try:
+        stamp = _iso(_parse_iso(str(ts))) if ts else _now_iso()
+    except ValueError:
+        raise ValueError(f"Invalid ts {ts!r}: expected an ISO-8601 timestamp") from None
+    rk = _clean_text(range_key if range_key is not None else metrics_obj.get("range"), "all")
+    payload_json = json.dumps({"metrics": metrics_obj, "extra": dict(extra or {})}, sort_keys=True, default=str)
+    row_id = f"ms_{uuid.uuid4().hex[:12]}"
+    values = {
+        "id": row_id,
+        "ts": stamp,
+        "source": _clean_text(source, "manual"),
+        "range_key": rk,
+        "repo_slug": _resolve_repo_slug(repo_slug),
+        "tenant": _clean_text(tenant),
+        **kpis,
+        "payload_json": payload_json,
+    }
+    cols = ", ".join(SNAPSHOT_COLUMNS)
+    marks = ", ".join("?" for _ in SNAPSHOT_COLUMNS)
+
+    def _append() -> dict[str, Any]:
+        with closing(_connect(db_path, retry=False)) as conn:
+            # Idempotent under retry: a commit that landed before a transient error is not duplicated.
+            if conn.execute("SELECT 1 FROM metric_snapshots WHERE id = ?", (row_id,)).fetchone() is None:
+                conn.execute(
+                    f"INSERT INTO metric_snapshots({cols}) VALUES ({marks})",
+                    [values[c] for c in SNAPSHOT_COLUMNS],
+                )
+                conn.commit()
+            stored = conn.execute("SELECT * FROM metric_snapshots WHERE id = ?", (row_id,)).fetchone()
+            return _snapshot_to_dict(stored)
+
+    return _with_retry(_append)
+
+
+def _snapshot_filter_sql(
+    *, tenant: Optional[str], repo: Optional[str], source: Optional[str], since_ts: Optional[str]
+) -> tuple[str, list[Any]]:
+    where: list[str] = []
+    params: list[Any] = []
+    if tenant:
+        where.append("tenant = ?")
+        params.append(str(tenant).strip())
+    if repo:
+        raw = str(repo).strip()
+        where.append("repo_slug IN (?, ?)")
+        params.extend([_resolve_repo_slug(raw), raw])
+    if source:
+        where.append("source = ?")
+        params.append(str(source).strip())
+    if since_ts:
+        where.append("ts >= ?")
+        params.append(since_ts)
+    return (" WHERE " + " AND ".join(where)) if where else "", params
+
+
+def _snapshot_store(db_path: Optional[Path]) -> Optional[Path]:
+    path = Path(db_path) if db_path is not None else trail_db_path()
+    return path if path.is_file() else None
+
+
+def query_metric_snapshots(
+    *,
+    tenant: Optional[str] = None,
+    repo: Optional[str] = None,
+    source: Optional[str] = None,
+    since: Any = None,
+    limit: Any = DEFAULT_LIMIT,
+    order: str = "asc",
+    include_payload: bool = True,
+    db_path: Optional[Path] = None,
+) -> list[dict[str, Any]]:
+    """The latest ``limit`` matching snapshots, oldest -> newest (``order="desc"`` for newest first).
+
+    Returns ``[]`` when `trail.db` does not exist; never creates it. Raises ``ValueError`` on
+    an invalid ``since`` or ``order``.
+    """
+    if order not in ("asc", "desc"):
+        raise ValueError("order must be 'asc' or 'desc'")
+    since_ts = resolve_since(since)
+    path = _snapshot_store(db_path)
+    if path is None:
+        return []
+    where_sql, params = _snapshot_filter_sql(tenant=tenant, repo=repo, source=source, since_ts=since_ts)
+    with closing(_connect(path)) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM metric_snapshots{where_sql} ORDER BY ts DESC, rowid DESC LIMIT ?",
+            [*params, _clamp_limit(limit)],
+        ).fetchall()
+    items = [_snapshot_to_dict(r, include_payload=include_payload) for r in rows]
+    return list(reversed(items)) if order == "asc" else items
+
+
+def _empty_snapshot_summary() -> dict[str, Any]:
+    return {
+        "total": 0,
+        "snapshot_count": 0,
+        "first_ts": None,
+        "latest_ts": None,
+        "by_source": {},
+        "by_repo": {},
+        "by_tenant": {},
+        "latest": None,
+    }
+
+
+def summarize_metric_snapshots(
+    *,
+    tenant: Optional[str] = None,
+    repo: Optional[str] = None,
+    source: Optional[str] = None,
+    since: Any = None,
+    db_path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Aggregate over every matching snapshot (not truncated by a display limit).
+
+    ``latest`` is the newest matching snapshot's KPI row (without ``payload``).
+    """
+    since_ts = resolve_since(since)
+    path = _snapshot_store(db_path)
+    if path is None:
+        return _empty_snapshot_summary()
+    where_sql, params = _snapshot_filter_sql(tenant=tenant, repo=repo, source=source, since_ts=since_ts)
+    with closing(_connect(path)) as conn:
+        rows = conn.execute(
+            f"SELECT ts, source, repo_slug, tenant FROM metric_snapshots{where_sql}", params
+        ).fetchall()
+        if not rows:
+            return _empty_snapshot_summary()
+        latest = conn.execute(
+            f"SELECT * FROM metric_snapshots{where_sql} ORDER BY ts DESC, rowid DESC LIMIT 1", params
+        ).fetchone()
+    return {
+        "total": len(rows),
+        "snapshot_count": len(rows),
+        "first_ts": min(r["ts"] for r in rows),
+        "latest_ts": max(r["ts"] for r in rows),
+        "by_source": dict(sorted(Counter(r["source"] or "unknown" for r in rows).items())),
+        "by_repo": dict(sorted(Counter(r["repo_slug"] or "unscoped" for r in rows).items())),
+        "by_tenant": dict(sorted(Counter(r["tenant"] or "unscoped" for r in rows).items())),
+        "latest": _snapshot_to_dict(latest, include_payload=False) if latest is not None else None,
+    }
+
+
+def metrics_history_payload(
+    *,
+    tenant: Optional[str] = None,
+    repo: Optional[str] = None,
+    source: Optional[str] = None,
+    since: Any = None,
+    limit: Any = DEFAULT_LIMIT,
+    include_payload: bool = True,
+    db_path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """The `{snapshots, summary, filters}` contract shared by `GET /metrics/history` and the CLI."""
+    clamped = _clamp_limit(limit)
+    since_ts = resolve_since(since)
+    filters = {
+        "tenant": tenant or None,
+        "repo": repo or None,
+        "source": source or None,
+        "since": (str(since).strip() or None) if since is not None else None,
+        "since_ts": since_ts,
+        "limit": clamped,
+    }
+    query = {"tenant": tenant, "repo": repo, "source": source, "since": since_ts, "db_path": db_path}
+    return {
+        "snapshots": query_metric_snapshots(limit=clamped, include_payload=include_payload, **query),
+        "summary": summarize_metric_snapshots(**query),
+        "filters": filters,
+    }
+
+
+def _fmt_rate(value: Any) -> str:
+    return "-" if value is None else f"{float(value) * 100:.0f}%"
+
+
+def render_metric_snapshots_text(rows: list[Mapping[str, Any]]) -> str:
+    """One line per snapshot (oldest first) for terminals."""
+    if not rows:
+        return "No metric snapshots recorded."
+    lines = []
+    for r in rows:
+        scope = " ".join(x for x in (r.get("repo_slug") or "", r.get("tenant") or "") if x) or "-"
+        lines.append(
+            f"{r.get('ts')} {r.get('id')} [{r.get('source')}] {scope}: "
+            f"workstreams={r.get('workstreams_total')} done={r.get('cards_done')}/{r.get('cards_total')} "
+            f"diff={_fmt_rate(r.get('diff_pass_rate'))} blackbox={_fmt_rate(r.get('blackbox_pass_rate'))} "
+            f"first_pass={_fmt_rate(r.get('first_pass_rate'))} escape={_fmt_rate(r.get('escape_rate'))} "
+            f"panels={r.get('panels_total')} decisions={r.get('trail_decisions_total')}"
+        )
+    return "\n".join(lines)

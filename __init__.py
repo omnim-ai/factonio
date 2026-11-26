@@ -45,13 +45,14 @@ RETRO_BLUEPRINT_PROMPT = """Run a Factonio `/correct` retrospective. Do not chan
 1. Gather evidence from BOTH sources:
    - Kanban phase metrics: `factonio_status` (all=true) and the Desktop `/metrics` data (phase medians/P90, Diff vs Black-Box pass rates, rework, escape rate).
    - The append-only decision trail `trail.db`: run `hermes factonio trail --json --limit 500` (or `--markdown`) and read gate outcomes, fix rounds, superseded decisions, Attack the Premise probes, and `escape` rows.
+   - Long-term KPI trends from `trail.db` `metric_snapshots` (captured automatically on merges, panel consensus, and retros; they survive `kanban.db` resets): run `hermes factonio metrics --history --json` and compare pass rates, first-pass rate, escape rate, and rework across snapshots.
 2. Flag outliers: phases slower than 2x the repository median, cards with multiple fix rounds, verification rejects, and regressions that escaped verification.
 3. Mine recurring mistake classes: group failures by root cause (not by symptom or card). Only a class with >= 2 occurrences qualifies; cite every occurrence (card id, PR, decision id). Single occurrences are listed as watch items only.
 4. For each recurring class, apply the `/correct` enforcement ladder and pick the HIGHEST rung that can make the mistake impossible or loudly caught:
    Architecture (make it unrepresentable) -> Types -> Lint/CI check whose failure message names the fix -> Behavioral test -> Skill text last.
    Skill/prompt text is acceptable only when you show why every higher rung cannot work.
 5. Prove before adopting: a proposed check or test MUST be shown to fail on a real past failure from the trail (replay the bad commit, input, or fixture) and pass on the fix. Report the exact command and both outcomes; drop any proposal you cannot prove.
-6. Record the outcome with `factonio_log_decision` (phase `retro`, evidence = occurrences + proof command), superseding earlier retro decisions it replaces.
+6. Record the outcome with `factonio_log_decision` (phase `retro`, evidence = occurrences + proof command), superseding earlier retro decisions it replaces; a `retro` decision also captures a metrics snapshot, so the next retro can measure whether the correction moved the trend.
 7. Deliver a decision-ready handoff: plain language, the key table or chart first, then one recommendation per class with its evidence and risk."""
 
 

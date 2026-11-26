@@ -23,7 +23,7 @@ from .config import (
 )
 from .harness import HARNESS_DIR_NAME, HOOK_KINDS, REQUIRED_SECTIONS, VERIFY_MD_NAME, discover_harness
 from .metrics import aggregate_panel_verdicts as aggregate_panel_verdicts  # public re-export
-from .metrics import load_panel_lanes, summarize_panel, thread_cards
+from .metrics import capture_metrics_snapshot, load_panel_lanes, summarize_panel, thread_cards
 from .trail import query_decisions, record_transition
 
 _SLUG_RE = re.compile(r"[^a-z0-9-]+")
@@ -1085,12 +1085,31 @@ def evaluate_verification_panel(
                 recorded = True
                 decision_id = str(row.get("id"))
 
+    snapshot_id: Optional[str] = None
+    if recorded:
+        pr = summary.get("pr") or {}
+        snapshot = capture_metrics_snapshot(
+            _kanban_db_file(board),
+            source="panel_consensus",
+            repo_slug=str(pr.get("repo") or ""),
+            tenant=summary.get("tenant") or tenant or "",
+            extra={
+                "panel_id": summary["panel_id"],
+                "consensus": summary["consensus"],
+                "pr_number": pr.get("number"),
+                "has_disagreement": summary["has_disagreement"],
+                "decision_id": decision_id,
+            },
+        )
+        snapshot_id = (snapshot or {}).get("id")
+
     return {
         "ok": True,
         **summary,
         "other_panel_ids": [p["panel_id"] for p in candidates if p["panel_id"] != summary["panel_id"]],
         "recorded": recorded,
         "decision_id": decision_id,
+        "metrics_snapshot_id": snapshot_id,
     }
 
 
