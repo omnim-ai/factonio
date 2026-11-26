@@ -87,6 +87,57 @@ class TestDetectRepoProfile(unittest.TestCase):
             self.assertEqual(profile["workflows"], [".github/workflows/ci.yml"])
             self.assertIn("python3 -m unittest discover -s tests -q", profile["commands"]["test"])
 
+    def test_ci_drive_uses_verification_allowlist(self):
+        from factonio.harness import _is_ci_verification_command, _phases_for, detect_repo_profile
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            _write(
+                repo,
+                ".github/workflows/ci.yml",
+                "jobs:\n"
+                "  t:\n"
+                "    steps:\n"
+                "      - run: git status\n"
+                "      - run: export FOO=1\n"
+                "      - run: uv sync --frozen\n"
+                "      - run: pip install -e .\n"
+                "      - run: python -m pip install ruff\n"
+                "      - run: npm ci\n"
+                "      - run: apt-get update\n"
+                "      - run: dnf install -y ffmpeg\n"
+                "      - run: python3 -W error -m compileall -q .\n"
+                "      - run: uvx ruff check --select E9,F .\n"
+                "      - run: node --check desktop/plugin.js\n"
+                "      - run: python3 tools/check_repo_integrity.py\n"
+                "      - run: npm run test:ci\n",
+            )
+            profile = detect_repo_profile(repo)
+            drive = _phases_for(profile)["drive"]
+            for expected in (
+                "python3 -W error -m compileall -q .",
+                "uvx ruff check --select E9,F .",
+                "node --check desktop/plugin.js",
+                "python3 tools/check_repo_integrity.py",
+                "npm run test:ci",
+            ):
+                self.assertIn(expected, drive)
+            for excluded in (
+                "git status",
+                "export FOO=1",
+                "uv sync --frozen",
+                "pip install -e .",
+                "python -m pip install ruff",
+                "npm ci",
+                "apt-get update",
+                "dnf install -y ffmpeg",
+            ):
+                self.assertNotIn(excluded, drive)
+                self.assertFalse(_is_ci_verification_command(excluded))
+            self.assertFalse(_is_ci_verification_command("uv run pip install requests"))
+            self.assertTrue(_is_ci_verification_command("cargo test --workspace"))
+            self.assertTrue(_is_ci_verification_command("go test ./..."))
+
     def test_node_rust_go_make_flask_express_detection(self):
         from factonio.harness import detect_repo_profile
 
