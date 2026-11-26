@@ -604,7 +604,13 @@ class TestFixRound1Regressions(unittest.TestCase):
                     self.assertTrue(payload["errors"])
 
                     self.assertTrue(show_harness(str(repo))["present"])
-                    self.assertIn(audit_harness(str(repo))["severity"], ("clean", "stale"))
+                    audit = audit_harness(str(repo))
+                    self.assertEqual((audit["severity"], audit["drifted"]), ("stale", True))
+                    self.assertTrue(audit["manifest_errors"])
+                    self.assertEqual(audit["drift_classification"]["classification"], "harness_gap")
+                    self.assertEqual(chk["manifest_errors"], [e for e in chk["errors"] if e in chk["manifest_errors"]])
+                    from factonio.harness import classify_harness_drift
+                    self.assertEqual(classify_harness_drift(audit, chk)["classification"], "harness_gap")
                     for action in ("show", "audit"):
                         _, out, err = run("harness", action, str(repo), "--json")
                         self.assertNotIn("Traceback", out + err)
@@ -1388,7 +1394,15 @@ class TestDriftClassification(unittest.TestCase):
         )
         self.assertEqual(optional_only["classification"], "clean")
         schema = classify_harness_drift({"severity": "clean"}, {"errors": ["harness.json schema_version must be 1; got 2"]})
-        self.assertEqual(schema["classification"], "doc_drift")
+        self.assertEqual((schema["classification"], schema["classifications"]), ("harness_gap", ["harness_gap"]))
+        structured = classify_harness_drift({"severity": "stale", "manifest_errors": ["feature_map has duplicate id 'x'"]})
+        self.assertEqual(structured["classification"], "harness_gap")
+        self.assertTrue(structured["reasons"][0].startswith("harness_gap: Malformed .factonio/harness.json"))
+        outranked = classify_harness_drift(
+            {"severity": "stale", "manifest_errors": ["harness.json is not valid JSON: x"]},
+            {"hook_results": {"results": [self._hook("tests", ok=False, exit_code=1)]}},
+        )
+        self.assertEqual(outranked["classifications"], ["product_regression", "harness_gap"])
 
     def test_live_check_results_classify_end_to_end(self):
         from factonio.harness import audit_harness, bootstrap_verify_harness, check_harness, classify_harness_drift
@@ -1413,6 +1427,151 @@ class TestDriftClassification(unittest.TestCase):
             stale = audit_harness(str(repo))
             self.assertEqual(stale["drift_classification"]["classification"], "doc_drift")
             self.assertTrue(any(r.startswith("Drift classification `doc_drift`") for r in stale["recommendations"]))
+
+
+class TestHybridBaselineAndMalformedManifest(unittest.TestCase):
+    """ hybrid JSON/Markdown gate baselines and malformed manifests as `harness_gap`."""
+
+    HOOKS = [
+        {"name": "lint", "kind": "invariant", "command": "true"},
+        {"name": "pixels", "kind": "visual_diff", "command": "true", "optional": True},
+    ]
+    LINT_LINE = "- **lint** (`invariant`, required): `true`"
+
+    def _hybrid_repo(self, home: Path) -> Path:
+        """A valid committed harness whose harness.json has no `hooks` key, so hooks come from verify.md."""
+        from factonio.harness import bootstrap_verify_harness, check_harness
+
+        repo = _make_repo(home)
+        bootstrap_verify_harness(str(repo), hooks=self.HOOKS)
+        hj = repo / ".factonio" / "harness.json"
+        manifest = json.loads(hj.read_text(encoding="utf-8"))
+        del manifest["hooks"]
+        hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        self.assertIn(self.LINT_LINE, (repo / ".factonio" / "verify.md").read_text(encoding="utf-8"))
+        _commit_all(repo, "hybrid harness")
+        baseline = check_harness(str(repo), run_doctor=True, run_hooks=True)
+        self.assertTrue(baseline["valid"], baseline["errors"])
+        self.assertEqual([(h["name"], h["optional"]) for h in baseline["hooks"]], [("lint", False), ("pixels", True)])
+        self.assertEqual(baseline["hook_results"]["ran"], 2)
+        self.assertFalse(baseline["gate_loosening"]["loosened"])
+        return repo
+
+    @staticmethod
+    def _edit_md(repo: Path, old: str, new: str) -> None:
+        md = repo / ".factonio" / "verify.md"
+        text = md.read_text(encoding="utf-8")
+        assert old in text, old
+        md.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+    def _assert_loosened(self, repo: Path, field: str, expected: list[str]) -> None:
+        from factonio.harness import audit_harness, check_harness, detect_harness_gate_loosening
+
+        before_index = _index_fingerprint(repo)
+        gate = detect_harness_gate_loosening(repo)
+        self.assertEqual((gate["checked"], gate["loosened"]), (True, True), gate)
+        self.assertEqual(gate["baseline_source"], "harness.json")
+        self.assertEqual(gate[field], expected)
+        chk = check_harness(str(repo), run_doctor=True, run_hooks=True)
+        self.assertEqual((chk["ok"], chk["valid"]), (False, False))
+        self.assertTrue(chk["gate_loosening"]["loosened"])
+        self.assertTrue(any(e.startswith("Gate loosening") for e in chk["errors"]), chk["errors"])
+        audit = audit_harness(str(repo))
+        self.assertEqual((audit["severity"], audit["drifted"]), ("stale", True))
+        self.assertEqual(audit["gate_loosening"][field], expected)
+        self.assertEqual(audit["drift_classification"]["classification"], "doc_drift")
+        self.assertEqual(_index_fingerprint(repo), before_index)
+
+    def test_hybrid_baseline_required_md_hook_removed(self):
+        with isolated_hermes_home() as home:
+            repo = self._hybrid_repo(home)
+            self._edit_md(repo, self.LINT_LINE + "\n", "")
+            self._assert_loosened(repo, "removed_required_hooks", ["lint"])
+
+    def test_hybrid_baseline_required_md_hook_downgraded(self):
+        with isolated_hermes_home() as home:
+            repo = self._hybrid_repo(home)
+            self._edit_md(repo, self.LINT_LINE, self.LINT_LINE.replace("required", "optional"))
+            self._assert_loosened(repo, "downgraded_hooks", ["lint"])
+
+    def test_hybrid_baseline_moving_hook_into_json_is_not_loosening(self):
+        from factonio.harness import check_harness
+
+        with isolated_hermes_home() as home:
+            repo = self._hybrid_repo(home)
+            hj = repo / ".factonio" / "harness.json"
+            manifest = json.loads(hj.read_text(encoding="utf-8"))
+            manifest["hooks"] = [{"name": "lint", "kind": "invariant", "command": "true", "optional": False}]
+            hj.write_text(json.dumps(manifest), encoding="utf-8")
+            self._edit_md(repo, self.LINT_LINE + "\n", "")
+            chk = check_harness(str(repo), run_doctor=True, run_hooks=True)
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertFalse(chk["gate_loosening"]["loosened"])
+
+            manifest["hooks"] = []
+            hj.write_text(json.dumps(manifest), encoding="utf-8")
+            chk = check_harness(str(repo))
+            self.assertEqual(chk["gate_loosening"]["removed_required_hooks"], ["lint"])
+            self.assertFalse(chk["valid"])
+
+    def _assert_malformed_is_harness_gap(self, repo: Path, needle: str) -> None:
+        from factonio.harness import audit_harness, check_harness, classify_harness_drift
+
+        audit = audit_harness(str(repo))
+        self.assertEqual((audit["severity"], audit["drifted"]), ("stale", True))
+        self.assertTrue(any(needle in e for e in audit["manifest_errors"]), audit["manifest_errors"])
+        self.assertEqual(audit["drift_classification"]["classification"], "harness_gap")
+        self.assertNotIn("No action", audit["drift_classification"]["recommended_action"])
+        self.assertTrue(any(r.startswith("Drift classification `harness_gap`") for r in audit["recommendations"]))
+
+        chk = check_harness(str(repo), run_doctor=True, run_hooks=True)
+        self.assertEqual((chk["ok"], chk["valid"]), (False, False))
+        self.assertTrue(any(needle in e for e in chk["manifest_errors"]), chk["manifest_errors"])
+        res = classify_harness_drift(audit, chk)
+        self.assertEqual(res["classification"], "harness_gap")
+        self.assertNotIn("doc_drift", res["classifications"])
+        self.assertEqual(classify_harness_drift(None, chk)["classification"], "harness_gap")
+
+        run = TestSurfaces()._cli()
+        code, out, _ = run("harness", "audit", str(repo), "--json")
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out)["drift_classification"]["classification"], "harness_gap")
+
+    def test_invalid_json_manifest_is_harness_gap(self):
+        from factonio.harness import bootstrap_verify_harness
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            bootstrap_verify_harness(str(repo), hooks=self.HOOKS)
+            _commit_all(repo, "harness")
+            (repo / ".factonio" / "harness.json").write_text("{not json", encoding="utf-8")
+            self._assert_malformed_is_harness_gap(repo, "not valid JSON")
+
+    def test_unsupported_schema_version_is_harness_gap(self):
+        from factonio.harness import bootstrap_verify_harness
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            bootstrap_verify_harness(str(repo), hooks=self.HOOKS)
+            _commit_all(repo, "harness")
+            hj = repo / ".factonio" / "harness.json"
+            manifest = json.loads(hj.read_text(encoding="utf-8"))
+            manifest["schema_version"] = 999
+            hj.write_text(json.dumps(manifest), encoding="utf-8")
+            self._assert_malformed_is_harness_gap(repo, "schema_version")
+
+    def test_informational_audit_warnings_stay_clean(self):
+        from factonio.harness import audit_harness
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            _write(repo, ".factonio/verify.md", TestDiscoverCheckHooks.HAND_MD)
+            _commit_all(repo, "hand harness")
+            audit = audit_harness(str(repo))
+            self.assertTrue(audit["warnings"])
+            self.assertEqual(audit["manifest_errors"], [])
+            self.assertEqual((audit["severity"], audit["drifted"]), ("clean", False))
+            self.assertEqual(audit["drift_classification"]["classification"], "clean")
 
 
 if __name__ == "__main__":

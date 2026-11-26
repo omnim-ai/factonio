@@ -982,6 +982,29 @@ def _parse_md_hooks(body: str) -> list[dict[str, Any]]:
     return hooks
 
 
+def _effective_hooks_and_phases(
+    manifest: Optional[dict[str, Any]], md_sections: Optional[dict[str, str]]
+) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+    """Per-field fallback shared by discovery and the gate-loosening baseline: each of `hooks` / `phases`
+    comes from harness.json when that key is set there, else from verify.md (``md_sections`` None = absent).
+    Malformed manifest fields are reported by check_harness; only well-typed values are exposed here."""
+    hooks: list[dict[str, Any]] = []
+    if manifest is not None and manifest.get("hooks") is not None:
+        raw_hooks = manifest["hooks"]
+        hooks = [h for h in raw_hooks if isinstance(h, dict)] if isinstance(raw_hooks, list) else []
+    elif md_sections is not None and "Hooks" in md_sections:
+        hooks = _parse_md_hooks(md_sections["Hooks"])
+    phases: dict[str, list[str]] = {}
+    if manifest is not None and isinstance(manifest.get("phases"), dict):
+        raw_phases = manifest["phases"]
+        phases = {k: list(raw_phases[k]) if _is_str_list(raw_phases.get(k)) else [] for k in PHASE_KEYS}
+    elif manifest is not None and manifest.get("phases") is not None:
+        phases = {k: [] for k in PHASE_KEYS}
+    elif md_sections is not None:
+        phases = {s.lower(): _section_commands(md_sections.get(s, "")) for s in REQUIRED_SECTIONS}
+    return hooks, phases
+
+
 def discover_harness(repo_path: str | Path) -> dict[str, Any]:
     """Read-only discovery of `<repo>/.factonio/` (full harness or a hand-authored `verify.md` only)."""
     root = Path(repo_path).expanduser()
@@ -1002,21 +1025,7 @@ def discover_harness(repo_path: str | Path) -> dict[str, Any]:
                 manifest_error = "harness.json must contain a JSON object"
         except ValueError as exc:
             manifest_error = f"harness.json is not valid JSON: {exc}"
-    # Malformed manifest fields are reported by check_harness; discovery only exposes well-typed values.
-    hooks: list[dict[str, Any]] = []
-    if manifest is not None and manifest.get("hooks") is not None:
-        raw_hooks = manifest["hooks"]
-        hooks = [h for h in raw_hooks if isinstance(h, dict)] if isinstance(raw_hooks, list) else []
-    elif has_md and "Hooks" in sections_map:
-        hooks = _parse_md_hooks(sections_map["Hooks"])
-    phases: dict[str, list[str]] = {}
-    if manifest is not None and isinstance(manifest.get("phases"), dict):
-        raw_phases = manifest["phases"]
-        phases = {k: list(raw_phases[k]) if _is_str_list(raw_phases.get(k)) else [] for k in PHASE_KEYS}
-    elif manifest is not None and manifest.get("phases") is not None:
-        phases = {k: [] for k in PHASE_KEYS}
-    elif has_md:
-        phases = {s.lower(): _section_commands(sections_map.get(s, "")) for s in REQUIRED_SECTIONS}
+    hooks, phases = _effective_hooks_and_phases(manifest, sections_map if has_md else None)
     return {
         "present": has_md,
         "mode": "full" if (has_md and has_json) else ("verify_md_only" if has_md else ("json_only" if has_json else "absent")),
@@ -1310,6 +1319,7 @@ def check_harness(
         "sections": info["sections"],
         "missing_sections": info["missing_sections"],
         "dead_globs": dead,
+        "manifest_errors": ([info["manifest_error"]] if info["manifest_error"] else []) + manifest_errors,
         "hooks": info["hooks"],
         "errors": errors,
         "warnings": warnings,
@@ -1324,34 +1334,30 @@ def check_harness(
 # ---------------------------------------------------------------------------
 
 
-def _gate_from_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
-    raw_hooks = manifest.get("hooks")
-    hooks = [h for h in raw_hooks if isinstance(h, dict)] if isinstance(raw_hooks, list) else []
-    phases = manifest.get("phases")
-    doctor = _str_list(phases.get("doctor")) if isinstance(phases, dict) else []
-    return hooks, doctor
-
-
 def _baseline_gates(root: Path, sha: str) -> Optional[dict[str, Any]]:
-    """The hooks + Doctor commands committed at ``sha`` (harness.json first, else verify.md), or None."""
-    proc = _git_ro(root, ["show", f"{sha}:{HARNESS_DIR_NAME}/{HARNESS_JSON_NAME}"])
-    if proc.returncode == 0:
+    """The effective hooks + Doctor commands committed at ``sha``, or None when no harness is committed there.
+
+    Uses discovery's per-field fallback, so a committed harness.json without `hooks` (or `phases`) still
+    inherits the required gates declared in the committed verify.md."""
+    json_proc = _git_ro(root, ["show", f"{sha}:{HARNESS_DIR_NAME}/{HARNESS_JSON_NAME}"])
+    manifest: Optional[dict[str, Any]] = None
+    if json_proc.returncode == 0:
         try:
-            loaded = json.loads(proc.stdout)
+            loaded = json.loads(json_proc.stdout)
         except ValueError:
             loaded = None
         if isinstance(loaded, dict):
-            hooks, doctor = _gate_from_manifest(loaded)
-            return {"source": HARNESS_JSON_NAME, "hooks": hooks, "doctor": doctor}
-    proc = _git_ro(root, ["show", f"{sha}:{HARNESS_DIR_NAME}/{VERIFY_MD_NAME}"])
-    if proc.returncode == 0:
-        sections = _split_sections(proc.stdout)
-        return {
-            "source": VERIFY_MD_NAME,
-            "hooks": _parse_md_hooks(sections.get("Hooks", "")),
-            "doctor": _section_commands(sections.get("Doctor", "")),
-        }
-    return None
+            manifest = loaded
+    md_proc = _git_ro(root, ["show", f"{sha}:{HARNESS_DIR_NAME}/{VERIFY_MD_NAME}"])
+    md_sections = _split_sections(md_proc.stdout) if md_proc.returncode == 0 else None
+    if manifest is None and md_sections is None:
+        return None
+    hooks, phases = _effective_hooks_and_phases(manifest, md_sections)
+    return {
+        "source": HARNESS_JSON_NAME if manifest is not None else VERIFY_MD_NAME,
+        "hooks": hooks,
+        "doctor": list(phases.get("doctor") or []),
+    }
 
 
 def detect_harness_gate_loosening(repo_path: str | Path, base_ref: Optional[str] = None) -> dict[str, Any]:
@@ -1390,11 +1396,7 @@ def detect_harness_gate_loosening(repo_path: str | Path, base_ref: Optional[str]
     result["baseline_source"] = baseline["source"]
 
     live = discover_harness(root)
-    live_manifest = live["manifest"] if live["manifest"] is not None and not live["manifest_error"] else None
-    if live_manifest is not None:
-        live_hooks, live_doctor = _gate_from_manifest(live_manifest)
-    else:
-        live_hooks, live_doctor = live["hooks"], list(live["phases"].get("doctor") or [])
+    live_hooks, live_doctor = live["hooks"], list(live["phases"].get("doctor") or [])
     live_by_name = {str(h.get("name") or "").strip(): h for h in live_hooks}
     short = sha[:12]
     seen: set[str] = set()
@@ -1485,6 +1487,7 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
         "new_cli_commands": [],
         "removed_cli_commands": [],
         "warnings": [],
+        "manifest_errors": [],
         "recommendations": [],
         "gate_loosening": _unchecked_gate(base_ref),
     }
@@ -1503,9 +1506,10 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
 
     manifest = info["manifest"] if not info["manifest_error"] else None
     if info["manifest_error"]:
-        result["warnings"].append(info["manifest_error"])
+        result["manifest_errors"] = [info["manifest_error"]]
     elif manifest is not None:
-        result["warnings"].extend(_validate_manifest(manifest))
+        result["manifest_errors"] = _validate_manifest(manifest)
+    result["warnings"].extend(result["manifest_errors"])
     is_git = _is_git_repo(root)
     if not is_git:
         result["warnings"].append("Not a git repository: change-based drift checks skipped")
@@ -1601,7 +1605,12 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
     if gate["loosened"]:
         result["warnings"].extend(gate["findings"])
         recs.append(_GATE_LOOSENING_RECOMMENDATION)
-    drifted = doc_drifted or gate["loosened"]
+    if result["manifest_errors"]:
+        recs.append(
+            f"Repair the malformed {HARNESS_DIR_NAME}/{HARNESS_JSON_NAME} ({len(result['manifest_errors'])} "
+            f"error(s)); `hermes factonio harness check {target['repo']}` lists them."
+        )
+    drifted = doc_drifted or gate["loosened"] or bool(result["manifest_errors"])
     result["drifted"] = drifted
     result["severity"] = "stale" if drifted else "clean"
     classification = classify_harness_drift(result)
@@ -1619,8 +1628,8 @@ _DRIFT_ACTIONS: dict[str, str] = {
         "Drive and Hooks by hand) and commit it; restore any removed or downgraded required gate."
     ),
     "harness_gap": (
-        "Fix the harness helper or environment (Doctor prerequisites, hook command paths, timeouts) so the "
-        "declared gates can run; do not edit product code or weaken gates to get green."
+        "Fix the harness helper or environment (a malformed `.factonio/harness.json`, Doctor prerequisites, hook "
+        "command paths, timeouts) so the declared gates can run; do not edit product code or weaken gates to get green."
     ),
     "product_regression": (
         "Report a product bug (e.g. a scoped `[implement]` fix card); never edit `.factonio/` to paper over "
@@ -1647,14 +1656,24 @@ def classify_harness_drift(
 ) -> dict[str, Any]:
     """Classify audit/check findings as `clean`, `doc_drift`, `harness_gap`, or `product_regression`.
 
-    `doc_drift`: `.factonio/` no longer describes the repo (missing/stale harness, schema or section errors,
-    dead globs, loosened gates). `harness_gap`: a gate could not run (Doctor failure, hook timeout or
+    `doc_drift`: `.factonio/` no longer describes the repo (missing/stale harness, section errors, dead globs,
+    loosened gates). `harness_gap`: the harness itself is broken or a gate could not run (malformed
+    harness.json: invalid JSON or schema/`schema_version` errors; Doctor failure, hook timeout or
     command-not-found). `product_regression`: a required hook ran and failed. Priority:
     product_regression > harness_gap > doc_drift > clean.
     """
     audit = audit_result if isinstance(audit_result, dict) else {}
     check = check_result if isinstance(check_result, dict) else {}
     reasons: dict[str, list[str]] = {k: [] for k in _DRIFT_PRIORITY}
+
+    manifest_errors: list[str] = []
+    for source in (audit, check):
+        manifest_errors.extend(e for e in _str_list(source.get("manifest_errors")) if e not in manifest_errors)
+    # check_result dicts built without `manifest_errors` still carry the `harness.json ...` error strings.
+    manifest_errors.extend(
+        e for e in _str_list(check.get("errors")) if e.startswith(f"{HARNESS_JSON_NAME} ") and e not in manifest_errors
+    )
+    reasons["harness_gap"].extend(f"Malformed {HARNESS_DIR_NAME}/{HARNESS_JSON_NAME}: {e}" for e in manifest_errors)
 
     severity = audit.get("severity")
     if severity == "missing" or (check and check.get("present") is False):
@@ -1697,7 +1716,7 @@ def classify_harness_drift(
         # An optional hook that ran and failed is a disclosed limit, not a gate: it does not classify drift.
     runtime_prefixes = ("Doctor command failed:", "Required hook ")
     for err in _str_list(check.get("errors")):
-        if err.startswith(runtime_prefixes) or err in gate_findings:
+        if err.startswith(runtime_prefixes) or err in gate_findings or err in manifest_errors:
             continue
         if err not in reasons["doc_drift"]:
             reasons["doc_drift"].append(err)
