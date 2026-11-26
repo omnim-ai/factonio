@@ -24,6 +24,7 @@ PHASES: tuple[str, ...] = ("define", "design", "implement", "verify", "watchdog"
 DESIGN_PROVIDERS: tuple[str, ...] = ("auto", "claude-design", "hermes", "off")
 DESIGN_APPROVAL_POLICIES: tuple[str, ...] = ("ask", "auto")
 MERGE_POLICIES: tuple[str, ...] = ("auto", "ask")
+PUBLISH_POLICIES: tuple[str, ...] = ("auto", "ask")
 RIGOR_LEVELS: tuple[str, ...] = ("standard", "high")
 
 AUX_TASK_SPECS: tuple[dict[str, str], ...] = (
@@ -63,6 +64,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "repos_root": "~/dev",
     "max_concurrent_workers": 4,
     "default_merge_policy": "auto",
+    "default_publish_policy": "auto",
     "default_max_fix_rounds": 3,
     "design_provider": "auto",
     "design_approval": "ask",
@@ -825,6 +827,48 @@ def resolve_rigor(*, repo_slug: Optional[str] = None, override: Optional[str] = 
                 return per_repo
     configured = _normalize_rigor(load_settings(use_root=True).get("default_rigor"), source="settings.default_rigor")
     return configured or "standard"
+
+
+def _normalize_publish_policy(value: Any, *, source: str) -> Optional[str]:
+    """Return ``"auto"``/``"ask"``, ``None`` when unset, or raise ``ValueError``."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in PUBLISH_POLICIES:
+            return norm
+    raise ValueError(f"{source} must be one of {', '.join(PUBLISH_POLICIES)}; got {value!r}")
+
+
+def resolve_publish_policy(
+    *,
+    repo_slug: Optional[str] = None,
+    repo: Optional[Mapping[str, Any]] = None,
+    override: Optional[str] = None,
+) -> str:
+    """Resolve whether Factonio may push branches and open PRs on its own (``"auto"``) or must stop
+    at a verified local branch and wait for an explicit publish (``"ask"``).
+
+    Precedence: explicit ``override`` -> ``repo["publish_policy"]`` (``repo`` or the entry
+    registered as ``repo_slug``) -> plugin ``settings.default_publish_policy`` -> ``"auto"``. Legacy
+    entries without ``publish_policy`` inherit the global default. An invalid value at any level
+    raises ``ValueError`` rather than silently falling back to publishing.
+    """
+    explicit = _normalize_publish_policy(override, source="publish_policy")
+    if explicit:
+        return explicit
+    entry: Any = repo
+    if entry is None and repo_slug:
+        entry = get_repo(repo_slug)
+    if isinstance(entry, Mapping):
+        field = f"repos.{entry.get('slug') or repo_slug or '?'}.publish_policy"
+        per_repo = _normalize_publish_policy(entry.get("publish_policy"), source=field)
+        if per_repo:
+            return per_repo
+    configured = _normalize_publish_policy(
+        load_settings(use_root=True).get("default_publish_policy"), source="settings.default_publish_policy"
+    )
+    return configured or "auto"
 
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")

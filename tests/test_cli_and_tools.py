@@ -150,8 +150,8 @@ class TestUpdateRepoTool(unittest.TestCase):
         self.assertEqual(schema["parameters"]["required"], ["repo"])
         self.assertEqual(
             set(props),
-            {"repo", "merge_policy", "max_fix_rounds", "default_branch", "design_provider", "design_approval",
-             "default_rigor"},
+            {"repo", "merge_policy", "publish_policy", "max_fix_rounds", "default_branch", "design_provider",
+             "design_approval", "default_rigor"},
         )
         self.assertEqual(props["default_rigor"]["enum"], ["standard", "high", "inherit"])
         self.assertIn("inherit", props["design_provider"]["enum"])
