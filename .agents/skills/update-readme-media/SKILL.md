@@ -69,7 +69,7 @@ Inspect every updated `.png` in `docs/images/` **and** every exported keyframe P
 - **Interactive states actually triggered:**
   - `sidebar.png`: card detail drawer is open and legible.
   - `demo-workflow.gif` final frame (`workflow_step7.png`): `Verify` filter is active and the completed verification card drawer is fully visible and unclipped.
-  - `demo-repo-editor.gif` (`repo-editor_step4.png` & `repo-editor_step5.png`): inline editor shows all 5 fields + live unsaved counter; final frame shows updated solid override badge and save toast.
+  - `demo-repo-editor.gif` (`repo-editor_step4.png` & `repo-editor_step5.png`): inline editor shows all 7 fields (including Publish policy) + live unsaved counter; final frame shows updated solid override badge and save toast.
 - **Compact size:** Keep each GIF crisp and lightweight (typically under 600 KB) so the repository stays fast to clone.
 
 If any defect appears, adjust the UI or harness viewport/step timing, re-run `--capture`, and re-inspect until clean.

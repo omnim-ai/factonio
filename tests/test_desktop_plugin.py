@@ -696,11 +696,11 @@ async function runSidebarScenarios(report, registered, oldRegistered) {
 // ---------------------------------------------------------------------------
 // Registered Repositories editor harness (/factonio page, GET/PATCH /repos)
 // ---------------------------------------------------------------------------
-const REPO_DEFAULTS = { merge_policy: 'auto', max_fix_rounds: 3, design_provider: 'auto', design_approval: 'ask' }
+const REPO_DEFAULTS = { merge_policy: 'auto', publish_policy: 'ask', max_fix_rounds: 3, design_provider: 'auto', design_approval: 'ask' }
 const REPOS = [
-  { slug: 'tozes-factonio', repo: 'tozes/factonio', url: 'https://github.com/tozes/factonio', path: '/home/tozes/dev/factonio', default_branch: 'main', merge_policy: 'auto', max_fix_rounds: 3, design_provider: null, design_approval: null, effective_design_provider: 'auto', effective_design_approval: 'ask', resolved_design_provider: 'claude-design', has_required_checks: false, models: {} },
-  { slug: 'acme-web-dashboard', repo: 'acme/web-dashboard', url: 'https://github.com/acme/web-dashboard', path: '/home/tozes/workspace/projects/acme-web-dashboard', default_branch: 'develop', merge_policy: 'ask', max_fix_rounds: 5, design_provider: 'hermes', design_approval: 'auto', effective_design_provider: 'hermes', effective_design_approval: 'auto', resolved_design_provider: 'hermes', has_required_checks: true, models: {} },
-  { slug: 'acme-cli-tools', repo: 'acme/cli-tools', url: 'https://github.com/acme/cli-tools', path: '/home/tozes/workspace/acme-cli-tools', default_branch: 'release/v2', merge_policy: 'auto', max_fix_rounds: 2, design_provider: 'off', design_approval: null, effective_design_provider: 'off', effective_design_approval: 'ask', resolved_design_provider: 'off', has_required_checks: false, models: {} }
+  { slug: 'tozes-factonio', repo: 'tozes/factonio', url: 'https://github.com/tozes/factonio', path: '/home/tozes/dev/factonio', default_branch: 'main', merge_policy: 'auto', publish_policy: 'auto', max_fix_rounds: 3, design_provider: null, design_approval: null, effective_design_provider: 'auto', effective_design_approval: 'ask', resolved_design_provider: 'claude-design', has_required_checks: false, models: {} },
+  { slug: 'acme-web-dashboard', repo: 'acme/web-dashboard', url: 'https://github.com/acme/web-dashboard', path: '/home/tozes/workspace/projects/acme-web-dashboard', default_branch: 'develop', merge_policy: 'ask', publish_policy: 'ask', max_fix_rounds: 5, design_provider: 'hermes', design_approval: 'auto', effective_design_provider: 'hermes', effective_design_approval: 'auto', resolved_design_provider: 'hermes', has_required_checks: true, models: {} },
+  { slug: 'acme-cli-tools', repo: 'acme/cli-tools', url: 'https://github.com/acme/cli-tools', path: '/home/tozes/workspace/acme-cli-tools', default_branch: 'release/v2', merge_policy: 'auto', publish_policy: 'auto', max_fix_rounds: 2, design_provider: 'off', design_approval: null, effective_design_provider: 'off', effective_design_approval: 'ask', resolved_design_provider: 'off', has_required_checks: false, models: {} }
 ]
 function deferred() {
   let resolve, reject
@@ -753,6 +753,7 @@ function readRepos(tree) {
     const tds = tr.props.children.filter(Boolean)
     const tag = td => { const t = find(td, n => String(n.props.className || '').startsWith('fc-tag fc-tag--')); return t ? { cls: t.node.props.className, text: text(t.node).replace(/\s+/g, ' ').trim(), title: t.node.props.title } : null }
     const btn = find(tr, n => n.type === 'button').node
+    const pol = td => { const p = find(td, n => n.props.className === 'fc-pol'); return { field: td.props['data-field'], text: text(td).trim(), pol: p ? p.node.props['data-pol'] ?? null : null, title: p ? p.node.props.title : null, tag: !!find(td, n => String(n.props.className || '').includes('fc-tag')) } }
     return {
       slug: tr.props['data-slug'],
       editing: tr.props['data-editing'] || null,
@@ -760,17 +761,22 @@ function readRepos(tree) {
       path: find(tds[0], n => n.props.className === 'fc-trunc fc-repo-path').node.props.title,
       branch: text(tds[1]).trim(),
       branchTitle: find(tds[1], n => n.type === 'span').node.props.title,
+      cells: tds.length,
       merge: text(tds[2]).trim(),
-      rounds: text(tds[3]).trim(),
-      roundsClass: tds[3].props.className,
-      provider: tag(tds[4]),
-      approval: tag(tds[5]),
+      mergeCell: pol(tds[2]),
+      publish: pol(tds[3]),
+      rounds: text(tds[4]).trim(),
+      roundsClass: tds[4].props.className,
+      provider: tag(tds[5]),
+      approval: tag(tds[6]),
       edit: { label: text(btn).trim(), ariaLabel: btn.props['aria-label'], expanded: btn.props['aria-expanded'], controls: btn.props['aria-controls'], active: btn.props['data-active'] || null, disabled: !!btn.props.disabled }
     }
   })
+  const wrap = find(tree, n => n.props.className === 'fc-repos-wrap')
   const order = findAll(find(tbl.node, n => n.type === 'tbody').node, n => n.type === 'tr').map(h => (h.node.props.className === 'fc-repo-ed' ? 'editor:' : 'row:') + h.node.props['data-slug'])
   return {
     tableClass: tbl.node.props.className,
+    wrapped: !!(wrap && find(wrap.node, n => n === tbl.node)),
     cols: findAll(tbl.node, n => n.type === 'col').map(h => h.node.props.className),
     headers: findAll(find(tbl.node, n => n.type === 'thead').node, n => n.type === 'th').map(h => ({ text: text(h.node).replace(/\s+/g, ' ').trim(), className: h.node.props.className || null })),
     rows,
@@ -800,7 +806,8 @@ function readEditor(tree) {
       describedBy: ctl.props['aria-describedby'],
       err: err ? { id: err.node.props.id, text: text(err.node).trim() } : null,
       hint: hint ? { id: hint.node.props.id, text: text(hint.node).replace(/\s+/g, ' ').trim() } : null,
-      options: ctl.type === 'select' ? findAll(ctl, n => n.type === 'option').map(o => [o.node.props.value, text(o.node).trim()]) : null
+      options: ctl.type === 'select' ? findAll(ctl, n => n.type === 'option').map(o => [o.node.props.value, text(o.node).trim()]) : null,
+      disabledOptions: ctl.type === 'select' ? findAll(ctl, n => n.type === 'option' && n.props.disabled).map(o => [o.node.props.value, text(o.node).trim()]) : null
     }
   }
   const msg = find(form, n => n.props['aria-live'] === 'polite').node
@@ -881,6 +888,7 @@ async function runReposScenarios(report) {
     sectionClass: head ? head.node.props.className : null,
     title: text(find(head.node, n => n.type === 'h2').node).trim(),
     sub: text(find(head.node, n => n.props.className === 'fc-sec-sub').node).replace(/\s+/g, ' ').trim(),
+    subs: findAll(head.node, n => n.props.className === 'fc-sec-sub').map(h => text(h.node).replace(/\s+/g, ' ').trim()),
     legend: text(find(head.node, n => n.props.className === 'fc-legend').node).replace(/\s+/g, ' ').trim(),
     legendTags: findAll(find(head.node, n => n.props.className === 'fc-legend').node, n => String(n.props.className || '').startsWith('fc-tag ')).map(h => h.node.props.className),
     buttons: allButtonLabels(head.node),
@@ -1083,6 +1091,77 @@ async function runReposScenarios(report) {
   await submitForm(tree); tree = m.render()
   { const ed = readEditor(tree); U.pow53Num = { rests: [...m.rests], value: ed.fields.max_fix_rounds.value, expected: 9007199254740992, invalid: ed.fields.max_fix_rounds.invalid, err: ed.fields.max_fix_rounds.err && ed.fields.max_fix_rounds.err.text } }
 
+  // Publish policy: one-field partial diff, revert drops it, PATCH holds only publish_policy.
+  const P = r.publish = {}
+  m = mountRepos({ data: { repos: REPOS, defaults: REPO_DEFAULTS }, client })
+  tree = m.render()
+  fire(editBtnHit(tree, 'tozes-factonio')); tree = m.render()
+  P.opened = readEditor(tree).fields.publish_policy
+  change(tree, 'publish_policy', 'ask'); tree = m.render()
+  P.dirty = readEditor(tree)
+  change(tree, 'publish_policy', 'auto'); tree = m.render()
+  P.reverted = readEditor(tree)
+  change(tree, 'publish_policy', 'ask'); tree = m.render()
+  m.setRest(async () => ({ ok: true }))
+  await submitForm(tree); tree = m.render()
+  P.rests = [...m.rests]
+  P.closed = readEditor(tree) === null
+  P.changes = mod.repoDraftChanges({ publish_policy: 'auto' }, REPOS[1])
+  P.legacySeed = mod.seedRepoDraft({ ...REPOS[2], publish_policy: undefined }).publish_policy
+  P.unknownSeed = mod.seedRepoDraft({ ...REPOS[2], publish_policy: null }).publish_policy
+  P.fixUnknown = mod.repoDraftChanges({ publish_policy: 'auto' }, { ...REPOS[2], publish_policy: null })
+  const { publish_policy: _omit, ...legacyRepo2 } = REPOS[2]
+  P.seeds = {
+    omittedNoDefaults: mod.seedRepoDraft(legacyRepo2).publish_policy,
+    omittedDefaultAsk: mod.seedRepoDraft(legacyRepo2, { publish_policy: 'ask' }).publish_policy,
+    omittedDefaultNull: mod.seedRepoDraft(legacyRepo2, { publish_policy: null }).publish_policy,
+    omittedDefaultBogus: mod.seedRepoDraft(legacyRepo2, { publish_policy: 'bogus' }).publish_policy,
+    nullWithDefaultAuto: mod.seedRepoDraft({ ...REPOS[2], publish_policy: null }, { publish_policy: 'auto' }).publish_policy,
+    bogus: mod.seedRepoDraft({ ...REPOS[2], publish_policy: 'bogus' }, { publish_policy: 'auto' }).publish_policy,
+    explicitAsk: mod.seedRepoDraft({ ...REPOS[2], publish_policy: 'ask' }, { publish_policy: 'auto' }).publish_policy
+  }
+  P.omittedNoSpurious = mod.repoDraftChanges({ default_branch: 'main' }, legacyRepo2, { publish_policy: 'auto' })
+  { // Valid ask repo: still only the two policy options, no unknown placeholder.
+    m = mountRepos({ data: { repos: REPOS, defaults: REPO_DEFAULTS }, client })
+    tree = m.render()
+    fire(editBtnHit(tree, 'acme-web-dashboard')); tree = m.render()
+    P.openedAsk = readEditor(tree).fields.publish_policy
+  }
+  const subsOf = t => findAll(find(t, n => n.props.className === 'fc-sec fc-repos-sec').node, n => n.props.className === 'fc-sec-sub').map(h => text(h.node).replace(/\s+/g, ' ').trim())
+
+  // Explicit null policy (repo + global default): unknown, never auto; choosing auto is an edit.
+  const N = r.publishNull = {}
+  m = mountRepos({ data: { repos: REPOS.map((x, i) => (i === 0 ? { ...x, publish_policy: null } : i === 2 ? { ...x, publish_policy: 'bogus' } : x)), defaults: { ...REPO_DEFAULTS, publish_policy: null } }, client })
+  tree = m.render()
+  N.subs = subsOf(tree)
+  N.cells = readRepos(tree).rows.map(x => x.publish)
+  fire(editBtnHit(tree, 'tozes-factonio')); tree = m.render()
+  N.opened = readEditor(tree)
+  change(tree, 'publish_policy', 'auto'); tree = m.render()
+  N.dirty = readEditor(tree)
+  await submitForm(tree); tree = m.render()
+  N.rests = [...m.rests]
+  m = mountRepos({ data: { repos: REPOS, defaults: { ...REPO_DEFAULTS, publish_policy: 'bogus' } }, client })
+  N.bogusDefaultSubs = subsOf(m.render())
+  { const { publish_policy: _p, ...noPolicyDefaults } = REPO_DEFAULTS
+    m = mountRepos({ data: { repos: REPOS, defaults: noPolicyDefaults }, client })
+    N.omittedDefaultSubs = subsOf(m.render()) }
+
+  // Older backend: no publish_policy key on any repo; falls back to the global default cleanly.
+  const O = r.publishOmitted = {}
+  const legacyRepos = REPOS.map(({ publish_policy: _x, ...x }) => x)
+  m = mountRepos({ data: { repos: legacyRepos, defaults: { ...REPO_DEFAULTS, publish_policy: 'auto' } }, client })
+  tree = m.render()
+  O.cells = readRepos(tree).rows.map(x => x.publish)
+  fire(editBtnHit(tree, 'tozes-factonio')); tree = m.render()
+  O.opened = readEditor(tree)
+  change(tree, 'default_branch', 'trunk'); tree = m.render()
+  O.dirty = readEditor(tree)
+  await submitForm(tree); tree = m.render()
+  O.rests = [...m.rests]
+  m = mountRepos({ data: { repos: legacyRepos, defaults: REPO_DEFAULTS }, client })
+  O.cellsAskDefault = readRepos(m.render()).rows.map(x => x.publish.text)
+
   globalThis.__fcReposState = undefined
   globalThis.__fcQueryClient = undefined
 }
@@ -1231,6 +1310,20 @@ async function runTrailScenarios(report) {
   dash.jumpVisible = { trail: readTrail(tree), scroll: JSON.parse(JSON.stringify(scrollLog)), focus: [...m.focusLog] }
   trailAction(tree, 'toggle-sup'); tree = m.render()
   dash.supShownAgain = readTrail(tree).stats
+
+  // Publish phase: published/refused rows, combined branch pill, draft only when true.
+  const PUB = [
+    dec({ id: 'dec_9a8c4f10b2', ts: '2026-11-25T17:10:00.000000Z', phase: 'publish', card_id: 't_pub1', actor: 'human', decision: 'publish_pr', why: 'Published the verified branch.', evidence: { pr_number: 42, head_sha: '8f2c1a9e77', branch: 'feat/publish-policy', base_branch: 'main', draft: false }, result: 'published', supersedes_id: 'dec_7f2e1d84c1' }),
+    dec({ id: 'dec_7f2e1d84c1', ts: '2026-11-25T17:00:00.000000Z', phase: 'publish', card_id: 't_pub1', actor: 'orchestrator', decision: 'publish_pr', why: 'Refused: publish_policy is ask.', evidence: { head_sha: '3b9e014c2d', branch: 'feat/publish-policy', base_branch: 'main' }, result: 'refused', superseded_by: ['dec_9a8c4f10b2'], is_superseded: true }),
+    dec({ id: 'dec_draftlong01', ts: '2026-11-25T16:55:00.000000Z', phase: 'publish', card_id: 't_pub2', actor: 'orchestrator', decision: 'publish_pr', why: 'Draft PR.', evidence: { branch: 'b'.repeat(60), base_branch: 'develop', draft: true }, result: 'published' }),
+    dec({ id: 'dec_baseonly01', ts: '2026-11-25T16:50:00.000000Z', phase: 'publish', card_id: 't_pub3', actor: 'orchestrator', decision: 'publish_pr', why: 'Base only.', evidence: { base_branch: 'main', draft: 'yes' }, result: 'error' }),
+    TRAIL[0], TRAIL[2]
+  ]
+  trailState = { data: { decisions: PUB, summary: { total: PUB.length, active: PUB.length - 1, superseded: 1, by_tenant: { [W2]: PUB.length } }, filters: {} }, isLoading: false, isError: false }
+  m = mountDash(); tree = m.render()
+  dash.publish = readTrail(tree)
+  trailPhase(tree, 'publish'); tree = m.render()
+  dash.publishOnly = readTrail(tree)
 
   // Empty.
   trailState = { data: { decisions: [], summary: { total: 0, active: 0, superseded: 0, by_tenant: {} }, filters: {} }, isLoading: false, isError: false }
@@ -2074,8 +2167,10 @@ class TestDesktopPlugin(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="factonio-lineage-") as tmp:
             fixture = Path(tmp) / "lineage.json"
             fixture.write_text(json.dumps(_lineage_fixture(Path(tmp))))
+            # Piped via stdin: the script outgrew Linux's 128 KiB per-argument limit (MAX_ARG_STRLEN).
             proc = subprocess.run(
-                ["node", "--input-type=module", "-e", SMOKE_SCRIPT],
+                ["node", "--input-type=module"],
+                input=SMOKE_SCRIPT,
                 capture_output=True,
                 text=True,
                 timeout=60,
@@ -2585,7 +2680,7 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual(t["bar"]["disabled"], "true")
         self.assertTrue(all(s["disabled"] for s in t["bar"]["selects"].values()))
         self.assertTrue(all(p["disabled"] for p in t["bar"]["phases"]))
-        self.assertEqual([p["phase"] for p in t["bar"]["phases"]][1:], ["define", "design", "implement", "verify", "gate", "merge", "escape", "watchdog"])
+        self.assertEqual([p["phase"] for p in t["bar"]["phases"]][1:], ["define", "design", "implement", "verify", "publish", "gate", "merge", "escape", "watchdog"])
         self.assertEqual(t["rows"], [])
         self.assertIsNone(t["alert"])
 
@@ -2928,19 +3023,26 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual(r["sectionClass"], "fc-sec fc-repos-sec")
         self.assertEqual(r["title"], "Registered Repositories")
         self.assertEqual(r["sub"], "Global defaults: design provider auto · design approval ask · rigor standard")
+        # Seeded (not inherited) policy defaults sit on their own second line.
+        self.assertEqual(
+            r["subs"],
+            ["Global defaults: design provider auto · design approval ask · rigor standard",
+             "New repos start with merge auto · publish ask , set per repo."],
+        )
+        self.assertTrue(r["wrapped"])  # .fc-repos-wrap scrolls the 992px table on narrow containers
         self.assertEqual(r["legend"], "value · global inherited value override")
         self.assertEqual(r["legendTags"], ["fc-tag fc-tag--inherit", "fc-tag fc-tag--set"])
         self.assertEqual(r["tableClass"], "fc-table fc-repos")
         self.assertEqual(
             r["cols"],
-            ["fc-col-repo", "fc-col-branch", "fc-col-merge", "fc-col-rounds", "fc-col-prov", "fc-col-appr", "fc-col-rigor", "fc-col-act"],
+            ["fc-col-repo", "fc-col-branch", "fc-col-merge", "fc-col-publish", "fc-col-rounds", "fc-col-prov", "fc-col-appr", "fc-col-rigor", "fc-col-act"],
         )
         self.assertEqual(
             [h["text"] for h in r["headers"]],
-            ["Repository Local path", "Branch", "Merge policy", "Max fix rounds", "Design provider", "Design approval", "Rigor", "Actions"],
+            ["Repository Local path", "Branch", "Merge policy", "Publish policy", "Max fix rounds", "Design provider", "Design approval", "Rigor", "Actions"],
         )
-        self.assertEqual(r["headers"][3]["className"], "fc-num")
-        self.assertEqual(r["headers"][7]["className"], "fc-act")
+        self.assertEqual(r["headers"][4]["className"], "fc-num")
+        self.assertEqual(r["headers"][8]["className"], "fc-act")
         self.assertEqual(r["order"], ["row:tozes-factonio", "row:acme-web-dashboard", "row:acme-cli-tools"])
         self.assertIsNone(r["editor"])
         # No Add / Remove repository controls: only one Edit button per row.
@@ -2954,7 +3056,12 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual(a["branchTitle"], "main")
         self.assertEqual(a["provider"], {"cls": "fc-tag fc-tag--inherit", "text": "auto · global", "title": "Inherited from global default; resolves to claude-design"})
         self.assertEqual(a["approval"], {"cls": "fc-tag fc-tag--inherit", "text": "ask · global", "title": "Inherited from global default"})
+        self.assertEqual(a["cells"], 9)
+        self.assertEqual(a["mergeCell"], {"field": "merge_policy", "text": "auto", "pol": "auto", "title": "auto: merges automatically", "tag": False})
+        self.assertEqual(a["publish"], {"field": "publish_policy", "text": "auto", "pol": "auto", "title": "auto: publishes automatically", "tag": False})
         b = rows["acme-web-dashboard"]
+        self.assertEqual(b["mergeCell"], {"field": "merge_policy", "text": "ask", "pol": "ask", "title": "ask: waits for your approval to merge", "tag": False})
+        self.assertEqual(b["publish"], {"field": "publish_policy", "text": "ask", "pol": "ask", "title": "ask: waits for your approval to publish", "tag": False})
         self.assertEqual(b["provider"], {"cls": "fc-tag fc-tag--set", "text": "hermes", "title": "Repository override"})
         self.assertEqual(b["approval"], {"cls": "fc-tag fc-tag--set", "text": "auto", "title": "Repository override"})
         c = rows["acme-cli-tools"]
@@ -3073,7 +3180,7 @@ class TestDesktopPlugin(unittest.TestCase):
         # Untouched fields reconcile to refreshed values; the user's edit is preserved.
         self.assertEqual(
             self._ed_vals(b["after"]),
-            {"default_branch": "user-feature", "merge_policy": "ask", "max_fix_rounds": "3", "design_provider": "hermes", "design_approval": "", "default_rigor": ""},
+            {"default_branch": "user-feature", "merge_policy": "ask", "publish_policy": "auto", "max_fix_rounds": "3", "design_provider": "hermes", "design_approval": "", "default_rigor": ""},
         )
         self.assertEqual(
             b["rests"],
@@ -3110,13 +3217,13 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual(row["edit"]["active"], "true")
         self.assertEqual(row["edit"]["controls"], ed["formId"])
         self.assertEqual(ed["editing"], "true")
-        self.assertEqual(ed["colSpan"], 8)
+        self.assertEqual(ed["colSpan"], 9)
         self.assertEqual(ed["formLabel"], "Edit settings for tozes/factonio")
         self.assertTrue(ed["noValidate"])
         self.assertEqual(ed["identity"], "Editing tozes-factonio Path /home/tozes/dev/factonio")
         self.assertEqual(ed["fieldsetClass"], "fc-ed-grid")
-        self.assertEqual(ed["fieldOrder"], ["default_branch", "merge_policy", "max_fix_rounds", "design_provider", "design_approval", "default_rigor"])
-        self.assertEqual(self._ed_vals(ed), {"default_branch": "main", "merge_policy": "auto", "max_fix_rounds": "3", "design_provider": "", "design_approval": "", "default_rigor": ""})
+        self.assertEqual(ed["fieldOrder"], ["default_branch", "merge_policy", "publish_policy", "max_fix_rounds", "design_provider", "design_approval", "default_rigor"])
+        self.assertEqual(self._ed_vals(ed), {"default_branch": "main", "merge_policy": "auto", "publish_policy": "auto", "max_fix_rounds": "3", "design_provider": "", "design_approval": "", "default_rigor": ""})
         for name, f in ed["fields"].items():
             with self.subTest(field=name):
                 self.assertEqual(f["labelFor"], f["id"])
@@ -3193,7 +3300,7 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertFalse(ed["save"]["disabled"])
         self.assertIsNone(ed["busy"])
         self.assertFalse(ed["fieldsetDisabled"])
-        self.assertEqual(self._ed_vals(ed), {"default_branch": " develop ", "merge_policy": "auto", "max_fix_rounds": "4", "design_provider": "hermes", "design_approval": "", "default_rigor": ""})
+        self.assertEqual(self._ed_vals(ed), {"default_branch": " develop ", "merge_policy": "auto", "publish_policy": "auto", "max_fix_rounds": "4", "design_provider": "hermes", "design_approval": "", "default_rigor": ""})
         self.assertEqual(ae["notifications"], [])
         self.assertEqual(ae["invalidations"], [])
         self.assertFalse(ae["table"]["rows"][0]["edit"]["disabled"])
@@ -3245,6 +3352,131 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual(x["switchedBackPristine"], "release/v2")
         self.assertIsNone(x["toggleClosed"])
         self.assertEqual(x["rests"], [])
+
+    def test_repo_editor_publish_policy_select_and_partial_patch(self):
+        p = self.report["repos"]["publish"]
+        f = p["opened"]
+        self.assertEqual((f["label"], f["tag"], f["value"]), ("Publish policy", "select", "auto"))
+        self.assertEqual(f["options"], [["auto", "auto"], ["ask", "ask"]])  # no inherit option
+        self.assertEqual(f["hint"]["text"], "auto pushes and opens a PR once verified; ask keeps work local until you approve.")
+        self.assertEqual(f["describedBy"], f["hint"]["id"])
+        self.assertTrue(f["id"].endswith("-publish_policy"))
+        self.assertEqual(p["dirty"]["msg"]["text"], "1 unsaved change")
+        self.assertFalse(p["dirty"]["save"]["disabled"])
+        self.assertEqual(self._ed_vals(p["dirty"])["publish_policy"], "ask")
+        self.assertEqual(p["reverted"]["msg"]["text"], "")
+        self.assertTrue(p["reverted"]["save"]["disabled"])
+        self.assertEqual(p["rests"], self._patch({"publish_policy": "ask"}))
+        self.assertTrue(p["closed"])
+        self.assertEqual(p["changes"], {"publish_policy": "auto"})
+        # An unresolvable policy (API null) is never presented as auto, so choosing auto is a real edit.
+        # An omitted key (older backend) inherits the global default, auto when that is omitted too.
+        self.assertEqual(p["legacySeed"], "auto")
+        self.assertEqual(p["unknownSeed"], "")
+        self.assertEqual(p["fixUnknown"], {"publish_policy": "auto"})
+        self.assertEqual(f["disabledOptions"], [])
+        ask = p["openedAsk"]
+        self.assertEqual(ask["value"], "ask")
+        self.assertEqual(ask["options"], [["auto", "auto"], ["ask", "ask"]])
+        self.assertEqual(ask["disabledOptions"], [])
+        self.assertEqual(
+            p["seeds"],
+            {"omittedNoDefaults": "auto", "omittedDefaultAsk": "ask", "omittedDefaultNull": "", "omittedDefaultBogus": "",
+             "nullWithDefaultAuto": "", "bogus": "", "explicitAsk": "ask"},
+        )
+        self.assertEqual(p["omittedNoSpurious"], {"default_branch": "main"})
+
+    def test_repo_editor_explicit_null_publish_policy_is_unknown_never_auto(self):
+        n = self.report["repos"]["publishNull"]
+        self.assertEqual(n["subs"][1], "New repos start with merge auto · publish unknown , set per repo.")
+        self.assertEqual(n["bogusDefaultSubs"][1], "New repos start with merge auto · publish unknown , set per repo.")
+        self.assertEqual(n["omittedDefaultSubs"][1], "New repos start with merge auto · publish auto , set per repo.")
+        null_cell, ask_cell, bogus_cell = n["cells"]
+        for cell in (null_cell, bogus_cell):
+            self.assertEqual((cell["text"], cell["pol"], cell["title"]), ("—", None, "publish policy: unknown"))
+        self.assertEqual((ask_cell["text"], ask_cell["pol"]), ("ask", "ask"))
+        f = n["opened"]["fields"]["publish_policy"]
+        # Real DOM <select> needs a matching '' option, else it shows the first option (auto).
+        self.assertEqual(f["value"], "")
+        self.assertEqual(f["options"], [["", "Invalid / unknown — choose policy"], ["auto", "auto"], ["ask", "ask"]])
+        self.assertEqual(f["disabledOptions"], [["", "Invalid / unknown — choose policy"]])
+        self.assertEqual(n["opened"]["msg"]["text"], "")
+        self.assertTrue(n["opened"]["save"]["disabled"])
+        d = n["dirty"]
+        self.assertEqual(d["fields"]["publish_policy"]["value"], "auto")
+        self.assertEqual(d["fields"]["publish_policy"]["options"], [["auto", "auto"], ["ask", "ask"]])
+        self.assertEqual(d["msg"]["text"], "1 unsaved change")
+        self.assertFalse(d["save"]["disabled"])
+        self.assertEqual(n["rests"], self._patch({"publish_policy": "auto"}))
+
+    def test_repo_editor_omitted_publish_policy_falls_back_to_default(self):
+        o = self.report["repos"]["publishOmitted"]
+        for cell in o["cells"]:
+            self.assertEqual((cell["text"], cell["pol"], cell["title"]), ("auto", "auto", "auto: publishes automatically"))
+        self.assertEqual(o["cellsAskDefault"], ["ask", "ask", "ask"])
+        f = o["opened"]["fields"]["publish_policy"]
+        self.assertEqual(f["value"], "auto")
+        self.assertEqual(f["options"], [["auto", "auto"], ["ask", "ask"]])
+        self.assertEqual(f["disabledOptions"], [])
+        self.assertEqual(o["opened"]["msg"]["text"], "")
+        self.assertTrue(o["opened"]["save"]["disabled"])
+        self.assertEqual(o["dirty"]["msg"]["text"], "1 unsaved change")
+        self.assertEqual(o["rests"], self._patch({"default_branch": "trunk"}))
+
+    def test_trail_publish_phase_tone_and_branch_pill(self):
+        t = self.report["trail"]["dashboard"]["publish"]
+        # publish sits between verify and gate/merge in the phase filter.
+        self.assertEqual([p["text"] for p in t["bar"]["phases"]], ["All", "verify 1", "publish 4", "merge 1"])
+        rows = {r["id"]: r for r in t["rows"]}
+        pub = rows["dec_9a8c4f10b2"]
+        self.assertEqual((pub["phase"], pub["result"], pub["tone"], pub["title"]), ("publish", "published", "ok", "Publish PR"))
+        self.assertEqual(
+            [(p["ev"], p["text"], p["title"]) for p in pub["pills"]],
+            [
+                ("pr_number", "PR #42", "Open omnim-ai/factonio#42"),
+                ("head_sha", "8f2c1a9", "head_sha 8f2c1a9e77"),
+                ("branch", "branch feat/publish-policy → main", "branch feat/publish-policy → base main"),
+            ],
+        )  # draft: false renders no pill; base_branch folds into the branch pill
+        refused = rows["dec_7f2e1d84c1"]
+        self.assertEqual((refused["result"], refused["tone"]), ("refused", "bad"))
+        self.assertEqual([p["ev"] for p in refused["pills"]], ["head_sha", "branch"])
+        long_ = rows["dec_draftlong01"]
+        self.assertEqual(long_["pills"][0]["text"], "branch " + "b" * 48 + " → develop")
+        self.assertEqual(long_["pills"][0]["title"], "branch " + "b" * 60 + " → base develop")
+        self.assertEqual((long_["pills"][1]["ev"], long_["pills"][1]["text"]), ("draft", "draft"))
+        base_only = rows["dec_baseonly01"]
+        self.assertEqual([(p["ev"], p["text"]) for p in base_only["pills"]], [("base_branch", "base branch main")])
+        only = self.report["trail"]["dashboard"]["publishOnly"]
+        self.assertEqual([r["phase"] for r in only["rows"]], ["publish"] * 4)
+        self.assertEqual([p["pressed"] for p in only["bar"]["phases"] if p["phase"] == "publish"], ["true"])
+
+    def test_publish_policy_styles_and_layout_rules(self):
+        source = PLUGIN_JS.read_text(encoding="utf-8")
+        start = source.index("const STYLES = `")
+        styles = source[start : source.index("`", start + len("const STYLES = `"))]
+        self.assertNotRegex(styles, r"#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(")
+        for needed in (
+            ".fc-repos-wrap { overflow-x: auto; max-width: 100%; }",
+            ".fc-repos { table-layout: fixed; min-width: 992px; }",
+            "position: sticky; left: 0; max-width: 100cqi; box-sizing: border-box;",
+            '@container (max-width: 640px) { .fc-ed-grid > .fc-field[data-field="default_branch"] { grid-column: 1 / -1; } }',
+            ".fc-pol::before",
+            '.fc-pol[data-pol="ask"] { color: var(--ui-text-primary); font-weight: 600; }',
+            '.fc-pol[data-pol="ask"]::before { border-color: var(--ui-accent); background: var(--ui-accent); }',
+            "color-mix(in srgb, var(--ui-text-secondary) 58%, transparent)",
+        ):
+            self.assertIn(needed, styles)
+        widths = dict(re.findall(r"\.fc-col-([a-z]+) \{ width: (\d+)%; \}", styles))
+        self.assertEqual(
+            widths,
+            {"repo": "21", "branch": "9", "merge": "8", "publish": "8", "rounds": "7", "prov": "13", "appr": "12", "rigor": "15", "act": "7"},
+        )
+        self.assertIn("const TRAIL_TONE = {\n  merged: 'ok', pass: 'ok', approved: 'ok', ready: 'ok', published: 'ok',", source)
+        self.assertIn(
+            "const REPO_FIELD_ORDER = ['default_branch', 'merge_policy', 'publish_policy', 'max_fix_rounds', 'design_provider', 'design_approval', 'default_rigor']",
+            source,
+        )
 
     def test_repos_editor_styles_use_theme_tokens_only(self):
         source = PLUGIN_JS.read_text(encoding="utf-8")

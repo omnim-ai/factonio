@@ -59,9 +59,24 @@ def status(profile: Optional[str] = Query(None)):
     }
 
 
+def _safe_publish_policy(info: Optional[dict[str, Any]] = None) -> Optional[str]:
+    """Effective publish policy, or None when a stored value is invalid.
+
+    Never falls back to ``"auto"`` on bad config: ``None`` tells the UI the value is unknown
+    instead of implying Factonio may publish on its own.
+    """
+    try:
+        if info is None:
+            return _config.resolve_default_publish_policy()
+        return _config.resolve_publish_policy(repo=info)
+    except ValueError:
+        return None
+
+
 def _repo_defaults(settings: dict[str, Any]) -> dict[str, Any]:
     return {
         "merge_policy": settings.get("default_merge_policy") or "auto",
+        "publish_policy": _safe_publish_policy(),
         "max_fix_rounds": settings.get("default_max_fix_rounds") or 3,
         "design_provider": settings.get("design_provider") or "auto",
         "design_approval": settings.get("design_approval") or "ask",
@@ -98,6 +113,7 @@ def _serialize_repo(slug: str, info: dict[str, Any], settings: dict[str, Any]) -
         "path": info.get("path"),
         "default_branch": info.get("default_branch", "main"),
         "merge_policy": info.get("merge_policy", defaults["merge_policy"]),
+        "publish_policy": _safe_publish_policy(info),
         "max_fix_rounds": info.get("max_fix_rounds", defaults["max_fix_rounds"]),
         "design_provider": explicit_provider,
         "design_approval": explicit_approval,
