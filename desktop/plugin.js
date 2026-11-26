@@ -712,12 +712,24 @@ function validateRounds(rounds) {
   return null
 }
 
-function seedRepoDraft(repo) {
+const isPolicy = v => v === 'auto' || v === 'ask'
+
+// Older backends omit `publish_policy`: inherit the global default (auto when that is
+// omitted too). An explicit null / invalid value means the server could not resolve a
+// valid policy, so it resolves to '' (unknown) and is never presented as auto.
+function resolvePublishPolicy(repo, defaults) {
+  const own = repo?.publish_policy
+  if (own !== undefined) return isPolicy(own) ? own : ''
+  const global = defaults?.publish_policy
+  if (global === undefined) return 'auto'
+  return isPolicy(global) ? global : ''
+}
+
+function seedRepoDraft(repo, defaults) {
   return {
     default_branch: String(repo.default_branch ?? ''),
     merge_policy: String(repo.merge_policy ?? 'auto'),
-    // null means the server could not resolve a valid policy; never present it as auto.
-    publish_policy: repo.publish_policy == null ? '' : String(repo.publish_policy),
+    publish_policy: resolvePublishPolicy(repo, defaults),
     max_fix_rounds: repo.max_fix_rounds == null ? '' : String(repo.max_fix_rounds),
     design_provider: repo.design_provider ? String(repo.design_provider) : '',
     design_approval: repo.design_approval ? String(repo.design_approval) : '',
@@ -745,10 +757,10 @@ function normalizeRepoDraft(d) {
 // changed) whose normalized value differs from the current live `repo`. Fields the
 // user never touched are never sent, so background refreshes are not reverted; an
 // explicit choice equal to an older value is still sent once `repo` has moved on.
-function repoDraftChanges(edits, repo) {
+function repoDraftChanges(edits, repo, defaults) {
   const own = edits || {}
-  const next = normalizeRepoDraft({ ...seedRepoDraft(repo || {}), ...own })
-  const base = normalizeRepoDraft(seedRepoDraft(repo || {}))
+  const next = normalizeRepoDraft({ ...seedRepoDraft(repo || {}, defaults), ...own })
+  const base = normalizeRepoDraft(seedRepoDraft(repo || {}, defaults))
   const body = {}
   for (const k of REPO_FIELD_ORDER) {
     if (!Object.prototype.hasOwnProperty.call(own, k) || next[k] === base[k]) continue
@@ -857,7 +869,7 @@ function RepoRow({ repo: r, defaults, editing, busy, editorId, onEdit, buttonRef
       }),
       jsx('td', { children: jsx('span', { className: 'fc-trunc fc-mono', title: r.default_branch || '', children: r.default_branch || '—' }) }),
       jsx(PolicyCell, { field: 'merge_policy', value: r.merge_policy }),
-      jsx(PolicyCell, { field: 'publish_policy', value: r.publish_policy }),
+      jsx(PolicyCell, { field: 'publish_policy', value: resolvePublishPolicy(r, defaults) }),
       jsx('td', { className: 'fc-num', children: r.max_fix_rounds ?? '—' }),
       jsx('td', {
         'data-field': 'design_provider',
@@ -918,7 +930,7 @@ function RepoEditor({ ctx, repo, defaults, autoResolved, reposQ, editorId, savin
   // Untouched fields always show the live (possibly refreshed) repo value and are never
   // PATCHed; edited fields keep the user's value across background refreshes.
   const [edits, setEdits] = useState({})
-  const live = seedRepoDraft(repo)
+  const live = seedRepoDraft(repo, defaults)
   const draft = { ...live, ...edits }
   const [errors, setErrors] = useState({})
   const [apiError, setApiError] = useState(null)
@@ -930,7 +942,7 @@ function RepoEditor({ ctx, repo, defaults, autoResolved, reposQ, editorId, savin
     branchRef.current?.focus?.()
   }, [])
 
-  const changes = repoDraftChanges(edits, repo)
+  const changes = repoDraftChanges(edits, repo, defaults)
   const count = Object.keys(changes).length
   const errorCount = Object.keys(errors).length
   const fid = name => `${editorId}-${name}`
@@ -1012,11 +1024,14 @@ function RepoEditor({ ctx, repo, defaults, autoResolved, reposQ, editorId, savin
       ]
     })
   }
-  const select = (options, inheritLabel) => props => jsx('select', {
+  // `unknownLabel` adds a disabled '' option only while the value is '' so real DOM
+  // <select> shows it instead of falling back to the first option (selectedIndex 0).
+  const select = (options, inheritLabel, unknownLabel) => props => jsx('select', {
     ...props,
     className: 'fc-input',
     children: [
       inheritLabel ? jsx('option', { key: '__inherit', value: '', children: inheritLabel }) : null,
+      unknownLabel && props.value === '' ? jsx('option', { key: '__unknown', value: '', disabled: true, children: unknownLabel }) : null,
       ...[...new Set([...options, ...(props.value && !options.includes(props.value) ? [props.value] : [])])]
         .map(o => jsx('option', { key: o, value: o, children: o }))
     ]
@@ -1090,7 +1105,7 @@ function RepoEditor({ ctx, repo, defaults, autoResolved, reposQ, editorId, savin
                 name: 'publish_policy',
                 label: 'Publish policy',
                 hint: 'auto pushes and opens a PR once verified; ask keeps work local until you approve.',
-                control: select(PUBLISH_POLICY_OPTIONS)
+                control: select(PUBLISH_POLICY_OPTIONS, null, 'Invalid / unknown — choose policy')
               }),
               field({
                 name: 'max_fix_rounds',
@@ -1251,7 +1266,7 @@ function ReposSection({ ctx, reposQ }) {
                   'New repos start with merge ',
                   jsx('span', { className: 'fc-mono', children: defaults.merge_policy || 'auto' }),
                   ' · publish ',
-                  jsx('span', { className: 'fc-mono', children: defaults.publish_policy || 'auto' }),
+                  jsx('span', { className: 'fc-mono', children: resolvePublishPolicy({}, defaults) || 'unknown' }),
                   ', set per repo.'
                 ]
               })

@@ -806,7 +806,8 @@ function readEditor(tree) {
       describedBy: ctl.props['aria-describedby'],
       err: err ? { id: err.node.props.id, text: text(err.node).trim() } : null,
       hint: hint ? { id: hint.node.props.id, text: text(hint.node).replace(/\s+/g, ' ').trim() } : null,
-      options: ctl.type === 'select' ? findAll(ctl, n => n.type === 'option').map(o => [o.node.props.value, text(o.node).trim()]) : null
+      options: ctl.type === 'select' ? findAll(ctl, n => n.type === 'option').map(o => [o.node.props.value, text(o.node).trim()]) : null,
+      disabledOptions: ctl.type === 'select' ? findAll(ctl, n => n.type === 'option' && n.props.disabled).map(o => [o.node.props.value, text(o.node).trim()]) : null
     }
   }
   const msg = find(form, n => n.props['aria-live'] === 'polite').node
@@ -1109,6 +1110,57 @@ async function runReposScenarios(report) {
   P.legacySeed = mod.seedRepoDraft({ ...REPOS[2], publish_policy: undefined }).publish_policy
   P.unknownSeed = mod.seedRepoDraft({ ...REPOS[2], publish_policy: null }).publish_policy
   P.fixUnknown = mod.repoDraftChanges({ publish_policy: 'auto' }, { ...REPOS[2], publish_policy: null })
+  const { publish_policy: _omit, ...legacyRepo2 } = REPOS[2]
+  P.seeds = {
+    omittedNoDefaults: mod.seedRepoDraft(legacyRepo2).publish_policy,
+    omittedDefaultAsk: mod.seedRepoDraft(legacyRepo2, { publish_policy: 'ask' }).publish_policy,
+    omittedDefaultNull: mod.seedRepoDraft(legacyRepo2, { publish_policy: null }).publish_policy,
+    omittedDefaultBogus: mod.seedRepoDraft(legacyRepo2, { publish_policy: 'bogus' }).publish_policy,
+    nullWithDefaultAuto: mod.seedRepoDraft({ ...REPOS[2], publish_policy: null }, { publish_policy: 'auto' }).publish_policy,
+    bogus: mod.seedRepoDraft({ ...REPOS[2], publish_policy: 'bogus' }, { publish_policy: 'auto' }).publish_policy,
+    explicitAsk: mod.seedRepoDraft({ ...REPOS[2], publish_policy: 'ask' }, { publish_policy: 'auto' }).publish_policy
+  }
+  P.omittedNoSpurious = mod.repoDraftChanges({ default_branch: 'main' }, legacyRepo2, { publish_policy: 'auto' })
+  { // Valid ask repo: still only the two policy options, no unknown placeholder.
+    m = mountRepos({ data: { repos: REPOS, defaults: REPO_DEFAULTS }, client })
+    tree = m.render()
+    fire(editBtnHit(tree, 'acme-web-dashboard')); tree = m.render()
+    P.openedAsk = readEditor(tree).fields.publish_policy
+  }
+  const subsOf = t => findAll(find(t, n => n.props.className === 'fc-sec fc-repos-sec').node, n => n.props.className === 'fc-sec-sub').map(h => text(h.node).replace(/\s+/g, ' ').trim())
+
+  // Explicit null policy (repo + global default): unknown, never auto; choosing auto is an edit.
+  const N = r.publishNull = {}
+  m = mountRepos({ data: { repos: REPOS.map((x, i) => (i === 0 ? { ...x, publish_policy: null } : i === 2 ? { ...x, publish_policy: 'bogus' } : x)), defaults: { ...REPO_DEFAULTS, publish_policy: null } }, client })
+  tree = m.render()
+  N.subs = subsOf(tree)
+  N.cells = readRepos(tree).rows.map(x => x.publish)
+  fire(editBtnHit(tree, 'tozes-factonio')); tree = m.render()
+  N.opened = readEditor(tree)
+  change(tree, 'publish_policy', 'auto'); tree = m.render()
+  N.dirty = readEditor(tree)
+  await submitForm(tree); tree = m.render()
+  N.rests = [...m.rests]
+  m = mountRepos({ data: { repos: REPOS, defaults: { ...REPO_DEFAULTS, publish_policy: 'bogus' } }, client })
+  N.bogusDefaultSubs = subsOf(m.render())
+  { const { publish_policy: _p, ...noPolicyDefaults } = REPO_DEFAULTS
+    m = mountRepos({ data: { repos: REPOS, defaults: noPolicyDefaults }, client })
+    N.omittedDefaultSubs = subsOf(m.render()) }
+
+  // Older backend: no publish_policy key on any repo; falls back to the global default cleanly.
+  const O = r.publishOmitted = {}
+  const legacyRepos = REPOS.map(({ publish_policy: _x, ...x }) => x)
+  m = mountRepos({ data: { repos: legacyRepos, defaults: { ...REPO_DEFAULTS, publish_policy: 'auto' } }, client })
+  tree = m.render()
+  O.cells = readRepos(tree).rows.map(x => x.publish)
+  fire(editBtnHit(tree, 'tozes-factonio')); tree = m.render()
+  O.opened = readEditor(tree)
+  change(tree, 'default_branch', 'trunk'); tree = m.render()
+  O.dirty = readEditor(tree)
+  await submitForm(tree); tree = m.render()
+  O.rests = [...m.rests]
+  m = mountRepos({ data: { repos: legacyRepos, defaults: REPO_DEFAULTS }, client })
+  O.cellsAskDefault = readRepos(m.render()).rows.map(x => x.publish.text)
 
   globalThis.__fcReposState = undefined
   globalThis.__fcQueryClient = undefined
@@ -3318,9 +3370,58 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertTrue(p["closed"])
         self.assertEqual(p["changes"], {"publish_policy": "auto"})
         # An unresolvable policy (API null) is never presented as auto, so choosing auto is a real edit.
-        self.assertEqual(p["legacySeed"], "")
+        # An omitted key (older backend) inherits the global default, auto when that is omitted too.
+        self.assertEqual(p["legacySeed"], "auto")
         self.assertEqual(p["unknownSeed"], "")
         self.assertEqual(p["fixUnknown"], {"publish_policy": "auto"})
+        self.assertEqual(f["disabledOptions"], [])
+        ask = p["openedAsk"]
+        self.assertEqual(ask["value"], "ask")
+        self.assertEqual(ask["options"], [["auto", "auto"], ["ask", "ask"]])
+        self.assertEqual(ask["disabledOptions"], [])
+        self.assertEqual(
+            p["seeds"],
+            {"omittedNoDefaults": "auto", "omittedDefaultAsk": "ask", "omittedDefaultNull": "", "omittedDefaultBogus": "",
+             "nullWithDefaultAuto": "", "bogus": "", "explicitAsk": "ask"},
+        )
+        self.assertEqual(p["omittedNoSpurious"], {"default_branch": "main"})
+
+    def test_repo_editor_explicit_null_publish_policy_is_unknown_never_auto(self):
+        n = self.report["repos"]["publishNull"]
+        self.assertEqual(n["subs"][1], "New repos start with merge auto · publish unknown , set per repo.")
+        self.assertEqual(n["bogusDefaultSubs"][1], "New repos start with merge auto · publish unknown , set per repo.")
+        self.assertEqual(n["omittedDefaultSubs"][1], "New repos start with merge auto · publish auto , set per repo.")
+        null_cell, ask_cell, bogus_cell = n["cells"]
+        for cell in (null_cell, bogus_cell):
+            self.assertEqual((cell["text"], cell["pol"], cell["title"]), ("—", None, "publish policy: unknown"))
+        self.assertEqual((ask_cell["text"], ask_cell["pol"]), ("ask", "ask"))
+        f = n["opened"]["fields"]["publish_policy"]
+        # Real DOM <select> needs a matching '' option, else it shows the first option (auto).
+        self.assertEqual(f["value"], "")
+        self.assertEqual(f["options"], [["", "Invalid / unknown — choose policy"], ["auto", "auto"], ["ask", "ask"]])
+        self.assertEqual(f["disabledOptions"], [["", "Invalid / unknown — choose policy"]])
+        self.assertEqual(n["opened"]["msg"]["text"], "")
+        self.assertTrue(n["opened"]["save"]["disabled"])
+        d = n["dirty"]
+        self.assertEqual(d["fields"]["publish_policy"]["value"], "auto")
+        self.assertEqual(d["fields"]["publish_policy"]["options"], [["auto", "auto"], ["ask", "ask"]])
+        self.assertEqual(d["msg"]["text"], "1 unsaved change")
+        self.assertFalse(d["save"]["disabled"])
+        self.assertEqual(n["rests"], self._patch({"publish_policy": "auto"}))
+
+    def test_repo_editor_omitted_publish_policy_falls_back_to_default(self):
+        o = self.report["repos"]["publishOmitted"]
+        for cell in o["cells"]:
+            self.assertEqual((cell["text"], cell["pol"], cell["title"]), ("auto", "auto", "auto: publishes automatically"))
+        self.assertEqual(o["cellsAskDefault"], ["ask", "ask", "ask"])
+        f = o["opened"]["fields"]["publish_policy"]
+        self.assertEqual(f["value"], "auto")
+        self.assertEqual(f["options"], [["auto", "auto"], ["ask", "ask"]])
+        self.assertEqual(f["disabledOptions"], [])
+        self.assertEqual(o["opened"]["msg"]["text"], "")
+        self.assertTrue(o["opened"]["save"]["disabled"])
+        self.assertEqual(o["dirty"]["msg"]["text"], "1 unsaved change")
+        self.assertEqual(o["rests"], self._patch({"default_branch": "trunk"}))
 
     def test_trail_publish_phase_tone_and_branch_pill(self):
         t = self.report["trail"]["dashboard"]["publish"]
