@@ -1693,6 +1693,47 @@ def _split_shell(text: str) -> list[str]:
         return re.findall(r"[();<>|&\n]+|[^\s();<>|&]+", text)
 
 
+_REDIRECT_OPS = frozenset({">", ">>", "<", "<>", ">|", ">&", "<&", "&>", "&>>", "<<", "<<<"})
+
+
+def _strip_redirections(tokens: list[str]) -> list[str]:
+    """Drop shell redirections (`> out`, `2>&1`, `<in`, `&>> log`) with their target and fd number, so they stay
+    part of the same simple command instead of splitting it or making the target look like its executable."""
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok not in _REDIRECT_OPS:
+            out.append(tok)
+            i += 1
+            continue
+        # `2>`: shlex splits the fd off; keep a digit that is the value of a preceding `--opt` (`--retries 2 > x`).
+        if out and out[-1].isdigit() and not (len(out) > 1 and out[-2].startswith("-") and "=" not in out[-2]):
+            out.pop()
+        i += 1
+        if i < len(tokens) and not _is_shell_op(tokens[i]):
+            i += 1
+    return out
+
+
+def _system_name(tok: str) -> Optional[str]:
+    """Basename of a bare (`env`) or absolute (`/usr/bin/env`) executable; None for a relative path such as
+    `scripts/env`, which is a repo-local program rather than the system wrapper, shell or interpreter."""
+    if "/" not in tok and "\\" not in tok:
+        return tok
+    return os.path.basename(tok) if tok.startswith("/") else None
+
+
+def _is_gate_flag(tok: str) -> bool:
+    """A long snapshot-regeneration option or any threshold-like option, which no wrapper may swallow."""
+    if not tok.startswith("-") or len(tok) < 2:
+        return False
+    key = tok.partition("=")[0]
+    if key.startswith("--") and key.lower() in _REGEN_FLAGS:
+        return True
+    return bool(_THRESHOLD_KEY_RE.search(key.lstrip("-")))
+
+
 # Execution wrappers that run their trailing argv as the real command: name -> (short options taking a
 # value, long options taking a value, required positional args before the command). `uv` only wraps `uv run`.
 _EXEC_WRAPPERS: dict[str, tuple[frozenset[str], frozenset[str], int]] = {
@@ -1715,15 +1756,18 @@ _UV_RUN_VALUE_OPTS = frozenset({
     "--link-mode", "--refresh-package", "--reinstall-package", "--upgrade-package", "--no-binary-package",
     "--no-build-package", "--allow-insecure-host", "--color", "-p", "-C", "-w", "-f", "-i",
 })
-_ENV_VALUE_OPTS = frozenset({"-u", "--unset", "-C", "--chdir"})
 # Shell reserved words that precede a command without being its executable.
 _SHELL_PREFIX_WORDS = frozenset({"!", "{", "}", "if", "then", "elif", "else", "do", "while", "until"})
 
 
-def _skip_options(tokens: list[str], i: int, short_vals: frozenset[str], long_vals: frozenset[str]) -> int:
-    """Index after a wrapper's options starting at ``i`` (``--`` consumed; value-taking options skip their value)."""
+def _skip_options(tokens: list[str], i: int, short_vals: frozenset[str],
+                  long_vals: frozenset[str]) -> Optional[int]:
+    """Index after a wrapper's options starting at ``i`` (``--`` consumed; value-taking options skip their value),
+    or None when an option is a regeneration/threshold flag, which then belongs to the wrapper as the command."""
     while i < len(tokens) and tokens[i].startswith("-") and len(tokens[i]) > 1:
         tok = tokens[i]
+        if _is_gate_flag(tok):
+            return None
         i += 1
         if tok == "--":
             break
@@ -1737,15 +1781,17 @@ def _skip_options(tokens: list[str], i: int, short_vals: frozenset[str], long_va
 
 def _skip_exec_wrapper(tokens: list[str], i: int) -> Optional[int]:
     """Index of the wrapped command when ``tokens[i]`` is a supported execution wrapper, else None."""
-    name = os.path.basename(tokens[i])
+    name = _system_name(tokens[i])
     if name == "uv":
         j = _skip_options(tokens, i + 1, frozenset("pCw"), frozenset({"--directory", "--project", "--cache-dir",
                                                                          "--config-file", "--color"}))
-        if j >= len(tokens) or tokens[j] != "run":
+        if j is None or j >= len(tokens) or tokens[j] != "run":
             return None
         j += 1
         while j < len(tokens) and tokens[j].startswith("-") and len(tokens[j]) > 1:
             tok = tokens[j]
+            if _is_gate_flag(tok):
+                return None
             j += 1
             if tok == "--":
                 break
@@ -1754,21 +1800,33 @@ def _skip_exec_wrapper(tokens: list[str], i: int) -> Optional[int]:
             if "=" not in tok and tok in _UV_RUN_VALUE_OPTS:
                 j += 1
         return j
-    spec = _EXEC_WRAPPERS.get(name)
+    spec = _EXEC_WRAPPERS.get(name or "")
     if spec is None:
         return None
     short_vals, long_vals, positional = spec
-    return _skip_options(tokens, i + 1, short_vals, long_vals) + positional
+    j = _skip_options(tokens, i + 1, short_vals, long_vals)
+    return None if j is None else j + positional
 
 
 def _env_split_script(opt: str, tokens: list[str], j: int) -> tuple[Optional[str], int]:
-    """The `env -S` script carried by option ``opt`` (attached `-S'...'`, `-S <s>` or `--split-string[=]<s>`)."""
-    if opt in ("-S", "--split-string"):
-        return (tokens[j], j + 1) if j < len(tokens) else (None, j)
-    if opt.startswith("--split-string="):
-        return opt.partition("=")[2], j
-    if opt.startswith("-S") and len(opt) > 2:
-        return opt[2:], j
+    """The `env -S` script carried by option ``opt`` (`-S <s>`, attached `-S'...'`, bundled `-iS <s>`, or
+    `--split-string[=]<s>`) and the index after any consumed value word (`-u NAME`, `-iC DIR`)."""
+    if opt.startswith("--"):
+        if opt == "--split-string":
+            return (tokens[j], j + 1) if j < len(tokens) else (None, j)
+        if opt.startswith("--split-string="):
+            return opt.partition("=")[2], j
+        if opt in ("--unset", "--chdir"):
+            return None, j + 1
+        return None, j
+    for k, ch in enumerate(opt[1:], start=1):
+        if ch in "SuC":
+            rest = opt[k + 1:]
+            if rest:
+                return (rest if ch == "S" else None), j
+            if j >= len(tokens):
+                return None, j
+            return (tokens[j] if ch == "S" else None), j + 1
     return None, j
 
 
@@ -1777,6 +1835,7 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
     `env [opts]` and execution wrappers (`timeout 30`, `uv run`, `nice -n 5`, ...), so wrapper options such as
     bash's or env's `-u` are never read as a regeneration flag. Only the command-head position (start, after a
     shell operator, `VAR=val` or a wrapper) is unwrapped: a positional argument such as `tests/env` is data."""
+    tokens = _strip_redirections(tokens)
     out: list[str] = []
     at_head = True
     i = 0
@@ -1790,7 +1849,7 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
             out.append(tok)
             i += 1
             continue
-        base = os.path.basename(tok)
+        base = _system_name(tok)
         if _ENV_ASSIGN_RE.match(tok):
             out.append(tok)
             i += 1
@@ -1801,19 +1860,27 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
         if base == "env" and depth < _MAX_SHELL_DEPTH:
             j = i + 1
             script: Optional[str] = None
-            while j < len(tokens) and tokens[j].startswith("-") and script is None:
+            gate = False
+            while j < len(tokens) and tokens[j].startswith("-") and len(tokens[j]) > 1 and script is None:
                 opt = tokens[j]
+                if _is_gate_flag(opt):
+                    gate = True
+                    break
                 j += 1
                 if opt == "--":
                     break
-                if opt in _ENV_VALUE_OPTS:
-                    j += 1  # `env -u NAME` unsets a variable; it is not jest's `-u`
-                    continue
+                # `env -u NAME` unsets a variable; it is not jest's `-u`
                 script, j = _env_split_script(opt, tokens, j)
+            if gate:
+                out.append(tok)
+                at_head, i = False, i + 1
+                continue
             if script is not None:
-                # GNU env splits the script into argv and appends the remaining arguments to it.
-                out.extend(_unwrap_shell_scripts(_split_shell(script) + tokens[j:], depth + 1))
-                return out
+                # GNU env splits the script into argv and appends the arguments up to the next shell operator.
+                end = next((k for k in range(j, len(tokens)) if _is_shell_op(tokens[k])), len(tokens))
+                out.extend(_unwrap_shell_scripts(_split_shell(script) + tokens[j:end], depth + 1))
+                at_head, i = False, end
+                continue
             i = j
             continue
         wrapped = _skip_exec_wrapper(tokens, i)
@@ -1826,6 +1893,9 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
                 j += 1
             while j < len(tokens) and tokens[j][:1] in ("-", "+") and len(tokens[j]) > 1 and tokens[j] != "--":
                 opt = tokens[j]
+                if _is_gate_flag(opt):
+                    has_c = False
+                    break
                 j += 1
                 if opt.startswith("--"):
                     continue
@@ -1845,7 +1915,8 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
 
 
 def _command_tokens(command: Any) -> list[str]:
-    """Shell-aware tokens of a hook command: operators split out and `sh -c` style scripts expanded inline."""
+    """Shell-aware tokens of a hook command: operators split out, redirections dropped and `sh -c` style
+    scripts expanded inline."""
     if isinstance(command, list):
         tokens = [str(c) for c in command]
     else:
@@ -1887,10 +1958,13 @@ def _command_head(seg: list[str]) -> int:
     while i < len(seg):
         if _ENV_ASSIGN_RE.match(seg[i]) or seg[i] in _SHELL_PREFIX_WORDS:
             i += 1
-        elif os.path.basename(seg[i]) == "env":
-            i += 1
-            while i < len(seg) and seg[i].startswith("-") and len(seg[i]) > 1:
-                i += 2 if seg[i] in _ENV_VALUE_OPTS else 1
+        elif _system_name(seg[i]) == "env":
+            j = i + 1
+            while j < len(seg) and seg[j].startswith("-") and len(seg[j]) > 1 and not _is_gate_flag(seg[j]):
+                _, j = _env_split_script(seg[j], seg, j + 1)
+            if j < len(seg) and _is_gate_flag(seg[j]):
+                break
+            i = j
         else:
             wrapped = _skip_exec_wrapper(seg, i)
             if wrapped is None:
@@ -1907,6 +1981,8 @@ def _python_args_start(seg: list[str], i: int) -> int:
             return i + 2
         if not tok.startswith("-") or tok == "-":
             return i + 1
+        if _is_gate_flag(tok):
+            return i
         i += 1
         if tok.startswith("--"):
             if tok == "--check-hash-based-pycs":
@@ -1925,6 +2001,8 @@ def _python_args_start(seg: list[str], i: int) -> int:
 def _shell_args_start(seg: list[str], i: int) -> int:
     """First index after a non-`-c` shell's own options and its script path (`bash -u script.sh ARGS`)."""
     while i < len(seg) and seg[i][:1] in ("-", "+") and len(seg[i]) > 1 and seg[i] != "--":
+        if _is_gate_flag(seg[i]):
+            return i
         i += 2 if seg[i][-1] in ("o", "O") else 1
     if i < len(seg) and seg[i] == "--":
         i += 1
@@ -1941,7 +2019,7 @@ def _regen_flags(tokens: list[str]) -> set[str]:
         head = _command_head(seg)
         if head >= len(seg):
             continue
-        name = os.path.basename(seg[head])
+        name = _system_name(seg[head]) or ""
         if name == "busybox" and head + 1 < len(seg) and seg[head + 1] in _SHELLS:
             head, name = head + 1, seg[head + 1]
         start, short_ok = head + 1, name not in _SHORT_FLAG_EXEMPT
@@ -2080,7 +2158,17 @@ def _threshold_loosening(base_tokens: list[str], live_tokens: list[str]) -> list
                 pool_live.setdefault(key, []).extend(finite(occ, key))
     for key in sorted(pool_base):
         reasons.extend(_compare_thresholds(key, pool_base[key], pool_live.get(key, []), " in a changed command"))
+    if len(matched_base) < len(base_segs):
+        # A base command was edited (even by an unrelated `--verbose`), so a threshold it never set is new
+        # tolerance on an existing check, not a brand-new check's own bar.
+        for key in sorted(set(pool_live) - set(pool_base)):
+            if any(v > 0 for v in pool_live[key]):
+                reasons.append(f"adds loosening threshold `{key}={max(pool_live[key]):g}` in a changed command")
     return reasons
+
+
+def _or_fallbacks(tokens: list[str]) -> int:
+    return sum(tok.count("||") for tok in tokens if _is_shell_op(tok))
 
 
 def _visual_hook_loosening(base_hook: dict[str, Any], live_hook: dict[str, Any]) -> list[str]:
@@ -2091,6 +2179,8 @@ def _visual_hook_loosening(base_hook: dict[str, Any], live_hook: dict[str, Any])
     if added_regen:
         reasons.append("adds snapshot-regeneration flag(s) " + ", ".join(f"`{f}`" for f in added_regen))
     reasons.extend(_threshold_loosening(base_tokens, live_tokens))
+    if _or_fallbacks(live_tokens) > _or_fallbacks(base_tokens):
+        reasons.append("adds shell `||` fallback to visual_diff hook (a failing check can still pass)")
     base_frozen = _frozen_baseline_globs(base_hook)
     if base_frozen:
         live_frozen = _frozen_baseline_globs(live_hook) if live_hook.get("kind") == "visual_diff" else []

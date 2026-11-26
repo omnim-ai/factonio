@@ -2644,5 +2644,122 @@ class TestFixRound5WrappersBooleanFlagsSegmentsAndHarnessCovers(unittest.TestCas
             self.assertIn(".factonio/model.cfg", _changed_files(repo, base, include_harness_dir=True))
 
 
+class TestFixRound6ChangedCommandThresholdsFallbacksPathsAndRedirects(unittest.TestCase):
+    """New thresholds on edited commands, `||` fallbacks, repo-local wrapper-named paths, redirections and
+    bundled `env -iS`."""
+
+    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_cases = TestFixRound4CompoundThresholdsAndShortFlags._assert_cases
+
+    def _reasons(self, base: Any, live: Any) -> str:
+        from factonio.harness import detect_harness_gate_loosening
+
+        with isolated_hermes_home() as home:
+            repo = self._visual_repo(home, base, name="svc")
+            self._set_command(repo, live)
+            return json.dumps(detect_harness_gate_loosening(repo)["findings"])
+
+    def test_new_threshold_on_edited_command_is_loosening(self):
+        a, b, c = "python3 check_snap.py a", "python3 check_snap.py b", "python3 check_snap.py c"
+        mixed = f"{a} --threshold 0.01 && {b} --threshold 0.05"
+        pw = "npx playwright test"
+        self._assert_cases({
+            "--verbose --threshold": ("python3 check.py", "python3 check.py --verbose --threshold 0.5", True),
+            "--reporter --max-diff-pixels": (pw, f"{pw} --reporter=line --max-diff-pixels=99999", True),
+            "CI=1 --max-diff-pixels": (pw, f"CI=1 {pw} --max-diff-pixels=99999", True),
+            "python3 -u --threshold": ("python3 check_ui.py", "python3 -u check_ui.py --threshold 0.99", True),
+            "redirect + threshold": ("python3 check.py", "python3 check.py --threshold 0.5 2>&1", True),
+            "verbose only": ("python3 check.py", "python3 check.py --verbose", False),
+            "zero threshold on edited": ("python3 check.py", "python3 check.py --verbose --threshold 0", False),
+            "new check appended": (mixed, f"{mixed} && {c} --threshold 0.02", False),
+        })
+
+    def test_or_fallback_is_loosening(self):
+        self._assert_cases({
+            "|| second run": ("npx jest --threshold 0.01", "npx jest --threshold 0.01 || npx jest --threshold 0.05",
+                              True),
+            "|| true": ("a --threshold 0.01", "a --threshold 0.01 || true", True),
+            "sh -c || true": ("a --threshold 0.01", "sh -c 'a --threshold 0.01 || true'", True),
+            "|| unchanged": ("a --threshold 0.01 || b", "a --threshold 0.01 || b", False),
+            "&& added": ("a --threshold 0.01", "a --threshold 0.01 && c --threshold 0.02", False),
+        })
+        self.assertIn("adds shell `||` fallback", self._reasons("a --threshold 0.01", "a --threshold 0.01 || true"))
+
+    def test_relative_paths_named_like_wrappers_are_not_unwrapped(self):
+        cases: dict[str, tuple[Any, Any, bool]] = {}
+        for path in ("tests/env", "./bin/env", "scripts/timeout", "scripts/nice", "scripts/time",
+                     "scripts/python3"):
+            cases[path] = (f"{path} --threshold 0.01", f"{path} --update-snapshots --threshold 0.99", True)
+        for path in ("scripts/sh", "scripts/bash"):
+            cases[path] = (f"{path} --threshold 0.01", f"{path} --update-snapshots --threshold 0.01", True)
+        cases["scripts/sh -u"] = ("scripts/sh --threshold 0.01", "scripts/sh -u --threshold 0.01", True)
+        cases["tests/env bare"] = ("tests/env", "tests/env --update-snapshots", True)
+        cases["true -> tests/env"] = ("true --threshold 0.01", "tests/env --update-snapshots --threshold 0.99", True)
+        cases["absolute /usr/bin/env -u NAME"] = ("true", "/usr/bin/env -u CI python3 -u check.py", False)
+        cases["absolute /bin/sh -c"] = ("true", "/bin/sh -c 'python3 -u check.py'", False)
+        self._assert_cases(cases)
+        for path in ("tests/env", "./bin/env", "scripts/timeout", "scripts/python3"):
+            with self.subTest(f"{path} reasons"):
+                reasons = self._reasons(f"{path} --threshold 0.01", f"{path} --update-snapshots --threshold 0.99")
+                self.assertIn("`--update-snapshots`", reasons)
+                self.assertIn("loosens threshold `threshold`", reasons)
+
+    def test_system_wrappers_never_swallow_gate_flags(self):
+        self._assert_cases({
+            "env --update-snapshots": ("true", "env --update-snapshots npx playwright test", True),
+            "timeout --update-snapshots": ("true", "timeout --update-snapshots 30 npx playwright test", True),
+            "nice --threshold": ("nice npx jest --threshold 0.01", "nice --threshold 0.99 npx jest", True),
+            "uv run --update-snapshots": ("true", "uv run --update-snapshots pytest", True),
+            "python3 --update-snapshots": ("true", "python3 --update-snapshots check.py", True),
+            "sh --update-snapshots -c": ("true", "sh --update-snapshots -c 'python3 check.py'", True),
+            "bash --update-snapshots script": ("true", "bash --update-snapshots check.sh", True),
+        })
+
+    def test_redirections_stay_in_the_same_simple_command(self):
+        self._assert_cases({
+            "leading > file": ("true", "> output.txt python3 -u check.py", False),
+            "leading 2>/dev/null": ("true", "2>/dev/null python3 -u check.py", False),
+            "trailing > file 2>&1": ("true", "python3 -u check.py > output.txt 2>&1", False),
+            "&>> log": ("true", "python3 -u check.py &>> log.txt", False),
+            "< input": ("true", "< in.txt python3 -u check.py", False),
+            "leading > file jest -u": ("true", "> output.txt npx jest -u", True),
+            "trailing redirect jest -u": ("true", "npx jest -u 2>/dev/null", True),
+        })
+
+    def test_env_bundled_split_string_and_scoped_recursion(self):
+        five = " && ".join(["env -S 'true'"] * 4 + ["env -S 'npx jest -u'"])
+        self._assert_cases({
+            "env -iS": ("true", 'env -iS "npx jest -u"', True),
+            "env -iS attached": ("true", "env -iS'npx jest -u'", True),
+            "env -iu NAME": ("true", "env -iu CI python3 -u check.py", False),
+            "five sequential env -S": ("true", five, True),
+            "env -S scoped to its command": ("true", "env -S 'python3' -u check.py && npx playwright test", False),
+        })
+
+    def test_redirected_python_and_edited_threshold_end_to_end(self):
+        from factonio.harness import audit_harness, check_harness
+
+        script = ("import sys\n"
+                  "t = float(sys.argv[sys.argv.index('--threshold') + 1]) if '--threshold' in sys.argv else 0.01\n"
+                  "sys.exit(1 if 0.25 > t else 0)\n")
+        with isolated_hermes_home() as home:
+            repo = self._visual_repo(home, "python3 check.py", name="svc")
+            _write(repo, "check.py", script)
+            _commit_all(repo, "visual check script")
+            self.assertEqual(check_harness(str(repo), run_hooks=True)["hook_results"]["failed_required"], ["pixels"])
+            self._set_command(repo, "python3 check.py --verbose --threshold 0.5")
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertEqual(chk["hook_results"]["failed_required"], [])
+            self.assertFalse(chk["valid"])
+            self.assertTrue(chk["gate_loosening"]["loosened"])
+            audit = audit_harness(str(repo))
+            self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("stale", True))
+
+            self._set_command(repo, "> output.txt python3 -u check.py 2>&1")
+            chk = check_harness(str(repo))
+            self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+
+
 if __name__ == "__main__":
     unittest.main()
