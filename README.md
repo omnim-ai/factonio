@@ -150,7 +150,7 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 
 | Command | Purpose |
 |---|---|
-| `hermes factonio init [--apply-config] [--workers N] [--force]` | Create or update the headless `factonio` worker profile and plugin link |
+| `hermes factonio init [--apply-config] [--workers N] [--force] [--force-link]` | Create or update the headless `factonio` worker profile and plugin link (refuses to link a persistent profile to an ephemeral worktree/workspace/scratch checkout unless `--force-link`) |
 | `hermes factonio doctor [--json]` | Check `git`, `gh auth`, worker profile, Kanban config, and cross-model setup |
 | `hermes factonio add <owner/repo> [--path DIR] [--merge-policy auto\|ask] [--max-fix-rounds N]` | Register, clone (unless `--no-clone`), anchor Hermes Project, and inspect CI |
 | `hermes factonio update\|edit <repo> [--merge-policy ...] [--max-fix-rounds N] [--default-branch B] [--design-provider ...] [--design-approval ...] [--default-rigor standard\|high\|inherit]` | Update per-repo settings (`inherit` clears design and rigor overrides) |

@@ -33,6 +33,13 @@ This barrier is the entire reason Black-Box Verification runs in an isolated car
    git rev-parse HEAD
    ```
    Verify `git rev-parse HEAD` matches the PR's `head_sha`.
+3. **Pin an isolated Hermes home before probing CLI/API flows.** Commands such as `hermes factonio init`, `doctor`, `add`, or `harness` read and write `HERMES_HOME` and the Kanban DB. Run them from the scratch checkout only with a throwaway home so real profiles, `kanban.db`, and `plugins/` symlinks are never mutated:
+   ```bash
+   export HERMES_HOME="$(mktemp -d)" HERMES_KANBAN_DB="$HERMES_HOME/kanban.db"
+   mkdir -p "$HERMES_HOME/plugins" && ln -s "$PWD" "$HERMES_HOME/plugins/factonio"   # only when probing Factonio itself
+   printf 'plugins:\n  enabled: [factonio]\n' > "$HERMES_HOME/config.yaml"
+   ```
+   Never run `hermes factonio init --force-link` against a real profile from a scratch checkout; the persistent worker link guard refuses ephemeral targets for exactly this reason. Remove the temporary home during cleanup.
 
 ### 2. Run Acceptance and Holdout Scenarios
 
