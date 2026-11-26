@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-26T05:33:33Z",
+  "generated_at": "2026-11-26T08:40:00Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -217,7 +217,8 @@
         "Dashboard, sidebar and repo editor render with host theme tokens only",
         "Repo editor sends default_rigor standard/high, or null to inherit, with partial-diff dirty tracking",
         "Trends strip renders populated/empty/loading/error states from GET /metrics/history",
-        "Sidebar verification panel consensus is fail-closed and never shows pass without the recorded verify_panel_consensus"
+        "Sidebar verification panel consensus is fail-closed and never shows pass without the recorded verify_panel_consensus",
+        "Sidebar panel shows inconclusive (never pass) when any expected lane from spawn_verify panel_lanes or the recorded consensus lanes is missing"
       ]
     },
     {
@@ -262,7 +263,8 @@
         "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest discover -s tests -v'"
       ],
       "scenarios": [
-        "Full suite passes from any checkout or worktree directory name"
+        "Full suite passes from any checkout or worktree directory name",
+        "Sidebar missing-lane regressions (shrunk or extended live lane sets) fail closed in tests.test_desktop_plugin"
       ]
     }
   ],
