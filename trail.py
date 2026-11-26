@@ -288,12 +288,16 @@ def _remaining() -> float:
 
 
 def _busy_timeout_ms() -> int:
+    """SQLite busy wait for the next statement: the budget's cap, clipped to the time left.
+
+    The budget bounds *waiting on locks*, not uncontended work. Once it is spent (e.g. a cold
+    WAL switch + schema creation on a slow CI disk), statements still run with a 1 ms busy wait,
+    so an uncontended store succeeds while a held lock fails fast as ``database is locked``.
+    """
     budget = _BUDGET.get()
     if budget is None:
         return _BUSY_TIMEOUT_MS
     remaining_ms = int(_remaining() * 1000)
-    if remaining_ms <= 0:
-        raise _locked("trail.db lock budget exhausted")
     return max(1, min(budget.busy_timeout_ms, remaining_ms))
 
 
