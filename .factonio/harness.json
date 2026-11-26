@@ -98,6 +98,7 @@
         "`add` subcommand runs and exits 0 with --help",
         "`arena` subcommand runs and exits 0 with --help",
         "`doctor` subcommand runs and exits 0 with --help",
+        "`eval` subcommand runs and exits 0 with --help",
         "`harness` subcommand runs and exits 0 with --help",
         "`init` subcommand runs and exits 0 with --help",
         "`issues` subcommand runs and exits 0 with --help",
@@ -237,6 +238,33 @@
       ]
     },
     {
+      "id": "eval",
+      "surface": "Blind skill & model eval harness",
+      "paths": [
+        "eval_skills.py",
+        "tools/eval_skills.py"
+      ],
+      "commands": [
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_eval_skills -v'",
+        "python3 -S tools/eval_skills.py bloat skills/implement --json"
+      ],
+      "scenarios": [
+        "`eval ab A B --phase P --seed S --json` blinds candidates into Candidate X / Candidate Y with no labels (including single-character `Candidate A` and metadata `candidate` / `variant` / `run_name` identities), model/vendor names, card ids or home paths in the packet, and the same seed gives the same key",
+        "A candidate that reads holdout/ (implement/design/verify-diff) or runs git diff / reads source (verify-blackbox) is disqualified, including `cat -v`, `execute_code` `read_file` / `open` / `Path.read_text`, `python3 -c` / `node -e` one-liners, `tool_call` wrappers and `.factonio/../src` traversal; quoted prohibitions and quoted JSON in user/system/tool messages are ignored; `rg 'app.py' README.md` is not a source read",
+        "`eval ab --strict-vendor` exits 1 before judging when any candidate or judge vendor is unknown or the judge shares a candidate's vendor family (provider-only vendors resolve); `--record-trail` logs skill_eval (phase eval) to trail.db and `--dry-run` never writes it (`dry_run: true`, `trail_decision_id: null`)",
+        "Top-level `verdict` / `scenarios_run` / `findings` beside `messages` are kept in the packet and scored by the rubric",
+        "`eval audit` exits 1 on barrier leaks; `eval bloat` accepts files or skill directories (`eval bloat skills` reports all 6 SKILL.md files) and exits 0 when measurement succeeds (budgets soft 3000 / hard 4500; `orchestrator` reported `over_budget`), exiting 1 on over_budget only with `--strict` / `--fail-on-over-budget`",
+        "`python3 -S tools/eval_skills.py {ab|audit|bloat}` runs standalone without Hermes or site-packages",
+        "Barrier audit fix round 2: user/system/tool envelopes suppress nested assistant calls inside `messages` / `events` / `transcript`; `print(\"Never read holdout/case.md\")` and `print(\"Never run git diff\")` are clean while `open(\"holdout/case.md\")` and `subprocess.run(\"git diff\")` are flagged; `deno eval \"Deno.readTextFileSync('src/auth.py')\"`, `rg secret`, `grep -R password .` and `sort < src/app.py` are source_read in verify-blackbox, while `rg 'app.py' README.md`, `rg foo .factonio/`, `cat < .factonio/verify.md` and `echo hi > out.py` stay clean",
+        "Barrier audit fix round 3: `search_files(pattern=\"SECRET\", target=\"content\")` with an omitted path, `path=\".\"` or `path=\"/home/alice/dev/repo/src\"` (structured or inside execute_code) is source_read and disqualified in A/B while `target=\"files\"` and `path=\".factonio\"` stay clean; Python code is audited from `ast.parse` call nodes so `print(\"Never run subprocess.run('git diff')\")` and `python3 -c 'print(\"open(\\\"holdout/case.md\\\")\")'` are clean while `subprocess.run([\"git\", \"diff\"])` and `read_file(\"holdout/case.md\")` are flagged; `cat <<'EOF'` heredoc bodies are passive data while `python3 - <<'EOF'` bodies are audited as programs",
+        "Fix round 4: `eval ab A.json B.json` without label metadata and direct-string candidates never leave `Candidate A` / `Candidate B` / `Option A` / `candidate_a` / `A:` headers in the judge packet (articles such as `a bug` / `an issue` stay intact; the original mapping lives only in `key`); `p = 'src/auth.py'; open(p).read(); p = 'README.md'` in execute_code is source_read (`eval audit` exit 1, A/B disqualification) because variables resolve in execution order (branches, loops and back edges merge by union; function scopes are isolated), while `p = 'src/app.py'; p = 'README.md'; open(p)` and `print(\"do not read src/app.py\")` stay clean",
+        "Fix round 5: `cmd = ['git', 'diff']; subprocess.run(cmd)` (also tuples, `['cat', p]`, `+=`, `append` / `extend` / `insert`, aliases, `os.execvp('git', cmd)`) in execute_code is diff_inspection or source_read with `eval audit` exit 1 and A/B disqualification, while `cmd = ['git', 'diff']; cmd = ['echo', 'ok']; subprocess.run(cmd)` stays clean and `paths = [...]; for p in paths: open(p)` binds every element; `open('probe.py', 'w')`, `mode='wb'`, `io.open(p, 'a')` and `Path(p).open('x')` are clean and never disqualify, while omitted, `r`, `r+`, `w+` and dynamic modes stay source_read",
+        "Fix round 6: `bash -lc \"git diff\"`, `bash -ec \"git diff\"`, `sh -ec \"cat src/app.py\"` (verify-blackbox) and `bash -lc \"cat holdout/synthetic.md\"` (implement) exit 1 from `eval audit` and disqualify the candidate in A/B, while `bash -lc \"echo never run git diff\"` stays clean; `eval ab A.json B.json` without label metadata redacts newline-separated `Option A` / `candidate_a` / `Candidate B` / `B:` headings; `search_files(**{'pattern': 'foo', 'target': 'content', 'path': '.factonio'})`, `search_files(**{'pattern': '*.py', 'target': 'files'})` and `opts = {...}; search_files(**opts)` stay clean while `path: 'src'` and `**unknown_kwargs` stay source_read",
+        "Fix round 7: in execute_code `opts = {'path': 'README.md'}; opts['path'] = 'src/auth.py'; read_file(**opts)`, `opts.update({'path': 'holdout/secret.md'})`, `read_file(**unknown)` and `open(**opts).read()` fail closed (source_read for verify-blackbox, holdout_access for implement / design / verify-diff) with `eval audit` exit 1 and A/B disqualification, while literal `read_file(**{'path': '.factonio/verify.md'})` and `open(**{'file': '/tmp/out.txt', 'mode': 'w'})` stay clean; `echo \"$(cat src/a.py)\"`, `printf \"%s\" \"$(cat src/a.py)\"` and `echo \"`git diff`\"` (verify-blackbox) and `echo \"$(cat holdout/synthetic.txt)\"` (implement) are flagged while `echo '$(cat src/a.py)'` and `echo \"never run git diff\"` stay clean; `Path(\"design\", \"/src/a.py\").read_text()`, `os.path.join`, `/` and `joinpath` reset on the absolute component while `Path(\"design\", \"mock.html\")` stays clean; an `except` handler sees `p = 'src/a.py'` set before a mid-try `raise` or raising call; `gh --repo owner/repo pr diff 31`, `gh -R owner/repo pr diff 31`, `gh --repo=owner/repo pr diff 31` and `gh pr --repo owner/repo diff 31` are diff_inspection while `gh --repo owner/repo pr view 31 --json state` stays clean",
+        "Fix round 8: `git show HEAD:holdout/synthetic.md`, `git show HEAD:./holdout/synthetic.md`, `git cat-file -p HEAD:holdout/synthetic.md` and `git show :0:holdout/synthetic.md` are holdout_access in implement / design / verify-diff with `eval audit` exit 1 and A/B disqualification, while `git show HEAD:README.md` and `echo 'never run git show HEAD:holdout/synthetic.md'` stay clean; `git cat-file -p HEAD:src/app.py` is source_read in verify-blackbox while `git cat-file -p HEAD:holdout/synthetic.md` stays clean"
+      ]
+    },
+    {
       "id": "observability",
       "surface": "Decision trail, metrics & watchdog",
       "paths": [
@@ -362,6 +390,13 @@
         "Sidebar missing-lane regressions (shrunk or extended live lane sets) fail closed in tests.test_desktop_plugin",
         "silent_start, trail audit and skill prose contracts are covered in tests.test_watchdog_liveness, tests.test_trail and tests.test_plugin_registration",
         "Trail-audit false positives, PR-scoped closure, malformed pr_number evidence and the cold-init lock-budget regression are covered in tests.test_trail, tests.test_pr_gate_hardening and tests.test_metrics_history",
+        "Barrier-audit fix round 2 regressions (envelope roles, printed prohibitions, Deno reads, recursive/default-root searches, stdin redirections) are covered in tests.test_eval_skills",
+        "Barrier-audit fix round 3 regressions (structured/code-tool content searches, printed-vs-executed Python calls, passive vs interpreter heredocs, bloat default exit 0 and --strict exit 1) are covered in tests.test_eval_skills",
+        "Fix round 4 regressions (default A/B packet redaction via API and standalone file CLI, execution-order/branch/loop/function-scope code reads and negative controls) are covered in tests.test_eval_skills",
+        "Fix round 5 regressions (assigned/mutated/aliased argv lists and tuples, reassignment before vs after run, list-variable loops, write-only vs read open modes via audit CLI and forced-judge A/B) are covered in tests.test_eval_skills",
+        "Fix round 6 regressions (grouped shell -lc/-ec options via audit CLI and forced-judge A/B, newline-separated default identity headings via API and standalone file CLI, literal and assigned **kwargs searches with negative controls) are covered in tests.test_eval_skills",
+        "Fix round 7 regressions (opaque **kwargs read_file/open reads in all four barrier phases, executed $(...) / backtick substitutions vs single-quoted text, absolute-component path reset, mid-try raising states, gh global options, each via audit API, standalone audit CLI and forced-judge A/B with negative controls) are covered in tests.test_eval_skills",
+        "Fix round 8 regressions (Git <rev>:<path> object operands HEAD:holdout/..., HEAD:./holdout/..., :0:holdout/..., git cat-file -p in implement / design / verify-diff, and REV:src/... source reads in verify-blackbox, each via audit API, standalone audit CLI and forced-judge A/B with REV:README.md and quoted-prose negative controls) are covered in tests.test_eval_skills",
         "recall, crash-pickup and core-principle contracts are covered in tests.test_recall_and_principles",
         "spaced and tab-interleaved holdout recall paths are covered end to end (log_decision -> trail --recall --json/--markdown -> Definition card) in tests.test_recall_and_principles",
         "ANSI CSI, OSC, DCS and C1 escape sequences inside holdout recall paths are covered end to end (log_decision -> trail --recall --json/--markdown -> Definition card) in tests.test_recall_and_principles",
@@ -417,6 +452,7 @@
       "add",
       "arena",
       "doctor",
+      "eval",
       "harness",
       "init",
       "issues",
