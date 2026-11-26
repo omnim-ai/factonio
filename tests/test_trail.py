@@ -672,6 +672,208 @@ class TestTrailCliAndApi(unittest.TestCase):
             self.assertIn("totals", metrics)
 
 
+class TestTrailAudit(unittest.TestCase):
+    KEYS = {"ok", "clean", "inspected", "active_inspected", "counts", "findings", "filters"}
+
+    def _kinds(self, audit: dict[str, Any]) -> dict[str, set[str]]:
+        out: dict[str, set[str]] = {}
+        for f in audit["findings"]:
+            out.setdefault(f["kind"], set()).add(f["decision_id"])
+        return out
+
+    def test_absent_store_is_clean_and_never_created(self):
+        from factonio import trail
+
+        with isolated_hermes_home() as home:
+            audit = trail.audit_trail_evidence()
+            self.assertEqual(set(audit), self.KEYS)
+            self.assertTrue(audit["ok"] and audit["clean"])
+            self.assertEqual((audit["inspected"], audit["active_inspected"], audit["findings"]), (0, 0, []))
+            self.assertEqual(audit["counts"], {k: 0 for k in trail.AUDIT_FINDING_KINDS})
+            self.assertFalse(trail.trail_db_path().exists())
+            other = home / "elsewhere" / "trail.db"
+            self.assertTrue(trail.audit_trail_evidence(db_path=other)["clean"])
+            self.assertFalse(other.parent.exists())
+
+    def test_each_finding_kind_and_superseded_rows_are_skipped(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            log = trail.log_decision
+            good = log("spawn_verify", tenant="w", phase="verify", card_id="t_v", why="PR opened",
+                       evidence={"pr_number": 7, "head_sha": "abc"}, result="spawned")
+            blank = log("note", tenant="w", phase="implement", card_id="t_i", why="", evidence={"files": ["a.py"]})
+            nulls = log("note", tenant="w", phase="define", card_id="t_d", why="scoped", evidence={"x": None, "y": ""})
+            weak = log("verify_verdict", tenant="w", phase="verify-diff", card_id="t_v", why="looked fine",
+                       evidence={"notes": "lgtm"}, result="spawned")
+            override = log("countersign override", tenant="w", phase="gate", card_id="t_g", why="human ok",
+                           evidence={"approver": "alice"})
+            loosen = log("relax ci", tenant="w", phase="implement", card_id="t_l", why="Skip test for flaky suite",
+                         evidence={"files": ["ci.yml"]})
+            flagged_ev = log("merge_pr", tenant="w", phase="merge", card_id="t_m", why="stacked tip",
+                             evidence={"pr_number": 9, "allow_stacked_merge": True}, result="merged")
+            unflagged_ev = log("merge_pr", tenant="w", phase="merge", card_id="t_m2", why="bottom of stack",
+                               evidence={"pr_number": 8, "allow_stacked_merge": False}, result="merged")
+            # A weak row corrected by a well-evidenced superseding row is not reported.
+            old = log("verify_verdict", tenant="w", phase="verify", card_id="t_s", why="", evidence={})
+            fixed = log("verify_verdict", tenant="w", phase="verify", card_id="t_s", why="re-ran suite",
+                        evidence={"tests_run": 12, "verdict": "pass"}, result="pass", supersedes_id=old["id"])
+
+            audit = trail.audit_trail_evidence(tenant="w")
+            kinds = self._kinds(audit)
+            self.assertEqual(kinds["missing_evidence"], {blank["id"], nulls["id"]})
+            self.assertEqual(kinds["weak_evidence"], {weak["id"], override["id"]})
+            self.assertEqual(kinds["gate_loosening"], {loosen["id"], flagged_ev["id"]})
+            self.assertNotIn("unclosed_escalation", kinds)
+            flagged = {f["decision_id"] for f in audit["findings"]}
+            for clean_row in (good, unflagged_ev, old, fixed):
+                self.assertNotIn(clean_row["id"], flagged)
+            self.assertEqual((audit["inspected"], audit["active_inspected"]), (10, 9))
+            self.assertEqual(
+                audit["counts"],
+                {"missing_evidence": 2, "weak_evidence": 2, "unclosed_escalation": 0, "gate_loosening": 2},
+            )
+            self.assertFalse(audit["clean"])
+            self.assertTrue(audit["ok"])
+            loose = next(f for f in audit["findings"] if f["decision_id"] == loosen["id"])
+            self.assertEqual(loose["tokens"], ["skip_test"])
+            self.assertEqual((loose["tenant"], loose["phase"], loose["card_id"]), ("w", "implement", "t_l"))
+
+    def test_unclosed_escalations_respect_scope_order_and_phase_filter(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            log = trail.log_decision
+            ev = {"pr_number": 1}
+            closed = log("verify_verdict", tenant="w", phase="verify", card_id="t_a", why="bug", evidence=ev,
+                         result="reject")
+            log("merge_pr", tenant="w", phase="merge", card_id="t_a", why="fixed", evidence=ev, result="merged")
+            other_card = log("verify_verdict", tenant="w", phase="verify", card_id="t_b", why="bug", evidence=ev,
+                             result="inconclusive")
+            tenant_wide = log("pr_gate", tenant="w", phase="gate", why="conflict", evidence=ev, result="blocked")
+            log("pr_gate", tenant="w", phase="gate", card_id="t_c", why="green", evidence=ev, result="ready")
+            # A resolution logged before the escalation does not close it.
+            log("pr_gate", tenant="x", phase="gate", why="green", evidence=ev, result="ready")
+            late = log("harness_init", tenant="x", phase="harness", why="doctor failed", evidence=ev,
+                       result="proof_failed")
+            escape = log("escaped_regression", tenant="x", phase="escape", card_id="t_fix", why="escaped",
+                         evidence={"escaped_from": "t_v", "fix_card_id": "t_fix"}, result="recorded")
+
+            audit = trail.audit_trail_evidence()
+            unclosed = self._kinds(audit)["unclosed_escalation"]
+            self.assertEqual(unclosed, {other_card["id"], late["id"], escape["id"]})
+            self.assertNotIn(closed["id"], unclosed)
+            self.assertNotIn(tenant_wide["id"], unclosed)
+            # Escape rows also need a verifiable artifact.
+            self.assertIn(escape["id"], self._kinds(audit)["weak_evidence"])
+
+            # --phase verify still sees the later `merged` row from the merge phase.
+            scoped = trail.audit_trail_evidence(tenant="w", phase="verify")
+            self.assertEqual(scoped["inspected"], 2)
+            self.assertEqual(self._kinds(scoped)["unclosed_escalation"], {other_card["id"]})
+            self.assertEqual(scoped["filters"], {"tenant": "w", "repo": None, "phase": "verify", "card_id": None})
+
+            log("verify_verdict", tenant="w", phase="verify", card_id="t_b", why="fixed", evidence=ev, result="pass")
+            self.assertTrue(trail.audit_trail_evidence(tenant="w", card_id="t_b")["clean"])
+
+    def test_inspects_every_row_beyond_display_limit_and_is_read_only(self):
+        import hashlib
+
+        from factonio import trail
+
+        with isolated_hermes_home():
+            trail.log_decision("seed", tenant="bulk", phase="define", why="seed", evidence={"files": ["x"]})
+            path = trail.trail_db_path()
+            total = trail.MAX_LIMIT + 25
+            with contextlib.closing(sqlite3.connect(path)) as conn:
+                conn.executemany(
+                    "INSERT INTO decisions(id, ts, tenant, phase, decision, why, evidence_json)"
+                    " VALUES (?, ?, 'bulk', 'define', 'note', '', '{}')",
+                    [(f"d_bulk{i:07d}", f"2026-01-01T00:00:00.{i:06d}Z") for i in range(total)],
+                )
+                conn.commit()
+            before = hashlib.sha256(path.read_bytes()).hexdigest()
+            audit = trail.audit_trail_evidence(tenant="bulk")
+            self.assertEqual(audit["inspected"], total + 1)
+            self.assertEqual(audit["counts"]["missing_evidence"], total)
+            # Opened mode=ro: the store itself is byte-identical (SQLite may add WAL sidecars only).
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before)
+            self.assertEqual(len(trail.query_decisions(tenant="bulk", limit=trail.MAX_LIMIT)), trail.MAX_LIMIT)
+
+    def test_unreadable_store_reports_error_not_clean(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            path = trail.trail_db_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"this is not a sqlite database" * 64)
+            audit = trail.audit_trail_evidence()
+            self.assertFalse(audit["ok"])
+            self.assertFalse(audit["clean"])
+            self.assertIn("trail.db unreadable", audit["error"])
+            self.assertIn("ERROR", trail.render_trail_audit_text(audit))
+            self.assertIn("**Error:**", trail.render_trail_audit_markdown(audit))
+
+    def test_renderers(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            clean = trail.audit_trail_evidence()
+            self.assertTrue(trail.render_trail_audit_text(clean).startswith("Trail audit: CLEAN"))
+            md = trail.render_trail_audit_markdown(clean)
+            self.assertTrue(md.startswith("## Trail Audit\n"))
+            self.assertIn("**Clean:** no findings", md)
+            self.assertIn("| gate_loosening | 0 |", md)
+
+            row = trail.log_decision("force-merge | now", tenant="w", phase="merge", card_id="t_m", why="")
+            audit = trail.audit_trail_evidence()
+            text = trail.render_trail_audit_text(audit)
+            self.assertIn("ATTENTION - 3 finding(s)", text)
+            self.assertIn(f"! gate_loosening {row['id']}", text)
+            md = trail.render_trail_audit_markdown(audit)
+            self.assertIn("**Attention:** 3 finding(s)", md)
+            self.assertIn("force-merge \\| now", md)
+            self.assertIn("`t_m`", md)
+
+    def test_cli_trail_audit_exit_codes_and_formats(self):
+        run = TestTrailCliAndApi._cli(self)
+        from factonio import trail
+
+        with isolated_hermes_home():
+            code, out = run("trail", "--audit")
+            self.assertEqual(code, 0)
+            self.assertIn("Trail audit: CLEAN", out)
+
+            trail.log_decision("spawn_verify", tenant="good", phase="verify", card_id="t_ok", why="PR opened",
+                               evidence={"pr_number": 3}, result="spawned")
+            bad = trail.log_decision("verify_verdict", tenant="bad", phase="verify", card_id="t_bad",
+                                     why="", evidence={}, result="reject")
+            code, out = run("trail", "--audit", "--tenant", "good")
+            self.assertEqual(code, 0, out)
+
+            code, out = run("trail", "--audit")
+            self.assertEqual(code, 1)
+            self.assertIn("ATTENTION", out)
+            self.assertIn(bad["id"], out)
+
+            for argv in (("trail", "--audit", "--card", "t_bad", "--json"),
+                         ("--json", "trail", "--audit", "--phase", "verify", "--repo", "", "--card", "t_bad")):
+                code, out = run(*argv)
+                self.assertEqual(code, 1)
+                data = json.loads(out)
+                self.assertEqual(set(data), self.KEYS)
+                self.assertEqual(data["filters"]["card_id"], "t_bad")
+                self.assertEqual(
+                    data["counts"],
+                    {"missing_evidence": 1, "weak_evidence": 1, "unclosed_escalation": 1, "gate_loosening": 0},
+                )
+
+            code, out = run("trail", "--audit", "--markdown", "--tenant", "bad")
+            self.assertEqual(code, 1)
+            self.assertTrue(out.startswith("## Trail Audit"))
+            self.assertIn("`unclosed_escalation`", out)
+
+
 class TestRetroAndSkills(unittest.TestCase):
     def test_retro_prompt_mines_trail_and_applies_correct_ladder(self):
         from factonio import RETRO_BLUEPRINT_PROMPT as prompt

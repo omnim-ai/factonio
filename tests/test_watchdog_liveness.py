@@ -143,6 +143,37 @@ class TestPhaseThresholds(unittest.TestCase):
         self.assertEqual(r("implement", stale_heartbeat_minutes=12, phase_overrides={"design": 99}), 12)
         self.assertEqual(r("implement", phase_overrides={"implement": 0}), 25)
 
+    def test_initial_progress_window_defaults_cap_and_opt_out(self):
+        from factonio.config import (
+            DEFAULT_INITIAL_PROGRESS_MINUTES,
+            DEFAULT_SETTINGS,
+            resolve_initial_progress_minutes as r,
+        )
+
+        self.assertEqual(DEFAULT_INITIAL_PROGRESS_MINUTES, 10)
+        self.assertEqual(DEFAULT_SETTINGS["initial_progress_minutes"], 10)
+        self.assertEqual(r("implement"), 10)
+        self.assertEqual(r("design", initial_progress_minutes=12), 12)
+        # Capped at the phase stale threshold so it never fires after the full check.
+        self.assertEqual(r("verify-diff"), 10)
+        self.assertEqual(r("verify-diff", initial_progress_minutes=15), 10)
+        self.assertEqual(r("implement", initial_progress_minutes=40), 25)
+        self.assertEqual(r("implement", phase_overrides={"implement": 5}), 5)
+        self.assertEqual(r("implement", stale_heartbeat_minutes=6), 6)
+        # Explicit non-positive values disable the check; junk falls back to the default.
+        self.assertIsNone(r("implement", initial_progress_minutes=0))
+        self.assertIsNone(r("implement", initial_progress_minutes=-3))
+        self.assertIsNone(r("implement", initial_progress_minutes="0"))
+        self.assertEqual(r("implement", initial_progress_minutes="junk"), 10)
+        self.assertEqual(r("implement", initial_progress_minutes=None), 10)
+
+    def test_initial_progress_minutes_in_config_schema(self):
+        import hermes_yaml as yaml
+
+        schema = yaml.safe_load((PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8"))["config_schema"]
+        self.assertEqual(schema["initial_progress_minutes"]["type"], "int")
+        self.assertEqual(schema["initial_progress_minutes"]["default"], 10)
+
 
 class TestWatchdogLiveness(unittest.TestCase):
     def setUp(self) -> None:
@@ -214,7 +245,10 @@ class TestWatchdogLiveness(unittest.TestCase):
             for tid, skill in (("t_vd", "factonio:verify-diff"), ("t_vb", "factonio:verify-blackbox"),
                                ("t_def", "factonio:define"), ("t_imp", "factonio:implement"),
                                ("t_des", "factonio:design")):
-                _add_task(db, tid, now=now, skill=skill, started_ago=22 * 60, heartbeat_ago=22 * 60)
+                # One real post-start event 21m ago isolates the steady-state phase thresholds
+                # from the early silent_start window.
+                _add_task(db, tid, now=now, skill=skill, started_ago=22 * 60, heartbeat_ago=22 * 60,
+                          events=(("edited", 21 * 60),))
             found = _scan(db, now)
             self.assertEqual(set(found), {"t_vd", "t_vb", "t_def"})
             self.assertEqual(found["t_vd"]["threshold_minutes"], 10)
@@ -226,6 +260,13 @@ class TestWatchdogLiveness(unittest.TestCase):
             self.assertEqual(_scan(db, now, stale_heartbeat_minutes=40), {})
             found = _scan(db, now, stale_heartbeat_minutes=40, phase_overrides={"design": 21})
             self.assertEqual(set(found), {"t_des"})
+
+            # Opting out of silent_start gives the same steady-state result without the event.
+            for tid, skill in (("t_vd2", "factonio:verify-diff"), ("t_imp2", "factonio:implement")):
+                _add_task(db, tid, now=now, skill=skill, started_ago=22 * 60, heartbeat_ago=22 * 60)
+            found = _scan(db, now, initial_progress_minutes=0)
+            self.assertEqual(set(found), {"t_vd", "t_vb", "t_def", "t_vd2"})
+            self.assertEqual(found["t_vd2"]["kind"], "stale_running")
 
     def test_fresh_side_effects_suppress_stale_heartbeat(self):
         with isolated_hermes_home() as home:
@@ -539,6 +580,159 @@ class TestWatchdogLiveness(unittest.TestCase):
             self.assertEqual(found["t_old"]["phase"], "verify-diff")
             self.assertIsNone(found["t_old"]["pid_alive"])
             self.assertEqual(found["t_blk"]["kind"], "blocked_waiting")
+
+
+_STARTUP_EVENTS = (("created", 12 * 60), ("claimed", 12 * 60), ("spawned", 12 * 60),
+                   ("owner_admitted", 12 * 60), ("worker_bound", 12 * 60), ("heartbeat", 30))
+
+
+class TestSilentStart(unittest.TestCase):
+    def setUp(self) -> None:
+        self._llm = mock.patch("agent.auxiliary_client.call_llm", side_effect=AssertionError("LLM must not be called"))
+        self._llm.start()
+        self.addCleanup(self._llm.stop)
+
+    def test_startup_bookkeeping_and_heartbeats_alone_flag_silent_start(self):
+        with isolated_hermes_home() as home:
+            now = time.time()
+            db = home / "kanban.db"
+            _add_task(db, "t_silent", now=now, started_ago=12 * 60, heartbeat_ago=30, pid=1,
+                      events=_STARTUP_EVENTS, comments=(("factonio:watchdog", "earlier alert", 60),))
+            found = _scan(db, now, pid_alive_fn=lambda p: True)
+            f = found["t_silent"]
+            self.assertEqual(f["kind"], "silent_start")
+            self.assertEqual(f["stall_signal"], "silent_start")
+            self.assertEqual(f["phase"], "implement")
+            self.assertEqual(f["initial_progress_minutes"], 10)
+            self.assertEqual(f["threshold_minutes"], 25)
+            self.assertIsNone(f["triage"])
+            self.assertIn("12m", f["reason"])
+
+    def test_silent_start_waits_for_the_initial_window(self):
+        with isolated_hermes_home() as home:
+            now = time.time()
+            db = home / "kanban.db"
+            _add_task(db, "t_young", now=now, started_ago=9 * 60, heartbeat_ago=30, pid=1,
+                      events=(("claimed", 9 * 60), ("heartbeat", 30)))
+            self.assertEqual(_scan(db, now, pid_alive_fn=lambda p: True), {})
+            self.assertEqual(_scan(db, now + 60, pid_alive_fn=lambda p: True)["t_young"]["kind"], "silent_start")
+
+    def test_any_post_start_side_effect_suppresses_silent_start(self):
+        with isolated_hermes_home() as home, mock.patch.dict(os.environ, GIT_ENV):
+            now = time.time()
+            db = home / "kanban.db"
+            _add_task(db, "t_event", now=now, started_ago=12 * 60, heartbeat_ago=30, pid=1,
+                      events=(*_STARTUP_EVENTS, ("edited", 11 * 60)))
+            _add_task(db, "t_comment", now=now, started_ago=12 * 60, heartbeat_ago=30, pid=1,
+                      events=_STARTUP_EVENTS, comments=(("factonio", "reading spec", 11 * 60),))
+            ws = home / "ws"
+            ws.mkdir()
+            (ws / "new.py").write_text("x = 1\n", encoding="utf-8")
+            _add_task(db, "t_ws", now=now, started_ago=12 * 60, heartbeat_ago=30, pid=1,
+                      events=_STARTUP_EVENTS, workspace=str(ws))
+            # A workspace whose only mtimes predate the run start is not progress.
+            stale_ws = home / "stale-ws"
+            stale_ws.mkdir()
+            (stale_ws / "old.txt").write_text("old", encoding="utf-8")
+            old = now - 7200
+            os.utime(stale_ws / "old.txt", (old, old))
+            os.utime(stale_ws, (old, old))
+            _add_task(db, "t_old_ws", now=now, started_ago=12 * 60, heartbeat_ago=30, pid=1,
+                      events=_STARTUP_EVENTS, workspace=str(stale_ws))
+            found = _scan(db, now, pid_alive_fn=lambda p: True)
+            self.assertEqual(set(found), {"t_old_ws"})
+            self.assertEqual(found["t_old_ws"]["kind"], "silent_start")
+
+    def test_opt_out_and_phase_cap(self):
+        with isolated_hermes_home() as home:
+            now = time.time()
+            db = home / "kanban.db"
+            _add_task(db, "t_imp", now=now, started_ago=12 * 60, heartbeat_ago=30, pid=1, events=_STARTUP_EVENTS)
+            _add_task(db, "t_vd", now=now, skill="factonio:verify-diff", started_ago=6 * 60, heartbeat_ago=30,
+                      pid=1, events=(("claimed", 6 * 60),))
+            self.assertEqual(_scan(db, now, pid_alive_fn=lambda p: True, initial_progress_minutes=0), {})
+            self.assertEqual(_scan(db, now, pid_alive_fn=lambda p: True, initial_progress_minutes=None).keys(),
+                             {"t_imp"})
+            found = _scan(db, now, pid_alive_fn=lambda p: True, initial_progress_minutes=5)
+            self.assertEqual(set(found), {"t_imp", "t_vd"})
+            self.assertEqual(found["t_vd"]["initial_progress_minutes"], 5)
+            # A window wider than the phase threshold is capped: the full check owns the card then.
+            found = _scan(db, now + 5 * 60, pid_alive_fn=lambda p: True, initial_progress_minutes=60)
+            self.assertEqual(found["t_vd"]["kind"], "no_side_effects")
+            self.assertNotIn("t_imp", found)  # 17m in, window capped at the 25m implement threshold
+            found = _scan(db, now + 13 * 60, pid_alive_fn=lambda p: True, initial_progress_minutes=60)
+            self.assertEqual(found["t_imp"]["kind"], "no_side_effects")
+
+    def test_silent_start_is_triage_eligible(self):
+        with isolated_hermes_home() as home:
+            now = time.time()
+            db = home / "kanban.db"
+            _add_task(db, "t_a", now=now, started_ago=12 * 60, heartbeat_ago=30, pid=1, events=_STARTUP_EVENTS)
+            working = _CountingTriage({"classification": "working", "rationale": "cloning a big repo"})
+            self.assertEqual(_scan(db, now, pid_alive_fn=lambda p: True, triage_fn=working), {})
+            self.assertEqual(working.calls[0]["stall_signal"], "silent_start")
+            self.assertEqual(working.calls[0]["initial_progress_minutes"], 10)
+
+            stalled = _CountingTriage({"classification": "stalled", "rationale": "no tool calls"})
+            f = _scan(db, now, pid_alive_fn=lambda p: True, triage_fn=stalled)["t_a"]
+            self.assertEqual(f["kind"], "silent_start")
+            self.assertIn("no tool calls", f["reason"])
+
+    def test_cached_silent_start_verdict_does_not_mute_escalation(self):
+        with isolated_hermes_home() as home:
+            now = time.time()
+            db = home / "kanban.db"
+            _add_task(db, "t_a", now=now, started_ago=20 * 60, heartbeat_ago=30, pid=1,
+                      events=(("claimed", 20 * 60), ("worker_bound", 20 * 60), ("heartbeat", 30)))
+            cooldowns: dict = {}
+            triage = _CountingTriage({"classification": "working", "rationale": "compiling"})
+            self.assertEqual(_scan(db, now, pid_alive_fn=lambda p: True, triage_fn=triage,
+                                   triage_cooldowns=cooldowns), {})
+            self.assertEqual(cooldowns["t_a"]["stall_signal"], "silent_start")
+            # 6 minutes later (inside the 15m cooldown) the card crosses the 25m implement threshold.
+            triage.response = {"classification": "stalled", "rationale": "still nothing"}
+            f = _scan(db, now + 6 * 60, pid_alive_fn=lambda p: True, triage_fn=triage,
+                      triage_cooldowns=cooldowns)["t_a"]
+            self.assertEqual(f["kind"], "no_side_effects")
+            self.assertEqual(len(triage.calls), 2)
+            self.assertEqual(triage.calls[1]["stall_signal"], "no_side_effects")
+
+    def test_tick_escalates_silent_start_with_kind_aware_dedup(self):
+        from factonio.watchdog import run_watchdog_tick
+
+        with isolated_hermes_home() as home:
+            now = time.time()
+            db = home / "kanban.db"
+            _add_task(db, "t_a", now=now, started_ago=12 * 60, heartbeat_ago=30, pid=1, events=_STARTUP_EVENTS)
+            ctx = _FakeCtx()
+            kw = dict(db_path_override=db, pid_alive_fn=lambda p: True, runs_root=home / "none")
+            first = run_watchdog_tick(ctx, now=now, **kw)
+            self.assertEqual([a["kind"] for a in first["alerts"]], ["silent_start"])
+            second = run_watchdog_tick(ctx, now=now + 6 * 60, **kw)
+            self.assertTrue(second["ran"])
+            self.assertEqual(second["alerts"], [])
+            third = run_watchdog_tick(ctx, now=now + 14 * 60, **kw)
+            self.assertEqual([a["kind"] for a in third["alerts"]], ["no_side_effects"])
+            fourth = run_watchdog_tick(ctx, now=now + 20 * 60, **kw)
+            self.assertEqual(fourth["alerts"], [])
+            self.assertEqual([e[1]["kind"] for e in ctx.events], ["silent_start", "no_side_effects"])
+
+    def test_tick_honors_configured_opt_out(self):
+        from factonio.watchdog import run_watchdog_tick
+
+        with isolated_hermes_home() as home:
+            now = time.time()
+            db = home / "kanban.db"
+            _add_task(db, "t_a", now=now, started_ago=12 * 60, heartbeat_ago=30, pid=1, events=_STARTUP_EVENTS)
+            (home / "config.yaml").write_text(
+                "plugins:\n  entries:\n    factonio:\n      settings:\n        initial_progress_minutes: 0\n",
+                encoding="utf-8",
+            )
+            ctx = _FakeCtx()
+            result = run_watchdog_tick(ctx, now=now, db_path_override=db, pid_alive_fn=lambda p: True,
+                                       runs_root=home / "none")
+            self.assertTrue(result["ran"])
+            self.assertEqual(result["alerts"], [])
 
 
 if __name__ == "__main__":

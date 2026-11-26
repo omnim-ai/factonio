@@ -784,6 +784,266 @@ def render_trail_markdown(rows: list[Mapping[str, Any]]) -> str:
     return header + "\n".join(out) + "\n"
 
 
+
+# --- trail --audit: deterministic, read-only pre-handoff evidence audit ----------------------
+
+AUDIT_FINDING_KINDS = ("missing_evidence", "weak_evidence", "unclosed_escalation", "gate_loosening")
+_HIGH_STAKES_PHASES = frozenset({"verify", "escape", "retro", "merge"})
+_OVERRIDE_DECISION_TOKENS = ("override", "countersign")
+_ARTIFACT_KEYS = (
+    "pr_number", "head_sha", "commit", "patch_id", "command", "proof", "proof_command", "repro",
+    "panel_id", "tests_passed", "tests_run", "occurrences", "url", "files", "decision_id", "gate",
+    "verdict", "lane_count",
+)
+_ESCALATION_RESULTS = frozenset(
+    {"blocked", "escalated", "needs_input", "reject", "inconclusive", "conflict", "proof_failed"}
+)
+_RESOLVING_RESULTS = frozenset({"pass", "merged", "resolved", "adopted", "continuous", "ready"})
+_GATE_LOOSENING_TOKENS = (
+    "gate_loosening", "skip_test", "disable_ci", "continue-on-error", "downgrade_hook",
+    "allow_stacked_merge", "force_merge", "bypass_gate", "weaken_assertion", "raise_timeout",
+)
+_TOKEN_SEP_RE = re.compile(r"[\s\-]+")
+
+
+def _norm_token_text(text: str) -> str:
+    # "skip test", "skip-test" and "skip_test" all name the same gate change.
+    return _TOKEN_SEP_RE.sub("_", text.lower())
+
+
+def _phase_family(phase: Any) -> str:
+    """``verify-diff`` / ``verify:blackbox`` / ``verify_panel`` all belong to ``verify``."""
+    return re.split(r"[-:_./ ]", str(phase or "").strip().lower(), maxsplit=1)[0]
+
+
+def _is_nullish(value: Any) -> bool:
+    return value is None or (isinstance(value, (str, list, dict, tuple)) and len(value) == 0)
+
+
+def _audit_scope(row: Any) -> tuple[str, Optional[str]]:
+    """``(tenant, card_id)``; a row without a card is scoped to its whole tenant (``card_id=None``)."""
+    return (str(row["tenant"] or ""), str(row["card_id"] or "") or None)
+
+
+def _empty_audit(filters: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "clean": True,
+        "inspected": 0,
+        "active_inspected": 0,
+        "counts": {kind: 0 for kind in AUDIT_FINDING_KINDS},
+        "findings": [],
+        "filters": filters,
+    }
+
+
+def _open_trail_ro(path: Path) -> sqlite3.Connection:
+    # mode=ro: never creates trail.db, never migrates it, never takes a write lock.
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=_BUSY_TIMEOUT_MS / 1000)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def audit_trail_evidence(
+    *,
+    tenant: Optional[str] = None,
+    repo: Optional[str] = None,
+    phase: Optional[str] = None,
+    card_id: Optional[str] = None,
+    db_path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Audit every matching active decision for evidence gaps before a human handoff.
+
+    Strictly read-only: an absent `trail.db` yields a clean empty result and is not created.
+    Superseded rows are skipped (their correction is audited instead). Findings:
+
+    - ``missing_evidence``: blank ``why`` or empty / all-null ``evidence``.
+    - ``weak_evidence``: a ``verify`` / ``escape`` / ``retro`` / ``merge`` row, or an override /
+      countersign decision, whose evidence names no verifiable artifact (`_ARTIFACT_KEYS`).
+    - ``unclosed_escalation``: an ``escape`` row or an escalating ``result`` with no later active
+      resolving row in the same scope (``(tenant, card_id)``, or the tenant when no card is set).
+    - ``gate_loosening``: a gate-loosening token in ``decision``/``why``/``result``/``evidence``.
+
+    Resolution rows are looked up across every phase, so ``--phase verify`` still sees a later
+    ``merged`` row. Returns ``{ok, clean, inspected, active_inspected, counts, findings, filters}``.
+    """
+    filters = {
+        "tenant": tenant or None,
+        "repo": repo or None,
+        "phase": phase or None,
+        "card_id": card_id or None,
+    }
+    path = Path(db_path) if db_path is not None else trail_db_path()
+    if not path.is_file():
+        return _empty_audit(filters)
+    where_sql, params = _filter_sql(tenant=tenant, repo=repo, phase=phase, card_id=card_id, since=None)
+    try:
+        with closing(_open_trail_ro(path)) as conn:
+            conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+            rows = conn.execute(
+                f"SELECT rowid AS _seq, * FROM decisions{where_sql} ORDER BY ts ASC, rowid ASC", params
+            ).fetchall()
+            superseded = {
+                r[0]
+                for r in conn.execute("SELECT supersedes_id FROM decisions WHERE supersedes_id IS NOT NULL")
+            }
+            marks = ", ".join("?" for _ in _RESOLVING_RESULTS)
+            resolvers = [
+                (r["ts"], r["_seq"], _audit_scope(r))
+                for r in conn.execute(
+                    f"SELECT rowid AS _seq, id, ts, tenant, card_id FROM decisions"
+                    f" WHERE lower(trim(result)) IN ({marks})",
+                    sorted(_RESOLVING_RESULTS),
+                ).fetchall()
+                if r["id"] not in superseded
+            ]
+    except sqlite3.Error as exc:
+        return {**_empty_audit(filters), "ok": False, "clean": False, "error": f"trail.db unreadable: {exc}"}
+
+    findings: list[dict[str, Any]] = []
+    active = 0
+    for raw in rows:
+        if raw["id"] in superseded:
+            continue
+        active += 1
+        row = _row_to_dict(raw)
+        evidence = row["evidence"]
+        decision_l = str(row["decision"] or "").lower()
+        result_l = str(row["result"] or "").strip().lower()
+        family = _phase_family(row["phase"])
+        base = {k: row[k] for k in ("ts", "tenant", "repo_slug", "phase", "card_id", "actor", "decision", "result")}
+
+        def flag(kind: str, message: str, **extra: Any) -> None:
+            findings.append({"kind": kind, "decision_id": row["id"], **base, "message": message, **extra})
+
+        gaps = []
+        if not str(row["why"] or "").strip():
+            gaps.append("blank why")
+        if not evidence or all(_is_nullish(v) for v in evidence.values()):
+            gaps.append("empty evidence")
+        if gaps:
+            flag("missing_evidence", "Decision has " + " and ".join(gaps) + ".", gaps=gaps)
+
+        override = any(tok in decision_l for tok in _OVERRIDE_DECISION_TOKENS)
+        if family in _HIGH_STAKES_PHASES or override:
+            artifacts = [k for k in _ARTIFACT_KEYS if not _is_nullish(evidence.get(k))]
+            if not artifacts:
+                why_stakes = "override/countersign decision" if override else f"high-stakes phase '{family}'"
+                flag(
+                    "weak_evidence",
+                    f"{why_stakes.capitalize()} cites no verifiable artifact "
+                    f"(expected one of: {', '.join(_ARTIFACT_KEYS)}).",
+                )
+
+        if (family == "escape" or result_l in _ESCALATION_RESULTS) and result_l not in _RESOLVING_RESULTS:
+            scope = _audit_scope(row)
+            closed = any(
+                (ts, seq) > (raw["ts"], raw["_seq"])
+                and r_scope[0] == scope[0]
+                and (scope[1] is None or r_scope[1] == scope[1])
+                for ts, seq, r_scope in resolvers
+            )
+            if not closed:
+                what = "escape row" if family == "escape" else f"result '{result_l}'"
+                flag(
+                    "unclosed_escalation",
+                    f"Unresolved {what}: no later {'/'.join(sorted(_RESOLVING_RESULTS))} row for "
+                    f"{'card ' + scope[1] if scope[1] else 'tenant ' + (scope[0] or '(none)')}.",
+                )
+
+        # False/None evidence values record that a gate was *not* loosened; leave them out.
+        asserted = {k: v for k, v in evidence.items() if v is not None and v is not False}
+        haystack = _norm_token_text(
+            " ".join(
+                [str(row["decision"] or ""), str(row["why"] or ""), str(row["result"] or ""),
+                 json.dumps(asserted, sort_keys=True, default=str)]
+            )
+        )
+        tokens = [t for t in _GATE_LOOSENING_TOKENS if _norm_token_text(t) in haystack]
+        if tokens:
+            flag(
+                "gate_loosening",
+                f"Gate-loosening signal ({', '.join(tokens)}): confirm spec.md authorization and a countersign.",
+                tokens=tokens,
+            )
+
+    counts = {kind: sum(1 for f in findings if f["kind"] == kind) for kind in AUDIT_FINDING_KINDS}
+    return {
+        "ok": True,
+        "clean": not findings,
+        "inspected": len(rows),
+        "active_inspected": active,
+        "counts": counts,
+        "findings": findings,
+        "filters": filters,
+    }
+
+
+def _audit_counts_inline(audit: Mapping[str, Any]) -> str:
+    counts = audit.get("counts") or {}
+    return ", ".join(f"{k}={counts.get(k, 0)}" for k in AUDIT_FINDING_KINDS)
+
+
+def render_trail_audit_text(audit: Mapping[str, Any]) -> str:
+    """Plain-text audit report: a CLEAN/ATTENTION headline, then one line per finding."""
+    if not audit.get("ok", True):
+        return f"Trail audit: ERROR - {audit.get('error') or 'trail.db could not be audited'}"
+    head = (
+        f"inspected={audit.get('inspected', 0)} active={audit.get('active_inspected', 0)} "
+        f"({_audit_counts_inline(audit)})"
+    )
+    findings = list(audit.get("findings") or [])
+    if not findings:
+        return f"Trail audit: CLEAN - {head}"
+    lines = [f"Trail audit: ATTENTION - {len(findings)} finding(s); {head}"]
+    for f in findings:
+        scope = " ".join(
+            x for x in (f.get("tenant") or "", f"[{f['phase']}]" if f.get("phase") else "", f.get("card_id") or "") if x
+        )
+        result = f" -> {f['result']}" if f.get("result") else ""
+        lines.append(f"! {f['kind']} {f.get('decision_id')} {f.get('ts')} {scope}: {f.get('decision')}{result}".rstrip())
+        lines.append(f"    {f.get('message')}")
+    return "\n".join(lines)
+
+
+def render_trail_audit_markdown(audit: Mapping[str, Any]) -> str:
+    """Markdown audit report for handoffs: status line, counts, and a findings table."""
+    header = "## Trail Audit\n\n"
+    if not audit.get("ok", True):
+        return header + f"**Error:** {_md_cell(audit.get('error') or 'trail.db could not be audited')}\n"
+    findings = list(audit.get("findings") or [])
+    status = (
+        f"**Attention:** {len(findings)} finding(s)" if findings else "**Clean:** no findings"
+    ) + f" across {audit.get('active_inspected', 0)} active of {audit.get('inspected', 0)} inspected decisions.\n\n"
+    counts = audit.get("counts") or {}
+    out = [header + status + "| Finding | Count |", "|---|---|"]
+    out.extend(f"| {k} | {counts.get(k, 0)} |" for k in AUDIT_FINDING_KINDS)
+    if findings:
+        out += [
+            "",
+            "| Finding | Decision | Time (UTC) | Tenant | Phase | Card | Decision text | Result | Detail |",
+            "|---|---|---|---|---|---|---|---|---|",
+        ]
+        for f in findings:
+            out.append(
+                "| "
+                + " | ".join(
+                    [
+                        f"`{_md_cell(f.get('kind'))}`",
+                        f"`{_md_cell(f.get('decision_id'))}`",
+                        _md_cell(f.get("ts")),
+                        _md_cell(f.get("tenant")),
+                        _md_cell(f.get("phase")),
+                        f"`{_md_cell(f['card_id'])}`" if f.get("card_id") else "",
+                        _md_cell(f.get("decision")),
+                        _md_cell(f.get("result")),
+                        _md_cell(f.get("message")),
+                    ]
+                )
+                + " |"
+            )
+    return "\n".join(out) + "\n"
+
 # --- metric_snapshots (schema v2): append-only long-term factory KPI time series -------------
 
 _SINCE_REL_RE = re.compile(r"^(\d{1,5})d$")

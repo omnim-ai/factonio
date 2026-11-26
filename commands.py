@@ -32,6 +32,9 @@ from .repos import (
     update_repo,
 )
 from .trail import (
+    audit_trail_evidence,
+    render_trail_audit_markdown,
+    render_trail_audit_text,
     metrics_history_payload,
     render_metric_snapshots_text,
     render_trail_markdown,
@@ -437,6 +440,12 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         p_trail.add_argument("--limit", type=int, default=50, help="Max decisions to show, newest first (default: 50).")
         p_trail.add_argument("--markdown", action="store_true", help="Render a Markdown table (for PRs, retros, handoffs).")
         p_trail.add_argument(
+            "--audit",
+            action="store_true",
+            help="Read-only pre-handoff evidence audit over every matching active decision "
+            "(exit 0 when clean, 1 when findings exist).",
+        )
+        p_trail.add_argument(
             "--json",
             action="store_true",
             default=argparse.SUPPRESS,
@@ -769,6 +778,19 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             return
 
         if cmd == "trail":
+            if getattr(args, "audit", False):
+                audit = audit_trail_evidence(
+                    tenant=args.tenant, repo=args.repo, phase=args.phase, card_id=args.card_id
+                )
+                if as_json:
+                    print(json.dumps(audit, indent=2, default=str))
+                elif args.markdown:
+                    print(render_trail_audit_markdown(audit), end="")
+                else:
+                    print(render_trail_audit_text(audit))
+                if not audit.get("clean"):
+                    sys.exit(1)
+                return
             payload = trail_payload(
                 tenant=args.tenant,
                 repo=args.repo,

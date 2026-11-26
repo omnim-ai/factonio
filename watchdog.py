@@ -17,11 +17,13 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .config import (
+    DEFAULT_INITIAL_PROGRESS_MINUTES,
     DEFAULT_STALE_HEARTBEAT_MINUTES,
     WORKER_PROFILE,
     get_root_hermes_home_path,
     list_repos,
     load_settings,
+    resolve_initial_progress_minutes,
     resolve_phase_model,
     resolve_stale_heartbeat_minutes,
 )
@@ -41,6 +43,8 @@ DEFAULT_TRIAGE_COOLDOWN_MINUTES = 15
 MAX_TRIAGE_TIMEOUT_S = 15.0
 _RATIONALE_MAX = 300
 _NON_PROGRESS_EVENT_KINDS = ("heartbeat",)
+# Dispatcher bookkeeping written when a run starts; never evidence that the worker did anything.
+_STARTUP_EVENT_KINDS = ("created", "claimed", "spawned", "owner_admitted", "worker_bound")
 # Bounded metadata walks so a huge worktree/run dir cannot stall the dispatcher tick.
 _MTIME_WALK_LIMIT = 2000
 _STATUS_MTIME_LIMIT = 2000
@@ -335,8 +339,10 @@ def _triage_ambiguous_stall(
 ) -> Optional[dict[str, Any]]:
     """Bounded triage with per-task cooldown. Returns a verdict or None (deterministic fallback)."""
     tid = finding["task_id"]
+    signal = finding.get("stall_signal")
     cached = cooldowns.get(tid)
-    if isinstance(cached, dict):
+    # A verdict cached for a milder signal (silent_start) must not mute an escalated stall.
+    if isinstance(cached, dict) and cached.get("stall_signal", signal) == signal:
         cached_ts = _float_or_none(cached.get("ts"))
         if cached_ts is not None and (now_ts - cached_ts) < cooldown_s:
             if cached.get("classification") in TRIAGE_CLASSIFICATIONS:
@@ -358,6 +364,7 @@ def _triage_ambiguous_stall(
 
     cooldowns[tid] = {
         "ts": now_ts,
+        "stall_signal": signal,
         "classification": verdict["classification"] if verdict else None,
         "rationale": verdict["rationale"] if verdict else "",
     }
@@ -369,6 +376,7 @@ def scan_stuck_cards(
     *,
     now: Optional[float] = None,
     stale_heartbeat_minutes: int = DEFAULT_STALE_HEARTBEAT_MINUTES,
+    initial_progress_minutes: Any = DEFAULT_INITIAL_PROGRESS_MINUTES,
     blocked_reminder_minutes: int = 45,
     max_fix_rounds: int = 3,
     assignee: str = WORKER_PROFILE,
@@ -383,7 +391,9 @@ def scan_stuck_cards(
     """Inspect kanban.db read-only and return structured alerts for stuck Factonio cards.
 
     Running cards are evaluated in strict order: dead PID, hard runtime cap, side-effect
-    freshness, then ambiguous stalls (optionally triaged by the ``factonio_watchdog`` model).
+    freshness against the full phase threshold, then the early ``silent_start`` window (no
+    post-start side effect within ``initial_progress_minutes``; ``<= 0`` disables it). Ambiguous
+    stalls are optionally triaged by the ``factonio_watchdog`` model.
     ``triage_cooldowns`` is mutated in place so callers can persist it between ticks.
     """
     now_ts = float(now if now is not None else time.time())
@@ -556,6 +566,7 @@ def scan_stuck_cards(
                     continue
 
                 event_ts = None
+                progress_event_ts = None
                 if has_events and "kind" in event_cols:
                     placeholders = ", ".join("?" for _ in _NON_PROGRESS_EVENT_KINDS)
                     ev = conn.execute(
@@ -564,6 +575,14 @@ def scan_stuck_cards(
                         (tid, *_NON_PROGRESS_EVENT_KINDS),
                     ).fetchone()
                     event_ts = ev["ts"] if ev else None
+                    excluded = (*_NON_PROGRESS_EVENT_KINDS, *_STARTUP_EVENT_KINDS)
+                    placeholders = ", ".join("?" for _ in excluded)
+                    ev = conn.execute(
+                        f"SELECT MAX(created_at) AS ts FROM task_events WHERE task_id = ?"
+                        f" AND (kind IS NULL OR kind NOT IN ({placeholders}))",
+                        (tid, *excluded),
+                    ).fetchone()
+                    progress_event_ts = _float_or_none(ev["ts"]) if ev else None
                 comment_ts = _max_ts(*(c.get("created_at") for c in comments if c.get("author") != WATCHDOG_AUTHOR))
                 workspace_ts = _workspace_activity_ts(task.get("workspace_path"))
                 run_dir_ts = _run_dir_activity_ts(runs_root, task.get("tenant"))
@@ -589,6 +608,49 @@ def scan_stuck_cards(
                 })
 
                 if side_age is None or side_age < threshold_s:
+                    initial_min = resolve_initial_progress_minutes(
+                        phase,
+                        initial_progress_minutes=initial_progress_minutes,
+                        stale_heartbeat_minutes=stale_heartbeat_minutes,
+                        phase_overrides=phase_overrides,
+                    )
+                    has_post_start_progress = started_at is not None and any(
+                        ts is not None and ts > started_at
+                        for ts in (progress_event_ts, comment_ts, workspace_ts, run_dir_ts)
+                    )
+                    if (
+                        initial_min is not None
+                        and started_at is not None
+                        and not has_post_start_progress
+                        and (now_ts - started_at) >= max(60, initial_min * 60)
+                    ):
+                        age_min = int((now_ts - started_at) // 60)
+                        finding = {
+                            **running,
+                            "kind": "silent_start",
+                            "stall_signal": "silent_start",
+                            "initial_progress_minutes": initial_min,
+                            "reason": f"Running card started {age_min}m ago but has produced no post-start side "
+                            f"effects beyond heartbeats and startup bookkeeping (phase {phase} initial window "
+                            f"{initial_min}m, stale threshold {threshold_min}m).",
+                        }
+                        findings.append(finding)
+                        ambiguous.append((finding, {
+                            "task_id": tid,
+                            "title": task.get("title") or "",
+                            "phase": phase,
+                            "stall_signal": "silent_start",
+                            "threshold_minutes": threshold_min,
+                            "initial_progress_minutes": initial_min,
+                            "minutes_since_start": age_min,
+                            "heartbeat_age_minutes": int(beat_age // 60) if beat_age is not None else None,
+                            "worker_pid_alive": pid_alive,
+                            "recent_comments": [
+                                {"author": c.get("author"), "body": str(c.get("body") or "")[:300]}
+                                for c in comments
+                                if c.get("author") != WATCHDOG_AUTHOR
+                            ][:3],
+                        }))
                     continue
 
                 if beat_age is not None and beat_age >= threshold_s:
@@ -741,6 +803,8 @@ def run_watchdog_tick(
         db_path,
         now=now_ts,
         stale_heartbeat_minutes=int(settings.get("stale_heartbeat_minutes") or DEFAULT_STALE_HEARTBEAT_MINUTES),
+        # Passed through raw: an explicit 0 must reach the resolver as the opt-out, not the default.
+        initial_progress_minutes=settings.get("initial_progress_minutes", DEFAULT_INITIAL_PROGRESS_MINUTES),
         blocked_reminder_minutes=int(settings.get("blocked_reminder_minutes") or 45),
         max_fix_rounds=int(settings.get("default_max_fix_rounds") or 3),
         phase_overrides=phase_overrides if isinstance(phase_overrides, dict) else None,

@@ -22,6 +22,10 @@ Factonio adapts engineering patterns and instruction text from the third-party p
 - Wave 4 adapted patterns:
   - `create-verification-skill` proof step: `harness init --prove` runs Doctor, required hooks and an evidence-survives-cleanup probe and fails closed with rollback (`harness.py` `bootstrap_verify_harness(prove=True)`, `factonio_bootstrap_verify`, `hermes factonio harness init --prove`).
   - `maintain-verification-skill` live pass: read-only gate-loosening detection (`detect_harness_gate_loosening`, `harness check --base`), the `doc_drift` / `harness_gap` / `product_regression` drift rubric (`classify_harness_drift`, the `harness-audit` blueprint in `__init__.py`), and Black-Box user-POV preconditions plus the `verified-unreachable` reporting rule (`skills/verify-blackbox/SKILL.md`).
+  - gate integrity, `comment-sicko` `MUST KILL`, the blast-radius certainty ladder, and `dropped` hypothesis transparency in Diff Check reviews (`skills/verify-diff/SKILL.md`).
+  - tiered fix-round re-verification and a cross-model pre-handoff audit of the `show-me-your-work` trail (`skills/orchestrator/SKILL.md`, `trail.py` `audit_trail_evidence`, `hermes factonio trail --audit`).
+  - `/correct` Rule-to-Enforcer ledger with forced ladder promotion, rule pruning, and 1-commit-per-class hardening cards (`RETRO_BLUEPRINT_PROMPT` in `__init__.py`).
+  - first-tick silent-start liveness check (`watchdog.py` `silent_start`, `initial_progress_minutes`).
 
 ```text
 MIT License
