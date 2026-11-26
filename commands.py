@@ -19,6 +19,7 @@ from .config import (
     resolve_rigor,
     resolve_verify_panel,
 )
+from .eval_skills import add_eval_arguments, run_eval_cli
 from .harness import audit_harness, bootstrap_verify_harness, check_harness, show_harness
 from .issues import triage_repo_issues
 from .metrics import RANGE_SECONDS, capture_metrics_snapshot, compute_metrics, default_kanban_db_path
@@ -764,6 +765,12 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             help="Output machine-readable JSON.",
         )
 
+        p_eval = sub.add_parser(
+            "eval",
+            help="Blind A/B skill/model eval, Information Barrier transcript audit, or skill bloat check (offline).",
+        )
+        add_eval_arguments(p_eval, json_default=argparse.SUPPRESS)
+
         sub.add_parser("doctor", help="Verify git, gh auth, worker profile, Kanban config, and phase models.")
 
         p_ar = sub.add_parser(
@@ -807,7 +814,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         if not cmd:
             print(
                 "Usage: hermes factonio {init|add|update|remove|list|models|start|status|panel|pr-gate|publish-pr|restack|worktrees"
-                "|harness|issues|trail|metrics|arena|doctor} [--json]"
+                "|harness|eval|issues|trail|metrics|arena|doctor} [--json]"
             )
             return
 
@@ -1308,6 +1315,12 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                 _print_issue_triage(res)
             return
 
+        if cmd == "eval":
+            code = run_eval_cli(args)
+            if code:
+                sys.exit(code)
+            return
+
         if cmd == "doctor":
             res = run_doctor(plugin_dir)
             if as_json:
@@ -1327,8 +1340,8 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         "factonio",
         help=(
             "Manage the Factonio pure-Hermes software factory "
-            "(init, add, update, models, start, status, panel, publish-pr, restack, worktrees, harness, issues, trail, "
-            "metrics, arena, doctor)."
+            "(init, add, update, models, start, status, panel, publish-pr, restack, worktrees, harness, eval, issues, "
+            "trail, metrics, arena, doctor)."
         ),
         setup_fn=setup_parser,
         handler_fn=handle_cli,
