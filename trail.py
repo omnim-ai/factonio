@@ -1529,25 +1529,65 @@ _RECALL_INVISIBLE = frozenset(
 )
 
 
-def _recall_fold(text: str) -> str:
-    """NFKC-fold, delete control/format/invisible characters, and turn whitespace controls into spaces.
+# Complete terminal escape sequences (7-bit ESC and 8-bit C1 forms). Deleting only the ESC byte
+# would leave printable parameters (``ho[31mldout``) splitting the marker the matcher looks for.
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]|\x9b[0-?]*[ -/]*[@-~]"  # CSI
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\|$)|\x9d[^\x07\x9c]*(?:\x07|\x9c|$)"  # OSC
+    r"|\x1b[PX^_][^\x1b]*(?:\x1b\\|$)|[\x90\x98\x9e\x9f][^\x9c]*(?:\x9c|$)"  # DCS/SOS/PM/APC
+    r"|\x1b[ -/]*[0-~]"  # other ESC sequences (two-byte Fe/Fp/Fs, nF charset designations)
+)
+# Bytes that introduce or terminate escape sequences; kept until sequences are stripped.
+_ANSI_SYNTAX = frozenset("\x07\x1b\x90\x98\x9b\x9c\x9d\x9e\x9f")
 
-    Deleting (not spacing) ``h\\x00o\\x1bldout`` rejoins the word, so the redactor and the barrier
-    both see ``holdout`` instead of an evasive ``h o ldout``.
-    """
+
+def _recall_drop_controls(text: str, keep: frozenset = frozenset()) -> str:
     out = []
-    for ch in unicodedata.normalize("NFKC", str(text)):
-        if ch in "\t\n\r":
+    for ch in text:
+        if ch in keep:
+            out.append(ch)
+        elif ch in "\t\n\r":
+            out.append(" " if not keep else ch)
+        elif unicodedata.category(ch) in ("Zl", "Zp"):
             out.append(" ")
-            continue
-        cat = unicodedata.category(ch)
-        if cat in ("Zl", "Zp"):
-            out.append(" ")
-        elif cat.startswith("C") or ord(ch) in _RECALL_INVISIBLE:
+        elif unicodedata.category(ch).startswith("C") or ord(ch) in _RECALL_INVISIBLE:
             continue
         else:
             out.append(ch)
     return "".join(out)
+
+
+def _recall_strip_ansi(text: str) -> str:
+    # Repeat until stable: removing one sequence (or an interleaved NUL) can complete another.
+    prev = None
+    while prev != text:
+        prev = text
+        text = _ANSI_ESCAPE_RE.sub("", _recall_drop_controls(text, _ANSI_SYNTAX))
+    return text
+
+
+def _recall_fold(text: str) -> str:
+    """Strip terminal escape sequences, NFKC-fold, delete control/format/invisible characters, and
+    turn whitespace controls into spaces.
+
+    Deleting (not spacing) ``h\\x00o\\x1bldout`` rejoins the word, and stripping whole sequences
+    rejoins ``ho\\x1b[31mldout``, so the redactor and the barrier both see ``holdout``.
+    """
+    text = _recall_strip_ansi(str(text))
+    text = _recall_strip_ansi(unicodedata.normalize("NFKC", text))
+    return _recall_drop_controls(text)
+
+
+def _recall_fold_plain(text: str) -> str:
+    """Fold without sequence stripping (only deletes ESC/C1 bytes); matched alongside ``_recall_fold``."""
+    return _recall_drop_controls(unicodedata.normalize("NFKC", str(text)))
+
+
+def _recall_has_holdout(text: str, folded: Optional[str] = None) -> bool:
+    # Fail closed if EITHER reading names holdout: stripping a sequence must never hide a marker
+    # that byte-deletion alone would have exposed (e.g. an unterminated OSC swallowing the path).
+    folded = _recall_fold(text) if folded is None else folded
+    return bool(_HOLDOUT_RE.search(folded) or _HOLDOUT_RE.search(_recall_fold_plain(text)))
 
 
 def _recall_redact_text(text: str) -> str:
@@ -1557,16 +1597,16 @@ def _recall_redact_text(text: str) -> str:
     trailing fragment could be a scenario name: fail closed on the entire field or line.
     """
     folded = _recall_fold(text)
-    return _HOLDOUT_REDACTED if _HOLDOUT_RE.search(folded) else folded
+    return _HOLDOUT_REDACTED if _recall_has_holdout(text, folded) else folded
 
 
 def contains_holdout_reference(text: Any) -> bool:
     """True when ``text`` mentions a holdout path or name (after the same folding the redactor uses)."""
-    return bool(_HOLDOUT_RE.search(_recall_fold(str(text or ""))))
+    return _recall_has_holdout(str(text or ""))
 
 
 def _recall_is_holdout_key(key: Any) -> bool:
-    return bool(_HOLDOUT_RE.search(_recall_fold(str(key))))
+    return _recall_has_holdout(str(key))
 
 
 def _recall_scrub(value: Any) -> Any:

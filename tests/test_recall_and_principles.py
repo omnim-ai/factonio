@@ -773,6 +773,80 @@ class TestRecallSpacedHoldoutPaths(unittest.TestCase):
             self._assert_clean(out)
 
 
+class TestRecallAnsiEscapeSequences(unittest.TestCase):
+    """Complete terminal escape sequences inside the marker must not leave printable parameters behind."""
+
+    PATHS = (
+        "/runs/old/ho\x1b[31mldout\x1b[0m/ansi-secret-case.md",
+        "/runs/old/ho\x1b]8;;https://x\x07ldout/ansi-secret-case.md",
+        "/runs/old/ho\x1b]0;title\x1b\\ldout/ansi-secret-case.md",
+        "/runs/old/ho\x9b31mldout\x9b0m/ansi-secret-case.md",
+        "/runs/old/ho\x9d8;;x\x9cldout/ansi-secret-case.md",
+        "/runs/old/ho\x1bPq#0\x1b\\ldout/ansi-secret-case.md",
+        "/runs/old/ho\x1b(Bldout/ansi-secret-case.md",
+        "/runs/old/ho\x1b\x00[1;31mld\x1b[0mout/ansi-secret-case.md",
+        "/runs/old/ho\x1b\uff3b31mldout/ansi-secret-case.md",
+    )
+    FRAGMENTS = ("ansi-secret-case", "holdout", "[31m", "[0m", "31mldout", "\x1b", "\x9b", "\x9d")
+
+    def _assert_clean(self, text: str) -> None:
+        from factonio import trail
+
+        for needle in self.FRAGMENTS:
+            self.assertNotIn(needle, text)
+        self.assertFalse(trail.contains_holdout_reference(text))
+
+    def test_detection_and_whole_field_redaction(self):
+        from factonio import trail
+
+        for path in self.PATHS:
+            self.assertTrue(trail.contains_holdout_reference(path), repr(path))
+            self.assertEqual(trail._recall_redact_text(f"see {path} now"), "[redacted]", repr(path))
+        colored = "\x1b[32mPASS\x1b[0m: 505 tests"
+        self.assertFalse(trail.contains_holdout_reference(colored))
+        self.assertEqual(trail._recall_redact_text(colored), "PASS: 505 tests")
+        self.assertFalse(trail.contains_holdout_reference("\x1b[1mhold out\x1b[0m for review"))
+
+    def test_ansi_paths_never_reach_recall_or_definition_card(self):
+        from factonio import trail
+        from factonio.orchestrator import start_workstream
+
+        for path in self.PATHS:
+            with self.subTest(path=repr(path)), isolated_hermes_home() as home:
+                _register(home)
+                esc = trail.log_decision(
+                    "escaped_regression", tenant="acme-old", repo_slug="acme-sample", phase="escape",
+                    card_id=f"t_esc {path}", why=f"caching escaped via {path}", result=f"Failed at {path}",
+                    evidence={"note": path, path: "key", "nested": {"why": path}},
+                )
+                a = trail.log_decision("pick_cache", tenant="acme-old", repo_slug="acme-sample", phase="define",
+                                       why="caching via memcached", result="adopted")
+                trail.log_decision("pick_cache", tenant="acme-old", repo_slug="acme-sample", phase="define",
+                                   why=f"caching via sqlite; see {path}", result="adopted",
+                                   supersedes_id=a["id"])
+                res = trail.recall_decisions(repo="acme-sample", query="caching")
+                self.assertEqual(res["count"], 2, res)
+                self._assert_clean(_blob(res))
+                item = next(i for i in res["items"] if i["id"] == esc["id"])
+                self.assertEqual((item["why"], item["result"]), ("[redacted]", "[redacted]"))
+                run = _cli()
+                for fmt in ("--json", "--markdown"):
+                    code, out = run("trail", "--recall", "--repo", "acme/sample", fmt)
+                    self.assertEqual(code, 0, out)
+                    self.assertIn(a["id"], out)
+                    self.assertIn(esc["id"], out)
+                    self._assert_clean(out)
+                started = start_workstream("acme/sample", "Add caching", kind="feature", issue_number=5)
+                self.assertEqual(started["recall_count"], 2)
+                body = _task(started["task_id"]).body
+                section = body.split("## Prior Institutional Memory (Recall)", 1)[1]
+                self.assertIn(a["id"], section)
+                self.assertIn(esc["id"], section)
+                self._assert_clean(section)
+                for needle in ("ansi-secret-case", "\x1b", "\x9b", "\x9d", "[31m"):
+                    self.assertNotIn(needle, body)
+
+
 class TestRecallRepoAliases(unittest.TestCase):
     def _history(self, repo: str, tenant: str) -> dict[str, dict[str, Any]]:
         from factonio import trail
