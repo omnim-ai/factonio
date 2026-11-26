@@ -311,7 +311,8 @@
         "`GET /status` under /api/plugins/factonio responds as documented",
         "`GET /trail` under /api/plugins/factonio responds as documented",
         "`GET /trail/{decision_id}` under /api/plugins/factonio responds as documented",
-        "`PATCH /repos/{slug}` under /api/plugins/factonio responds as documented"
+        "`PATCH /repos/{slug}` under /api/plugins/factonio responds as documented",
+        "`GET /repos` returns defaults.publish_policy and per-repo publish_policy (legacy records inherit the global default; invalid stored values read as null, never auto); `PATCH /repos/{slug}` persists publish_policy auto/ask and answers 422 for any other value including null and \"\""
       ]
     },
     {
@@ -328,6 +329,7 @@
         "Zero-build ESM importing only @hermes/plugin-sdk, react and react/jsx-runtime",
         "Dashboard, sidebar and repo editor render with host theme tokens only",
         "Repo editor sends default_rigor standard/high, or null to inherit, with partial-diff dirty tracking",
+        "Repo table shows 9 columns with Merge/Publish policy .fc-pol cells; repo editor has a Publish policy select (auto/ask, no inherit) and PATCHes only publish_policy when it alone changes; Decision Trail has a publish phase filter, published reads as ok, and branch/base_branch render as one `branch X → Y` pill with draft shown only when true",
         "Trends strip renders populated/empty/loading/error states from GET /metrics/history",
         "Sidebar verification panel consensus is fail-closed and never shows pass without the recorded verify_panel_consensus",
         "Sidebar panel shows inconclusive (never pass) when any expected lane from spawn_verify panel_lanes or the recorded consensus lanes is missing"

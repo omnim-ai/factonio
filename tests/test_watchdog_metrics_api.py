@@ -233,11 +233,11 @@ class TestWatchdogMetricsAndApi(unittest.TestCase):
                 body = r.json()
                 self.assertEqual(
                     body["defaults"],
-                    {"merge_policy": "auto", "max_fix_rounds": 3, "design_provider": "auto", "design_approval": "ask",
-                     "default_rigor": "standard"},
+                    {"merge_policy": "auto", "publish_policy": "auto", "max_fix_rounds": 3, "design_provider": "auto",
+                     "design_approval": "ask", "default_rigor": "standard"},
                 )
                 item = body["repos"][0]
-                for key in ("slug", "repo", "url", "path", "default_branch", "merge_policy", "max_fix_rounds",
+                for key in ("slug", "repo", "url", "path", "default_branch", "merge_policy", "publish_policy", "max_fix_rounds",
                             "has_required_checks", "models"):
                     self.assertIn(key, item)
                 self.assertIsNone(item["design_provider"])
@@ -301,6 +301,69 @@ class TestWatchdogMetricsAndApi(unittest.TestCase):
 
                 r = client.get(f"{base}/repos")
                 self.assertEqual(r.json()["repos"][0]["merge_policy"], "ask")
+
+    def test_repos_api_publish_policy(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from factonio.config import list_repos, save_repos_store, save_settings
+        from factonio.repos import add_repo
+
+        with isolated_hermes_home() as home:
+            for name in ("sample", "legacy"):
+                local = home / "dev" / name
+                (local / ".git").mkdir(parents=True)
+                add_repo(f"acme/{name}", local_path=str(local), clone=False, inspect_remote=False)
+            store = list_repos()
+            store["acme-legacy"].pop("publish_policy", None)
+            save_repos_store(store)
+            save_settings({"default_publish_policy": "ask"})
+
+            spec = importlib.util.spec_from_file_location(
+                "factonio_test_plugin_api_publish", PLUGIN_ROOT / "dashboard" / "plugin_api.py"
+            )
+            assert spec is not None and spec.loader is not None
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            app = FastAPI()
+            app.include_router(mod.router, prefix="/api/plugins/factonio")
+            client = TestClient(app)
+            base = "/api/plugins/factonio"
+            repos_json = home / "plugin-data" / "factonio" / "repos.json"
+
+            body = client.get(f"{base}/repos").json()
+            self.assertEqual(body["defaults"]["publish_policy"], "ask")
+            by_slug = {r["slug"]: r for r in body["repos"]}
+            # add_repo seeded the explicit value at registration time (global was auto then).
+            self.assertEqual(by_slug["acme-sample"]["publish_policy"], "auto")
+            # Legacy records without the key inherit the current global default.
+            self.assertNotIn("publish_policy", json.loads(repos_json.read_text(encoding="utf-8"))["acme-legacy"])
+            self.assertEqual(by_slug["acme-legacy"]["publish_policy"], "ask")
+
+            for value in ("ask", "auto"):
+                with self.subTest(value=value):
+                    r = client.patch(f"{base}/repos/acme-sample", json={"publish_policy": value})
+                    self.assertEqual(r.status_code, 200, r.text)
+                    self.assertEqual(r.json()["repo"]["publish_policy"], value)
+                    stored = json.loads(repos_json.read_text(encoding="utf-8"))["acme-sample"]
+                    self.assertEqual(stored["publish_policy"], value)
+
+            before = repos_json.read_text(encoding="utf-8")
+            for bad in ("always", None, "", 1, True, ["ask"]):
+                with self.subTest(bad=bad):
+                    r = client.patch(f"{base}/repos/acme-sample", json={"publish_policy": bad})
+                    self.assertEqual(r.status_code, 422, r.text)
+            self.assertEqual(repos_json.read_text(encoding="utf-8"), before)
+
+            # Invalid global config never reads as "auto": GET stays 200 and reports null.
+            save_settings({"default_publish_policy": "sometimes"})
+            r = client.get(f"{base}/repos")
+            self.assertEqual(r.status_code, 200, r.text)
+            body = r.json()
+            self.assertIsNone(body["defaults"]["publish_policy"])
+            by_slug = {x["slug"]: x for x in body["repos"]}
+            self.assertIsNone(by_slug["acme-legacy"]["publish_policy"])
+            self.assertEqual(by_slug["acme-sample"]["publish_policy"], "auto")
 
     def test_dashboard_manifest_discovered_by_hermes(self):
         from hermes_cli.web_server_dashboard import _discover_dashboard_plugins

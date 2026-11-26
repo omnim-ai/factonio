@@ -704,6 +704,7 @@ export function initialReposState() {
   return {
     defaults: {
       merge_policy: 'auto',
+      publish_policy: 'auto',
       max_fix_rounds: 3,
       design_provider: 'auto',
       design_approval: 'ask',
@@ -717,6 +718,7 @@ export function initialReposState() {
         path: '~/dev/factonio',
         default_branch: 'main',
         merge_policy: 'auto',
+        publish_policy: 'auto',
         max_fix_rounds: 3,
         design_provider: null,
         design_approval: null,
@@ -735,6 +737,7 @@ export function initialReposState() {
         path: '~/dev/payments-api',
         default_branch: 'main',
         merge_policy: 'ask',
+        publish_policy: 'ask',
         max_fix_rounds: 5,
         design_provider: 'off',
         design_approval: null,
@@ -753,6 +756,7 @@ export function initialReposState() {
         path: '~/dev/web-console',
         default_branch: 'develop',
         merge_policy: 'auto',
+        publish_policy: 'auto',
         max_fix_rounds: 3,
         design_provider: 'hermes',
         design_approval: 'auto',
@@ -809,6 +813,8 @@ const ACME = 'acme-payments-api-rate-limit-i42';
 const d = trailDecision;
 export const DASHBOARD_TRAIL = [
   d({ id: 'd_f012c8a47b99', ts: trailIso(12), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'merge', card_id: 't_bcf5502a', decision: 'pr_merged', why: 'Squash-merged PR #12 after the GraphQL readback confirmed all four gate tiers green on the exact head.', evidence: { pr_number: 12, head_sha: '5d178304e1', tests_passed: 114 }, result: 'merged' }),
+  d({ id: 'd_3c5e7a9b1d20', ts: trailIso(16), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'publish', card_id: 't_bcf5502a', actor: 'human', decision: 'publish_pr', why: 'Approved publication: pushed the exact verified head for PR #12.', evidence: { pr_number: 12, head_sha: '5d178304e1', branch: 'feat/watchdog-liveness', base_branch: 'main', draft: false }, result: 'published', supersedes_id: 'd_3c5e7a9b1d1f' }),
+  d({ id: 'd_3c5e7a9b1d1f', ts: trailIso(21), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'publish', card_id: 't_bcf5502a', decision: 'publish_pr', why: 'publish_policy is ask: kept the verified branch local and waited for approval.', evidence: { head_sha: '5d178304e1', branch: 'feat/watchdog-liveness', base_branch: 'main' }, result: 'refused' }),
   d({ id: 'd_7e30f91b5c04', ts: trailIso(27), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'escape', card_id: 't_1658b10a', decision: 'escape_gap_opened', why: 'A liveness bug from #9 reached main despite a passing verify. Opened a Verification Gap Analysis to find which check should have caught it.', evidence: { escaped_from: 'omnim-ai/factonio#9', card_id: 't_1658b10a' }, result: 'recorded' }),
   d({ id: 'd_c4f08e2a91b7', ts: trailIso(40), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'verify', card_id: 't_bcf5502a', decision: 'verify_carryover', why: 'Reused the prior verify-diff pass after git patch-id matched the unchanged hunks.', evidence: { pr_number: 12, head_sha: '5d178304e1', patch_id: '91e4f0a2c7b1', tests_passed: 114, tests_failed: 0 }, result: 'pass', supersedes_id: 'd_9a1e4c0b2f31' }),
   d({ id: 'd_2d67a4e8f012', ts: trailIso(54), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'watchdog', card_id: 't_caf57a3b', actor: 'watchdog', decision: 'stall_detected', why: 'Worker 48219 is alive but has made no file, git or API side effect for 27 minutes. Flagged the card for operator attention.', evidence: { card_id: 't_caf57a3b', worker_pid: 48219, side_effect_age_s: 1620 }, result: 'stalled' }),
@@ -1535,8 +1541,8 @@ REPO_EDITOR_DEMO_HTML = f"""<!doctype html>
           await new Promise(r => setTimeout(r, 40));
           scrollToRepos();
         }} else if (i === 3) {{
-          setCaption(4, 'Raise Max fix rounds from 3 → 5 for bounded verification repair loops');
-          setControlValue('max_fix_rounds', '5');
+          setCaption(4, 'Switch Publish policy from auto → ask (keep verified work local until you approve the push)');
+          setControlValue('publish_policy', 'ask');
           await new Promise(r => setTimeout(r, 40));
           scrollToRepos();
         }} else if (i === 4) {{
@@ -1860,10 +1866,10 @@ def capture_selected(out_dir: Path, targets: list[str], qa_dir: Path | None = No
                     re_frames: list[Path] = []
                     for i in range(6):
                         frame = re_dir / f"frame_{i:02d}.png"
-                        capture_url(chrome, f"{base}/__harness/repo-editor-demo.html?step={i}", frame, 960, 580, scale=2)
+                        capture_url(chrome, f"{base}/__harness/repo-editor-demo.html?step={i}", frame, 1080, 640, scale=2)
                         re_frames.append(frame)
                     out_gif = out_dir / "demo-repo-editor.gif"
-                    encode_gif(re_frames, [2.0, 1.8, 1.5, 1.5, 2.0, 3.0], out_gif, width=960)
+                    encode_gif(re_frames, [2.0, 1.8, 1.5, 1.5, 2.0, 3.0], out_gif, width=1080)
                     _verify_image(out_gif, b"GIF89a")
                     print(f"Wrote {out_gif} ({out_gif.stat().st_size} bytes)")
                     if qa_dir is not None:
@@ -1936,7 +1942,7 @@ def main() -> int:
         re_frames = sorted((args.frames_dir / "repo-editor").glob("frame_*.png"))
         if re_frames:
             re_durs = [2.0, 1.8, 1.5, 1.5, 2.0, 2.8][: len(re_frames)]
-            encode_gif(re_frames, re_durs, args.out / "demo-repo-editor.gif", width=960)
+            encode_gif(re_frames, re_durs, args.out / "demo-repo-editor.gif", width=1080)
             print(f"Wrote {args.out / 'demo-repo-editor.gif'} ({(args.out / 'demo-repo-editor.gif').stat().st_size} bytes)")
         return 0
 

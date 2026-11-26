@@ -65,17 +65,17 @@ const STYLES = `
 .fc-table th, .fc-table td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--ui-stroke-tertiary, var(--ui-stroke-secondary)); }
 .fc-table th { color: var(--ui-text-secondary); font-weight: 500; }
 .fc-mono { font-family: var(--dt-font-mono, ui-monospace, monospace); font-size: 11px; }
-.fc-warn { border: 1px solid rgba(245, 158, 11, 0.45); background: rgba(245, 158, 11, 0.09); border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; font-size: 12px; }
+.fc-warn { border: 1px solid color-mix(in srgb, var(--ui-warning, var(--ui-yellow, color-mix(in srgb, var(--dt-destructive) 55%, var(--ui-success)))) 45%, transparent); background: color-mix(in srgb, var(--ui-warning, var(--ui-yellow, color-mix(in srgb, var(--dt-destructive) 55%, var(--ui-success)))) 9%, transparent); border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; font-size: 12px; }
 .fc-pill { display: inline-flex; align-items: center; gap: 6px; border: 0; background: transparent; color: var(--ui-text-secondary); font-size: 11px; padding: 2px 6px; border-radius: 4px; cursor: pointer; font-variant-numeric: tabular-nums; }
 .fc-pill:hover { background: var(--ui-row-hover-background); color: var(--ui-text-primary); }
 .fc-dot { width: 7px; height: 7px; border-radius: 999px; display: inline-block; }
-.fc-dot-green { background: #34d399; }
-.fc-dot-amber { background: #fbbf24; }
-.fc-dot-red { background: #f87171; }
+.fc-dot-green { background: var(--ui-success); }
+.fc-dot-amber { background: var(--ui-warning, var(--ui-yellow, color-mix(in srgb, var(--dt-destructive) 55%, var(--ui-success)))); }
+.fc-dot-red { background: var(--dt-destructive); }
 .fc-dot-muted { background: var(--ui-text-tertiary); }
 .fc-badge { font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--ui-stroke-secondary); color: var(--ui-text-secondary); }
 .fc-step { border: 1px solid var(--ui-stroke-secondary); border-radius: 8px; padding: 10px 12px; margin: 8px 0; display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
-.fc-step-cmd { background: var(--ui-bg-elevated, rgba(127,127,127,0.08)); padding: 6px 8px; border-radius: 5px; font-family: var(--dt-font-mono, ui-monospace, monospace); font-size: 11px; overflow-x: auto; }
+.fc-step-cmd { background: var(--ui-bg-elevated, color-mix(in srgb, var(--ui-text-secondary) 8%, transparent)); padding: 6px 8px; border-radius: 5px; font-family: var(--dt-font-mono, ui-monospace, monospace); font-size: 11px; overflow-x: auto; }
 .fc-step-actions { display: flex; gap: 8px; align-items: center; }
 .fc-sec-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
 .fc-sec-head h2 { margin: 0; }
@@ -91,12 +91,17 @@ const STYLES = `
 .fc-btn:focus-visible, .fc-input:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 1px; }
 .fc-btn--primary { border-color: color-mix(in srgb, var(--ui-accent) 55%, transparent); background: color-mix(in srgb, var(--ui-accent) 14%, transparent); font-weight: 600; }
 .fc-btn--primary:hover:not(:disabled) { background: color-mix(in srgb, var(--ui-accent) 22%, transparent); }
-.fc-repos { table-layout: fixed; }
+.fc-repos-wrap { overflow-x: auto; max-width: 100%; }
+.fc-repos { table-layout: fixed; min-width: 992px; }
 .fc-repos th { white-space: normal; line-height: 1.25; vertical-align: bottom; }
 .fc-repos td { vertical-align: middle; }
 .fc-repos tbody tr:not(.fc-repo-ed):hover > td { background: var(--ui-row-hover-background); }
-.fc-col-repo { width: 22%; } .fc-col-branch { width: 10%; } .fc-col-merge { width: 10%; } .fc-col-rounds { width: 9%; }
-.fc-col-prov { width: 14%; } .fc-col-appr { width: 12%; } .fc-col-rigor { width: 15%; } .fc-col-act { width: 8%; }
+.fc-col-repo { width: 21%; } .fc-col-branch { width: 9%; } .fc-col-merge { width: 8%; } .fc-col-publish { width: 8%; } .fc-col-rounds { width: 7%; }
+.fc-col-prov { width: 13%; } .fc-col-appr { width: 12%; } .fc-col-rigor { width: 15%; } .fc-col-act { width: 7%; }
+.fc-pol { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; font-family: var(--dt-font-mono); font-size: 11.5px; color: var(--ui-text-secondary); white-space: nowrap; }
+.fc-pol::before { content: ""; flex: none; width: 6px; height: 6px; box-sizing: border-box; border-radius: 999px; border: 1.25px solid color-mix(in srgb, var(--ui-text-secondary) 58%, transparent); }
+.fc-pol[data-pol="ask"] { color: var(--ui-text-primary); font-weight: 600; }
+.fc-pol[data-pol="ask"]::before { border-color: var(--ui-accent); background: var(--ui-accent); }
 .fc-th-sub { display: block; font-weight: 400; font-size: 10.5px; color: var(--ui-text-secondary); }
 .fc-num, .fc-act { text-align: right !important; }
 .fc-trunc { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -110,11 +115,12 @@ const STYLES = `
 .fc-repos tr[data-editing="true"] > td:first-child { box-shadow: inset 2px 0 0 var(--ui-accent); }
 .fc-repos tr[data-editing="true"] .fc-tag--inherit { background: var(--ui-chat-surface-background); }
 .fc-repo-ed > td { padding: 0; }
-.fc-ed { display: flex; flex-direction: column; gap: 12px; margin: 0; padding: 2px 14px 14px 16px; border: 0; min-width: 0; }
+.fc-ed { display: flex; flex-direction: column; gap: 12px; margin: 0; padding: 2px 14px 14px 16px; border: 0; min-width: 0; position: sticky; left: 0; max-width: 100cqi; box-sizing: border-box; }
 .fc-ed-id { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 11px; color: var(--ui-text-secondary); }
 .fc-ed-id .fc-mono { color: var(--ui-text-primary); }
 .fc-ed-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 16px; border: 0; margin: 0; padding: 0; min-width: 0; }
 @container (max-width: 640px) { .fc-ed-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@container (max-width: 640px) { .fc-ed-grid > .fc-field[data-field="default_branch"] { grid-column: 1 / -1; } }
 .fc-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .fc-field label { font-size: 11.5px; font-weight: 500; color: var(--ui-text-primary); }
 .fc-input { height: 28px; box-sizing: border-box; width: 100%; padding: 0 8px; border: 1px solid color-mix(in srgb, var(--ui-text-secondary) 32%, var(--ui-stroke-secondary)); border-radius: 6px; background: var(--ui-chat-surface-background); color: var(--ui-text-primary); font: inherit; font-size: 12px; }
@@ -651,6 +657,11 @@ function FactonioSettingsPage({ ctx }) {
 // ---------------------------------------------------------------------------
 
 const MERGE_POLICY_OPTIONS = ['auto', 'ask']
+const PUBLISH_POLICY_OPTIONS = ['auto', 'ask']
+const POLICY_TITLES = {
+  merge_policy: { ask: 'ask: waits for your approval to merge', auto: 'auto: merges automatically' },
+  publish_policy: { ask: 'ask: waits for your approval to publish', auto: 'auto: publishes automatically' }
+}
 const DESIGN_PROVIDER_OPTIONS = ['auto', 'claude-design', 'hermes', 'off']
 const DESIGN_APPROVAL_OPTIONS = ['ask', 'auto']
 const RIGOR_OPTIONS = [['standard', 'Standard'], ['high', 'High (multi-vendor panel)']]
@@ -658,7 +669,7 @@ const RIGOR_HINT = {
   standard: 'Single cross-model diff check + black-box check.',
   high: 'Multi-vendor panel: needs ≥2 verify models from distinct vendor families; fails closed on disagreement.'
 }
-const REPO_FIELD_ORDER = ['default_branch', 'merge_policy', 'max_fix_rounds', 'design_provider', 'design_approval', 'default_rigor']
+const REPO_FIELD_ORDER = ['default_branch', 'merge_policy', 'publish_policy', 'max_fix_rounds', 'design_provider', 'design_approval', 'default_rigor']
 const REPOS_QUERY_KEY = ['factonio', 'repos']
 
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`
@@ -705,6 +716,8 @@ function seedRepoDraft(repo) {
   return {
     default_branch: String(repo.default_branch ?? ''),
     merge_policy: String(repo.merge_policy ?? 'auto'),
+    // null means the server could not resolve a valid policy; never present it as auto.
+    publish_policy: repo.publish_policy == null ? '' : String(repo.publish_policy),
     max_fix_rounds: repo.max_fix_rounds == null ? '' : String(repo.max_fix_rounds),
     design_provider: repo.design_provider ? String(repo.design_provider) : '',
     design_approval: repo.design_approval ? String(repo.design_approval) : '',
@@ -720,6 +733,7 @@ function normalizeRepoDraft(d) {
   return {
     default_branch: String(d.default_branch ?? '').trim(),
     merge_policy: String(d.merge_policy ?? ''),
+    publish_policy: String(d.publish_policy ?? ''),
     max_fix_rounds: Number.isSafeInteger(n) ? String(n) : rounds,
     design_provider: d.design_provider || null,
     design_approval: d.design_approval || null,
@@ -815,6 +829,21 @@ function RigorTag({ value, effective }) {
   })
 }
 
+// Policies are non-clearable per-repo values, so they render as plain text with a
+// dot (ask) / ring (auto) instead of the inherited/override `.fc-tag` badges.
+function PolicyCell({ field, value }) {
+  const v = value == null || value === '' ? null : String(value)
+  return jsx('td', {
+    'data-field': field,
+    children: jsx('span', {
+      className: 'fc-pol',
+      'data-pol': v ?? undefined,
+      title: (v && POLICY_TITLES[field]?.[v]) || `${field.replace('_', ' ')}: ${v ?? 'unknown'}`,
+      children: v ?? '—'
+    })
+  })
+}
+
 function RepoRow({ repo: r, defaults, editing, busy, editorId, onEdit, buttonRef }) {
   return jsxs('tr', {
     'data-slug': r.slug,
@@ -827,7 +856,8 @@ function RepoRow({ repo: r, defaults, editing, busy, editorId, onEdit, buttonRef
         ]
       }),
       jsx('td', { children: jsx('span', { className: 'fc-trunc fc-mono', title: r.default_branch || '', children: r.default_branch || '—' }) }),
-      jsx('td', { children: r.merge_policy ?? '—' }),
+      jsx(PolicyCell, { field: 'merge_policy', value: r.merge_policy }),
+      jsx(PolicyCell, { field: 'publish_policy', value: r.publish_policy }),
       jsx('td', { className: 'fc-num', children: r.max_fix_rounds ?? '—' }),
       jsx('td', {
         'data-field': 'design_provider',
@@ -1017,7 +1047,7 @@ function RepoEditor({ ctx, repo, defaults, autoResolved, reposQ, editorId, savin
     'data-editing': 'true',
     'data-slug': repo.slug,
     children: jsx('td', {
-      colSpan: 8,
+      colSpan: 9,
       children: jsxs('form', {
         className: 'fc-ed',
         id: editorId,
@@ -1055,6 +1085,12 @@ function RepoEditor({ ctx, repo, defaults, autoResolved, reposQ, editorId, savin
                 label: 'Merge policy',
                 hint: 'auto merges when checks pass; ask waits for you.',
                 control: select(MERGE_POLICY_OPTIONS)
+              }),
+              field({
+                name: 'publish_policy',
+                label: 'Publish policy',
+                hint: 'auto pushes and opens a PR once verified; ask keeps work local until you approve.',
+                control: select(PUBLISH_POLICY_OPTIONS)
               }),
               field({
                 name: 'max_fix_rounds',
@@ -1208,6 +1244,16 @@ function ReposSection({ ctx, reposQ }) {
                   ' · rigor ',
                   jsx('span', { className: 'fc-mono', children: defaults.default_rigor || 'standard' })
                 ]
+              }),
+              jsxs('p', {
+                className: 'fc-sec-sub',
+                children: [
+                  'New repos start with merge ',
+                  jsx('span', { className: 'fc-mono', children: defaults.merge_policy || 'auto' }),
+                  ' · publish ',
+                  jsx('span', { className: 'fc-mono', children: defaults.publish_policy || 'auto' }),
+                  ', set per repo.'
+                ]
               })
             ]
           }),
@@ -1222,28 +1268,32 @@ function ReposSection({ ctx, reposQ }) {
           })
         ]
       }),
-      jsxs('table', {
-        className: 'fc-table fc-repos',
-        children: [
-          jsxs('colgroup', {
-            children: ['fc-col-repo', 'fc-col-branch', 'fc-col-merge', 'fc-col-rounds', 'fc-col-prov', 'fc-col-appr', 'fc-col-rigor', 'fc-col-act'].map(col)
-          }),
-          jsx('thead', {
-            children: jsxs('tr', {
-              children: [
-                jsxs('th', { scope: 'col', children: ['Repository', jsx('span', { className: 'fc-th-sub', children: 'Local path' })] }),
-                jsx('th', { scope: 'col', children: 'Branch' }),
-                jsx('th', { scope: 'col', children: 'Merge policy' }),
-                jsx('th', { scope: 'col', className: 'fc-num', children: 'Max fix rounds' }),
-                jsx('th', { scope: 'col', children: 'Design provider' }),
-                jsx('th', { scope: 'col', children: 'Design approval' }),
-                jsx('th', { scope: 'col', children: 'Rigor' }),
-                jsx('th', { scope: 'col', className: 'fc-act', children: jsx('span', { className: 'fc-sr', children: 'Actions' }) })
-              ]
-            })
-          }),
-          jsx('tbody', { children: rows })
-        ]
+      jsx('div', {
+        className: 'fc-repos-wrap',
+        children: jsxs('table', {
+          className: 'fc-table fc-repos',
+          children: [
+            jsxs('colgroup', {
+              children: ['fc-col-repo', 'fc-col-branch', 'fc-col-merge', 'fc-col-publish', 'fc-col-rounds', 'fc-col-prov', 'fc-col-appr', 'fc-col-rigor', 'fc-col-act'].map(col)
+            }),
+            jsx('thead', {
+              children: jsxs('tr', {
+                children: [
+                  jsxs('th', { scope: 'col', children: ['Repository', jsx('span', { className: 'fc-th-sub', children: 'Local path' })] }),
+                  jsx('th', { scope: 'col', children: 'Branch' }),
+                  jsx('th', { scope: 'col', children: 'Merge policy' }),
+                  jsx('th', { scope: 'col', children: 'Publish policy' }),
+                  jsx('th', { scope: 'col', className: 'fc-num', children: 'Max fix rounds' }),
+                  jsx('th', { scope: 'col', children: 'Design provider' }),
+                  jsx('th', { scope: 'col', children: 'Design approval' }),
+                  jsx('th', { scope: 'col', children: 'Rigor' }),
+                  jsx('th', { scope: 'col', className: 'fc-act', children: jsx('span', { className: 'fc-sr', children: 'Actions' }) })
+                ]
+              })
+            }),
+            jsx('tbody', { children: rows })
+          ]
+        })
       })
     ]
   })
@@ -1257,16 +1307,16 @@ function ReposSection({ ctx, reposQ }) {
 
 const TRAIL_LIMIT = 200
 const TRAIL_QUERY_KEY = ['factonio', 'trail', TRAIL_LIMIT]
-const TRAIL_PHASE_ORDER = ['define', 'design', 'implement', 'verify', 'gate', 'merge', 'escape', 'watchdog']
+const TRAIL_PHASE_ORDER = ['define', 'design', 'implement', 'verify', 'publish', 'gate', 'merge', 'escape', 'watchdog']
 const TRAIL_TONE = {
-  merged: 'ok', pass: 'ok', approved: 'ok', ready: 'ok',
+  merged: 'ok', pass: 'ok', approved: 'ok', ready: 'ok', published: 'ok',
   reject: 'bad', stalled: 'bad', dead_worker: 'bad', blocked: 'bad', refused: 'bad', error: 'bad',
   inconclusive: 'warn', pivot: 'warn', escape: 'warn',
   spawned: 'info', recorded: 'info', queued: 'info'
 }
 const TRAIL_SB_TONE = { ok: 'pass', bad: 'reject', warn: 'warn', info: 'info' }
 const TRAIL_ACTOR_ICON = { orchestrator: 'dash', worker: 'running', watchdog: 'queued', human: 'person' }
-const TRAIL_KNOWN_EVIDENCE = new Set(['pr_number', 'head_sha', 'patch_id', 'tests_passed', 'tests_failed', 'escaped_from', 'side_effect_age_s', 'worker_pid', 'card_id'])
+const TRAIL_KNOWN_EVIDENCE = new Set(['pr_number', 'head_sha', 'patch_id', 'tests_passed', 'tests_failed', 'escaped_from', 'side_effect_age_s', 'worker_pid', 'card_id', 'branch', 'base_branch', 'draft'])
 const GH_SLUG = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 
 const resultTone = r => TRAIL_TONE[String(r || '').toLowerCase()] || null
@@ -1334,6 +1384,18 @@ function evidencePills(d, gh) {
     out.push({ key: 'pr_number', text: `PR #${e.pr_number}`, href, title: href ? `Open ${gh}#${n}` : `pr_number ${e.pr_number}` })
   }
   if (has('head_sha')) out.push({ key: 'head_sha', text: String(e.head_sha).slice(0, 7), title: `head_sha ${e.head_sha}` })
+  const hasBase = has('base_branch') && typeof e.base_branch !== 'object'
+  if (has('branch') && typeof e.branch !== 'object') {
+    out.push({
+      key: 'branch',
+      label: 'branch',
+      text: String(e.branch).slice(0, 48) + (hasBase ? ` → ${e.base_branch}` : ''),
+      title: `branch ${e.branch}` + (hasBase ? ` → base ${e.base_branch}` : '')
+    })
+  } else if (hasBase) {
+    out.push({ key: 'base_branch', label: 'base branch', text: String(e.base_branch).slice(0, 32), title: `base_branch ${e.base_branch}` })
+  }
+  if (e.draft === true) out.push({ key: 'draft', text: 'draft', title: 'draft true' })
   if (has('patch_id')) out.push({ key: 'patch_id', label: 'patch-id', text: String(e.patch_id).slice(0, 7), title: `patch_id ${e.patch_id}` })
   if (has('tests_passed')) out.push({ key: 'tests_passed', text: `${e.tests_passed} pass`, tone: 'ok', title: `tests_passed ${e.tests_passed}` })
   if (has('tests_failed') && Number(e.tests_failed) !== 0) out.push({ key: 'tests_failed', text: `${e.tests_failed} fail`, tone: 'bad', title: `tests_failed ${e.tests_failed}` })
