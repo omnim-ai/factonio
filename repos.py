@@ -13,7 +13,7 @@ import tempfile
 import time
 from contextlib import closing
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from .config import (
     DESIGN_APPROVAL_POLICIES,
@@ -1384,8 +1384,8 @@ def verify_patch_continuity(
     }
 
 
-_WORKFLOW_DIR = ".github/workflows/"
-_LOCKFILE_NAMES = frozenset({
+_WORKFLOW_DIR_B = b".github/workflows/"
+_LOCKFILE_NAMES_B = frozenset(n.encode("ascii") for n in {
     "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb",
     "poetry.lock", "pipfile.lock", "uv.lock", "pdm.lock", "cargo.lock", "gemfile.lock", "composer.lock",
     "go.sum", "flake.lock", "mix.lock", "pubspec.lock", "podfile.lock", "packages.lock.json", "gradle.lockfile",
@@ -1393,8 +1393,8 @@ _LOCKFILE_NAMES = frozenset({
 _REBASE_REQUIRED_POLICIES = frozenset({"overlap_rebase_required", "workflow_rebase_required"})
 
 
-def _is_lockfile(path: str) -> bool:
-    return path.rsplit("/", 1)[-1].lower() in _LOCKFILE_NAMES
+def _is_lockfile(path: bytes) -> bool:
+    return path.rsplit(b"/", 1)[-1].lower() in _LOCKFILE_NAMES_B
 
 
 def assess_trunk_drift(
@@ -1433,29 +1433,40 @@ def assess_trunk_drift(
             raise RuntimeError(_git_err(proc, "rev-list"))
         ahead = int(proc.stdout.strip() or 0)
 
-        def _names(rng: str) -> set[str]:
-            # -z: NUL-separated raw paths; without it core.quotePath C-quotes non-ASCII/special names.
-            out = _run_git(["diff", "--name-only", "-z", rng, "--"], cwd=cwd, timeout=60)
+        def _names(rng: str) -> set[bytes]:
+            # -z + bytes: Git paths are arbitrary bytes (not necessarily UTF-8); classify them raw so one
+            # undecodable filename can never make the drift gate unavailable (fail open).
+            out = subprocess.run(
+                ["git", "--no-optional-locks", "diff", "--name-only", "-z", rng, "--"],
+                cwd=str(cwd), capture_output=True, timeout=60, check=False,
+            )
             if out.returncode != 0:
-                raise RuntimeError(_git_err(out, "diff --name-only"))
-            return {p for p in out.stdout.split("\0") if p}
+                detail = out.stderr.decode("utf-8", "replace").strip() or f"exit {out.returncode}"
+                raise RuntimeError(f"git diff --name-only failed: {detail}")
+            return {p for p in out.stdout.split(b"\0") if p}
 
-        trunk_files = _names(f"{merge_base}..{trunk_ref}")
-        pr_files = _names(f"{merge_base}..{head_ref}")
+        trunk_raw = _names(f"{merge_base}..{trunk_ref}")
+        pr_raw = _names(f"{merge_base}..{head_ref}")
     except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
         return {
             "ok": False, "has_drift": False, "has_overlap": False, "overlapping_files": [],
             "policy": "unavailable", "rebase_required": False, "workflow_files": [], "error": str(exc),
         }
-    overlapping = sorted(trunk_files & pr_files)
-    workflow_files = sorted(f for f in trunk_files if f.startswith(_WORKFLOW_DIR))
+
+    def _display(paths: Iterable[bytes]) -> list[str]:
+        return sorted({p.decode("utf-8", "replace") for p in paths})
+
+    overlap_raw = trunk_raw & pr_raw
+    workflow_raw = {p for p in trunk_raw if p.startswith(_WORKFLOW_DIR_B)}
+    overlapping = _display(overlap_raw)
+    workflow_files = _display(workflow_raw)
     if ahead == 0:
         policy = "clean"
-    elif workflow_files:
+    elif workflow_raw:
         policy = "workflow_rebase_required"
-    elif overlapping:
+    elif overlap_raw:
         policy = "overlap_rebase_required"
-    elif trunk_files and all(_is_lockfile(f) for f in trunk_files):
+    elif trunk_raw and all(_is_lockfile(p) for p in trunk_raw):
         policy = "lockfile_only"
     else:
         policy = "disjoint"
@@ -1465,8 +1476,8 @@ def assess_trunk_drift(
         "head_ref": head_ref,
         "merge_base": merge_base,
         "trunk_commits_ahead": ahead,
-        "trunk_files": sorted(trunk_files),
-        "pr_files": sorted(pr_files),
+        "trunk_files": _display(trunk_raw),
+        "pr_files": _display(pr_raw),
         "overlapping_files": overlapping,
         "has_drift": ahead > 0,
         "has_overlap": bool(overlapping),

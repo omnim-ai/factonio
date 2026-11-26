@@ -504,6 +504,85 @@ class TestTieredTrunkDrift(unittest.TestCase):
                 if rebase:
                     self.assertEqual(gate["blockers"], [f"Trunk drift requires rebase (workflow_rebase_required): {workflow}"])
 
+    def _byte_commit(self, repo: Path, branch: str, files: dict[bytes, bytes], msg: str) -> str:
+        _git(repo, "checkout", "-q", branch)
+        for name, content in files.items():
+            path = os.path.join(os.fsencode(repo), name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            try:
+                with open(path, "wb") as fh:
+                    fh.write(content)
+            except OSError as exc:  # e.g. filesystems that reject non-UTF-8 names
+                self.skipTest(f"filesystem rejects non-UTF-8 filename {name!r}: {exc}")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", msg)
+        _git(repo, "push", "-q", "origin", branch)
+        sha = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "checkout", "-q", "main")
+        return sha
+
+    def test_non_utf8_trunk_filename_does_not_fail_open(self):
+        from factonio.repos import assess_trunk_drift, inspect_pr_gate, merge_pr
+
+        cases = [
+            ({b"asset-\xff.txt": b"x\n", b".github/workflows/ci.yml": b"on: pull_request\n"},
+             "workflow_rebase_required", ".github/workflows/ci.yml"),
+            ({b"asset-\xfe.txt": b"x\n", b"a.txt": b"trunk\n"}, "overlap_rebase_required", "a.txt"),
+        ]
+        for files, policy, blocker_path in cases:
+            with self.subTest(policy=policy), isolated_hermes_home() as home, _git_env():
+                repo = Repo(home)
+                self._byte_commit(repo.seed, "main", files, "trunk")
+                res = assess_trunk_drift(repo.local, "origin/feat/x", fetch=True)
+                self.assertTrue(res["ok"], res)
+                self.assertEqual((res["policy"], res["rebase_required"]), (policy, True))
+                asset = next(n for n in files if n.startswith(b"asset-"))
+                self.assertIn(asset.decode("utf-8", "replace"), res["trunk_files"])
+                json.dumps(res).encode("utf-8")  # display lists are serializable UTF-8 (no lone surrogates)
+
+                repo.register()
+                node = _pr_node(head_branch="feat/x", head_sha=repo.head)
+                with mock.patch("factonio.repos._run_gh", Gh({12: node})):
+                    gate = inspect_pr_gate("acme/sample", 12)
+                self.assertEqual(gate["trunk_drift"]["policy"], policy)
+                self.assertFalse(gate["ready_to_merge"])
+                self.assertEqual(gate["blocker_tier"], 1)
+                self.assertEqual(gate["blockers"], [f"Trunk drift requires rebase ({policy}): {blocker_path}"])
+
+                views = {12: {"state": "MERGED", "mergedAt": "2026-11-26T00:00:00Z", "baseRefName": "main"}}
+                gh = Gh({12: node}, views=views)
+                with mock.patch("factonio.repos._run_gh", gh):
+                    refused = merge_pr("acme/sample", 12, expected_head_sha=repo.head)
+                self.assertFalse(refused["ok"], refused)
+                self.assertFalse(any(c[:2] == ["pr", "merge"] for c in gh.calls))
+
+                code, out = TestCliAndTools()._cli({12: node}, "--json", "pr-gate", "acme/sample", "12")
+                self.assertEqual(code, 1, out)
+                data = json.loads(out)
+                self.assertFalse(data["ready_to_merge"])
+                self.assertEqual(data["trunk_drift"]["policy"], policy)
+
+    def test_non_utf8_paths_compare_as_raw_bytes(self):
+        from factonio.repos import assess_trunk_drift
+
+        cases = [
+            ({b"bin-\xff.dat": b"t\n"}, {b"bin-\xfe.dat": b"b\n"}, "disjoint", False, []),
+            ({b"shared-\xff.dat": b"t\n"}, {b"shared-\xff.dat": b"b\n"}, "overlap_rebase_required", True,
+             [b"shared-\xff.dat".decode("utf-8", "replace")]),
+        ]
+        for trunk, branch, policy, overlap, overlapping in cases:
+            with self.subTest(policy=policy), isolated_hermes_home() as home, _git_env():
+                repo = Repo(home)
+                self._byte_commit(repo.seed, "feat/x", branch, "branch")
+                self._byte_commit(repo.seed, "main", trunk, "trunk")
+                _git(repo.local, "fetch", "-q", "origin")
+                res = assess_trunk_drift(repo.local, "origin/feat/x", fetch=True)
+                self.assertTrue(res["ok"], res)
+                self.assertEqual(res["pr_files"], sorted(["a.txt", *(n.decode("utf-8", "replace") for n in branch)]))
+                self.assertEqual((res["policy"], res["has_overlap"], res["overlapping_files"]),
+                                 (policy, overlap, overlapping))
+                json.dumps(res).encode("utf-8")
+
     def test_fork_head_branch_colliding_with_origin_branch_fetches_pull_ref(self):
         from factonio.repos import inspect_pr_gate
 
