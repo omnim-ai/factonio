@@ -62,7 +62,8 @@
         "Plugin loads in an isolated HERMES_HOME and `hermes factonio --help` lists every subcommand",
         "plugin.yaml declares every factonio_* tool and bundled skill",
         "harness-audit blueprint pairs `harness audit` with a live `harness check --run-doctor --run-hooks` and the doc_drift / harness_gap / product_regression rubric",
-        "plugin.yaml config_schema declares `initial_progress_minutes` (default 10) and the retro blueprint maintains the AGENTS.md Rule-to-Enforcer ledger"
+        "plugin.yaml config_schema declares `initial_progress_minutes` (default 10) and the retro blueprint maintains the AGENTS.md Rule-to-Enforcer ledger",
+        "ORCHESTRATOR_PROMPT_SECTION stays under 2,900 characters and documents publish_policy, local-only Implementation and local-branch verification on `ask`, and `factonio_publish_pr` only after explicit human approval"
       ]
     },
     {
@@ -295,7 +296,8 @@
         "verify-diff keeps the Gate-Integrity Audit, MUST KILL rule, certainty ladder and `dropped` list; orchestrator section 4 tiers rigor=high fix-round re-verification and runs a pre-handoff `trail --audit` Attention check",
         "define §1c, verify-diff checklist item 11 and orchestrator §1.4 document the refactor, perf and read-only investigate modes",
         "orchestrator section 5 caps trunk-drift rebases (escalate before a 3rd rebase of the same PR) and runs merge-result caller checks on disjoint drift",
-        "define Core Principles add Build the Lever / Idempotency / Minimize Reader Load / \"No is an acceptable answer\" plus a §1 recall step; implement §1b Crash-Pickup Protocol; orchestrator §1 pushback rule, Decision Trail pre-workstream recall and Error Handling crash pickup (outside §5)"
+        "define Core Principles add Build the Lever / Idempotency / Minimize Reader Load / \"No is an acceptable answer\" plus a §1 recall step; implement §1b Crash-Pickup Protocol; orchestrator §1 pushback rule, Decision Trail pre-workstream recall and Error Handling crash pickup (outside §5)",
+        "publish_policy: ask workflow: orchestrator §4b local-branch factonio_spawn_verify (incl. rigor=high + factonio_evaluate_panel branch filter), bounded local fix rounds, publish handoff and factonio_publish_pr only on explicit approval; implement §2d local-only delivery (no git push / gh pr create); verify-diff and verify-blackbox local unpublished branch modes keep their barriers"
       ]
     },
     {
@@ -317,7 +319,8 @@
         "CHANGELOG Unreleased, docs/architecture.md and THIRD_PARTY_NOTICES.md document each Wave 4 and Wave 5 unit",
         "CHANGELOG Unreleased and docs/architecture.md document the Wave 4 polish trail-audit, malformed-pr_number and lock-budget changes",
         "CHANGELOG Unreleased and docs/architecture.md document whole-field fail-closed recall redaction",
-        "CHANGELOG Unreleased and docs/architecture.md document ANSI escape-sequence stripping in recall redaction"
+        "CHANGELOG Unreleased and docs/architecture.md document ANSI escape-sequence stripping in recall redaction",
+        "README.md, SECURITY.md, docs/architecture.md and CHANGELOG Unreleased document publish_policy / default_publish_policy, the exact-SHA fail-closed publish_pr gate, `hermes factonio publish-pr`, and `publish` / `published` in trail --audit"
       ]
     },
     {
@@ -336,7 +339,8 @@
         "Trail-audit false positives, PR-scoped closure, malformed pr_number evidence and the cold-init lock-budget regression are covered in tests.test_trail, tests.test_pr_gate_hardening and tests.test_metrics_history",
         "recall, crash-pickup and core-principle contracts are covered in tests.test_recall_and_principles",
         "spaced and tab-interleaved holdout recall paths are covered end to end (log_decision -> trail --recall --json/--markdown -> Definition card) in tests.test_recall_and_principles",
-        "ANSI CSI, OSC, DCS and C1 escape sequences inside holdout recall paths are covered end to end (log_decision -> trail --recall --json/--markdown -> Definition card) in tests.test_recall_and_principles"
+        "ANSI CSI, OSC, DCS and C1 escape sequences inside holdout recall paths are covered end to end (log_decision -> trail --recall --json/--markdown -> Definition card) in tests.test_recall_and_principles",
+        "publish_policy prompt, skill, docs and plugin.yaml contracts are covered in tests.test_plugin_registration"
       ]
     }
   ],

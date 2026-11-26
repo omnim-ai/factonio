@@ -50,6 +50,7 @@ Factonio runs autonomous software delivery on a dedicated headless `factonio` wo
    - **Diff Check** inspects `spec.md` and `git diff` without ever seeing `holdout/`.
    - **Black-Box Check** runs the built artifact against acceptance criteria and `holdout/` without reading source code or diffs.
    - On rejection, Factonio runs bounded repair rounds (up to `max_fix_rounds`, reporting only observable symptoms). Once GitHub CI and both checks pass on the **exact live `head_sha`**, the PR squash-merges automatically (or waits for approval when `merge_policy: ask`).
+   - **Local-first publishing (`publish_policy: ask`):** with the default `publish_policy: auto` (global `default_publish_policy`), Implementation pushes its branch and opens the PR itself. With `publish_policy: ask`, Implementation commits only on a local worktree branch (no `git push`, no `gh pr create`), both checks (and `rigor="high"` panels) verify the unpublished branch at its exact `head_sha`, and nothing reaches GitHub until you approve. The orchestrator then publishes that exact verified SHA with `factonio_publish_pr` (`hermes factonio publish-pr`), and the normal GitHub CI, PR gate, and `merge_policy` flow takes over.
 
 For a full technical breakdown of worktrees, storage locking, watchdog ticks, and API endpoints, see [docs/architecture.md](docs/architecture.md).
 
@@ -65,7 +66,7 @@ Track workstream throughput, Diff vs Black-Box pass rates, rework rate, post-mer
 
 ### Inline Repository Settings Editor
 
-Edit any registered repository's `default_branch`, `merge_policy`, `max_fix_rounds`, `design_provider`, `design_approval`, or `default_rigor` directly in `/factonio` — clearly distinguishing inherited global defaults (`value · global`) from per-repo overrides:
+Edit any registered repository's `default_branch`, `merge_policy`, `publish_policy`, `max_fix_rounds`, `design_provider`, `design_approval`, or `default_rigor` directly in `/factonio` — clearly distinguishing inherited global defaults (`value · global`) from per-repo overrides:
 
 ![Animated walkthrough of editing a registered repository inline on the Factonio dashboard](docs/images/demo-repo-editor.gif)
 
@@ -137,6 +138,7 @@ Adjust any registered repository's settings without re-adding it (only passed fl
 
 ```bash
 hermes factonio update owner/repo --merge-policy ask --max-fix-rounds 5
+hermes factonio update owner/repo --publish-policy ask   # verify locally, publish PRs only on approval
 hermes factonio update owner-repo --default-branch develop
 hermes factonio update owner/repo --design-provider hermes --design-approval auto
 hermes factonio update owner/repo --design-provider inherit   # revert to global default
@@ -154,8 +156,8 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 |---|---|
 | `hermes factonio init [--apply-config] [--workers N] [--force] [--force-link]` | Create or update the headless `factonio` worker profile and plugin link (refuses to link a persistent profile to an ephemeral worktree/workspace/scratch checkout unless `--force-link`) |
 | `hermes factonio doctor [--json]` | Check `git`, `gh auth`, worker profile, Kanban config, and cross-model setup |
-| `hermes factonio add <owner/repo> [--path DIR] [--merge-policy auto\|ask] [--max-fix-rounds N]` | Register, clone (unless `--no-clone`), anchor Hermes Project, and inspect CI |
-| `hermes factonio update\|edit <repo> [--merge-policy ...] [--max-fix-rounds N] [--default-branch B] [--design-provider ...] [--design-approval ...] [--default-rigor standard\|high\|inherit]` | Update per-repo settings (`inherit` clears design and rigor overrides) |
+| `hermes factonio add <owner/repo> [--path DIR] [--merge-policy auto\|ask] [--publish-policy auto\|ask] [--max-fix-rounds N]` | Register, clone (unless `--no-clone`), anchor Hermes Project, and inspect CI |
+| `hermes factonio update\|edit <repo> [--merge-policy ...] [--publish-policy auto\|ask] [--max-fix-rounds N] [--default-branch B] [--design-provider ...] [--design-approval ...] [--default-rigor standard\|high\|inherit]` | Update per-repo settings (`inherit` clears design and rigor overrides) |
 | `hermes factonio list [--json]` | List registered repositories and active settings |
 | `hermes factonio remove <repo>` | Unregister a repository (keeps local files intact) |
 | `hermes factonio models [--repo SLUG] [--json]` | Show resolved provider/model per phase, default rigor, the high-rigor verify panel, and cross-model warning |
@@ -164,6 +166,7 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 | `hermes factonio panel [panel_id] [--tenant T] [--pr N] [--record] [--json]` | Evaluate a `rigor=high` verification panel's fail-closed consensus (`pass` / `reject` / `inconclusive` / `pending`), disagreement summary, and findings; `--record` logs a terminal consensus to `trail.db` (exits non-zero when no panel matches) |
 | `hermes factonio arena spawn\|status [repo] [--request R] [--target define\|design] [--tenant T] [--candidate M ...] [--judge-model M] [--no-judge] [--strict-cross-vendor] [--arena-id ID] [--spawn-judge] [--json]` | Opt-in arena: fan out competing cross-vendor Definition or Design candidates (fails closed unless >= 2 vendor families) plus a dependent judge that hand-grafts the canonical artifact, or report read-only arena progress |
 | `hermes factonio pr-gate <repo> <pr_number> [--json]` | Inspect live PR HEAD SHA, mergeability, and CI check status |
+| `hermes factonio publish-pr <repo> <branch> --expected-head-sha <sha> --title <title> [--body <text> \| --body-file <path>] [--base B] [--draft] [--remote R] [--tenant T] [--card-id ID] [--json]` | Publish a locally verified branch (`publish_policy: ask`): refuses on any HEAD drift before any remote call, pushes exactly `<sha>:refs/heads/<branch>`, opens the PR via a temporary body file, and confirms it by live readback (exit `0` only when published) |
 | `hermes factonio harness init\|check\|show\|audit <repo> [--force] [--dry-run] [--prove] [--base REF] [--run-doctor] [--run-hooks] [--json]` | Bootstrap, validate, show, or read-only drift-audit the repo's `.factonio/verify.md` + `harness.json` black-box verification harness (`init --prove` fails closed and rolls back unless Doctor, required hooks and evidence survival pass; `check` fails when required gates were removed/downgraded vs `--base`, default `HEAD`; `audit` exits non-zero when `stale` or `missing` and classifies drift as `doc_drift` / `harness_gap` / `product_regression`) |
 | `hermes factonio restack <repo> [pr_number] [--parent-pr N] [--from-branch B] [--new-base B] [--old-base-sha SHA] [--verified-sha SHA] [--no-push] [--no-retarget] [--dry-run] [--json]` | Rebase a stacked PR (or every open child of a parent) onto its new base in a throwaway worktree and report `git patch-id` verdict continuity |
 | `hermes factonio trail [--tenant T] [--repo R] [--phase P] [--card ID] [--limit N] [--markdown] [--json]` | Show the append-only decision trail (`trail.db`) as text, a Markdown table, or the `{decisions, summary, filters}` JSON contract |
@@ -175,21 +178,22 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 <summary>Agent tools registered in toolset <code>factonio</code></summary>
 
 - `factonio_add_repo` — register a GitHub repository and anchor its Hermes Project
-- `factonio_update_repo` — update per-repository settings (`merge_policy`, `max_fix_rounds`, `default_branch`, `design_provider`, `design_approval`, `default_rigor`)
+- `factonio_update_repo` — update per-repository settings (`merge_policy`, `publish_policy`, `max_fix_rounds`, `default_branch`, `design_provider`, `design_approval`, `default_rigor`)
 - `factonio_start` — start a workstream (`feature`, `bug`, `quick`, behavior-preserving `refactor`, benchmark-checked `perf`, read-only `investigate`, or `escaped_from` for post-merge regressions); CLI: `hermes factonio start <repo> "<request>" --kind ...`
 - `factonio_spawn_design` — spawn a Phase 1b UI/UX Design card
 - `factonio_spawn_implement` — spawn a scoped git-worktree Implementation card (optionally stacked on a parent PR via `base_branch` / `stack_parent_pr`)
-- `factonio_spawn_verify` — spawn mutually isolated Diff Check and Black-Box Check cards in parallel; `rigor: "high"` (or a repo's `default_rigor: high`) fans out one isolated pair per model of a multi-vendor `verify_panel`, failing closed unless it spans >= 2 vendor families
+- `factonio_spawn_verify` — spawn mutually isolated Diff Check and Black-Box Check cards in parallel for a PR (`pr_number`) or an unpublished local branch (`branch` + `head_sha` [+ `base_branch`]); `rigor: "high"` (or a repo's `default_rigor: high`) fans out one isolated pair per model of a multi-vendor `verify_panel`, failing closed unless it spans >= 2 vendor families
 - `factonio_evaluate_panel` — aggregate a high-rigor panel's lanes into a fail-closed consensus (`merge_allowed` only on unanimous `pass`), with `disagreement_summary` and aggregated findings, and log `verify_panel_consensus` to `trail.db`
 - `factonio_spawn_arena` / `factonio_evaluate_arena` — opt-in arena for contested specs or designs: isolated cross-vendor candidates per vendor family plus a dependent hand-grafting judge, and read-only progress (`ready_for_synthesis`, `synthesized`)
 - `factonio_status` — inspect active workstream cards, registered repos, and resolved phase models
 - `factonio_pr_gate` — verify live PR HEAD SHA and CI status checks via `gh`
 - `factonio_merge_pr` — verify exact HEAD SHA and squash-merge a verified PR
+- `factonio_publish_pr` — after explicit human approval, push the exact locally verified `expected_head_sha` of an unpublished branch and open its GitHub PR (fail-closed on HEAD drift, invalid input, or unregistered repo; logs `publish_pr` to `trail.db`)
 - `factonio_bootstrap_verify` — `init` / `check` / `show` / `audit` a repo's `.factonio/` verification harness (Launch / Doctor / Drive / Evidence / Cleanup playbook, feature map, optional `visual_diff` / `invariant` / `custom` hooks); Black-Box Verification cards receive it automatically
 - `factonio_restack_pr` — after a parent PR lands, rebase its child PR(s) onto the new base, push with `--force-with-lease`, retarget, and report whether verification verdicts carry over (`verdict_continuous`)
 - `factonio_log_decision` — append a decision (fork, pivot, Attack the Premise probe, gate countersign) to the append-only `trail.db`; correct one by logging a new row with `supersedes_id`
 
-Factory transitions (start, escape, design/implement/verify spawns, PR gate and merge outcomes) are recorded in `<HERMES_HOME>/plugin-data/factonio/trail.db` automatically and served at `GET /api/plugins/factonio/trail?tenant=&repo=&phase=&card_id=&limit=` (single rows at `GET /api/plugins/factonio/trail/{decision_id}`). Merges, terminal verification panel consensus, and `retro` decisions also append a factory KPI snapshot to `trail.db` (schema v2 `metric_snapshots`), so trends survive `kanban.db` resets; read them at `GET /api/plugins/factonio/metrics/history?repo=&tenant=&source=&since=7d|30d|90d|all|<ISO-8601>&limit=` or with `hermes factonio metrics --history`.
+Factory transitions (start, escape, design/implement/verify spawns, PR publication, PR gate and merge outcomes) are recorded in `<HERMES_HOME>/plugin-data/factonio/trail.db` automatically and served at `GET /api/plugins/factonio/trail?tenant=&repo=&phase=&card_id=&limit=` (single rows at `GET /api/plugins/factonio/trail/{decision_id}`). Merges, terminal verification panel consensus, and `retro` decisions also append a factory KPI snapshot to `trail.db` (schema v2 `metric_snapshots`), so trends survive `kanban.db` resets; read them at `GET /api/plugins/factonio/metrics/history?repo=&tenant=&source=&since=7d|30d|90d|all|<ISO-8601>&limit=` or with `hermes factonio metrics --history`.
 
 </details>
 

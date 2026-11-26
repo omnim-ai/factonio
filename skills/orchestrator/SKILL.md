@@ -26,7 +26,7 @@ Coordinate software delivery on registered GitHub repositories across Definition
 1. Confirm the target repository is registered using `factonio_status`. If missing, register it with `factonio_add_repo`.
 2. Ask at most one concise batch of clarifying questions if scope, acceptance criteria, or constraints are genuinely ambiguous.
    - **"No is an acceptable answer":** when a request is unsafe, already solved, contradicted by prior decisions, or not worth its cost, push back with evidence and a recommended alternative before starting a workstream; do not start one just because it was asked.
-3. If the user asks to change a registered repository's settings (merge policy, max fix rounds, default branch, design provider/approval), call `factonio_update_repo(repo, <only the fields to change>)` (CLI: `hermes factonio update <repo> --merge-policy ask ...`). Pass `"inherit"` for `design_provider`/`design_approval` to clear the per-repo override and fall back to the global default. Do not re-run `factonio_add_repo` just to edit settings.
+3. If the user asks to change a registered repository's settings (merge policy, publish policy, max fix rounds, default branch, design provider/approval), call `factonio_update_repo(repo, <only the fields to change>)` (CLI: `hermes factonio update <repo> --merge-policy ask --publish-policy ask ...`). `publish_policy` is `auto` (default, from `default_publish_policy`: Implementation pushes and opens the PR itself) or `ask` (Implementation stays local-only and nothing reaches GitHub until the user approves publishing, see §4b). Pass `"inherit"` for `design_provider`/`design_approval` to clear the per-repo override and fall back to the global default. Do not re-run `factonio_add_repo` just to edit settings.
 4. Choose the entry path:
    - **Feature (`kind="feature"`):** Definition -> optional Phase 1b Design (when `has_ui: true` or requested) -> parallel Implementation -> parallel Verification -> Merge.
    - **Bug (`kind="bug"`):** Definition (diagnosis mode) -> Implementation -> parallel Verification -> Merge.
@@ -60,6 +60,7 @@ Opt-in only: use it when the user asks for competing proposals, or the approach 
 2. Dispatch every independent task unit from the spec DAG in parallel using `factonio_spawn_implement` (which automatically attaches approved `design/` artifacts when present), chaining only true dependencies via `parents`.
 3. End your turn after dispatching cards; Kanban notifies you on block or completion. Do not sleep-poll in the foreground.
 4. **Stacked units:** when a unit must build on another unit's unmerged PR, spawn it with `factonio_spawn_implement(..., base_branch=<parent head branch>, stack_parent_pr=<parent PR>, parents=[<parent impl card>])`. The result's `branch_seeded` says whether the worktree starts on the parent tip; the card tells the worker to open the PR with `--base <parent branch>`. Prefer independent units off the default branch; stack only true code dependencies.
+5. **Local-only units (`publish_policy: ask`):** `factonio_start` / `factonio_spawn_implement` stamp `Publish policy: ask`, a `local-only` completion contract, and a `## Local-Only Delivery (publish_policy: ask)` section. The worker commits on its local worktree branch, never runs `git push` or `gh pr create`, and completes with `branch`, `base_branch`, `head_sha`, `pr_title`, and `pr_body` in metadata instead of a PR number.
 
 ### 4. Isolated Parallel Verification
 
@@ -81,6 +82,15 @@ Opt-in only: use it when the user asks for competing proposals, or the approach 
    2. **Minor non-behavioral fix or mechanical conflict resolution** (typo, comment, rename, import order, rebase conflict with no logic change): spawn a single cross-vendor re-check, one Diff + Black-Box pair on a model from a different vendor family than Implementation, instead of the whole panel.
    3. **New behavior, redesign, contract change, or large diff** (new code path, changed API/schema/wire format, or anything you cannot classify as tier 1 or 2): re-run the full `rigor: "high"` panel via `factonio_spawn_verify`.
    When in doubt, pick the higher tier; never carry a verdict across a tier-3 change.
+
+### 4b. Local-First Verification and Publish (`publish_policy: ask`)
+
+1. When a local-only Implementation card completes, call `factonio_spawn_verify(repo, tenant, branch=<branch>, head_sha=<head_sha>, base_branch=<base_branch>, impl_card_id=...)` with no `pr_number` (passing both, or `branch` without a full `head_sha`, fails closed). Diff Check audits `git diff <base_ref>...<head_sha>` in the local checkout after confirming `refs/heads/<branch>` still equals the expected SHA; Black-Box Check runs from an isolated scratch clone detached at `<head_sha>`. The `holdout/` barrier and `.factonio/` harness injection are unchanged.
+2. `rigor="high"` works the same for local targets: one Diff + Black-Box pair per panel model under one `panel_id`; read consensus with `factonio_evaluate_panel(panel_id=..., branch=<branch>)` (CLI: `hermes factonio panel --branch <branch>`).
+3. On `reject`, run bounded local fix rounds within `max_fix_rounds`: the fix card commits on the same local branch (still no push or PR), reports the new `head_sha`, and you re-verify that SHA. Over budget, escalate to the user.
+4. When local verification passes, stop and present a decision-ready Human Handoff (Ketchup): the proposed `pr_title`, the `pr_body` briefing, the verified `head_sha`, diff stat, and verdicts. Ask for an explicit reply such as `publish` or `hold`.
+5. Only after explicit user approval, call `factonio_publish_pr(repo, branch, expected_head_sha=<verified head_sha>, title=<pr_title>, body=<pr_body>, base_branch=<base_branch>)` (CLI: `hermes factonio publish-pr <repo> <branch> --expected-head-sha <sha> --title ... --body-file ...`). It fails closed on any HEAD drift, pushes exactly `<sha>:refs/heads/<branch>`, opens the PR, and reads it back. Never call it on silence, implied consent, or a SHA that was not verified.
+6. After publishing, the normal flow resumes: GitHub CI, `factonio_pr_gate(repo, pr_number, verified_head_sha=...)`, and the repo's `merge_policy` (§5). Publishing never bypasses branch protection or required checks.
 
 ### 5. Merge Gate
 
@@ -107,7 +117,7 @@ Opt-in only: use it when the user asks for competing proposals, or the approach 
 
 ## Decision Trail (Show Your Work)
 
-- Factory transitions (`start`, `escape`, `spawn_design`, `spawn_implement`, `spawn_verify` (with `rigor` / `panel_id`), `verify_panel_consensus`, `pr_gate`, `merge_pr`, `restack_pr`) are recorded automatically in the append-only `trail.db`.
+- Factory transitions (`start`, `escape`, `spawn_design`, `spawn_implement`, `spawn_verify` (with `rigor` / `panel_id`), `verify_panel_consensus`, `publish_pr` (phase `publish`, result `published` / `refused` / `error`), `pr_gate`, `merge_pr`, `restack_pr`) are recorded automatically in the append-only `trail.db`.
 - Log your own judgment calls with `factonio_log_decision`: forks between approaches, pivots, Attack the Premise probes, unblock decisions, and merge countersigns. Put checkable facts (PR, SHA, patch-id, test counts, command) in `evidence`.
 - Rows are immutable. To correct a decision, log a new row with `supersedes_id` set to the old id; never re-log as if the old one did not happen.
 - Read it back with `hermes factonio trail --tenant <t> --markdown` when writing summaries or handoffs.
@@ -116,7 +126,7 @@ Opt-in only: use it when the user asks for competing proposals, or the approach 
 
 ## Human Handoffs (Ketchup)
 
-Every time you stop to ask the user for a decision (design approval, `merge_policy: ask`, over-budget fix rounds, `inconclusive` verdicts, escalations), make the message decision-ready:
+Every time you stop to ask the user for a decision (design approval, `publish_policy: ask`, `merge_policy: ask`, over-budget fix rounds, `inconclusive` verdicts, escalations), make the message decision-ready:
 
 1. **Plain language first:** one or two sentences on what happened and what you need, with no internal jargon, card ids, or tool names as the lead.
 2. **Visuals before prose:** lead with the preview, screenshot, table, or diff stat that shows the state; text explains it.

@@ -60,7 +60,19 @@ When the card lists `Target base branch` (and usually `Stack parent PR`), this u
 - Open the PR with `gh pr create --base <base>`; never target the default branch for a stacked unit.
 - Do not restack after the parent merges yourself; the orchestrator runs `factonio_restack_pr`, which reports whether earlier verdicts still apply.
 
+### 2d. Local-Only Delivery (`publish_policy: ask`)
+
+When the card says `Publish policy: ask` (or carries a `## Local-Only Delivery (publish_policy: ask)` section), nothing leaves this machine until a human approves publishing:
+
+- Commit on the local worktree branch and run the repository's local build, lint, and test commands as usual.
+- **NEVER run `git push` or `gh pr create`** (and never call `factonio_publish_pr`); skip the push, PR, and CI steps of section 3. The orchestrator publishes the exact verified SHA later with `factonio_publish_pr`.
+- Prepare the PR title and a `<= 40`-line briefing using the PR Briefing Template below, but keep them in card metadata instead of a GitHub PR.
+- Complete with `branch`, `base_branch`, `head_sha` (full SHA of the committed tip, `git rev-parse HEAD`), `pr_title`, and `pr_body` in `kanban_complete` metadata (see section 4).
+- **Local-only fix rounds:** when local verification rejects, commit the fix on the same local branch (still no push or PR), re-run local checks, and report the new `head_sha`. Do not rewrite history the verifiers already saw unless the card asks for it.
+
 ### 3. Publish or Update the Pull Request
+
+Skip the push and PR steps here for `publish_policy: ask` cards (section 2d); still use the PR Briefing Template for `pr_body`.
 
 1. Stage and commit only intended files with a clear commit message.
 2. Push the branch: `git push -u origin HEAD`.
@@ -144,6 +156,23 @@ Call `kanban_complete` with a concise `summary` and structured `metadata`:
   "pr_number": 42,
   "published_pr": "https://github.com/owner/repo/pull/42",
   "head_sha": "<40-char commit sha>",
+  "changed_files": ["src/foo.py", "tests/test_foo.py"],
+  "checks_run": ["pytest -q"]
+}
+```
+
+For a `publish_policy: ask` local-only card, omit `pr_number` / `published_pr` and report the unpublished target instead:
+
+```json
+{
+  "phase": "implement",
+  "repo": "owner/repo",
+  "publish_policy": "ask",
+  "branch": "<local worktree branch>",
+  "base_branch": "main",
+  "head_sha": "<40-char commit sha>",
+  "pr_title": "<concise title>",
+  "pr_body": "<= 40-line PR briefing",
   "changed_files": ["src/foo.py", "tests/test_foo.py"],
   "checks_run": ["pytest -q"]
 }

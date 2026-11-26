@@ -378,6 +378,108 @@ class TestBundledSkillRigorAndAttribution(unittest.TestCase):
         self.assertLess(prompt.index("Skill text last"), prompt.index("Ledger maintenance"))
         self.assertLess(prompt.index("Hardening cards"), prompt.index("Record the outcome with `factonio_log_decision`"))
 
+    def test_prompt_and_manifest_document_publish_policy(self):
+        import factonio
+
+        prompt = factonio.ORCHESTRATOR_PROMPT_SECTION
+        self.assertLess(len(prompt), 2900)
+        self._assert_all_in(prompt, (
+            "publish_policy",
+            "`publish_policy: ask`",
+            "local-only",
+            "factonio_spawn_verify(branch=..., head_sha=...)",
+            "`factonio_publish_pr` only after explicit human approval",
+            "factonio_update_repo",
+            "hermes factonio update",
+        ), "orchestrator prompt section")
+        manifest = self._read("plugin.yaml")
+        self._assert_all_in(manifest, ("default_publish_policy:", "- factonio_publish_pr"), "plugin.yaml")
+
+    def test_orchestrator_skill_local_first_publish_flow(self):
+        text = self._read("skills/orchestrator/SKILL.md")
+        intake = text.split("### 1. Intake and Clarification", 1)[1].split("### 1b.", 1)[0]
+        self._assert_all_in(intake, ("`publish_policy`", "`auto`", "`ask`", "--publish-policy ask"), "orchestrator intake")
+        local = text.split("### 4b. Local-First Verification and Publish (`publish_policy: ask`)", 1)[1].split("### 5.", 1)[0]
+        self._assert_all_in(local, (
+            "factonio_spawn_verify(repo, tenant, branch=<branch>, head_sha=<head_sha>, base_branch=<base_branch>",
+            'rigor="high"',
+            "factonio_evaluate_panel(panel_id=..., branch=<branch>)",
+            "bounded local fix rounds",
+            "Human Handoff (Ketchup)",
+            "`pr_title`",
+            "`pr_body`",
+            "Only after explicit user approval",
+            "factonio_publish_pr(",
+            "factonio_pr_gate",
+            "`merge_policy`",
+        ), "orchestrator 4b")
+        # Local publishing happens before, and outside, the PR merge gate.
+        self.assertLess(text.index("### 4b."), text.index("### 5. Merge Gate"))
+        merge_gate = text.split("### 5. Merge Gate", 1)[1].split("\n## ", 1)[0]
+        self.assertNotIn("factonio_publish_pr", merge_gate)
+        trail_section = text.split("## Decision Trail", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("`publish_pr`", trail_section)
+        handoffs = text.split("## Human Handoffs (Ketchup)", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("`publish_policy: ask`", handoffs)
+
+    def test_implement_skill_local_only_delivery(self):
+        text = self._read("skills/implement/SKILL.md")
+        local = text.split("### 2d. Local-Only Delivery (`publish_policy: ask`)", 1)[1].split("\n### ", 1)[0]
+        self._assert_all_in(local, (
+            "**NEVER run `git push` or `gh pr create`**",
+            "`<= 40`-line briefing",
+            "`branch`, `base_branch`, `head_sha`",
+            "`pr_title`, and `pr_body`",
+            "**Local-only fix rounds:**",
+        ), "implement 2d")
+        self.assertLess(text.index("### 2d."), text.index("### 3. Publish or Update the Pull Request"))
+        complete = text.split("### 4. Complete the Card", 1)[1].split("\n## ", 1)[0]
+        for key in ('"branch"', '"base_branch"', '"head_sha"', '"pr_title"', '"pr_body"', '"publish_policy": "ask"'):
+            self.assertIn(key, complete)
+
+    def test_verify_skills_local_branch_mode_keeps_barriers(self):
+        diff = self._read("skills/verify-diff/SKILL.md")
+        local = diff.split("## Local Unpublished Branch Mode (`publish_policy: ask`)", 1)[1].split("\n## ", 1)[0]
+        self._assert_all_in(local, (
+            "`expected_head_sha`",
+            "`base_branch`",
+            "git -C <repo_path> rev-parse refs/heads/<branch>",
+            "git -C <repo_path> diff <base_ref>...<head_sha>",
+            "**Skip `gh pr diff` and `factonio_pr_gate`:**",
+            "never search for, open, or read any `holdout/` directory",
+        ), "verify-diff local mode")
+        self.assertIn("Never search for, open, or read any `holdout/` directory.", diff)
+        bb = self._read("skills/verify-blackbox/SKILL.md")
+        self._assert_all_in(bb, (
+            "**Local unpublished branch mode (`publish_policy: ask`):**",
+            "git clone --no-hardlinks <repo_path> app && cd app && git checkout --detach <head_sha>",
+            "Verify `git rev-parse HEAD` equals the card's `head_sha`",
+            "`.factonio/` harness",
+            "never run `git diff`",
+        ), "verify-blackbox local mode")
+        self.assertIn("Never run `git diff`, `git show`, `gh pr diff`, or read implementation source files", bb)
+
+    def test_docs_cover_publish_policy_and_gate(self):
+        readme = self._read("README.md")
+        self._assert_all_in(readme, (
+            "`publish_policy: ask`", "`default_publish_policy`", "`factonio_publish_pr`",
+            "hermes factonio publish-pr", "--publish-policy auto\\|ask",
+        ), "README")
+        security = self._read("SECURITY.md")
+        self._assert_all_in(security, (
+            "`publish_policy: ask`", "`default_publish_policy: ask`", "`publish_pr`", "`expected_head_sha`",
+            "<expected_head_sha>:refs/heads/<branch>",
+        ), "SECURITY.md")
+        self.assertLess(security.index("**Repository merge policy"), security.index("**Repository publish policy"))
+        arch = self._read("docs/architecture.md")
+        self._assert_all_in(arch, (
+            "`publish_policy`", "**Local-target verification (`publish_policy: ask`):**",
+            "### Remote PR publish gate (`publish_pr`)", "`factonio_publish_pr`", "hermes factonio publish-pr",
+            "`defaults.publish_policy`", "`PATCH /repos/{slug}` — validated partial updates (`merge_policy`, `publish_policy`",
+        ), "docs/architecture.md")
+        audit = arch.split("- **Pre-handoff audit (`trail --audit`):**", 1)[1].split("\n- **", 1)[0]
+        self._assert_all_in(audit, ("/ `publish` row (the high-stakes phases)", "/ `published` row"), "trail audit docs")
+
     def test_readme_acknowledges_poteto_and_pstack(self):
         readme = self._read("README.md")
         self.assertIn("## Acknowledgments", readme)

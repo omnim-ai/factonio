@@ -16,13 +16,22 @@ Independently audit a pull request's code diff against the written specification
 
 ## Information Barrier
 
-- Read `spec.md` (if linked), the pull request metadata, and the git diff (`gh pr diff <pr> --repo <owner/repo>`).
+- Read `spec.md` (if linked), the pull request metadata, and the git diff (`gh pr diff <pr> --repo <owner/repo>`). For a local unpublished target (see below), the diff is `git -C <repo_path> diff <base_ref>...<head_sha>` instead.
 - Never search for, open, or read any `holdout/` directory. Holdout scenarios belong exclusively to Black-Box Verification.
 - **Panel lanes:** a card stamped `- Verification panel: \`vp_...\`` is one independent lane of a `rigor: high` multi-vendor panel. Review on your own: do not read, wait for, or echo other lanes' cards or verdicts. The orchestrator aggregates lanes fail-closed, so a dissenting `reject` from your lane blocks the merge on its own.
 
+## Local Unpublished Branch Mode (`publish_policy: ask`)
+
+A card titled `[verify:diff] <owner/repo>@<branch>` carries `branch`, `expected_head_sha`, and `base_branch` instead of a PR number: the change has not been pushed or opened as a PR yet.
+
+- **Exact HEAD check:** run `git -C <repo_path> rev-parse refs/heads/<branch>` and confirm it equals `expected_head_sha`. A missing branch or any mismatch means the target moved: call `kanban_block(kind="needs_input", ...)` quoting both SHAs instead of reviewing a different commit.
+- **Diff:** audit `git -C <repo_path> diff <base_ref>...<head_sha>` (the card names `<base_ref>`, normally `base_branch` or `origin/<base_branch>`); `git -C <repo_path> log <base_ref>..<head_sha>` is fine for commit context.
+- **Skip `gh pr diff` and `factonio_pr_gate`:** there is no PR yet. Never push, open a PR, or call `factonio_publish_pr`; publication is the orchestrator's decision after human approval.
+- Everything else is unchanged: run tests from a scratch worktree or clone at `<head_sha>` (never edit the implementer's worktree), apply the whole checklist, and never search for, open, or read any `holdout/` directory. Report `branch`, `base_branch`, and `head_sha` in metadata (with `pr_number: null`).
+
 ## Review Checklist
 
-1. **Exact HEAD check:** Call `factonio_pr_gate(repo, pr_number)` and confirm the live `head_sha` matches the card's expected SHA (note any mismatch).
+1. **Exact HEAD check:** Call `factonio_pr_gate(repo, pr_number)` and confirm the live `head_sha` matches the card's expected SHA (note any mismatch). In local branch mode, use `git -C <repo_path> rev-parse refs/heads/<branch>` instead (see above).
 2. **Spec fidelity:** Check every requirement and non-goal in `spec.md` against the diff. Flag missing requirements or unrequested scope creep.
 3. **Correctness and edge cases:** Trace boundary values, error paths, concurrency/race conditions, resource cleanup, and backwards compatibility.
 4. **Security and hygiene:** Check for secret leaks, injection vectors, unsafe shell/SQL construction, path traversal, or bypassed validation.
