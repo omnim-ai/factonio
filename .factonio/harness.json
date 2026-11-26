@@ -131,7 +131,7 @@
         "factonio_bootstrap_verify accepts prove (init) and base_ref (check/audit)",
         "Refused merge/gate trail rows never carry override hints (allow_stacked_merge) in why; only real overrides read as gate_loosening in trail --audit (tests.test_pr_gate_hardening.TestMergeTrailAudit)",
         "factonio_start `kind` enum equals WORKSTREAM_KINDS (feature, bug, quick, refactor, perf, investigate)",
-        "factonio_publish_pr passes raw arguments to repos.publish_pr (no coercion; title=None, empty base_branch/remote and missing keys are refused); factonio_add_repo / factonio_update_repo accept publish_policy auto|ask"
+        "factonio_publish_pr passes raw arguments to repos.publish_pr (no coercion; title=None, non-boolean draft, empty base_branch/remote and missing keys are refused); factonio_add_repo / factonio_update_repo accept publish_policy auto|ask, an omitted publish_policy inherits/preserves and an explicit null is refused without mutating repos.json"
       ]
     },
     {
@@ -188,7 +188,7 @@
         "Merging a stacked PR is refused unless allow_stacked_merge; a rebased head merges only with allow_patch_continuity and an identical patch-id",
         "`restack` keeps patch-id continuity",
         "`worktrees` audit is read-only unless --prune-safe",
-        "`publish_pr` refuses (no git push, no gh call, refused publish_pr trail row) on invalid input (including SCP-style/path remotes and unreadable or NUL body_file), unregistered repo, missing checkout, branch == base, missing refs/heads/<branch>, HEAD drift or a remote not configured in the checkout; otherwise pushes `<expected_head_sha>:refs/heads/<branch>`, opens the PR via a temporary --body-file that is always removed, and reports published only after `gh pr view` confirms head and base"
+        "`publish_pr` refuses (no git push, no gh call, refused publish_pr trail row) on invalid input (including SCP-style/path remotes, unreadable or NUL body_file, a branch or resolved base (explicit or persisted default_branch) failing `git check-ref-format refs/heads/<name>` / `--branch` or equal to `@`, non-UTF-8-encodable strings such as lone surrogates, and non-boolean draft), unregistered repo, missing checkout, branch == base, missing refs/heads/<branch>, HEAD drift or a remote not configured in the checkout; otherwise pushes `<expected_head_sha>:refs/heads/<branch>`, opens the PR via a temporary --body-file that is always removed, and reports published only after `gh pr view` confirms head and base"
       ]
     },
     {

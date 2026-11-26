@@ -271,6 +271,25 @@ class TestRepoPublishPolicy(unittest.TestCase):
             save_settings({"repos": repos, "default_publish_policy": "ask"})
             self.assertEqual(_register_stub(home)["repo"]["publish_policy"], "ask")
 
+    def test_add_explicit_null_publish_policy_fails_closed(self):
+        from factonio.repos import add_repo
+
+        with isolated_hermes_home() as home:
+            local = home / "dev" / "sample"
+            (local / ".git").mkdir(parents=True)
+            with mock.patch("factonio.repos._run_gh") as gh, self.assertRaises(ValueError):
+                add_repo("acme/sample", local_path=str(local), clone=False, inspect_remote=False, publish_policy=None)
+            gh.assert_not_called()
+            self.assertFalse((home / "plugin-data" / "factonio" / "repos.json").exists())
+
+            _register_stub(home, publish_policy="ask")
+            before = _store(home)
+            with self.assertRaises(ValueError):
+                _register_stub(home, publish_policy=None)
+            self.assertEqual(_store(home), before)
+            self.assertEqual(_register_stub(home)["repo"]["publish_policy"], "ask")
+            self.assertEqual(_register_stub(home, "acme/other")["repo"]["publish_policy"], "auto")
+
     def test_update_publish_policy(self):
         from factonio.repos import update_repo
 
@@ -426,6 +445,101 @@ class TestPublishPr(unittest.TestCase):
             self.assertEqual(len(rows), len(cases))
             self.assertEqual({r["result"] for r in rows}, {"refused"})
             self.assertEqual({r["phase"] for r in rows}, {"publish"})
+
+    def test_invalid_git_refs_refused_before_push(self):
+        from factonio.config import list_repos, save_settings
+
+        bad_refs = ("main~1", "main^1", "a@{b}", "@{-1}", "a:b", "main.", "/main", "main/", "main.lock",
+                    "HEAD", "@", "a\\b", "a?b", "a*b", "a[b")
+        with isolated_hermes_home() as home, _git_env():
+            fx = PublishFixture(home)
+            # Give @{-1} a real referent so only ref-format validation can catch it.
+            _git(fx.local, "checkout", "-q", "feat/x")
+            _git(fx.local, "checkout", "-q", "main")
+            count = 0
+            for ref in bad_refs:
+                for how in ("base_branch", "persisted default_branch", "branch"):
+                    with self.subTest(ref=ref, how=how):
+                        gh = FakeGh(head=fx.sha)
+                        if how == "base_branch":
+                            res, git_calls = self._publish(fx, gh, base_branch=ref)
+                        elif how == "branch":
+                            res, git_calls = self._publish(fx, gh, branch=ref)
+                        else:
+                            repos = list_repos()
+                            repos["acme-sample"]["default_branch"] = ref
+                            save_settings({"repos": repos})
+                            try:
+                                res, git_calls = self._publish(fx, gh)
+                            finally:
+                                repos["acme-sample"]["default_branch"] = "main"
+                                save_settings({"repos": repos})
+                        count += 1
+                        self.assertEqual(
+                            (res["ok"], res["published"], res["pushed"], res["created"], res["refused"]),
+                            (False, False, False, False, True), res,
+                        )
+                        self.assertEqual(gh.calls, [])
+                        self.assertFalse(any(c[:1] == ["push"] for c in git_calls), git_calls)
+            self.assertIsNone(fx.origin_ref("feat/x"))
+            self.assertEqual(_git(fx.origin, "for-each-ref", "--format=%(refname)"), "refs/heads/main")
+            rows = _publish_rows()
+            self.assertEqual(len(rows), count)
+            self.assertEqual({r["result"] for r in rows}, {"refused"})
+
+    def test_unencodable_strings_and_non_bool_draft_refused_before_push(self):
+        with isolated_hermes_home() as home, _git_env():
+            fx = PublishFixture(home)
+            cases = {
+                "body": {"body": "bad \ud800 body"},
+                "title": {"title": "Fix \ud800"},
+                "branch": {"branch": "feat/\ud800"},
+                "base_branch": {"base_branch": "rel\ud800"},
+                "remote": {"remote": "orig\ud800"},
+                "repo": {"repo": "acme/sam\ud800"},
+                "body_file": {"body": None, "body_file": str(home / "b\ud800.md")},
+                "draft str": {"draft": "false"},
+                "draft int": {"draft": 1},
+                "draft None": {"draft": None},
+            }
+            for name, kw in cases.items():
+                with self.subTest(case=name):
+                    gh = FakeGh(head=fx.sha)
+                    res, git_calls = self._publish(fx, gh, **kw)
+                    self.assertEqual(
+                        (res["ok"], res["published"], res["pushed"], res["created"], res["refused"]),
+                        (False, False, False, False, True), res,
+                    )
+                    self.assertIn("draft" if name.startswith("draft") else "UTF-8", res["error"])
+                    self.assertEqual(gh.calls, [])
+                    self.assertEqual(git_calls, [])
+            self.assertIsNone(fx.origin_ref("feat/x"))
+            rows = _publish_rows()
+            self.assertEqual(len(rows), len(cases))
+            self.assertEqual({r["result"] for r in rows}, {"refused"})
+
+    def test_unexpected_body_write_error_after_push_is_audited(self):
+        with isolated_hermes_home() as home, _git_env():
+            fx = PublishFixture(home)
+            gh = FakeGh(head=fx.sha)
+            made: list[str] = []
+            import tempfile as _tempfile
+            real_mkstemp = _tempfile.mkstemp
+
+            def mkstemp(*a: Any, **k: Any) -> tuple[int, str]:
+                fd, path = real_mkstemp(*a, **k)
+                made.append(path)
+                return fd, path
+
+            with mock.patch("factonio.repos.tempfile.mkstemp", mkstemp), \
+                    mock.patch("factonio.repos._require_utf8", lambda value, field: None):
+                res, _ = self._publish(fx, gh, body="bad \ud800 body")
+            self.assertEqual((res["ok"], res["pushed"], res["created"], res["refused"]), (False, True, False, False))
+            self.assertIn("gh pr create failed", res["error"])
+            self.assertEqual(gh.calls, [])
+            self.assertTrue(made)
+            self.assertFalse(any(Path(p).exists() for p in made))
+            self.assertEqual([r["result"] for r in _publish_rows()], ["error"])
 
     def test_drift_after_verification_is_refused(self):
         with isolated_hermes_home() as home, _git_env():
@@ -651,6 +765,66 @@ class TestPublishToolAndCli(unittest.TestCase):
             save_settings({"repos": repos, "default_publish_policy": "ask"})
             code, out, _ = _run_cli("list")
             self.assertIn("publish=ask", out)
+
+    def test_add_tool_explicit_null_fails_closed_and_omitted_inherits(self):
+        from factonio.agent_tools import register_tools
+
+        stub_remote = {"repo": "acme/sample", "url": "https://github.com/acme/sample", "default_branch": "main",
+                       "required_checks": [], "has_required_checks": False}
+        with isolated_hermes_home() as home, mock.patch("factonio.repos.inspect_github_repo", return_value=stub_remote):
+            ctx = _Ctx()
+            register_tools(ctx)
+            handler = ctx.tools["factonio_add_repo"]["handler"]
+            local = home / "dev" / "sample"
+            (local / ".git").mkdir(parents=True)
+            args = {"repo": "acme/sample", "local_path": str(local), "clone": False}
+            res = json.loads(handler({**args, "publish_policy": None}))
+            self.assertFalse(res["ok"], res)
+            self.assertIn("publish_policy", res["error"])
+            self.assertFalse((home / "plugin-data" / "factonio" / "repos.json").exists())
+
+            self.assertTrue(json.loads(handler({**args, "publish_policy": "ask"}))["ok"])
+            before = _store(home)
+            res = json.loads(handler({**args, "publish_policy": None}))
+            self.assertFalse(res["ok"], res)
+            self.assertEqual(_store(home), before)
+            self.assertTrue(json.loads(handler(dict(args)))["ok"])
+            self.assertEqual(_store(home)["acme-sample"]["publish_policy"], "ask")
+
+            other = home / "dev" / "other"
+            (other / ".git").mkdir(parents=True)
+            self.assertTrue(json.loads(handler({"repo": "acme/other", "local_path": str(other), "clone": False}))["ok"])
+            self.assertEqual(_store(home)["acme-other"]["publish_policy"], "auto")
+
+    def test_publish_tool_refuses_non_bool_draft_and_surrogates(self):
+        from factonio.agent_tools import register_tools
+
+        with isolated_hermes_home() as home, _git_env():
+            fx = PublishFixture(home)
+            ctx = _Ctx()
+            register_tools(ctx)
+            handler = ctx.tools["factonio_publish_pr"]["handler"]
+            good = {"repo": "acme/sample", "branch": "feat/x", "expected_head_sha": fx.sha, "title": "T"}
+            cases = {
+                "draft str": ({**good, "draft": "false"}, "draft"),
+                "body surrogate": ({**good, "body": "bad \ud800 body"}, "UTF-8"),
+                "title surrogate": ({**good, "title": "Fix \ud800"}, "UTF-8"),
+                "branch surrogate": ({**good, "branch": "feat/\ud800"}, "UTF-8"),
+                "base ref": ({**good, "base_branch": "main~1"}, "base_branch"),
+            }
+            with mock.patch("factonio.repos._run_gh") as gh:
+                for name, (args, needle) in cases.items():
+                    with self.subTest(case=name):
+                        res = json.loads(handler(args))
+                        self.assertEqual(
+                            (res["ok"], res["refused"], res["published"], res["pushed"], res["created"]),
+                            (False, True, False, False, False), res,
+                        )
+                        self.assertIn(needle, res["error"])
+                gh.assert_not_called()
+            self.assertIsNone(fx.origin_ref("feat/x"))
+            self.assertEqual({r["result"] for r in _publish_rows()}, {"refused"})
+            self.assertEqual(len(_publish_rows()), len(cases))
 
     def test_cli_add_and_list_fail_closed_on_null_or_empty_policy(self):
         from factonio.config import list_repos, save_settings

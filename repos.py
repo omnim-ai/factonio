@@ -249,7 +249,7 @@ def add_repo(
     default_branch: Optional[str] = None,
     design_provider: Any = _UNSET,
     design_approval: Any = _UNSET,
-    publish_policy: Optional[str] = None,
+    publish_policy: Any = _UNSET,
 ) -> dict[str, Any]:
     """Register a GitHub repository with Factonio and anchor a Hermes Project.
 
@@ -271,8 +271,12 @@ def add_repo(
     else:
         policy = _validate_merge_policy(settings.get("default_merge_policy") or "auto")
 
-    # Only a missing key inherits the global default; a persisted null/"" fails closed here.
-    publish = resolve_publish_policy(repo=existing, override=publish_policy)
+    # Omitted inherits (missing key -> global default); an explicit value, including None, must be
+    # valid, and a persisted null/"" fails closed here.
+    if publish_policy is _UNSET:
+        publish = resolve_publish_policy(repo=existing)
+    else:
+        publish = _validate_publish_policy(publish_policy)
 
     if max_fix_rounds is not None:
         rounds = _validate_max_fix_rounds(max_fix_rounds)
@@ -330,7 +334,7 @@ def add_repo(
         existing = raw_existing if isinstance(raw_existing, dict) else {}
         if merge_policy is None and existing.get("merge_policy"):
             policy = str(existing["merge_policy"])
-        if publish_policy is None and "publish_policy" in existing:
+        if publish_policy is _UNSET and "publish_policy" in existing:
             publish = resolve_publish_policy(repo=existing)
         if max_fix_rounds is None and existing.get("max_fix_rounds") is not None:
             rounds = existing["max_fix_rounds"]
@@ -1716,7 +1720,8 @@ def _validate_full_sha(value: Any, field: str = "expected_head_sha") -> str:
 
 def _echo(value: Any) -> Optional[str]:
     """Bounded echo of caller input into results/trail evidence before it is validated."""
-    return value[:200] if isinstance(value, str) else None
+    # Lone surrogates are replaced so a refusal can still be written to trail.db.
+    return value[:200].encode("utf-8", "replace").decode("utf-8") if isinstance(value, str) else None
 
 
 def _validate_branch_field(value: Any, field: str) -> str:
@@ -1724,6 +1729,25 @@ def _validate_branch_field(value: Any, field: str) -> str:
         return _validate_default_branch(value)
     except ValueError as exc:
         raise ValueError(str(exc).replace("default_branch", field, 1)) from None
+
+
+def _validate_git_ref_name(cwd: Path, name: str, field: str) -> None:
+    """Refuse anything git would not accept as a plain branch name (``@``, ``main~1``, ``@{-1}``, ``HEAD``...)."""
+    if name == "@":
+        raise ValueError(f"{field} {name!r} is not a valid branch name")
+    for args in (["check-ref-format", f"refs/heads/{name}"], ["check-ref-format", "--branch", name]):
+        if _run_git(args, cwd=cwd).returncode != 0:
+            raise ValueError(f"{field} {name!r} is not a valid branch name")
+    if name == "HEAD":
+        raise ValueError(f"{field} {name!r} is not a valid branch name")
+
+
+def _require_utf8(value: Any, field: str) -> None:
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeError:
+            raise ValueError(f"{field} is not valid UTF-8 (contains unencodable characters)") from None
 
 
 def _record_publish(result: dict[str, Any], *, outcome: str, reason: str, repo_slug: str,
@@ -1793,11 +1817,11 @@ def publish_pr(
         "expected_head_sha": _echo(expected_head_sha),
         "branch": _echo(branch),
         "base_branch": _echo(base_branch),
-        "draft": bool(draft),
+        "draft": draft if isinstance(draft, bool) else None,
         "state": None,
     }
     # trail.record_transition maps a registered spec to its slug and keeps unknown specs verbatim.
-    repo_slug = repo_spec.strip()[:200] if isinstance(repo_spec, str) else ""
+    repo_slug = (_echo(repo_spec.strip()) or "") if isinstance(repo_spec, str) else ""
 
     def finish(outcome: str, reason: str, error: Optional[str] = None) -> dict[str, Any]:
         if error:
@@ -1808,9 +1832,14 @@ def publish_pr(
         return result
 
     try:
+        for field, value in (("repo", repo_spec), ("branch", branch), ("title", title), ("body", body),
+                             ("body_file", body_file), ("base_branch", base_branch), ("remote", remote)):
+            _require_utf8(value, field)
         spec = repo_spec.strip() if isinstance(repo_spec, str) else ""
         if not spec:
             raise ValueError("repo must be a registered slug or 'owner/repo'")
+        if not isinstance(draft, bool):
+            raise ValueError(f"draft must be a boolean; got {type(draft).__name__}")
         clean_branch = _validate_branch_field(branch, "branch")
         result["branch"] = clean_branch
         clean_remote = _validate_remote(remote)
@@ -1836,6 +1865,10 @@ def publish_pr(
             return finish("refused", "body_file_unreadable", f"cannot read body_file {body_file[:200]!r}: {exc}")
     else:
         body_text = body or ""
+    try:
+        _require_utf8(body_text, "body_file" if body_file is not None else "body")
+    except ValueError as exc:
+        return finish("refused", "invalid_input", str(exc))
 
     entry, cwd = _registered_checkout(spec)
     if entry is None:
@@ -1856,6 +1889,14 @@ def publish_pr(
     except ValueError as exc:
         return finish("refused", "invalid_input", str(exc))
     result["base_branch"] = target_base
+    try:
+        _require_utf8(target_base, "base_branch")
+        _validate_git_ref_name(cwd, clean_branch, "branch")
+        _validate_git_ref_name(cwd, target_base, "base_branch")
+    except ValueError as exc:
+        return finish("refused", "invalid_input", str(exc))
+    except (OSError, subprocess.SubprocessError) as exc:
+        return finish("refused", "git_unavailable", f"cannot validate branch names: {exc}")
     if clean_branch == target_base:
         return finish(
             "refused", "branch_is_base",
@@ -1863,9 +1904,6 @@ def publish_pr(
         )
 
     try:
-        fmt = _run_git(["check-ref-format", "--branch", clean_branch], cwd=cwd)
-        if fmt.returncode != 0:
-            return finish("refused", "invalid_input", f"invalid branch name {clean_branch!r}")
         local_head = _verify_commit(cwd, f"refs/heads/{clean_branch}")
     except (OSError, subprocess.SubprocessError) as exc:
         return finish("refused", "git_unavailable", f"cannot inspect local branch: {exc}")
@@ -1908,7 +1946,8 @@ def publish_pr(
         if draft:
             args.append("--draft")
         created = _run_gh(args, timeout=60)
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        # ValueError covers UnicodeError on the body write; preflight should already have refused it.
         return finish("error", "create_failed", f"gh pr create failed: {exc}")
     finally:
         if tmp_path:

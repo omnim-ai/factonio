@@ -177,13 +177,15 @@ def register_tools(ctx: Any) -> None:
 
     def handle_add_repo(args: dict[str, Any], **kwargs: Any) -> str:
         try:
+            # An omitted publish_policy inherits; an explicit null must reach add_repo and fail closed.
+            policy_kwargs = {"publish_policy": args["publish_policy"]} if "publish_policy" in args else {}
             res = add_repo(
                 str(args["repo"]),
                 local_path=args.get("local_path"),
                 merge_policy=args.get("merge_policy"),
                 max_fix_rounds=args.get("max_fix_rounds"),
                 clone=bool(args.get("clone", True)),
-                publish_policy=args.get("publish_policy"),
+                **policy_kwargs,
             )
             return _json_ok(res)
         except Exception as exc:
@@ -832,7 +834,7 @@ def register_tools(ctx: Any) -> None:
                 body=args.get("body"),
                 body_file=args.get("body_file"),
                 base_branch=args["base_branch"] if "base_branch" in args else None,
-                draft=bool(args.get("draft", False)),
+                draft=args["draft"] if "draft" in args else False,
                 remote=args["remote"] if "remote" in args else "origin",
                 tenant=ctx_args["tenant"] or None,
                 card_id=ctx_args["card_id"] or None,

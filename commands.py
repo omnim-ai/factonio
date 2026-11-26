@@ -779,6 +779,8 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             return
 
         if cmd == "add":
+            cli_policy = getattr(args, "publish_policy", None)
+            policy_kwargs = {"publish_policy": cli_policy} if cli_policy is not None else {}
             try:
                 res = add_repo(
                     args.repo,
@@ -786,7 +788,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                     merge_policy=args.merge_policy,
                     max_fix_rounds=args.max_fix_rounds,
                     clone=not bool(args.no_clone),
-                    publish_policy=getattr(args, "publish_policy", None),
+                    **policy_kwargs,
                 )
             except ValueError as exc:
                 if as_json:
