@@ -428,7 +428,11 @@ class TestEvalCli(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("CLEAN", out)
 
-            skill = PLUGIN_ROOT / "skills" / "implement" / "SKILL.md"
+            # A fixed-size fixture keeps exit-code coverage independent of bundled skill growth.
+            skill = home / "fixture-skill" / "SKILL.md"
+            skill.parent.mkdir()
+            skill.write_text("---\nname: fixture\ndescription: Use when testing.\n---\n\n# Fixture\n\n"
+                             + "Run the documented command and report the verdict.\n" * 40)
             code, out = run("eval", "bloat", str(skill), "--json")
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(out)["results"][0]["status"], "ok")
@@ -1812,6 +1816,264 @@ class TestFixRound6KwargsUnpacking(unittest.TestCase):
                 self.assertEqual((code, res["clean"]), (0, True), res)
             code, res = _standalone_audit(self.LEAKS["literal src"], home)
             self.assertEqual(code, 1, res)
+
+
+_BARRIER_PHASES = {"verify-blackbox": "source_read", "implement": "holdout_access", "design": "holdout_access",
+                   "verify-diff": "holdout_access"}
+
+
+class TestFixRound7OpaqueKwargsReads(unittest.TestCase):
+    """Fix round 7, finding 1: unresolved ``**kwargs`` reads fail closed in every barrier phase."""
+
+    LEAKS = {
+        "subscript mutation": "opts = {'path': 'README.md'}\nopts['path'] = 'src/auth.py'\nread_file(**opts)",
+        "update mutation": "opts = {'path': 'README.md'}\nopts.update({'path': 'holdout/secret.md'})\nread_file(**opts)",
+        "unknown kwargs": "import json\nunknown = json.loads(input())\nread_file(**unknown)",
+        "undefined kwargs": "read_file(**unknown)",
+        "open mutated file": "opts = {'file': 'README.md'}\nopts['file'] = 'src/auth.py'\nprint(open(**opts).read())",
+        "open unknown kwargs": "import json\nprint(open(**json.loads(input())).read())",
+        "dynamic path value": "import sys\nread_file(**{'path': sys.argv[1]})",
+        "write mode overridable": "opts = {'file': '/tmp/out.txt', 'mode': 'w'}\nopts['mode'] = 'r'\nopen(**opts)",
+    }
+    CLEAN = {
+        "literal safe read_file": "read_file(**{'path': '.factonio/verify.md'})",
+        "literal write-only open": "open(**{'file': '/tmp/out.txt', 'mode': 'w'}).write('x')",
+        "literal write-only positional": "tmp = '/tmp/out.txt'\nopen(tmp, 'w').write('x')",
+    }
+
+    def test_opaque_kwargs_reads_fail_closed_in_every_phase(self):
+        from factonio.eval_skills import audit_barrier_leaks
+
+        for phase, rule in _BARRIER_PHASES.items():
+            for label, code in self.LEAKS.items():
+                with self.subTest(phase=phase, case=label):
+                    res = audit_barrier_leaks(_code(code), phase=phase)
+                    self.assertEqual({f["rule"] for f in res["findings"]}, {rule}, (label, res))
+
+    def test_literal_controls_stay_clean(self):
+        from factonio.eval_skills import audit_barrier_leaks
+
+        for phase in _BARRIER_PHASES:
+            for label, code in self.CLEAN.items():
+                with self.subTest(phase=phase, case=label):
+                    self.assertTrue(audit_barrier_leaks(_code(code), phase=phase)["clean"], label)
+
+    def test_ab_and_standalone_cli(self):
+        with isolated_hermes_home() as home:
+            for phase, rule in _BARRIER_PHASES.items():
+                for label in ("subscript mutation", "update mutation", "unknown kwargs", "open mutated file"):
+                    with self.subTest(phase=phase, case=label):
+                        res = _forced_judge_ab(self.LEAKS[label], phase)
+                        self.assertEqual([res["key"][s] for s in res["disqualified"]], ["subject"], res)
+                        self.assertEqual(res["winner_label"], "other")
+                        code, out = _standalone_audit(self.LEAKS[label], home, phase)
+                        self.assertEqual((code, out["clean"]), (1, False), out)
+                        self.assertEqual({f["rule"] for f in out["results"][0]["findings"]}, {rule})
+                for label, src in self.CLEAN.items():
+                    with self.subTest(phase=phase, control=label):
+                        res = _forced_judge_ab(src, phase)
+                        self.assertEqual((res["disqualified"], res["winner_label"]), ([], "subject"), res)
+                        code, out = _standalone_audit(src, home, phase)
+                        self.assertEqual((code, out["clean"]), (0, True), out)
+
+
+class TestFixRound7CommandSubstitution(unittest.TestCase):
+    """Fix round 7, finding 2: ``$(...)`` / backticks run before passive commands such as ``echo``."""
+
+    LEAKS = {
+        'echo "$(cat src/a.py)"': ("verify-blackbox", "source_read"),
+        'echo "$(cat holdout/synthetic.txt)"': ("implement", "holdout_access"),
+        'echo "`cat holdout/synthetic.txt`"': ("design", "holdout_access"),
+        'echo "$(cat holdout/synthetic.txt)" > /tmp/x': ("verify-diff", "holdout_access"),
+        'echo "`git diff`"': ("verify-blackbox", "diff_inspection"),
+        'printf "%s" "$(cat src/a.py)"': ("verify-blackbox", "source_read"),
+        "echo $(echo $(git show HEAD))": ("verify-blackbox", "diff_inspection"),
+        "true $(cat src/a.py)": ("verify-blackbox", "source_read"),
+        "x=$(git diff); echo ok": ("verify-blackbox", "diff_inspection"),
+        "echo \"it's $(cat src/a.py)\"": ("verify-blackbox", "source_read"),
+        "cat <<EOF\n$(cat src/a.py)\nEOF": ("verify-blackbox", "source_read"),
+        'echo "$(printf x; echo "$(cat holdout/synthetic.txt)")"': ("implement", "holdout_access"),
+    }
+    CLEAN = {
+        "echo '$(cat src/a.py)'": "verify-blackbox",
+        'echo "never run git diff"': "verify-blackbox",
+        "echo 'never run git diff'": "verify-blackbox",
+        'echo "\\$(cat src/a.py)"': "verify-blackbox",
+        "echo '$(cat holdout/synthetic.txt)'": "implement",
+        'echo "$(date)"': "verify-blackbox",
+        "cat <<'EOF'\n$(cat src/a.py)\nEOF": "verify-blackbox",
+    }
+
+    def test_substitutions_are_inspected(self):
+        from factonio.eval_skills import audit_barrier_leaks
+
+        for cmd, (phase, rule) in self.LEAKS.items():
+            with self.subTest(cmd=cmd):
+                res = audit_barrier_leaks(_term(cmd), phase=phase)
+                self.assertEqual({f["rule"] for f in res["findings"]}, {rule}, res)
+
+    def test_quoted_or_escaped_substitutions_stay_clean(self):
+        from factonio.eval_skills import audit_barrier_leaks
+
+        for cmd, phase in self.CLEAN.items():
+            with self.subTest(cmd=cmd):
+                self.assertTrue(audit_barrier_leaks(_term(cmd), phase=phase)["clean"], cmd)
+
+    def test_ab_and_standalone_cli(self):
+        with isolated_hermes_home() as home:
+            for cmd in ('echo "$(cat src/a.py)"', 'echo "$(cat holdout/synthetic.txt)"', 'echo "`git diff`"',
+                        'printf "%s" "$(cat src/a.py)"'):
+                phase, rule = self.LEAKS[cmd]
+                with self.subTest(cmd=cmd):
+                    res = _forced_judge_term_ab(cmd, phase)
+                    self.assertEqual([res["key"][s] for s in res["disqualified"]], ["subject"], res)
+                    code, out = _standalone_transcript_audit(_term(cmd), home, phase)
+                    self.assertEqual((code, out["clean"]), (1, False), out)
+                    self.assertEqual([f["rule"] for f in out["results"][0]["findings"]], [rule])
+            for cmd in ("echo '$(cat src/a.py)'", 'echo "never run git diff"'):
+                with self.subTest(control=cmd):
+                    res = _forced_judge_term_ab(cmd, "verify-blackbox")
+                    self.assertEqual((res["disqualified"], res["winner_label"]), ([], "subject"))
+                    code, out = _standalone_transcript_audit(_term(cmd), home, "verify-blackbox")
+                    self.assertEqual((code, out["clean"]), (0, True), out)
+
+
+class TestFixRound7AbsolutePathReset(unittest.TestCase):
+    """Fix round 7, finding 3: a later absolute component resets ``Path`` / ``join`` / ``/``."""
+
+    LEAKS = {
+        "ctor": ("Path('design', '/src/a.py').read_text()", "verify-blackbox"),
+        "os.path.join": ("import os\nopen(os.path.join('design', '/src/a.py')).read()", "verify-blackbox"),
+        "division": ("(Path('design') / '/src/a.py').read_text()", "verify-blackbox"),
+        "joinpath": ("Path('design').joinpath('/src/a.py').read_text()", "verify-blackbox"),
+        "pure ctor": ("from pathlib import PurePosixPath\nopen(PurePosixPath('design', 'x', '/src/a.py'))",
+                      "verify-blackbox"),
+        "holdout reset": ("Path('design', '/tmp/holdout/secret.md').read_text()", "implement"),
+    }
+    CLEAN = {
+        "relative design": "Path('design', 'mock.html').read_text()",
+        "relative division": "(Path('design') / 'mock.html').read_text()",
+        "absolute then relative": "Path('/runs/x/holdout', 'scenario.md').read_text()",
+    }
+
+    def test_absolute_component_resets(self):
+        from factonio.eval_skills import _PyCodeScan, audit_barrier_leaks
+        import ast
+
+        for label, (code, phase) in self.LEAKS.items():
+            with self.subTest(case=label):
+                rule = _BARRIER_PHASES[phase]
+                res = audit_barrier_leaks(_code(code), phase=phase)
+                self.assertEqual({f["rule"] for f in res["findings"]}, {rule}, res)
+        tree = ast.parse("Path('design', '/src/a.py').read_text()")
+        self.assertEqual(_PyCodeScan(tree).ops(tree)["reads"], [("/src/a.py", False)])
+
+    def test_relative_controls_stay_clean(self):
+        from factonio.eval_skills import audit_barrier_leaks
+
+        for label, code in self.CLEAN.items():
+            with self.subTest(case=label):
+                self.assertTrue(audit_barrier_leaks(_code(code), phase="verify-blackbox")["clean"], label)
+
+    def test_ab_and_standalone_cli(self):
+        with isolated_hermes_home() as home:
+            for label, (src, phase) in self.LEAKS.items():
+                with self.subTest(case=label):
+                    res = _forced_judge_ab(src, phase)
+                    self.assertEqual([res["key"][s] for s in res["disqualified"]], ["subject"], res)
+                    code, out = _standalone_audit(src, home, phase)
+                    self.assertEqual((code, out["clean"]), (1, False), out)
+            res = _forced_judge_ab(self.CLEAN["relative design"])
+            self.assertEqual((res["disqualified"], res["winner_label"]), ([], "subject"))
+            code, out = _standalone_audit(self.CLEAN["relative design"], home)
+            self.assertEqual((code, out["clean"]), (0, True), out)
+
+
+class TestFixRound7TryRaisingStates(unittest.TestCase):
+    """Fix round 7, finding 4: ``except`` handlers see every intermediate state of the ``try`` body."""
+
+    LEAKS = {
+        "explicit raise": "p = 'README.md'\ntry:\n    p = 'src/a.py'\n    raise ValueError()\n    p = 'README.md'\n"
+                          "except ValueError:\n    open(p)",
+        "call may raise": "p = 'README.md'\ndef helper():\n    pass\ntry:\n    p = 'src/a.py'\n    helper()\n"
+                          "    p = 'README.md'\nexcept Exception:\n    open(p)",
+        "nested block": "import sys\np = 'README.md'\ntry:\n    if sys.argv:\n        p = 'src/a.py'\n        helper()\n"
+                        "        p = 'README.md'\nexcept Exception:\n    open(p)",
+        "finally after handler": "p = 'README.md'\ntry:\n    pass\nexcept Exception:\n    p = 'src/a.py'\n    helper()\n"
+                                 "    p = 'README.md'\nfinally:\n    open(p)",
+    }
+    CLEAN = {
+        "allowed only": "p = 'README.md'\ntry:\n    p = '.factonio/verify.md'\n    helper()\n    p = 'README.md'\n"
+                        "except Exception:\n    open(p)",
+        "function locals do not leak": "p = 'README.md'\ntry:\n    def f():\n        p = 'src/a.py'\n        return p\n"
+                                       "    f()\nexcept Exception:\n    open(p)",
+    }
+
+    def test_intermediate_states_reach_handlers(self):
+        from factonio.eval_skills import audit_barrier_leaks
+
+        for label, code in self.LEAKS.items():
+            with self.subTest(case=label):
+                res = audit_barrier_leaks(_code(code), phase="verify-blackbox")
+                self.assertEqual({f["rule"] for f in res["findings"]}, {"source_read"}, res)
+        holdout = self.LEAKS["explicit raise"].replace("src/a.py", "holdout/secret.md")
+        self.assertFalse(audit_barrier_leaks(_code(holdout), phase="implement")["clean"])
+
+    def test_controls_stay_clean(self):
+        from factonio.eval_skills import audit_barrier_leaks
+
+        for label, code in self.CLEAN.items():
+            with self.subTest(case=label):
+                self.assertTrue(audit_barrier_leaks(_code(code), phase="verify-blackbox")["clean"], label)
+
+    def test_ab_and_standalone_cli(self):
+        with isolated_hermes_home() as home:
+            for label in ("explicit raise", "call may raise"):
+                with self.subTest(case=label):
+                    res = _forced_judge_ab(self.LEAKS[label])
+                    self.assertEqual([res["key"][s] for s in res["disqualified"]], ["subject"], res)
+                    code, out = _standalone_audit(self.LEAKS[label], home)
+                    self.assertEqual((code, out["clean"]), (1, False), out)
+            res = _forced_judge_ab(self.CLEAN["allowed only"])
+            self.assertEqual((res["disqualified"], res["winner_label"]), ([], "subject"))
+            code, out = _standalone_audit(self.CLEAN["allowed only"], home)
+            self.assertEqual((code, out["clean"]), (0, True), out)
+
+
+class TestFixRound7GhGlobalOptions(unittest.TestCase):
+    """Fix round 7, finding 5: ``gh`` inherited/global options never hide ``gh pr diff``."""
+
+    LEAKS = ("gh --repo owner/repo pr diff 31", "gh -R owner/repo pr diff 31", "gh --repo=owner/repo pr diff 31",
+             "gh pr --repo owner/repo diff 31", "gh --hostname github.example.com pr diff 31",
+             "gh -R=owner/repo pr -R owner/repo diff", "env GH_REPO=o/r gh pr diff 31")
+    CLEAN = ("gh --repo owner/repo pr view 31 --json state", "gh -R owner/repo pr checks 31",
+             "gh pr view 31 --repo diff", "gh --help", "gh pr list --search diff")
+
+    def test_gh_options_before_subcommands(self):
+        from factonio.eval_skills import audit_barrier_leaks
+
+        for cmd in self.LEAKS:
+            with self.subTest(cmd=cmd):
+                res = audit_barrier_leaks(_term(cmd), phase="verify-blackbox")
+                self.assertEqual({f["rule"] for f in res["findings"]}, {"diff_inspection"}, res)
+        for cmd in self.CLEAN:
+            with self.subTest(control=cmd):
+                self.assertTrue(audit_barrier_leaks(_term(cmd), phase="verify-blackbox")["clean"], cmd)
+
+    def test_ab_and_standalone_cli(self):
+        with isolated_hermes_home() as home:
+            for cmd in self.LEAKS[:4]:
+                with self.subTest(cmd=cmd):
+                    res = _forced_judge_term_ab(cmd, "verify-blackbox")
+                    self.assertEqual([res["key"][s] for s in res["disqualified"]], ["subject"], res)
+                    code, out = _standalone_transcript_audit(_term(cmd), home, "verify-blackbox")
+                    self.assertEqual((code, out["clean"]), (1, False), out)
+                    self.assertEqual([f["rule"] for f in out["results"][0]["findings"]], ["diff_inspection"])
+            cmd = self.CLEAN[0]
+            res = _forced_judge_term_ab(cmd, "verify-blackbox")
+            self.assertEqual((res["disqualified"], res["winner_label"]), ([], "subject"))
+            code, out = _standalone_transcript_audit(_term(cmd), home, "verify-blackbox")
+            self.assertEqual((code, out["clean"]), (0, True), out)
 
 
 if __name__ == "__main__":

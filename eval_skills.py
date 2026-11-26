@@ -523,12 +523,14 @@ def _quote_state(state: Optional[str], text: str, end: int) -> Optional[str]:
     return q
 
 
-def _extract_heredocs(command: str) -> tuple[str, list[str]]:
+def _extract_heredocs(command: str, expanding: Optional[list[bool]] = None) -> tuple[str, list[str]]:
     """Lift heredoc bodies out of a shell command.
 
     Each unquoted ``<<[-]DELIM`` becomes ``<< FACTONIOHEREDOC<n>`` and its body (up to the
     terminating delimiter line, or end of text as bash does) is returned separately, so body
     text is never split into argv words. Unquoted newlines become ``;`` command separators.
+    ``expanding`` (when given) receives, per body, whether its delimiter was unquoted so the
+    shell expands ``$(...)`` inside it.
     """
     lines = command.split("\n")
     out: list[str] = []
@@ -548,6 +550,8 @@ def _extract_heredocs(command: str) -> tuple[str, list[str]]:
                 pieces.append(line[last:m.start()])
                 pieces.append(f" << {_HEREDOC_MARK}{len(bodies) + len(pending)} ")
                 pending.append((m.group(2) or m.group(3) or m.group(4), bool(m.group(1))))
+                if expanding is not None:
+                    expanding.append(bool(m.group(4)) and "\\" not in m.group(0))
                 last = m.end()
         pieces.append(line[last:])
         rebuilt = "".join(pieces)
@@ -568,6 +572,99 @@ def _extract_heredocs(command: str) -> tuple[str, list[str]]:
         else:
             out.append(rebuilt + "\n")
     return "".join(out), bodies
+
+
+def _subst_end(text: str, i: int) -> int:
+    """Index of the ``)`` closing a ``$(`` whose body starts at ``text[i]`` (``len(text)`` if unclosed)."""
+    depth, n = 1, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            j = text.find("'", i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        if c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\":
+                    i += 1
+                elif text.startswith("$(", i):
+                    i = _subst_end(text, i + 2)
+                elif text[i] == "`":
+                    j = text.find("`", i + 1)
+                    i = n if j < 0 else j
+                i += 1
+            i += 1
+            continue
+        if c == "`":
+            j = text.find("`", i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return n
+
+
+def _command_substitutions(command: str) -> list[str]:
+    """Inner commands of every executed ``$(...)`` / backtick substitution in shell text.
+
+    Quote-aware: single-quoted text (and quoted heredoc bodies) is literal, ``\\$(`` and
+    ``\\``` are escaped, and ``#`` comments are skipped. Nested substitutions are left inside
+    the returned inner command for the caller's recursive scan.
+    """
+    if "$(" not in command and "`" not in command:
+        return []
+    out: list[str] = []
+    text = command
+    if "<<" in command:
+        expanding: list[bool] = []
+        text, bodies = _extract_heredocs(command, expanding)
+        for body, expands in zip(bodies, expanding):
+            if expands:
+                out.extend(_command_substitutions('"' + body.replace('"', '\\"') + '"'))
+    n, i, dq = len(text), 0, False
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if not dq and c == "'":
+            j = text.find("'", i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        if not dq and c == "#" and (i == 0 or text[i - 1] in " \t\n;&|()"):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c == '"':
+            dq = not dq
+        elif text.startswith("$(", i):
+            end = _subst_end(text, i + 2)
+            out.append(text[i + 2:end])
+            i = end + 1
+            continue
+        elif c == "`":
+            j, buf = i + 1, []
+            while j < n and text[j] != "`":
+                if text[j] == "\\" and j + 1 < n:
+                    buf.append(text[j + 1] if text[j + 1] in "$`\\" else text[j:j + 2])
+                    j += 2
+                    continue
+                buf.append(text[j])
+                j += 1
+            out.append("".join(buf))
+            i = j + 1
+            continue
+        i += 1
+    return [sub for sub in out if sub.strip()]
 
 
 def _new_segment(piped: bool = False) -> dict[str, Any]:
@@ -1152,6 +1249,20 @@ def _concat(parts: list[set[_Seq]]) -> set[_Seq]:
     return set(combos)
 
 
+_ABS_COMPONENT_RE = re.compile(r"^(?:[/\\]|[A-Za-z]:)")
+
+
+def _path_join(parts: list[str]) -> str:
+    """Join path components like ``PurePath`` / ``os.path.join``: an absolute component resets."""
+    out = ""
+    for part in parts:
+        if not out or _ABS_COMPONENT_RE.match(part):
+            out = part
+        elif part:
+            out += part if out.endswith("/") else "/" + part
+    return out
+
+
 def _argv_join(seq: _Seq) -> Optional[str]:
     if all(e is None for e in seq):
         return None
@@ -1205,8 +1316,9 @@ class _PyCodeScan:
         self.aliases: dict[str, str] = {}
         self.path_vars: set[str] = set()
         self.out: dict[str, list[Any]] = {"reads": [], "writes": [], "searches": [], "commands": [], "codes": [],
-                                          "fs": []}
+                                          "fs": [], "opaque_reads": []}
         self._seen: set[tuple[int, str, str]] = set()
+        self._raise_sinks: list[Optional[list[_Env]]] = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for al in node.names:
@@ -1304,8 +1416,7 @@ class _PyCodeScan:
             left, right = self.statics(node.left, env, depth + 1), self.statics(node.right, env, depth + 1)
             if not left and not right:
                 return set()
-            sep = "" if isinstance(node.op, ast.Add) else "/"
-            return _combine([left or {"*"}, right or {"*"}], sep.join)
+            return _combine([left or {"*"}, right or {"*"}], "".join if isinstance(node.op, ast.Add) else _path_join)
         if isinstance(node, ast.IfExp):
             return _bounded(self.statics(node.body, env, depth + 1) | self.statics(node.orelse, env, depth + 1))
         if isinstance(node, ast.Name):
@@ -1324,12 +1435,12 @@ class _PyCodeScan:
                     return {"."} if name in _PY_PATH_CTORS else set()
                 if not any(parts):
                     return set()
-                return _combine([p or {"*"} for p in parts], "/".join)
+                return _combine([p or {"*"} for p in parts], _path_join)
             if isinstance(node.func, ast.Attribute) and node.func.attr in _PY_PATH_DERIVE:
                 base = self.statics(node.func.value, env, depth + 1)
                 if not base:
                     return set()
-                return _combine([base, *(self.statics(a, env, depth + 1) or {"*"} for a in node.args)], "/".join)
+                return _combine([base, *(self.statics(a, env, depth + 1) or {"*"} for a in node.args)], _path_join)
         return set()
 
     def _name_values(self, name: str, env: _Env) -> set[Any]:
@@ -1622,7 +1733,25 @@ class _PyCodeScan:
     def _block(self, stmts: list[ast.stmt], env: _Env) -> _Env:
         for st in stmts:
             env = self._stmt(st, env)
+            self._note_raising(env)
         return env
+
+    def _note_raising(self, env: _Env) -> None:
+        """Record ``env`` as a state an exception may leave from, for every enclosing ``try``."""
+        for sink in reversed(self._raise_sinks):
+            if sink is None:
+                break  # a function / class body: its locals never reach the caller's handlers
+            sink[0] = _merge_envs(sink[0], env)
+
+    def _collect_raising(self, run: Callable[[], _Env], start: _Env) -> tuple[_Env, _Env]:
+        """Run ``run()`` and return ``(end state, every state an exception may leave from)``."""
+        sink = [_copy_env(start)]
+        self._raise_sinks.append(sink)
+        try:
+            end = run()
+        finally:
+            self._raise_sinks.pop()
+        return end, _merge_envs(sink[0], end)
 
     def _targets(self, target: ast.expr, env: _Env) -> None:
         """Scan the evaluated parts of an assignment target (``obj.attr`` / ``obj[key]``)."""
@@ -1673,18 +1802,23 @@ class _PyCodeScan:
                     self._bind(item.optional_vars, set(), env)
             return self._block(st.body, env)
         if isinstance(st, (ast.Try, getattr(ast, "TryStar", ast.Try))):
-            body = self._block(st.body, _copy_env(env))
-            # An exception may leave the body at any statement.
-            raised = _merge_envs(env, body)
-            outs = []
-            for handler in st.handlers:
-                h_env = _copy_env(raised)
-                self._expr(handler.type, h_env)
-                if handler.name:
-                    h_env.pop(handler.name, None)
-                outs.append(self._block(handler.body, h_env))
-            orelse = self._block(st.orelse, body)
-            return self._block(st.finalbody, _merge_envs(raised, orelse, *outs))
+            # Handlers start from the try-entry state merged with the state after every body
+            # statement (at any nesting depth): a raise or a raising call may leave at any of them.
+            body, raised = self._collect_raising(lambda: self._try_body(st.body, _copy_env(env)), env)
+
+            def rest() -> _Env:
+                outs = []
+                for handler in st.handlers:
+                    h_env = _copy_env(raised)
+                    self._expr(handler.type, h_env)
+                    if handler.name:
+                        h_env.pop(handler.name, None)
+                    outs.append(self._block(handler.body, h_env))
+                return _merge_envs(self._block(st.orelse, body), *outs)
+
+            # ``finally`` also runs when a handler or ``else`` block itself raises part-way.
+            done, leaving = self._collect_raising(rest, raised)
+            return self._block(st.finalbody, _merge_envs(raised, done, leaving))
         if isinstance(st, ast.Match):
             self._expr(st.subject, env)
             outs = [_copy_env(env)]
@@ -1706,7 +1840,11 @@ class _PyCodeScan:
         if isinstance(st, ast.ClassDef):
             for expr in (*st.decorator_list, *st.bases, *(k.value for k in st.keywords)):
                 self._expr(expr, env)
-            self._block(st.body, _copy_env(env))
+            self._raise_sinks.append(None)
+            try:
+                self._block(st.body, _copy_env(env))
+            finally:
+                self._raise_sinks.pop()
             env.pop(st.name, None)
             return env
         if isinstance(st, (ast.Import, ast.ImportFrom)):
@@ -1729,6 +1867,15 @@ class _PyCodeScan:
                 branches.append(self._block(value, _copy_env(env)))
         return _merge_envs(env, *branches) if branches else env
 
+    def _try_body(self, stmts: list[ast.stmt], env: _Env) -> _Env:
+        """Walk a ``try`` body in order, stopping after a statement that always leaves it."""
+        for st in stmts:
+            env = self._stmt(st, env)
+            self._note_raising(env)
+            if isinstance(st, (ast.Raise, ast.Return, ast.Break, ast.Continue)):
+                break
+        return env
+
     def _loop(self, st: Any, env: _Env, enter: Callable[[_Env], None], test: Optional[ast.expr] = None) -> _Env:
         # Iterate to a fixpoint so values assigned late in the body reach earlier calls via the
         # back edge; the loop may also run zero times.
@@ -1750,10 +1897,14 @@ class _PyCodeScan:
         for k, v in self.may.items():
             if k not in local:
                 f_env[k] = _bounded(f_env.get(k, set()) | v)
-        if isinstance(body, list):
-            self._block(body, f_env)
-        else:
-            self._expr(body, f_env)
+        self._raise_sinks.append(None)
+        try:
+            if isinstance(body, list):
+                self._block(body, f_env)
+            else:
+                self._expr(body, f_env)
+        finally:
+            self._raise_sinks.pop()
 
     def _expr(self, node: Optional[ast.AST], env: _Env) -> None:
         if node is None:
@@ -1801,6 +1952,13 @@ class _PyCodeScan:
             m and set(m) <= set("waxbt") and any(c in m for c in "wax") for m in modes
         )
 
+    @staticmethod
+    def _path_from_unpack(node: ast.Call) -> bool:
+        """The path argument can only come from a ``**mapping`` (no explicit path argument)."""
+        if node.args or any(kw.arg in _PATH_ARG_NAMES for kw in node.keywords):
+            return False
+        return any(kw.arg is None for kw in node.keywords)
+
     def _call(self, node: ast.Call, env: _Env) -> None:
         name = self.callee(node.func) or ""
         if name in _PY_COMMAND_CALLS:
@@ -1821,8 +1979,13 @@ class _PyCodeScan:
             if name in _PY_MODE_OPENS and self._write_only(
                     self.arg(node, _PY_MODE_OPENS[name], "mode", env=env, default="r"), env):
                 kind = "writes"
-            for path in sorted(self.statics(self.arg(node, 0, *_PATH_ARG_NAMES, env=env), env)):
+            paths = self.statics(self.arg(node, 0, *_PATH_ARG_NAMES, env=env), env)
+            for path in sorted(paths):
                 self._emit(kind, node, (path, False))
+            if not paths and kind == "reads" and self._path_from_unpack(node):
+                # ``read_file(**opts)`` whose mapping is unknown, mutated or holds an unknown path:
+                # the target is opaque, so the read fails closed in every barrier phase.
+                self._emit("opaque_reads", node, f"{name}(**kwargs)")
         elif name in _PY_CONTENT_SEARCH_CALLS:
             sf = name == "search_files"
             target_node = self.arg(node, 1 if sf else None, "target", env=env, default="content")
@@ -1880,6 +2043,9 @@ def _code_findings(code: str, canon: str, depth: int = 0, lang: str = "python") 
             return [("holdout_access", hit)] if hit else []
         return _blackbox_command_findings(code, depth + 1) if canon == "verify-blackbox" else []
     ops = _code_ops(code, lang)
+    if canon in _HOLDOUT_PHASES or canon == "verify-blackbox":
+        rule = "holdout_access" if holdout else "source_read"
+        found.extend((rule, f"<unresolved path: {call}>") for call in ops.get("opaque_reads", ()))
     for path, search in ops["reads"]:
         if holdout and _HOLDOUT_TOKEN_RE.search(_norm_path(path)):
             found.append(("holdout_access", path))
@@ -1914,6 +2080,11 @@ def _code_findings(code: str, canon: str, depth: int = 0, lang: str = "python") 
 
 
 def _holdout_in_command(command: str, depth: int = 0) -> Optional[str]:
+    # Substitutions run before the command that receives their output (even ``echo``).
+    for sub in _command_substitutions(command) if depth < 3 else ():
+        hit = _holdout_in_command(sub, depth + 1)
+        if hit:
+            return hit
     plist = _parse_command(command)
     for idx, parsed in enumerate(plist):
         for target in (*parsed["inputs"], *parsed["outputs"]):
@@ -1967,6 +2138,27 @@ def _git_subcommand(seg: list[str]) -> tuple[Optional[str], list[str]]:
         else:
             return tok, seg[i + 1:]
     return None, []
+
+
+# ``gh`` global / inherited options that consume the next token (unless given as ``--opt=value``).
+_GH_OPTS_WITH_VALUE = frozenset({"-R", "--repo", "--hostname", "--color", "-q", "--jq", "-t", "--template"})
+
+
+def _gh_subcommands(seg: list[str]) -> list[str]:
+    """Positional ``gh`` tokens (``pr``, ``diff``, ...) with options and their values skipped."""
+    out: list[str] = []
+    i = 1
+    while i < len(seg):
+        tok = seg[i]
+        if tok == "--":
+            out.extend(seg[i + 1:])
+            break
+        if tok.startswith("-") and len(tok) > 1:
+            i += 2 if tok in _GH_OPTS_WITH_VALUE else 1
+            continue
+        out.append(tok)
+        i += 1
+    return out
 
 
 _SOURCE_DIRS = frozenset({"src", "lib", "app", "pkg", "internal", "cmd", "source", "sources"})
@@ -2092,6 +2284,9 @@ def _content_search_hits(roots: Any, globs: Any) -> list[str]:
 
 def _blackbox_command_findings(command: str, depth: int = 0) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
+    # Substitutions run before the command that receives their output (even ``echo``).
+    for sub in _command_substitutions(command) if depth < 3 else ():
+        found.extend(_blackbox_command_findings(sub, depth + 1))
     plist = _parse_command(command)
     for idx, parsed in enumerate(plist):
         for target in parsed["inputs"]:
@@ -2128,7 +2323,7 @@ def _blackbox_command_findings(command: str, depth: int = 0) -> list[tuple[str, 
             if diffy:
                 found.append(("diff_inspection", " ".join(seg)))
                 continue
-        if verb == "gh" and seg[1:3] == ["pr", "diff"]:
+        if verb == "gh" and _gh_subcommands(seg)[:2] == ["pr", "diff"]:
             found.append(("diff_inspection", " ".join(seg)))
             continue
         grep = _grep_parse(seg)
