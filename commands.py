@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from .config import (
     resolve_verify_panel,
 )
 from .harness import audit_harness, bootstrap_verify_harness, check_harness, show_harness
+from .metrics import RANGE_SECONDS, capture_metrics_snapshot, compute_metrics, default_kanban_db_path
 from .orchestrator import evaluate_verification_panel, workstream_status
 from .profile_setup import init_factonio_profile, run_doctor
 from .repos import (
@@ -29,7 +31,13 @@ from .repos import (
     restack_stack,
     update_repo,
 )
-from .trail import render_trail_markdown, render_trail_text, trail_payload
+from .trail import (
+    metrics_history_payload,
+    render_metric_snapshots_text,
+    render_trail_markdown,
+    render_trail_text,
+    trail_payload,
+)
 
 
 def _print_result(data: dict[str, Any], as_json: bool) -> None:
@@ -142,6 +150,45 @@ def _print_panel(res: dict[str, Any]) -> None:
         print(f"  Recorded verify_panel_consensus {res.get('decision_id')} in trail.db")
 
 
+def _rate(value: Any) -> str:
+    return "-" if value is None else f"{float(value) * 100:.1f}%"
+
+
+def _print_metrics(m: dict[str, Any]) -> None:
+    t, v, rw, esc = m["totals"], m["verification"], m["rework"], m["escapes"]
+    print(f"Factonio metrics (range={m['range']}" + (f", tenant={m['tenant']}" if m.get("tenant") else "") + ")")
+    print(
+        f"  Cards: total={t['cards']} done={t['done']} running={t['running']} blocked={t['blocked']}"
+        f" triage={t['triage']} | workstreams={t['workstreams']}"
+    )
+    for label, key in (("Diff Check", "diff"), ("Black-Box Check", "blackbox")):
+        b = v[key]
+        print(f"  {label}: pass={b['pass']} reject={b['reject']} inconclusive={b['inconclusive']} pass_rate={_rate(b['pass_rate'])}")
+    print(
+        f"  Rework: cards_with_rework={rw['cards_with_rework']} avg_runs={rw['avg_runs_per_implement_card'] or '-'}"
+        f" first_pass_rate={_rate(rw.get('first_pass_rate'))}"
+    )
+    print(f"  Escapes: {esc['count']}/{esc['verified_total']} escape_rate={_rate(esc['escape_rate'])}")
+    for phase, info in m["phases"].items():
+        med = "-" if info["median_seconds"] is None else f"{info['median_seconds']:.0f}s"
+        print(f"  Phase {phase:<15} count={info['count']} done={info['done']} median={med}")
+    vp = m.get("verification_panels") or {}
+    if vp:
+        print(
+            f"  Panels: total={vp['total']} pass={vp['pass']} reject={vp['reject']} inconclusive={vp['inconclusive']}"
+            f" pending={vp['pending']} disagreements={vp['disagreements']}"
+        )
+    h = m.get("history") or {}
+    print(f"  History: {h.get('snapshot_count', 0)} snapshot(s), latest={h.get('latest_ts') or '-'}")
+
+
+def _print_history(payload: dict[str, Any]) -> None:
+    s = payload["summary"]
+    by_source = " ".join(f"{k}={v}" for k, v in s["by_source"].items()) or "-"
+    print(f"Metric snapshots: total={s['total']} (showing {len(payload['snapshots'])}) sources: {by_source}")
+    print(render_metric_snapshots_text(payload["snapshots"]))
+
+
 def _print_verify_panel(panel: dict[str, Any], rigor: Any) -> None:
     print(f"\n  default rigor -> {rigor or '(invalid)'}")
     if panel["entries"]:
@@ -171,6 +218,68 @@ def _print_restack_one(r: dict[str, Any]) -> None:
         print(f"  Conflicting files: {', '.join(r['conflict_files'])}")
     if r.get("error"):
         print(f"  Error: {r['error']}")
+
+
+def _metrics_fail(message: str, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps({"ok": False, "error": message}, indent=2))
+    else:
+        print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _handle_metrics(args: Any, as_json: bool) -> None:
+    """`hermes factonio metrics`: live KPIs, `--snapshot` capture, and/or `--history` time series."""
+    if not 1 <= int(args.limit) <= 1000:
+        _metrics_fail("--limit must be between 1 and 1000", as_json)
+    snapshot = None
+    if args.snapshot:
+        snapshot = capture_metrics_snapshot(
+            source="manual",
+            range_key=args.range_key or "all",
+            repo_slug=args.repo,
+            tenant=args.tenant,
+            extra={"trigger": "cli"},
+            lock_budget_s=None,
+        )
+        if snapshot is None:
+            _metrics_fail("could not capture a metrics snapshot (trail.db unavailable; see logs)", as_json)
+    if args.history:
+        try:
+            payload: dict[str, Any] = metrics_history_payload(
+                tenant=args.tenant,
+                repo=args.repo,
+                source=args.source,
+                since=args.since if args.since is not None else args.range_key,
+                limit=args.limit,
+            )
+        except ValueError as exc:
+            _metrics_fail(str(exc), as_json)
+            return
+        except (sqlite3.Error, OSError) as exc:
+            _metrics_fail(f"trail.db metric history unavailable: {exc}", as_json)
+            return
+        if snapshot is not None:
+            payload = {"snapshot": snapshot, **payload}
+        if as_json:
+            print(json.dumps(payload, indent=2, default=str))
+        else:
+            if snapshot is not None:
+                print(f"Captured metric snapshot {snapshot['id']} at {snapshot['ts']}")
+            _print_history(payload)
+        return
+    if snapshot is not None:
+        if as_json:
+            print(json.dumps({"ok": True, "snapshot": snapshot}, indent=2, default=str))
+        else:
+            print(f"Captured metric snapshot {snapshot['id']} at {snapshot['ts']} (source=manual, range={snapshot['range_key']})")
+            print(render_metric_snapshots_text([snapshot]))
+        return
+    metrics = compute_metrics(default_kanban_db_path(), range_key=args.range_key or "30d", tenant=args.tenant)
+    if as_json:
+        print(json.dumps(metrics, indent=2, default=str))
+    else:
+        _print_metrics(metrics)
 
 
 def register_cli(ctx: Any, plugin_dir: Path) -> None:
@@ -313,6 +422,28 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             help="Output the {decisions, summary, filters} JSON contract.",
         )
 
+        p_metrics = sub.add_parser(
+            "metrics",
+            help="Show factory KPIs, capture a long-term trail.db snapshot, or show snapshot history.",
+        )
+        p_metrics.add_argument(
+            "--range", dest="range_key", choices=list(RANGE_SECONDS), default=None,
+            help="KPI window (default 30d; --snapshot defaults to all; with --history it is the --since fallback).",
+        )
+        p_metrics.add_argument("--tenant", default=None, help="Filter KPIs/history by tenant; tags a --snapshot.")
+        p_metrics.add_argument("--repo", default=None, help="Filter history by repo slug or 'owner/repo'; tags a --snapshot.")
+        p_metrics.add_argument("--history", action="store_true", help="Show long-term metric snapshots (oldest first).")
+        p_metrics.add_argument("--snapshot", action="store_true", help="Capture a factory-wide snapshot into trail.db now.")
+        p_metrics.add_argument("--source", default=None, help="history: filter by source (merge, panel_consensus, retro, manual).")
+        p_metrics.add_argument("--since", default=None, help="history: 7d, 30d, 90d, all, or an ISO-8601 timestamp.")
+        p_metrics.add_argument("--limit", type=int, default=100, help="history: latest N snapshots, 1..1000 (default: 100).")
+        p_metrics.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Output machine-readable JSON.",
+        )
+
         p_h = sub.add_parser(
             "harness",
             help="Bootstrap, validate, show, or drift-audit a repo's .factonio/ verification harness.",
@@ -340,7 +471,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         if not cmd:
             print(
                 "Usage: hermes factonio {init|add|update|remove|list|models|status|panel|pr-gate|restack|worktrees"
-                "|harness|trail|doctor} [--json]"
+                "|harness|trail|metrics|doctor} [--json]"
             )
             return
 
@@ -622,6 +753,10 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                 print(render_trail_text(payload["decisions"]))
             return
 
+        if cmd == "metrics":
+            _handle_metrics(args, as_json)
+            return
+
         if cmd == "harness":
             action = args.action
             try:
@@ -667,7 +802,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         "factonio",
         help=(
             "Manage the Factonio pure-Hermes software factory "
-            "(init, add, update, models, status, panel, restack, worktrees, harness, trail, doctor)."
+            "(init, add, update, models, status, panel, restack, worktrees, harness, trail, metrics, doctor)."
         ),
         setup_fn=setup_parser,
         handler_fn=handle_cli,

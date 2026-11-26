@@ -20,6 +20,7 @@ from .harness import (
     check_harness,
     show_harness,
 )
+from .metrics import capture_metrics_snapshot
 from .orchestrator import (
     evaluate_verification_panel,
     spawn_design_card,
@@ -535,6 +536,7 @@ def register_tools(ctx: Any) -> None:
                 expected_head_sha=args.get("expected_head_sha"),
                 method=str(args.get("method") or "squash"),
                 delete_branch=bool(args.get("delete_branch", True)),
+                tenant=_trail_context(args)["tenant"] or None,
             )
         except Exception as exc:
             return _json_err(exc)
@@ -723,7 +725,16 @@ def register_tools(ctx: Any) -> None:
                 supersedes_id=args.get("supersedes_id"),
                 **_trail_context(args),
             )
-            return _json_ok({"ok": True, "decision": row})
+            out: dict[str, Any] = {"ok": True, "decision": row}
+            if str(row.get("phase") or "").lower() == "retro":
+                snapshot = capture_metrics_snapshot(
+                    source="retro",
+                    repo_slug=row.get("repo_slug") or None,
+                    tenant=row.get("tenant") or None,
+                    extra={"decision_id": row["id"], "decision": row["decision"]},
+                )
+                out["metrics_snapshot_id"] = (snapshot or {}).get("id")
+            return _json_ok(out)
         except Exception as exc:
             return _json_err(exc)
 

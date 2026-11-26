@@ -8,14 +8,14 @@ This guide covers repository layout, local development against Hermes Agent, run
 __init__.py                  Plugin entrypoint: registers aux models, skills, tools, CLI, watchdog, blueprint
 plugin.yaml                  Hermes plugin manifest (v2) and config_schema
 agent_tools.py               13 agent-callable tools (`factonio_*`), including `factonio_log_decision`, `factonio_bootstrap_verify`, `factonio_restack_pr` and `factonio_evaluate_panel`
-commands.py                  CLI subcommands (`hermes factonio init|add|update|remove|list|models|status|panel|pr-gate|restack|worktrees|harness|trail|doctor`)
+commands.py                  CLI subcommands (`hermes factonio init|add|update|remove|list|models|status|panel|pr-gate|restack|worktrees|harness|trail|metrics|doctor`)
 config.py                    Settings, durable repos.json store (atomic writes + flock), phase model & design resolution
 orchestrator.py              Workstream lifecycle, Kanban DAG creation, holdout/ isolation, session notify+wake subscriptions
 profile_setup.py             Dedicated headless `factonio` profile initializer and `doctor` diagnostics
 harness.py                   Repo-local `.factonio/` verification harness: stack/route/CLI detection, init/check/show, hooks, read-only drift audit
 repos.py                     GitHub repo registration, validation, exact-HEAD PR gate, squash-merge, and stacked-PR restack helpers
-trail.py                     Append-only SQLite decision trail (`trail.db`: WAL, schema_meta, immutability triggers)
-metrics.py                   Read-only SQLite queries over `kanban.db` (phase timings, pass rates, rework, escapes, enriched cards)
+trail.py                     Append-only SQLite `trail.db` (WAL, schema_meta v2 migration, immutability triggers): decisions + metric_snapshots
+metrics.py                   Read-only SQLite queries over `kanban.db` (phase timings, pass rates, rework, escapes, enriched cards) + best-effort snapshot capture
 watchdog.py                  In-process `on_kanban_dispatch_tick` PID/side-effect liveness, phase-aware stall detection, bounded triage
 dashboard/
   manifest.json              Hermes Dashboard API discovery manifest
@@ -42,6 +42,7 @@ tests/
   test_stacked_prs.py        Real-git stacked spawn/seeding, true-base gate & merge, `--onto` restack continuity, `restack` CLI/tool
   test_verify_panel.py       rigor/verify_panel config + vendor diversity, per-repo default_rigor (tool/CLI/API/doctor), high-rigor fan-out, fail-closed consensus, panel CLI/tool, additive metrics
   test_trail.py              trail.db store, transition hooks, CLI/API/tool, retro, cross-vendor warning
+  test_metrics_history.py    trail.db v1 -> v2 migration (incl. concurrent cold start), append-only metric_snapshots, capture hooks, `/metrics/history`, `metrics` CLI
   test_desktop_plugin.py     Node ESM smoke tests + Desktop SDK surface lint (59 tests)
 tools/
   check_repo_integrity.py    Manifest, skill frontmatter (runtime + contributor), and Markdown link verifier
