@@ -11,6 +11,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -1006,6 +1007,412 @@ class TestVerificationHarnessInjection(unittest.TestCase):
             self.assertIn("NEVER run `git diff`", bb_body)
             self.assertNotIn(".factonio", diff_task.body or "")
             self.assertNotIn("Repo Verification Harness", diff_task.body or "")
+
+
+_UNRAN_PROOF = {"ran": False, "ok": None, "doctor": None, "hooks": None, "evidence_survived": None, "errors": []}
+
+
+@contextlib.contextmanager
+def _scratch_tempdir(home: Path):
+    """Route tempfile.mkdtemp into a private dir so proof temp roots can be counted exactly."""
+    scratch = home / "proof-tmp"
+    scratch.mkdir()
+    with mock.patch.object(tempfile, "tempdir", str(scratch)):
+        yield scratch
+
+
+class TestHarnessProof(unittest.TestCase):
+    def test_prove_false_reports_unran_proof_and_keeps_fields(self):
+        from factonio import harness
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            dry = harness.bootstrap_verify_harness(str(repo), dry_run=True)
+            self.assertEqual(dry["proof"], _UNRAN_PROOF)
+            self.assertIn("verify_md_content", dry)
+            res = harness.bootstrap_verify_harness(str(repo))
+            self.assertEqual(res["proof"], _UNRAN_PROOF)
+            for key in ("ok", "written", "refused", "existing", "would_overwrite", "overwritten", "preserved_hooks",
+                        "manifest", "profile", "trail_decision_id"):
+                self.assertIn(key, res)
+            self.assertTrue(res["ok"] and res["written"])
+            refused = harness.bootstrap_verify_harness(str(repo))
+            self.assertTrue(refused["refused"])
+            self.assertEqual(refused["proof"], _UNRAN_PROOF)
+
+    def test_prove_success_writes_harness_and_cleans_proof_root(self):
+        from factonio import harness
+        from factonio.trail import query_decisions
+
+        with isolated_hermes_home() as home, _scratch_tempdir(home) as scratch:
+            repo = _make_repo(home)
+            hooks = [{"name": "inv", "kind": "invariant", "command": "true"},
+                     {"name": "soft", "kind": "visual_diff", "command": "exit 4", "optional": True}]
+            res = harness.bootstrap_verify_harness(str(repo), hooks=hooks, prove=True, tenant="t-p", card_id="c1")
+            self.assertTrue(res["ok"], res.get("error"))
+            self.assertTrue(res["written"])
+            proof = res["proof"]
+            self.assertEqual((proof["ran"], proof["ok"], proof["evidence_survived"], proof["errors"]),
+                             (True, True, True, []))
+            self.assertTrue(proof["doctor"]["ok"])
+            self.assertGreaterEqual(proof["doctor"]["ran"], 1)
+            self.assertEqual((proof["hooks"]["ran"], proof["hooks"]["failed_required"]), (2, []))
+            self.assertTrue((repo / ".factonio" / "harness.json").is_file())
+            self.assertEqual(list(scratch.iterdir()), [])
+            rows = query_decisions(phase="harness")
+            self.assertEqual([r["result"] for r in rows], ["written"])
+            self.assertTrue(rows[0]["evidence"]["proof"]["ok"])
+
+    def test_prove_failure_on_fresh_repo_leaves_nothing_behind(self):
+        from factonio import harness
+        from factonio.trail import query_decisions
+
+        with isolated_hermes_home() as home, _scratch_tempdir(home) as scratch:
+            repo = _make_repo(home)
+            res = harness.bootstrap_verify_harness(
+                str(repo), hooks=[{"name": "gate", "kind": "invariant", "command": "exit 3"}], prove=True
+            )
+            self.assertFalse(res["ok"])
+            self.assertFalse(res["written"])
+            self.assertTrue(res["rolled_back"])
+            self.assertIn("Harness proof failed", res["error"])
+            self.assertEqual((res["proof"]["ran"], res["proof"]["ok"]), (True, False))
+            self.assertEqual(res["proof"]["hooks"]["failed_required"], ["gate"])
+            self.assertTrue(res["proof"]["evidence_survived"])
+            self.assertTrue(any("'gate'" in e for e in res["proof"]["errors"]))
+            self.assertFalse((repo / ".factonio").exists())
+            self.assertEqual(_git(repo, "status", "--porcelain", "--untracked-files=all"), "")
+            self.assertEqual(list(scratch.iterdir()), [])
+            rows = query_decisions(phase="harness")
+            self.assertEqual([r["result"] for r in rows], ["proof_failed"])
+            self.assertEqual(rows[0]["evidence"]["proof"]["failed_required_hooks"], ["gate"])
+
+    def test_prove_failure_restores_existing_harness_bytes(self):
+        from factonio import harness
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            harness.bootstrap_verify_harness(str(repo), hooks=[{"name": "gate", "kind": "invariant", "command": "exit 1"}])
+            (repo / ".factonio" / "notes.txt").write_text("keep\n", encoding="utf-8")
+            before = {n: (repo / ".factonio" / n).read_bytes() for n in ("verify.md", "harness.json")}
+            res = harness.bootstrap_verify_harness(str(repo), force=True, prove=True)
+            self.assertFalse(res["ok"])
+            self.assertFalse(res["written"])
+            self.assertFalse(res["overwritten"])
+            self.assertTrue(res["preserved_hooks"])
+            for name, data in before.items():
+                self.assertEqual((repo / ".factonio" / name).read_bytes(), data, name)
+            self.assertEqual(sorted(p.name for p in (repo / ".factonio").iterdir()),
+                             ["harness.json", "notes.txt", "verify.md"])
+
+    def test_prove_failure_on_doctor_or_evidence_probe(self):
+        from factonio import harness
+
+        with isolated_hermes_home() as home, _scratch_tempdir(home) as scratch:
+            repo = _make_repo(home)
+            real_phases = harness._phases_for
+
+            def broken_doctor(profile):
+                phases = real_phases(profile)
+                phases["doctor"] = [*phases["doctor"], "exit 9"]
+                return phases
+
+            with mock.patch.object(harness, "_phases_for", side_effect=broken_doctor):
+                doc = harness.bootstrap_verify_harness(str(repo), prove=True)
+            self.assertFalse(doc["ok"])
+            self.assertFalse(doc["proof"]["doctor"]["ok"])
+            self.assertTrue(any("exit 9" in e for e in doc["proof"]["errors"]))
+            self.assertFalse((repo / ".factonio").exists())
+
+            real_rmtree = shutil.rmtree
+
+            def cleanup_destroys_evidence(path, *a, **kw):
+                path = Path(path)
+                if path.name == "work":
+                    real_rmtree(path.parent / "evidence")
+                return real_rmtree(path, *a, **kw)
+
+            with mock.patch.object(harness.shutil, "rmtree", side_effect=cleanup_destroys_evidence):
+                ev = harness.bootstrap_verify_harness(str(repo), prove=True)
+            self.assertFalse(ev["ok"])
+            self.assertFalse(ev["written"])
+            self.assertIs(ev["proof"]["evidence_survived"], False)
+            self.assertTrue(any("did not survive" in e for e in ev["proof"]["errors"]))
+            self.assertFalse((repo / ".factonio").exists())
+            self.assertEqual(list(scratch.iterdir()), [])
+
+    def test_prove_dry_run_never_writes_or_logs(self):
+        from factonio import harness
+        from factonio.trail import query_decisions
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            ok = harness.bootstrap_verify_harness(str(repo), dry_run=True, prove=True)
+            self.assertTrue(ok["ok"] and ok["proof"]["ok"])
+            bad = harness.bootstrap_verify_harness(
+                str(repo), dry_run=True, prove=True, hooks=[{"name": "g", "kind": "custom", "command": "false"}]
+            )
+            self.assertFalse(bad["ok"])
+            self.assertFalse(bad["written"])
+            self.assertFalse((repo / ".factonio").exists())
+            self.assertEqual(query_decisions(phase="harness"), [])
+
+    def test_cli_and_tool_prove(self):
+        from factonio import harness
+        from factonio.agent_tools import register_tools
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            run = TestSurfaces()._cli()
+            code, out, _ = run("harness", "init", str(repo), "--prove", "--json")
+            self.assertEqual(code, 0, out)
+            payload = json.loads(out)
+            self.assertTrue(payload["proof"]["ok"] and payload["written"])
+
+            harness.bootstrap_verify_harness(
+                str(repo), force=True, hooks=[{"name": "gate", "kind": "invariant", "command": "exit 2"}]
+            )
+            before = (repo / ".factonio" / "harness.json").read_bytes()
+            code, out, _ = run("harness", "init", str(repo), "--force", "--prove")
+            self.assertEqual(code, 1)
+            self.assertIn("Proof FAILED", out)
+            self.assertIn("'gate'", out)
+            self.assertEqual((repo / ".factonio" / "harness.json").read_bytes(), before)
+
+            ctx = _FakeCtx()
+            register_tools(ctx)
+            tool = ctx.tools["factonio_bootstrap_verify"]
+            self.assertEqual(tool["schema"]["parameters"]["properties"]["prove"]["type"], "boolean")
+            res = json.loads(tool["handler"]({"repo": str(repo), "force": True, "prove": True}))
+            self.assertFalse(res["ok"])
+            self.assertFalse(res["written"])
+            self.assertEqual(res["proof"]["hooks"]["failed_required"], ["gate"])
+            self.assertEqual((repo / ".factonio" / "harness.json").read_bytes(), before)
+
+
+class TestGateLoosening(unittest.TestCase):
+    HOOKS = [
+        {"name": "lint", "kind": "invariant", "command": "true"},
+        {"name": "types", "kind": "invariant", "command": "true"},
+        {"name": "pixels", "kind": "visual_diff", "command": "true", "optional": True},
+    ]
+
+    def _repo_with_committed_harness(self, home: Path) -> tuple[Path, str]:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home)
+        bootstrap_verify_harness(str(repo), hooks=self.HOOKS)
+        return repo, _commit_all(repo, "add harness")
+
+    @staticmethod
+    def _loosen(repo: Path) -> None:
+        hj = repo / ".factonio" / "harness.json"
+        manifest = json.loads(hj.read_text(encoding="utf-8"))
+        manifest["hooks"] = [h for h in manifest["hooks"] if h["name"] != "lint"]
+        for h in manifest["hooks"]:
+            if h["name"] == "types":
+                h["optional"] = True
+        manifest["phases"]["doctor"] = [c for c in manifest["phases"]["doctor"] if c != "git --version"]
+        hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    def test_clean_and_loosened_against_head_is_read_only(self):
+        from factonio.harness import detect_harness_gate_loosening
+
+        with isolated_hermes_home() as home:
+            repo, head = self._repo_with_committed_harness(home)
+            clean = detect_harness_gate_loosening(repo)
+            self.assertEqual((clean["checked"], clean["loosened"], clean["base_commit"]), (True, False, head))
+            self.assertEqual(clean["baseline_source"], "harness.json")
+            self.assertEqual(clean["findings"], [])
+
+            self._loosen(repo)
+            before_status = _git(repo, "status", "--porcelain")
+            before_index = _index_fingerprint(repo)
+            res = detect_harness_gate_loosening(repo)
+            self.assertEqual(_index_fingerprint(repo), before_index)
+            self.assertEqual(_git(repo, "status", "--porcelain"), before_status)
+            self.assertEqual(set(res), {"checked", "loosened", "base_ref", "base_commit", "baseline_source",
+                                        "removed_required_hooks", "downgraded_hooks", "removed_doctor_commands",
+                                        "findings"})
+            self.assertTrue(res["checked"] and res["loosened"])
+            self.assertEqual(res["removed_required_hooks"], ["lint"])
+            self.assertEqual(res["downgraded_hooks"], ["types"])
+            self.assertEqual(res["removed_doctor_commands"], ["git --version"])
+            self.assertEqual(len(res["findings"]), 3)
+
+    def test_optional_hook_removal_and_added_gates_are_not_loosening(self):
+        from factonio.harness import detect_harness_gate_loosening
+
+        with isolated_hermes_home() as home:
+            repo, _ = self._repo_with_committed_harness(home)
+            hj = repo / ".factonio" / "harness.json"
+            manifest = json.loads(hj.read_text(encoding="utf-8"))
+            manifest["hooks"] = [h for h in manifest["hooks"] if h["name"] != "pixels"]
+            manifest["hooks"].append({"name": "extra", "kind": "custom", "command": "true", "optional": False})
+            manifest["phases"]["doctor"].append("uname")
+            hj.write_text(json.dumps(manifest), encoding="utf-8")
+            res = detect_harness_gate_loosening(repo)
+            self.assertTrue(res["checked"])
+            self.assertFalse(res["loosened"], res["findings"])
+
+    def test_check_and_audit_fail_closed_when_loosened(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo, _ = self._repo_with_committed_harness(home)
+            ok = check_harness(str(repo))
+            self.assertTrue(ok["ok"], ok["errors"])
+            self.assertFalse(ok["gate_loosening"]["loosened"])
+            audit_ok = audit_harness(str(repo))
+            self.assertEqual((audit_ok["severity"], audit_ok["drifted"]), ("clean", False))
+            self.assertTrue(audit_ok["gate_loosening"]["checked"])
+            self.assertEqual(audit_ok["drift_classification"]["classification"], "clean")
+
+            self._loosen(repo)
+            chk = check_harness(str(repo))
+            self.assertEqual((chk["ok"], chk["valid"]), (False, False))
+            self.assertTrue(chk["gate_loosening"]["loosened"])
+            for needle in ("'lint'", "'types'", "git --version"):
+                self.assertTrue(any(needle in e and "Gate loosening" in e for e in chk["errors"]), needle)
+
+            audit = audit_harness(str(repo))
+            self.assertEqual((audit["severity"], audit["drifted"]), ("stale", True))
+            self.assertEqual(audit["gate_loosening"]["removed_required_hooks"], ["lint"])
+            self.assertTrue(any("Gate loosening" in w for w in audit["warnings"]))
+            self.assertTrue(any("Restore the removed or downgraded" in r for r in audit["recommendations"]))
+            self.assertEqual(audit["drift_classification"]["classification"], "doc_drift")
+
+    def test_explicit_base_ref_catches_committed_loosening(self):
+        from factonio.harness import check_harness, detect_harness_gate_loosening
+
+        with isolated_hermes_home() as home:
+            repo, harness_commit = self._repo_with_committed_harness(home)
+            self._loosen(repo)
+            _commit_all(repo, "loosen gates")
+            self.assertFalse(detect_harness_gate_loosening(repo)["loosened"])
+            self.assertTrue(check_harness(str(repo))["ok"])
+            res = detect_harness_gate_loosening(repo, base_ref=harness_commit)
+            self.assertEqual((res["loosened"], res["base_ref"], res["base_commit"]), (True, harness_commit, harness_commit))
+            chk = check_harness(str(repo), base_ref=harness_commit)
+            self.assertFalse(chk["valid"])
+            for bad in ("--output=x", "no-such-ref", ""):
+                with self.assertRaises(ValueError):
+                    detect_harness_gate_loosening(repo, base_ref=bad)
+            with self.assertRaises(ValueError):
+                check_harness(str(repo), base_ref="no-such-ref")
+
+            run = TestSurfaces()._cli()
+            code, out, _ = run("harness", "check", str(repo), "--base", harness_commit, "--json")
+            self.assertEqual(code, 1)
+            self.assertTrue(json.loads(out)["gate_loosening"]["loosened"])
+            code, out, _ = run("harness", "check", str(repo), "--json")
+            self.assertEqual(code, 0, out)
+            code, out, _ = run("harness", "check", str(repo), "--base", "no-such-ref", "--json")
+            self.assertEqual(code, 1)
+            self.assertFalse(json.loads(out)["ok"])
+
+            from factonio.agent_tools import register_tools
+
+            ctx = _FakeCtx()
+            register_tools(ctx)
+            handler = ctx.tools["factonio_bootstrap_verify"]["handler"]
+            res = json.loads(handler({"action": "check", "repo": str(repo), "base_ref": harness_commit}))
+            self.assertFalse(res["valid"])
+            self.assertEqual(res["gate_loosening"]["downgraded_hooks"], ["types"])
+
+    def test_verify_md_baseline_fallback_and_unchecked_cases(self):
+        from factonio.harness import detect_harness_gate_loosening
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            _write(repo, ".factonio/verify.md", TestDiscoverCheckHooks.HAND_MD)
+            unchecked = detect_harness_gate_loosening(repo)
+            self.assertEqual((unchecked["checked"], unchecked["loosened"]), (False, False))
+            _commit_all(repo, "hand harness")
+            md = repo / ".factonio" / "verify.md"
+            md.write_text(
+                TestDiscoverCheckHooks.HAND_MD.replace("- **lint** (`invariant`, required): `true`\n", "")
+                .replace("```bash\ntrue\n```\n\n## Drive", "```bash\n```\n\n## Drive"),
+                encoding="utf-8",
+            )
+            res = detect_harness_gate_loosening(repo)
+            self.assertEqual(res["baseline_source"], "verify.md")
+            self.assertEqual(res["removed_required_hooks"], ["lint"])
+            self.assertEqual(res["removed_doctor_commands"], ["true"])
+
+            plain = home / "plain"
+            plain.mkdir()
+            self.assertFalse(detect_harness_gate_loosening(plain)["checked"])
+            with self.assertRaises(ValueError):
+                detect_harness_gate_loosening(plain, base_ref="HEAD")
+
+
+class TestDriftClassification(unittest.TestCase):
+    @staticmethod
+    def _hook(name: str, *, ok: bool, exit_code: Any, optional: bool = False, timed_out: bool = False) -> dict:
+        return {"name": name, "kind": "invariant", "optional": optional, "ok": ok, "exit_code": exit_code,
+                "timed_out": timed_out, "command": "x"}
+
+    def test_priority_and_shape(self):
+        from factonio.harness import classify_harness_drift
+
+        clean = classify_harness_drift({"severity": "clean"})
+        self.assertEqual(set(clean), {"classification", "classifications", "reasons", "recommended_action"})
+        self.assertEqual((clean["classification"], clean["classifications"], clean["reasons"]), ("clean", [], []))
+        self.assertEqual(classify_harness_drift(None)["classification"], "clean")
+
+        stale = classify_harness_drift({"severity": "stale", "uncovered_changed_files": ["a.py"]})
+        self.assertEqual(stale["classification"], "doc_drift")
+        self.assertIn(".factonio/", stale["recommended_action"])
+        self.assertEqual(classify_harness_drift({"severity": "missing"})["classification"], "doc_drift")
+
+        doctor_fail = {"doctor": {"ok": False, "results": [{"command": "node --version", "ok": False, "exit_code": 127}]}}
+        gap = classify_harness_drift({"severity": "stale", "stale_features": ["api"]}, doctor_fail)
+        self.assertEqual((gap["classification"], gap["classifications"]), ("harness_gap", ["harness_gap", "doc_drift"]))
+
+        for hook in (self._hook("h", ok=False, exit_code=127), self._hook("h", ok=False, exit_code=None, timed_out=True)):
+            res = classify_harness_drift({"severity": "clean"}, {"hook_results": {"results": [hook]}})
+            self.assertEqual(res["classification"], "harness_gap", hook)
+
+        regression = classify_harness_drift(
+            {"severity": "stale", "orphaned_globs": ["x/**"]},
+            {**doctor_fail, "hook_results": {"results": [self._hook("tests", ok=False, exit_code=1)]}},
+        )
+        self.assertEqual(regression["classification"], "product_regression")
+        self.assertEqual(regression["classifications"], ["product_regression", "harness_gap", "doc_drift"])
+        self.assertTrue(regression["reasons"][0].startswith("product_regression: "))
+        self.assertIn("never edit `.factonio/`", regression["recommended_action"])
+
+        optional_only = classify_harness_drift(
+            {"severity": "clean"}, {"hook_results": {"results": [self._hook("pix", ok=False, exit_code=1, optional=True)]}}
+        )
+        self.assertEqual(optional_only["classification"], "clean")
+        schema = classify_harness_drift({"severity": "clean"}, {"errors": ["harness.json schema_version must be 1; got 2"]})
+        self.assertEqual(schema["classification"], "doc_drift")
+
+    def test_live_check_results_classify_end_to_end(self):
+        from factonio.harness import audit_harness, bootstrap_verify_harness, check_harness, classify_harness_drift
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            bootstrap_verify_harness(str(repo), hooks=[
+                {"name": "tests", "kind": "invariant", "command": "exit 1"},
+                {"name": "tool", "kind": "custom", "command": "definitely-not-a-real-binary-xyz"},
+            ])
+            _commit_all(repo, "harness")
+            audit = audit_harness(str(repo))
+            self.assertEqual(audit["drift_classification"]["classification"], "clean")
+            chk = check_harness(str(repo), run_doctor=True, run_hooks=True)
+            res = classify_harness_drift(audit, chk)
+            self.assertEqual(res["classification"], "product_regression")
+            self.assertEqual(res["classifications"], ["product_regression", "harness_gap"])
+            self.assertTrue(any("'tests'" in r for r in res["reasons"]))
+            self.assertTrue(any("'tool'" in r and "could not run" in r for r in res["reasons"]))
+
+            _write(repo, "newpkg/mod.py", "x = 1\n")
+            stale = audit_harness(str(repo))
+            self.assertEqual(stale["drift_classification"]["classification"], "doc_drift")
+            self.assertTrue(any(r.startswith("Drift classification `doc_drift`") for r in stale["recommendations"]))
 
 
 if __name__ == "__main__":

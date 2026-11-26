@@ -5,7 +5,7 @@ Every user-facing pull request adds an entry under `## Unreleased`.
 
 ## Unreleased
 
-_No unreleased changes yet._
+- Harness proof, gate-loosening detection & 3-way drift rubric (Wave 4 Unit 2): `hermes factonio harness init <repo> --prove` / `factonio_bootstrap_verify` `prove` / `bootstrap_verify_harness(prove=True)` runs Doctor, required hooks and an evidence-survives-cleanup probe (in a removed `factonio-harness-proof-*` temp root) and fails closed (`ok: false`, `written: false`, prior `.factonio/` bytes restored or new files removed, `trail.db` `result="proof_failed"`, CLI exit 1); every init result carries additive `proof: {ran, ok, doctor, hooks, evidence_survived, errors}`. New read-only `detect_harness_gate_loosening` (`--no-optional-locks`) flags required hooks removed or downgraded to optional and dropped Doctor commands versus the harness committed at `base_ref` (default `HEAD`), surfaced as additive `gate_loosening` in `check_harness` (fails closed with `ok`/`valid` false; `hermes factonio harness check --base <ref>`, tool `base_ref`) and `audit_harness` (`drifted: true`, `severity: "stale"`). New `classify_harness_drift` (`product_regression` > `harness_gap` > `doc_drift` > `clean`) adds `drift_classification` to `audit`; the `harness-audit` blueprint pairs `harness audit` with a live `harness check --run-doctor --run-hooks` and enforces the rubric (never edit `.factonio/` to paper over a product regression). `factonio:verify-blackbox` gains user-POV preconditions/gotchas, a live harness pass, and the `verified-unreachable` rule (`disclosed_limits`, `inconclusive` never `pass`, outranked by `reject`).
 
 ## 0.2.0 (2026-11-26)
 

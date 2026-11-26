@@ -91,13 +91,26 @@ def _print_harness(action: str, res: dict[str, Any]) -> None:
         if res.get("refused"):
             print(f"Refused: {res['error']}")
             return
-        verb = "Would write" if res.get("dry_run") else ("Overwrote" if res.get("overwritten") else "Wrote")
+        proof = res.get("proof") or {}
         m = res["manifest"]
-        print(f"{verb} {res['verify_md']} and {res['harness_json']}")
+        if proof.get("ran") and not proof.get("ok"):
+            restored = "" if res.get("dry_run") else "; restored the prior .factonio/ state"
+            print(f"Proof FAILED: nothing written for {res['repo']}{restored}")
+        else:
+            verb = "Would write" if res.get("dry_run") else ("Overwrote" if res.get("overwritten") else "Wrote")
+            print(f"{verb} {res['verify_md']} and {res['harness_json']}")
         print(
             f"  Stack: {', '.join(m['stack']) or '-'} | features={len(m['feature_map'])} hooks={len(m['hooks'])}"
             f" routes={len(m['discovered_surfaces']['routes'])} cli={len(m['discovered_surfaces']['cli_commands'])}"
         )
+        if proof.get("ran"):
+            doctor, hooks = proof.get("doctor") or {}, proof.get("hooks") or {}
+            print(
+                f"  Proof: {'OK' if proof.get('ok') else 'FAILED'} | doctor={doctor.get('ran', 0)} "
+                f"hooks={hooks.get('passed', 0)}/{hooks.get('ran', 0)} evidence_survived={proof.get('evidence_survived')}"
+            )
+            for err in proof.get("errors") or []:
+                print(f"  Error: {err}")
         if res.get("dry_run"):
             print("\n" + res["verify_md_content"])
         return
@@ -127,6 +140,9 @@ def _print_harness(action: str, res: dict[str, Any]) -> None:
     ):
         if res.get(key):
             print(f"  {key}: {', '.join(res[key])}")
+    classification = (res.get("drift_classification") or {}).get("classification")
+    if classification and classification != "clean":
+        print(f"  classification: {classification}")
     for warn in res.get("warnings") or []:
         print(f"  Warning: {warn}")
     for rec in res.get("recommendations") or []:
@@ -457,7 +473,18 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         p_h.add_argument("repo", help="Repo slug, 'owner/repo', or local checkout path.")
         p_h.add_argument("--force", action="store_true", help="init: overwrite an existing harness (hooks are kept).")
         p_h.add_argument("--dry-run", action="store_true", help="init: print the generated harness without writing.")
-        p_h.add_argument("--base", dest="base_ref", default=None, help="audit: git ref to compare against (default: harness base_commit).")
+        p_h.add_argument(
+            "--base",
+            dest="base_ref",
+            default=None,
+            help="audit: git ref to compare against (default: harness base_commit); "
+            "check: git ref whose committed harness gates must not be loosened (default: HEAD).",
+        )
+        p_h.add_argument(
+            "--prove",
+            action="store_true",
+            help="init: run Doctor, required hooks and an evidence-survival probe; fail closed and roll back on failure.",
+        )
         p_h.add_argument("--run-doctor", action="store_true", help="check: also run the Doctor commands.")
         p_h.add_argument("--run-hooks", action="store_true", help="check: also run declared hooks.")
         p_h.add_argument(
@@ -770,9 +797,13 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             action = args.action
             try:
                 if action == "init":
-                    res = bootstrap_verify_harness(args.repo, force=bool(args.force), dry_run=bool(args.dry_run))
+                    res = bootstrap_verify_harness(
+                        args.repo, force=bool(args.force), dry_run=bool(args.dry_run), prove=bool(args.prove)
+                    )
                 elif action == "check":
-                    res = check_harness(args.repo, run_doctor=bool(args.run_doctor), run_hooks=bool(args.run_hooks))
+                    res = check_harness(
+                        args.repo, run_doctor=bool(args.run_doctor), run_hooks=bool(args.run_hooks), base_ref=args.base_ref
+                    )
                 elif action == "show":
                     res = show_harness(args.repo)
                 else:
