@@ -7,10 +7,11 @@ This guide covers repository layout, local development against Hermes Agent, run
 ```text
 __init__.py                  Plugin entrypoint: registers aux models, skills, tools, CLI, watchdog, blueprint
 plugin.yaml                  Hermes plugin manifest (v2) and config_schema
-agent_tools.py               13 agent-callable tools (`factonio_*`), including `factonio_log_decision`, `factonio_bootstrap_verify`, `factonio_restack_pr` and `factonio_evaluate_panel`
-commands.py                  CLI subcommands (`hermes factonio init|add|update|remove|list|models|status|panel|pr-gate|restack|worktrees|harness|trail|metrics|doctor`)
+agent_tools.py               15 agent-callable tools (`factonio_*`), including `factonio_log_decision`, `factonio_bootstrap_verify`, `factonio_restack_pr`, `factonio_evaluate_panel` and `factonio_spawn_arena` / `factonio_evaluate_arena`
+commands.py                  CLI subcommands (`hermes factonio init|add|update|remove|list|models|status|panel|pr-gate|restack|worktrees|harness|trail|metrics|arena|doctor`)
 config.py                    Settings, durable repos.json store (atomic writes + flock), phase model & design resolution
 orchestrator.py              Workstream lifecycle, Kanban DAG creation, holdout/ isolation, session notify+wake subscriptions
+arena.py                     Opt-in arena: cross-vendor define/design candidate fan-out, dependent judge, read-only progress
 profile_setup.py             Dedicated headless `factonio` profile initializer and `doctor` diagnostics
 harness.py                   Repo-local `.factonio/` verification harness: stack/route/CLI detection, init/check/show, hooks, read-only drift audit
 repos.py                     GitHub repo registration, validation, exact-HEAD PR gate, squash-merge, and stacked-PR restack helpers

@@ -31,6 +31,8 @@ provides_tools:
   - factonio_bootstrap_verify
   - factonio_restack_pr
   - factonio_evaluate_panel
+  - factonio_spawn_arena
+  - factonio_evaluate_arena
 provides_hooks:
   - on_kanban_dispatch_tick
 config_schema:
