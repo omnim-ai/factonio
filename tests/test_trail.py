@@ -695,6 +695,57 @@ class TestTrailAudit(unittest.TestCase):
             self.assertTrue(trail.audit_trail_evidence(db_path=other)["clean"])
             self.assertFalse(other.parent.exists())
 
+    def test_existing_non_file_store_fails_closed_api_and_cli(self):
+        from factonio import trail
+
+        run = TestTrailCliAndApi._cli(self)
+
+        def make_dir(p: Path) -> None:
+            p.mkdir(parents=True)
+
+        def make_dangling(p: Path) -> None:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.symlink_to(p.parent / "missing-target.db")
+
+        for label, make in (("directory", make_dir), ("dangling symlink", make_dangling)):
+            with self.subTest(label), isolated_hermes_home():
+                db = trail.trail_db_path()
+                make(db)
+                audit = trail.audit_trail_evidence()
+                self.assertFalse(audit["ok"], audit)
+                self.assertFalse(audit["clean"], audit)
+                self.assertEqual(set(audit), self.KEYS | {"error"})
+                self.assertIn("trail.db unreadable", audit["error"])
+                self.assertEqual(audit["findings"], [])
+                self.assertFalse(trail.audit_trail_evidence(db_path=db)["clean"])
+
+                code, out = run("trail", "--audit", "--json")
+                self.assertEqual(code, 1, out)
+                data = json.loads(out)
+                self.assertFalse(data["ok"] or data["clean"])
+                code, out = run("trail", "--audit")
+                self.assertEqual(code, 1, out)
+                self.assertIn("Trail audit: ERROR", out)
+                self.assertTrue(os.path.lexists(db))
+                self.assertFalse(db.is_file())
+
+        with isolated_hermes_home():
+            code, out = run("trail", "--audit", "--json")
+            self.assertEqual(code, 0, out)
+            data = json.loads(out)
+            self.assertTrue(data["ok"] and data["clean"])
+            self.assertFalse(os.path.lexists(trail.trail_db_path()))
+
+        with isolated_hermes_home() as home:
+            trail.log_decision("spawn_verify", tenant="w", phase="verify", card_id="t_v", why="PR opened",
+                               evidence={"pr_number": 3}, result="spawned")
+            link = home / "linked" / "trail.db"
+            link.parent.mkdir()
+            link.symlink_to(trail.trail_db_path())
+            audit = trail.audit_trail_evidence(db_path=link)
+            self.assertTrue(audit["ok"] and audit["clean"], audit)
+            self.assertEqual(audit["inspected"], 1)
+
     def test_each_finding_kind_and_superseded_rows_are_skipped(self):
         from factonio import trail
 

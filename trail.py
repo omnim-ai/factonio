@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
+import stat
 import threading
 import time
 import uuid
@@ -854,7 +856,9 @@ def audit_trail_evidence(
 ) -> dict[str, Any]:
     """Audit every matching active decision for evidence gaps before a human handoff.
 
-    Strictly read-only: an absent `trail.db` yields a clean empty result and is not created.
+    Strictly read-only: an absent `trail.db` yields a clean empty result and is not created; an
+    existing path that is not a readable regular file (directory, dangling symlink) fails closed
+    with ``ok=False, clean=False`` and an ``error``.
     Superseded rows are skipped (their correction is audited instead). Findings:
 
     - ``missing_evidence``: blank ``why`` or empty / all-null ``evidence``.
@@ -874,8 +878,24 @@ def audit_trail_evidence(
         "card_id": card_id or None,
     }
     path = Path(db_path) if db_path is not None else trail_db_path()
-    if not path.is_file():
+
+    def _unreadable(reason: str) -> dict[str, Any]:
+        return {**_empty_audit(filters), "ok": False, "clean": False, "error": f"trail.db unreadable: {reason}"}
+
+    # Only genuine absence is clean-empty; an existing directory, dangling symlink, special file,
+    # or stat failure must fail closed so a misconfigured store is never certified clean.
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
         return _empty_audit(filters)
+    except OSError as exc:
+        return _unreadable(f"{path}: {exc}")
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        return _unreadable(f"{path}: {exc}")
+    if not stat.S_ISREG(st.st_mode):
+        return _unreadable(f"{path} is not a regular file")
     where_sql, params = _filter_sql(tenant=tenant, repo=repo, phase=phase, card_id=card_id, since=None)
     try:
         with closing(_open_trail_ro(path)) as conn:
@@ -897,8 +917,8 @@ def audit_trail_evidence(
                 ).fetchall()
                 if r["id"] not in superseded
             ]
-    except sqlite3.Error as exc:
-        return {**_empty_audit(filters), "ok": False, "clean": False, "error": f"trail.db unreadable: {exc}"}
+    except (sqlite3.Error, OSError) as exc:
+        return _unreadable(str(exc))
 
     findings: list[dict[str, Any]] = []
     active = 0
