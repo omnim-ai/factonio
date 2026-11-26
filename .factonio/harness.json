@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-26T20:28:05Z",
+  "generated_at": "2026-11-26T21:34:58Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -146,7 +146,8 @@
         "Definition cards (feature, bug, refactor, perf, investigate) gain a bounded `## Prior Institutional Memory (Recall)` section with no holdout references only when other workstreams' memory matches; quick / skip_define cards never do; results carry additive recall_count",
         "A holdout reference in a prior decision's tenant, phase, card_id or correction never reaches a Definition card; the recall section is dropped if any reference survives redaction",
         "Control and format characters interleaved in a holdout path (NUL, BEL, ESC, zero-width) are deleted, not spaced, before redaction, so no fragment of the path reaches recall output or a Definition card; Definition-card recall matches history logged under the registered owner/repo or its slug",
-        "A holdout path containing spaces (quoted or unquoted, in directory or filename) or whitespace-interleaved before a path separator (`hol<TAB>dout/x`) withholds the whole recalled field as [redacted], so no scenario-name suffix reaches a Definition card"
+        "A holdout path containing spaces (quoted or unquoted, in directory or filename) or whitespace-interleaved before a path separator (`hol<TAB>dout/x`) withholds the whole recalled field as [redacted], so no scenario-name suffix reaches a Definition card",
+        "Complete terminal escape sequences (ANSI CSI such as `ho<ESC>[31mldout`, OSC, DCS and 8-bit C1 forms) inside a holdout path are stripped before matching, so the whole recalled field becomes [redacted] and no scenario name reaches a Definition card, while colored non-holdout text is not redacted"
       ]
     },
     {
@@ -228,7 +229,8 @@
         "`recall_decisions` is read-only (absent store stays absent, unversioned store never migrated) and fails closed (ok false, items []) on a directory, dangling symlink or garbage trail.db; `render_recall_markdown` never exceeds max_chars",
         "`recall_decisions` resolves supersession chains (A <- B <- C, branching, cyclic) to the current terminal corrections, never a stale intermediate, emits inline corrections only inside --repo and outside the excluded tenant (else correction_out_of_scope with no correction content), and redacts holdout references from every emitted field including tenant, phase, card_id and nested corrections",
         "`recall_decisions(repo=)` treats owner/repo and its registered or derived slug (or a list of aliases) as one repository, case-insensitively, while distinct repositories such as scope/one and scope/two stay isolated",
-        "`recall_decisions` fails closed on the whole field: any emitted string or evidence value referencing holdout becomes exactly [redacted] (no trailing words or path suffix), while prose such as \"hold out for review\" is left untouched"
+        "`recall_decisions` fails closed on the whole field: any emitted string or evidence value referencing holdout becomes exactly [redacted] (no trailing words or path suffix), while prose such as \"hold out for review\" is left untouched",
+        "`contains_holdout_reference` strips complete ANSI CSI/OSC/DCS/C1 escape sequences before matching and also matches the byte-deleted reading, so escape sequences can neither split nor swallow the holdout marker"
       ]
     },
     {
@@ -309,7 +311,8 @@
         "README media regenerates with tools/capture_readme_media.py",
         "CHANGELOG Unreleased, docs/architecture.md and THIRD_PARTY_NOTICES.md document each Wave 4 and Wave 5 unit",
         "CHANGELOG Unreleased and docs/architecture.md document the Wave 4 polish trail-audit, malformed-pr_number and lock-budget changes",
-        "CHANGELOG Unreleased and docs/architecture.md document whole-field fail-closed recall redaction"
+        "CHANGELOG Unreleased and docs/architecture.md document whole-field fail-closed recall redaction",
+        "CHANGELOG Unreleased and docs/architecture.md document ANSI escape-sequence stripping in recall redaction"
       ]
     },
     {
@@ -327,7 +330,8 @@
         "silent_start, trail audit and skill prose contracts are covered in tests.test_watchdog_liveness, tests.test_trail and tests.test_plugin_registration",
         "Trail-audit false positives, PR-scoped closure, malformed pr_number evidence and the cold-init lock-budget regression are covered in tests.test_trail, tests.test_pr_gate_hardening and tests.test_metrics_history",
         "recall, crash-pickup and core-principle contracts are covered in tests.test_recall_and_principles",
-        "spaced and tab-interleaved holdout recall paths are covered end to end (log_decision -> trail --recall --json/--markdown -> Definition card) in tests.test_recall_and_principles"
+        "spaced and tab-interleaved holdout recall paths are covered end to end (log_decision -> trail --recall --json/--markdown -> Definition card) in tests.test_recall_and_principles",
+        "ANSI CSI, OSC, DCS and C1 escape sequences inside holdout recall paths are covered end to end (log_decision -> trail --recall --json/--markdown -> Definition card) in tests.test_recall_and_principles"
       ]
     }
   ],
