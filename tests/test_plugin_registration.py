@@ -262,6 +262,83 @@ class TestBundledSkillRigorAndAttribution(unittest.TestCase):
         self.assertEqual(tiers, sorted(tiers), "PR gate tiers out of priority order")
         self.assertIn("Never open or quote `holdout/` files in Implementation briefs", text)
 
+    def test_verify_diff_gate_integrity_must_kill_ladder_and_dropped(self):
+        text = self._read("skills/verify-diff/SKILL.md")
+        checklist = text.split("## Review Checklist", 1)[1].split("\n## ", 1)[0]
+        self._assert_all_in(checklist, (
+            "**Gate-Integrity Audit (mandatory):**",
+            "weakened test assertion",
+            "skipped",
+            "`continue-on-error`",
+            "loosened lint or typecheck rule",
+            "raised budget/timeout",
+            "`.factonio/` required hook",
+            "blocking `reject` unless `spec.md` explicitly authorizes it **and** a countersign row exists via `factonio_log_decision`",
+            "**`MUST KILL` rule:**",
+            "`IMPORTANT` / `do not remove`",
+            "encode the invariant structurally",
+            "**Blast-Radius Certainty Ladder**",
+            "`level: 1..5`",
+        ), "verify-diff checklist")
+        ladder = [checklist.index(rung) for rung in (
+            "1. `asserted`", "2. `file:line`", "3. `traced impossible`", "4. `ran test/probe`",
+            "5. `reproduced in running app`",
+        )]
+        self.assertEqual(ladder, sorted(ladder), "certainty ladder rungs out of order")
+        self.assertIn("unauthorized gate loosening found by the Gate-Integrity Audit", text)
+        schema = text.split("## Output Format", 1)[1]
+        self._assert_all_in(schema, ('"level": 4', '"dropped": [', '"hypothesis"', '"cleared_because"',
+                                     '"gate_integrity"'), "verify-diff output schema")
+
+    def test_orchestrator_reverify_tiering_and_trail_audit_live_outside_merge_gate(self):
+        text = self._read("skills/orchestrator/SKILL.md")
+        section4 = text.split("### 4. Isolated Parallel Verification", 1)[1].split("### 5. Merge Gate", 1)[0]
+        self._assert_all_in(section4, (
+            "**Smart fix-round re-verification (`rigor: \"high\"`):**",
+            "**Identical `git patch-id --stable`**",
+            "carry the panel verdict over",
+            "**Minor non-behavioral fix or mechanical conflict resolution**",
+            "single cross-vendor re-check",
+            "**New behavior, redesign, contract change, or large diff**",
+            "full `rigor: \"high\"` panel",
+            "factonio_log_decision",
+        ), "orchestrator section 4")
+        trail_section = text.split("## Decision Trail", 1)[1].split("\n## ", 1)[0]
+        self._assert_all_in(trail_section, (
+            "**Pre-handoff trail audit (multi-PR and `rigor: \"high\"` runs):**",
+            "hermes factonio trail --audit --tenant <t> --json",
+            "different vendor family",
+            "**Attention**",
+            "`unclosed_escalation`",
+            "`gate_loosening`",
+        ), "orchestrator decision trail")
+        handoffs = text.split("## Human Handoffs (Ketchup)", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("**Attention** list", handoffs)
+        merge_gate = text.split("### 5. Merge Gate", 1)[1].split("\n## ", 1)[0]
+        self.assertNotIn("trail --audit", merge_gate)
+        self.assertNotIn("Smart fix-round re-verification", merge_gate)
+
+    def test_retro_prompt_maintains_rule_to_enforcer_ledger(self):
+        from factonio import HARNESS_AUDIT_BLUEPRINT_PROMPT, RETRO_BLUEPRINT_PROMPT as prompt
+
+        self._assert_all_in(prompt, (
+            "## Rule-to-Enforcer Ledger",
+            "`AGENTS.md`",
+            "Forced promotion",
+            "MUST propose promoting it at least one rung up the ladder",
+            "Pruning",
+            "Architecture or Types now make the mistake unrepresentable",
+            "one commit per class",
+            "factonio_spawn_implement",
+            "hermes factonio trail --audit --json",
+            "hermes factonio trail --json",
+            "hermes factonio metrics --history --json",
+        ), "retro blueprint prompt")
+        self.assertNotIn("Rule-to-Enforcer", HARNESS_AUDIT_BLUEPRINT_PROMPT)
+        # The ladder is applied before ledger maintenance, and hardening cards precede the trail log.
+        self.assertLess(prompt.index("Skill text last"), prompt.index("Ledger maintenance"))
+        self.assertLess(prompt.index("Hardening cards"), prompt.index("Record the outcome with `factonio_log_decision`"))
+
     def test_readme_acknowledges_poteto_and_pstack(self):
         readme = self._read("README.md")
         self.assertIn("## Acknowledgments", readme)

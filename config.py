@@ -68,6 +68,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "design_approval": "ask",
     "watchdog_interval_minutes": 5,
     "stale_heartbeat_minutes": 20,
+    "initial_progress_minutes": 10,
     "blocked_reminder_minutes": 45,
     "default_rigor": "standard",
     "verify_panel": [],
@@ -75,6 +76,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 DEFAULT_STALE_HEARTBEAT_MINUTES = 20
+# First-tick silent-start check: a freshly started card should show a real side effect quickly.
+DEFAULT_INITIAL_PROGRESS_MINUTES = 10
 
 # Per-phase stale thresholds: verification cards are short-lived, design cards legitimately idle longer.
 PHASE_STALE_HEARTBEAT_MINUTES: dict[str, int] = {
@@ -122,6 +125,32 @@ def resolve_stale_heartbeat_minutes(
     if configured > DEFAULT_STALE_HEARTBEAT_MINUTES:
         return max(base, configured)
     return min(base, configured)
+
+
+def resolve_initial_progress_minutes(
+    phase: Optional[str],
+    *,
+    initial_progress_minutes: Any = None,
+    stale_heartbeat_minutes: Optional[int] = None,
+    phase_overrides: Optional[Mapping[str, Any]] = None,
+) -> Optional[int]:
+    """Return the silent-start window (minutes) for a card phase, or ``None`` when disabled.
+
+    An explicit ``initial_progress_minutes <= 0`` opts out. Otherwise the positive value (default
+    ``DEFAULT_INITIAL_PROGRESS_MINUTES``) is capped at the phase stale threshold, so the early
+    check never fires later than the full ``stale_running`` / ``no_side_effects`` check.
+    """
+    if initial_progress_minutes is not None and not isinstance(initial_progress_minutes, bool):
+        try:
+            if int(initial_progress_minutes) <= 0:
+                return None
+        except (TypeError, ValueError):
+            pass
+    window = _positive_minutes(initial_progress_minutes) or DEFAULT_INITIAL_PROGRESS_MINUTES
+    threshold = resolve_stale_heartbeat_minutes(
+        phase, stale_heartbeat_minutes=stale_heartbeat_minutes, phase_overrides=phase_overrides
+    )
+    return min(window, threshold)
 
 
 def get_hermes_home_path() -> Path:

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-26T11:45:00Z",
+  "generated_at": "2026-11-26T12:07:00Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -61,7 +61,8 @@
       "scenarios": [
         "Plugin loads in an isolated HERMES_HOME and `hermes factonio --help` lists every subcommand",
         "plugin.yaml declares every factonio_* tool and bundled skill",
-        "harness-audit blueprint pairs `harness audit` with a live `harness check --run-doctor --run-hooks` and the doc_drift / harness_gap / product_regression rubric"
+        "harness-audit blueprint pairs `harness audit` with a live `harness check --run-doctor --run-hooks` and the doc_drift / harness_gap / product_regression rubric",
+        "plugin.yaml config_schema declares `initial_progress_minutes` (default 10) and the retro blueprint maintains the AGENTS.md Rule-to-Enforcer ledger"
       ]
     },
     {
@@ -77,7 +78,8 @@
       "scenarios": [
         "`init` is idempotent and links plugins/factonio to the checkout",
         "`init` refuses an ephemeral (.worktrees/, kanban/workspaces/, cache/scratch/) link target on a persistent profile unless --force-link",
-        "`doctor` warns when a persistent worker plugin link points into an ephemeral path"
+        "`doctor` warns when a persistent worker plugin link points into an ephemeral path",
+        "`resolve_initial_progress_minutes` caps the silent-start window at the phase stale threshold and `0` disables it"
       ]
     },
     {
@@ -104,7 +106,8 @@
         "`status` subcommand runs and exits 0 with --help",
         "`trail` subcommand runs and exits 0 with --help",
         "`update` subcommand runs and exits 0 with --help",
-        "`worktrees` subcommand runs and exits 0 with --help"
+        "`worktrees` subcommand runs and exits 0 with --help",
+        "`trail --audit` exits 0 when clean and 1 with findings, with `--json` / `--markdown` and tenant/repo/phase/card filters"
       ]
     },
     {
@@ -183,7 +186,10 @@
       "scenarios": [
         "`trail --json` lists append-only decisions",
         "Watchdog ticks flag silent and blocked cards",
-        "`metrics --history --json` returns chronological append-only snapshots from trail.db v2 with summary.snapshot_count"
+        "`metrics --history --json` returns chronological append-only snapshots from trail.db v2 with summary.snapshot_count",
+        "`trail --audit --json` flags missing_evidence, weak_evidence, unclosed_escalation and gate_loosening read-only, never creating trail.db",
+        "`trail --audit --json` fails closed (ok/clean false, exit 1) when trail.db is a directory or dangling symlink",
+        "Watchdog flags `silent_start` before the phase threshold when only heartbeats/startup bookkeeping exist, then escalates to stale_running / no_side_effects"
       ]
     },
     {
@@ -239,7 +245,8 @@
       ],
       "scenarios": [
         "Every SKILL.md has valid frontmatter and keeps the holdout/ information barrier",
-        "verify-blackbox drives from the user's point of view and reports verified-unreachable scenarios as inconclusive, never pass"
+        "verify-blackbox drives from the user's point of view and reports verified-unreachable scenarios as inconclusive, never pass",
+        "verify-diff keeps the Gate-Integrity Audit, MUST KILL rule, certainty ladder and `dropped` list; orchestrator section 4 tiers rigor=high fix-round re-verification and runs a pre-handoff `trail --audit` Attention check"
       ]
     },
     {
@@ -257,7 +264,8 @@
       ],
       "scenarios": [
         "Manifest, skill frontmatter and local doc links stay valid",
-        "README media regenerates with tools/capture_readme_media.py"
+        "README media regenerates with tools/capture_readme_media.py",
+        "CHANGELOG Unreleased, docs/architecture.md and THIRD_PARTY_NOTICES.md document each Wave 4 unit"
       ]
     },
     {
@@ -271,7 +279,8 @@
       ],
       "scenarios": [
         "Full suite passes from any checkout or worktree directory name",
-        "Sidebar missing-lane regressions (shrunk or extended live lane sets) fail closed in tests.test_desktop_plugin"
+        "Sidebar missing-lane regressions (shrunk or extended live lane sets) fail closed in tests.test_desktop_plugin",
+        "silent_start, trail audit and skill prose contracts are covered in tests.test_watchdog_liveness, tests.test_trail and tests.test_plugin_registration"
       ]
     }
   ],

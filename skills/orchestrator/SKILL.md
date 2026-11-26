@@ -63,6 +63,11 @@ Coordinate software delivery on registered GitHub repositories across Definition
 6. If Black-Box returns `verdict: inconclusive`, treat it as **not passed**: it blocks auto-merge exactly like a missing verdict. Read `disclosed_limits`, then either fix the environment gap (credentials, service, browser) and re-run `factonio_spawn_verify`, or present the limits to the user and wait for an explicit merge decision. Never round `inconclusive` up to `pass`.
 7. **Fresh worker by default:** spawn every retry and fix round as a new card (fresh worker session) carrying the concrete findings, rather than continuing a previous worker's conversation, so failed reasoning does not anchor the next attempt. Reuse a prior session only when a fix is purely mechanical (rebase, typo) and you say so in the card.
 8. **Attack the Premise on fix round 3:** when a 3rd fix round targets the same gate that failed in rounds 1 and 2, the fix-round card body must instruct the implementer to first write down the shared assumption behind the failed fixes and test it directly (per `factonio:implement` section 3c) before pushing code. If round 3 still fails, escalate to the user with the probe evidence instead of spending more rounds.
+9. **Smart fix-round re-verification (`rigor: "high"`):** after a fix round on a panel-verified PR, pick the cheapest tier that still proves the new head, and log the choice with `factonio_log_decision` (evidence: old/new `head_sha`, patch-ids, diff stat, chosen tier):
+   1. **Identical `git patch-id --stable`** (verified diff vs new head diff, each against its merge-base with `origin/<base_branch>`): the change is byte-for-byte the verified one; carry the panel verdict over.
+   2. **Minor non-behavioral fix or mechanical conflict resolution** (typo, comment, rename, import order, rebase conflict with no logic change): spawn a single cross-vendor re-check, one Diff + Black-Box pair on a model from a different vendor family than Implementation, instead of the whole panel.
+   3. **New behavior, redesign, contract change, or large diff** (new code path, changed API/schema/wire format, or anything you cannot classify as tier 1 or 2): re-run the full `rigor: "high"` panel via `factonio_spawn_verify`.
+   When in doubt, pick the higher tier; never carry a verdict across a tier-3 change.
 
 ### 5. Merge Gate
 
@@ -86,6 +91,7 @@ Coordinate software delivery on registered GitHub repositories across Definition
 - Log your own judgment calls with `factonio_log_decision`: forks between approaches, pivots, Attack the Premise probes, unblock decisions, and merge countersigns. Put checkable facts (PR, SHA, patch-id, test counts, command) in `evidence`.
 - Rows are immutable. To correct a decision, log a new row with `supersedes_id` set to the old id; never re-log as if the old one did not happen.
 - Read it back with `hermes factonio trail --tenant <t> --markdown` when writing summaries or handoffs.
+- **Pre-handoff trail audit (multi-PR and `rigor: "high"` runs):** before a Human Handoff or final summary on a workstream with more than one PR or any `rigor: "high"` panel, run `hermes factonio trail --audit --tenant <t> --json` (read-only; exit `1` means findings). Ideally have a model from a different vendor family than the one that logged the decisions review the result. Any `missing_evidence`, `weak_evidence`, `unclosed_escalation`, or `gate_loosening` finding goes in an **Attention** section at the top of the handoff with the decision ids; either fix it first (log the missing evidence as a superseding row, close the escalation) or say plainly why it stays open. Never describe a run with audit findings as clean.
 
 ## Human Handoffs (Ketchup)
 
@@ -95,7 +101,7 @@ Every time you stop to ask the user for a decision (design approval, `merge_poli
 2. **Visuals before prose:** lead with the preview, screenshot, table, or diff stat that shows the state; text explains it.
 3. **Self-contained:** the user must not need to open the board or scroll back. Restate the context they need.
 4. **One recommendation:** state the option you recommend and why, plus at most two alternatives.
-5. **Evidence and risk:** link the PR, verdicts, check results, and trail rows backing the recommendation, and state what could go wrong if they accept it.
+5. **Evidence and risk:** link the PR, verdicts, check results, and trail rows backing the recommendation, and state what could go wrong if they accept it. When the pre-handoff `trail --audit` reported findings, lead this part with the **Attention** list.
 6. **Exact ask:** end with the specific reply you need (for example "Reply `merge` or `hold`").
 
 ## Error Handling

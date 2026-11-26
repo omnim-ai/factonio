@@ -77,6 +77,11 @@ config_schema:
     default: 20
     label: "Stale heartbeat threshold (minutes)"
     description: "Minutes without a heartbeat before a running Factonio card is flagged as silent."
+  initial_progress_minutes:
+    type: int
+    default: 10
+    label: "Initial progress window (minutes)"
+    description: "Minutes after a card starts before the watchdog flags silent_start when no post-start side effect (beyond heartbeats and startup bookkeeping) exists; capped at the phase stale threshold. 0 disables."
   blocked_reminder_minutes:
     type: int
     default: 45
