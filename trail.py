@@ -26,7 +26,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, TypeVar
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, TypeVar, Union
 
 try:
     import fcntl
@@ -1518,14 +1518,31 @@ def _recall_terms(query: Optional[str]) -> list[str]:
     return seen[:24]
 
 
+# Default-ignorable code points outside the ``C*`` categories (variation selectors, fillers, joiners).
+_RECALL_INVISIBLE = frozenset(
+    [0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x3164, 0xFFA0, *range(0x180B, 0x1810), *range(0xFE00, 0xFE10),
+     *range(0xE0100, 0xE01F0)]
+)
+
+
 def _recall_fold(text: str) -> str:
-    """NFKC-fold, drop format characters, and turn control characters (newlines included) into spaces."""
+    """NFKC-fold, delete control/format/invisible characters, and turn whitespace controls into spaces.
+
+    Deleting (not spacing) ``h\\x00o\\x1bldout`` rejoins the word, so the redactor and the barrier
+    both see ``holdout`` instead of an evasive ``h o ldout``.
+    """
     out = []
-    for ch in unicodedata.normalize("NFKC", text):
-        cat = unicodedata.category(ch)
-        if cat == "Cf":
+    for ch in unicodedata.normalize("NFKC", str(text)):
+        if ch in "\t\n\r":
+            out.append(" ")
             continue
-        out.append(" " if cat in ("Cc", "Zl", "Zp") else ch)
+        cat = unicodedata.category(ch)
+        if cat in ("Zl", "Zp"):
+            out.append(" ")
+        elif cat.startswith("C") or ord(ch) in _RECALL_INVISIBLE:
+            continue
+        else:
+            out.append(ch)
     return "".join(out)
 
 
@@ -1586,9 +1603,36 @@ def _empty_recall(filters: dict[str, Any], terms: list[str]) -> dict[str, Any]:
     }
 
 
+def _recall_repo_inputs(repo: Union[str, Iterable[str], None]) -> list[str]:
+    values = [repo] if isinstance(repo, str) or repo is None else list(repo)
+    return list(dict.fromkeys(str(v).strip() for v in values if v is not None and str(v).strip()))
+
+
+def _recall_repo_keys(aliases: list[str]) -> set[str]:
+    """Lower-cased identifiers that name the same repository as ``aliases`` (``owner/repo`` <-> slug)."""
+    keys: set[str] = set()
+    for raw in aliases:
+        keys.update({raw, _resolve_repo_slug(raw)})
+        try:
+            from .config import get_repo
+
+            entry = get_repo(raw)
+        except Exception:  # registry unreadable: fall back to the literal identifiers
+            entry = None
+        if entry:
+            keys.update(str(entry.get(k) or "") for k in ("slug", "repo"))
+        try:
+            from .repos import normalize_repo
+
+            keys.update(normalize_repo(raw))
+        except ValueError:  # a bare slug is not an owner/repo spec; already covered above
+            pass
+    return {k.strip().lower() for k in keys if k and k.strip()}
+
+
 def recall_decisions(
     *,
-    repo: Optional[str] = None,
+    repo: Union[str, Iterable[str], None] = None,
     query: Optional[str] = None,
     exclude_tenant: Optional[str] = None,
     limit: Any = RECALL_DEFAULT_LIMIT,
@@ -1611,7 +1655,9 @@ def recall_decisions(
     ``limit`` (1..100). A supersession chain (``A <- B <- C``, branching or even cyclic) is shown once,
     on its oldest scanned row, with ``corrections`` listing the chain's current (never-superseded)
     corrections newest first (``correction`` is the newest); intermediate links are never presented
-    as current. Only rows inside the requested ``repo`` and outside ``exclude_tenant`` are ever
+    as current. ``repo`` is one identifier or several aliases of the same repository; ``owner/repo``
+    and its registered (or derived) slug match each other, case-insensitively, while distinct
+    repositories stay isolated. Only rows inside the requested ``repo`` and outside ``exclude_tenant`` are ever
     emitted, inline corrections included; when every current correction is out of scope the item
     carries ``correction_out_of_scope: true`` and no correction content. Every emitted string is
     single-lined, clipped, and any ``holdout`` reference is redacted. Returns
@@ -1623,7 +1669,14 @@ def recall_decisions(
         cap = RECALL_DEFAULT_LIMIT
     terms = _recall_terms(query)
     excluded = str(exclude_tenant or "").strip()
-    filters = {"repo": repo or None, "query": query or None, "exclude_tenant": excluded or None, "limit": cap}
+    repo_inputs = _recall_repo_inputs(repo)
+    repo_keys = _recall_repo_keys(repo_inputs)
+    filters = {
+        "repo": (repo_inputs[0] if len(repo_inputs) == 1 else repo_inputs) or None,
+        "query": query or None,
+        "exclude_tenant": excluded or None,
+        "limit": cap,
+    }
     path = Path(db_path) if db_path is not None else trail_db_path()
 
     def _unreadable(reason: str) -> dict[str, Any]:
@@ -1642,12 +1695,15 @@ def recall_decisions(
     if not stat.S_ISREG(st.st_mode):
         return _unreadable(f"{path} is not a regular file")
 
-    where_sql, params = _filter_sql(tenant=None, repo=repo, phase=None, card_id=None, since=None)
+    where: list[str] = []
+    params: list[Any] = []
+    if repo_keys:
+        where.append(f"lower(repo_slug) IN ({', '.join('?' * len(repo_keys))})")
+        params.extend(sorted(repo_keys))
     if excluded:
-        where_sql = (where_sql + " AND " if where_sql else " WHERE ") + "tenant != ?"
+        where.append("tenant != ?")
         params.append(excluded)
-    repo_raw = str(repo or "").strip()
-    repo_keys = {_resolve_repo_slug(repo_raw), repo_raw} if repo_raw else set()
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
     try:
         with closing(_open_trail_ro(path)) as conn:
             conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
@@ -1665,7 +1721,7 @@ def recall_decisions(
     def _in_scope(r: sqlite3.Row) -> bool:
         if excluded and str(r["tenant"] or "") == excluded:
             return False
-        return not repo_keys or str(r["repo_slug"] or "") in repo_keys
+        return not repo_keys or str(r["repo_slug"] or "").strip().lower() in repo_keys
 
     children: dict[str, list[sqlite3.Row]] = {}
     parent_of: dict[str, str] = {}

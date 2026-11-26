@@ -250,10 +250,14 @@ def _completion_contract_for_repo(repo: dict[str, Any]) -> str:
 RECALL_SECTION_MAX_CHARS = 2000
 
 
-def _definition_recall(slug: str, request: str, tenant: str) -> tuple[str, int]:
-    """Best-effort read-only recall block for a Definition card; ``("", 0)`` on no match or error."""
+def _definition_recall(repo_ids: list[str], request: str, tenant: str) -> tuple[str, int]:
+    """Best-effort read-only recall block for a Definition card; ``("", 0)`` on no match or error.
+
+    ``repo_ids`` carries every identifier of the registered repository (``owner/repo`` and slug), since
+    decisions may have been logged under either.
+    """
     try:
-        recall = recall_decisions(repo=slug, query=request, exclude_tenant=tenant, limit=8)
+        recall = recall_decisions(repo=repo_ids, query=request, exclude_tenant=tenant, limit=8)
         if not recall.get("ok") or not recall.get("items"):
             return "", 0
         section = render_recall_markdown(recall, max_chars=RECALL_SECTION_MAX_CHARS)
@@ -388,7 +392,7 @@ def start_workstream(
                 card_body += "\n" + mode_section
             if escaped_from:
                 card_body += "\n" + verification_gap_section(str(escaped_from))
-        recall_section, recall_count = _definition_recall(slug, request, tenant)
+        recall_section, recall_count = _definition_recall([full_repo, slug], request, tenant)
         if recall_section:
             card_body += "\n" + recall_section
         skill_name = "factonio:define"

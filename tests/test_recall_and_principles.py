@@ -630,6 +630,140 @@ class TestRecallHoldoutBarrier(unittest.TestCase):
             self.assertFalse(trail.contains_holdout_reference("hold the line; check out main"))
 
 
+class TestRecallControlObfuscation(unittest.TestCase):
+    OBFUSCATED = (
+        "h\x00o\x07l\x1bdout/control-probe.md",
+        "hol\u200bd\ufeffo\u00adut/control-probe.md",
+        "\x1b[31mho\x00ld\u200b\x07out\x1b[0m/control-probe.md",
+    )
+    LEAKS = ("control-probe", "holdout", "h o l", "hol dout", "h o ldout")
+
+    def _assert_clean(self, text: str) -> None:
+        from factonio import trail
+
+        low = text.lower()
+        for needle in self.LEAKS:
+            self.assertNotIn(needle, low)
+        self.assertFalse(trail.contains_holdout_reference(text))
+
+    def test_control_and_format_characters_are_deleted_before_redaction(self):
+        from factonio import trail
+        from factonio.orchestrator import start_workstream
+
+        for path in self.OBFUSCATED:
+            self.assertTrue(trail.contains_holdout_reference(f"see {path}"), repr(path))
+            with self.subTest(path=repr(path)), isolated_hermes_home() as home:
+                _register(home)
+                trail.log_decision(
+                    "escaped_regression", tenant=f"acme-old {path}", repo_slug="acme-sample", phase="escape",
+                    card_id=f"t_esc {path}", why=f"caching escaped via {path}", result="recorded",
+                    evidence={"note": path, path: "key"},
+                )
+                a = trail.log_decision("pick_cache", tenant="acme-old", repo_slug="acme-sample", phase="define",
+                                       why="caching via memcached", result="adopted")
+                trail.log_decision(
+                    "pick_cache", tenant=f"acme-old\t{path}", repo_slug="acme-sample", phase="define",
+                    card_id=path, why=f"caching via sqlite, see {path}", result=f"adopted {path}",
+                    supersedes_id=a["id"], evidence={"nested": {"why": path}},
+                )
+                res = trail.recall_decisions(repo="acme-sample", query="caching")
+                self.assertEqual(res["count"], 2, res)
+                self._assert_clean(_blob(res))
+                run = _cli()
+                for fmt in ("--json", "--markdown"):
+                    code, out = run("trail", "--recall", "--repo", "acme/sample", fmt)
+                    self.assertEqual(code, 0, out)
+                    self.assertIn(a["id"], out)
+                    self._assert_clean(out)
+                started = start_workstream("acme/sample", "Add caching", kind="feature", issue_number=5)
+                self.assertEqual(started["recall_count"], 2)
+                body = _task(started["task_id"]).body
+                section = body.split("## Prior Institutional Memory (Recall)", 1)[1]
+                self.assertIn(a["id"], section)
+                self._assert_clean(section)
+                for needle in ("control-probe", "h o l", "\x00", "\x1b", "\u200b"):
+                    self.assertNotIn(needle, body)
+
+    def test_whitespace_controls_still_separate_words(self):
+        from factonio import trail
+
+        self.assertEqual(trail._recall_fold("a\tb\nc\r\nd\x00e\u200bf"), "a b c  def")
+        self.assertFalse(trail.contains_holdout_reference("hold the line; check out main"))
+
+
+class TestRecallRepoAliases(unittest.TestCase):
+    def _history(self, repo: str, tenant: str) -> dict[str, dict[str, Any]]:
+        from factonio import trail
+
+        rows = {
+            "escape": trail.log_decision("escaped_regression", tenant=tenant, repo_slug=repo, phase="escape",
+                                         why="arena scoring escaped verification", result="recorded"),
+            "dead_end": trail.log_decision("pick_arena_store", tenant=tenant, repo_slug=repo, phase="define",
+                                           why="arena store in redis", result="adopted"),
+            "reject": trail.log_decision("verify_blackbox", tenant=tenant, repo_slug=repo, phase="verify",
+                                         why="arena leaderboard broke", result="reject"),
+        }
+        rows["correction"] = trail.log_decision(
+            "pick_arena_store", tenant=tenant, repo_slug=repo, phase="define", why="arena store in sqlite",
+            result="adopted", supersedes_id=rows["dead_end"]["id"],
+        )
+        return rows
+
+    def _stored_repo_slugs(self, home: Path) -> set[str]:
+        from factonio import trail
+
+        with closing(sqlite3.connect(trail.trail_db_path())) as conn:
+            return {r[0] for r in conn.execute("SELECT repo_slug FROM decisions")}
+
+    def test_start_recalls_history_logged_under_owner_repo_or_slug(self):
+        from factonio import trail
+        from factonio.orchestrator import start_workstream
+
+        for label in ("owner_repo", "slug", "both"):
+            with self.subTest(label), isolated_hermes_home() as home:
+                ids: set[str] = set()
+                if label in ("owner_repo", "both"):
+                    # Logged before registration, so the documented `owner/repo` identifier is stored verbatim.
+                    rows = self._history("acme/arena-demo", "acme-arena-demo-old")
+                    ids |= {rows["escape"]["id"], rows["dead_end"]["id"], rows["reject"]["id"]}
+                _register(home, "acme/arena-demo")
+                if label in ("slug", "both"):
+                    rows = self._history("acme-arena-demo", "acme-arena-demo-older")
+                    ids |= {rows["escape"]["id"], rows["dead_end"]["id"], rows["reject"]["id"]}
+                if label == "both":
+                    self.assertEqual(self._stored_repo_slugs(home), {"acme/arena-demo", "acme-arena-demo"})
+                for spec in ("acme/arena-demo", "acme-arena-demo", "ACME/Arena-Demo"):
+                    res = trail.recall_decisions(repo=spec, query="arena")
+                    self.assertEqual({i["id"] for i in res["items"]}, ids, spec)
+                started = start_workstream("acme/arena-demo", "Improve arena scoring", kind="feature")
+                self.assertTrue(started["ok"], started)
+                self.assertEqual(started["recall_count"], len(ids))
+                body = _task(started["task_id"]).body
+                section = body.split("## Prior Institutional Memory (Recall)", 1)[1]
+                for row_id in ids:
+                    self.assertEqual(section.count(f"`{row_id}`"), 1, row_id)
+                self.assertIn("corrected by", section)
+
+    def test_distinct_repositories_stay_isolated(self):
+        from factonio import trail
+
+        with isolated_hermes_home() as home:
+            one = self._history("scope/one", "one-i1")
+            two = self._history("scope/two", "two-i1")
+            trail.log_decision("pick_arena_store", tenant="two-i2", repo_slug="scope-two", phase="define",
+                               why="SCOPE-TWO correction", result="adopted", supersedes_id=one["dead_end"]["id"])
+            _register(home, "scope/one")
+            for spec in ("scope/one", "scope-one", ["scope/one", "scope-one"]):
+                res = trail.recall_decisions(repo=spec, query="arena")
+                blob = _blob(res)
+                self.assertIn(one["escape"]["id"], blob)
+                self.assertIn(one["correction"]["id"], blob)
+                for row in two.values():
+                    self.assertNotIn(row["id"], blob)
+                for needle in ("two-i1", "two-i2", "SCOPE-TWO", "scope/two", "scope-two"):
+                    self.assertNotIn(needle, blob)
+
+
 class TestSkillPrinciplesAndCrashPickup(unittest.TestCase):
     @staticmethod
     def _read(rel: str) -> str:
