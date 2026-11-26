@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-26T18:48:31Z",
+  "generated_at": "2026-11-26T20:28:05Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -145,7 +145,8 @@
         "refactor cards pin behavior, perf cards embed the 7+7 benchmark checklist, and investigate rejects skip_define and spawns a read-only `[define] [investigate]` card that writes only investigation.md",
         "Definition cards (feature, bug, refactor, perf, investigate) gain a bounded `## Prior Institutional Memory (Recall)` section with no holdout references only when other workstreams' memory matches; quick / skip_define cards never do; results carry additive recall_count",
         "A holdout reference in a prior decision's tenant, phase, card_id or correction never reaches a Definition card; the recall section is dropped if any reference survives redaction",
-        "Control and format characters interleaved in a holdout path (NUL, BEL, ESC, zero-width) are deleted, not spaced, before redaction, so no fragment of the path reaches recall output or a Definition card; Definition-card recall matches history logged under the registered owner/repo or its slug"
+        "Control and format characters interleaved in a holdout path (NUL, BEL, ESC, zero-width) are deleted, not spaced, before redaction, so no fragment of the path reaches recall output or a Definition card; Definition-card recall matches history logged under the registered owner/repo or its slug",
+        "A holdout path containing spaces (quoted or unquoted, in directory or filename) or whitespace-interleaved before a path separator (`hol<TAB>dout/x`) withholds the whole recalled field as [redacted], so no scenario-name suffix reaches a Definition card"
       ]
     },
     {
@@ -226,7 +227,8 @@
         "`trail --audit` treats malformed evidence pr_number strings (Unicode digits such as '²', overlong digit strings) as absent and returns a structured audit instead of crashing",
         "`recall_decisions` is read-only (absent store stays absent, unversioned store never migrated) and fails closed (ok false, items []) on a directory, dangling symlink or garbage trail.db; `render_recall_markdown` never exceeds max_chars",
         "`recall_decisions` resolves supersession chains (A <- B <- C, branching, cyclic) to the current terminal corrections, never a stale intermediate, emits inline corrections only inside --repo and outside the excluded tenant (else correction_out_of_scope with no correction content), and redacts holdout references from every emitted field including tenant, phase, card_id and nested corrections",
-        "`recall_decisions(repo=)` treats owner/repo and its registered or derived slug (or a list of aliases) as one repository, case-insensitively, while distinct repositories such as scope/one and scope/two stay isolated"
+        "`recall_decisions(repo=)` treats owner/repo and its registered or derived slug (or a list of aliases) as one repository, case-insensitively, while distinct repositories such as scope/one and scope/two stay isolated",
+        "`recall_decisions` fails closed on the whole field: any emitted string or evidence value referencing holdout becomes exactly [redacted] (no trailing words or path suffix), while prose such as \"hold out for review\" is left untouched"
       ]
     },
     {
@@ -306,7 +308,8 @@
         "Manifest, skill frontmatter and local doc links stay valid",
         "README media regenerates with tools/capture_readme_media.py",
         "CHANGELOG Unreleased, docs/architecture.md and THIRD_PARTY_NOTICES.md document each Wave 4 and Wave 5 unit",
-        "CHANGELOG Unreleased and docs/architecture.md document the Wave 4 polish trail-audit, malformed-pr_number and lock-budget changes"
+        "CHANGELOG Unreleased and docs/architecture.md document the Wave 4 polish trail-audit, malformed-pr_number and lock-budget changes",
+        "CHANGELOG Unreleased and docs/architecture.md document whole-field fail-closed recall redaction"
       ]
     },
     {
@@ -323,7 +326,8 @@
         "Sidebar missing-lane regressions (shrunk or extended live lane sets) fail closed in tests.test_desktop_plugin",
         "silent_start, trail audit and skill prose contracts are covered in tests.test_watchdog_liveness, tests.test_trail and tests.test_plugin_registration",
         "Trail-audit false positives, PR-scoped closure, malformed pr_number evidence and the cold-init lock-budget regression are covered in tests.test_trail, tests.test_pr_gate_hardening and tests.test_metrics_history",
-        "recall, crash-pickup and core-principle contracts are covered in tests.test_recall_and_principles"
+        "recall, crash-pickup and core-principle contracts are covered in tests.test_recall_and_principles",
+        "spaced and tab-interleaved holdout recall paths are covered end to end (log_decision -> trail --recall --json/--markdown -> Definition card) in tests.test_recall_and_principles"
       ]
     }
   ],
