@@ -26,6 +26,7 @@ from .config import (
     repos_store_lock,
     save_settings,
 )
+from .metrics import capture_metrics_snapshot
 
 _GITHUB_URL_RE = re.compile(
     r"^(?:https?://github\.com/|git@github\.com:)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$"
@@ -958,6 +959,7 @@ def merge_pr(
     expected_head_sha: Optional[str] = None,
     method: str = "squash",
     delete_branch: bool = True,
+    tenant: Optional[str] = None,
 ) -> dict[str, Any]:
     """Verify PR gates, merge via `gh pr merge`, then confirm the live PR state.
 
@@ -967,7 +969,9 @@ def merge_pr(
     Refuses on stale HEAD or any gate blocker. After `gh pr merge` exits 0 the PR is read
     back: only a confirmed ``MERGED`` state reports ``merged: True`` (and fast-forwards the
     registered local default branch when safe); queued/auto-merge PRs report
-    ``queued: True``; a PR closed without merging is an error.
+    ``queued: True``; a PR closed without merging is an error. A confirmed merge also
+    captures a best-effort ``source="merge"`` metrics snapshot tagged with the repo and
+    ``tenant`` (``metrics_snapshot_id``, ``None`` if the capture failed).
     """
     gate = inspect_pr_gate(repo_spec, pr_number)
     if not gate.get("ok"):
@@ -1049,6 +1053,12 @@ def merge_pr(
             local_synced, local_sync_note = _sync_local_default_branch(local_path, str(branch))
         else:
             local_synced, local_sync_note = False, "skipped: local checkout not registered or missing"
+        snapshot = capture_metrics_snapshot(
+            source="merge",
+            repo_slug=str((repo_entry or {}).get("slug") or gate["repo"]),
+            tenant=tenant,
+            extra={"pr_number": gate["pr_number"], "head_sha": gate["head_sha"], "url": gate["url"]},
+        )
         return {
             "ok": True,
             "merged": True,
@@ -1059,6 +1069,7 @@ def merge_pr(
             "merged_at": live.get("mergedAt"),
             "local_synced": local_synced,
             "local_sync_note": local_sync_note,
+            "metrics_snapshot_id": (snapshot or {}).get("id"),
         }
     if live_state == "CLOSED":
         return {

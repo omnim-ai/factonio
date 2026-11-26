@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import statistics
@@ -10,10 +11,12 @@ import time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
-from .config import WORKER_PROFILE
-from .trail import summarize_trail
+from .config import WORKER_PROFILE, get_root_hermes_home_path
+from .trail import record_metric_snapshot, summarize_metric_snapshots, summarize_trail
+
+logger = logging.getLogger("factonio.metrics")
 
 RANGE_SECONDS: dict[str, Optional[int]] = {
     "7d": 7 * 86400,
@@ -536,7 +539,9 @@ def _percentile(values: list[float], pct: float) -> Optional[float]:
     return round(s[idx], 1)
 
 
-def _trail_metrics(*, tenant: Optional[str], cutoff: Optional[float]) -> dict[str, Any]:
+def _trail_metrics(
+    *, tenant: Optional[str], cutoff: Optional[float], trail_db: Optional[Path] = None
+) -> dict[str, Any]:
     """Additive `trail` block summarizing `trail.db` decisions for the same tenant/range window."""
     since = (
         datetime.fromtimestamp(cutoff, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -544,7 +549,7 @@ def _trail_metrics(*, tenant: Optional[str], cutoff: Optional[float]) -> dict[st
         else None
     )
     try:
-        summary = summarize_trail(tenant=tenant, since=since)
+        summary = summarize_trail(tenant=tenant, since=since, db_path=trail_db)
     except (sqlite3.Error, OSError):
         # An unreadable trail.db must not take down the Kanban KPIs it is appended to.
         summary = {}
@@ -557,6 +562,16 @@ def _trail_metrics(*, tenant: Optional[str], cutoff: Optional[float]) -> dict[st
     }
 
 
+def _history_metrics(*, tenant: Optional[str], trail_db: Optional[Path] = None) -> dict[str, Any]:
+    """Additive `history` block: how many long-term `metric_snapshots` exist (all time) for ``tenant``."""
+    try:
+        summary = summarize_metric_snapshots(tenant=tenant, db_path=trail_db)
+    except (sqlite3.Error, OSError, ValueError):
+        # A missing or unreadable trail.db must not take down the Kanban KPIs.
+        summary = {}
+    return {"snapshot_count": int(summary.get("total") or 0), "latest_ts": summary.get("latest_ts")}
+
+
 def compute_metrics(
     db_path: Path,
     *,
@@ -564,13 +579,66 @@ def compute_metrics(
     tenant: Optional[str] = None,
     assignee: str = WORKER_PROFILE,
     now: Optional[float] = None,
+    trail_db: Optional[Path] = None,
 ) -> dict[str, Any]:
-    """Compute phase durations, verification pass rates, rework, escape rate, and trail counts."""
+    """Compute phase durations, verification pass rates, rework, escape rate, trail and history counts."""
     result = _compute_kanban_metrics(db_path, range_key=range_key, tenant=tenant, assignee=assignee, now=now)
     window = RANGE_SECONDS[range_key]
     now_ts = float(now if now is not None else time.time())
-    result["trail"] = _trail_metrics(tenant=tenant, cutoff=(now_ts - window) if window is not None else None)
+    result["trail"] = _trail_metrics(
+        tenant=tenant, cutoff=(now_ts - window) if window is not None else None, trail_db=trail_db
+    )
+    result["history"] = _history_metrics(tenant=tenant, trail_db=trail_db)
     return result
+
+
+def default_kanban_db_path(board: Optional[str] = None) -> Path:
+    """Hermes's active `kanban.db` (honors ``HERMES_KANBAN_DB`` / boards when Hermes is importable)."""
+    try:
+        from hermes_cli.kanban_db import kanban_db_path
+
+        return Path(kanban_db_path(board=board))
+    except Exception:
+        return get_root_hermes_home_path() / "kanban.db"
+
+
+def capture_metrics_snapshot(
+    db_path: Optional[Path] = None,
+    *,
+    source: str = "manual",
+    range_key: str = "all",
+    repo_slug: Optional[str] = None,
+    tenant: Optional[str] = None,
+    scope_to_tenant: bool = False,
+    extra: Optional[Mapping[str, Any]] = None,
+    trail_db: Optional[Path] = None,
+) -> Optional[dict[str, Any]]:
+    """Best-effort: compute metrics and append them to `trail.db` `metric_snapshots`.
+
+    Metrics are factory-wide (``scope_to_tenant=False``) so milestone trends stay cumulative,
+    while ``repo_slug`` / ``tenant`` tag the triggering scope for filtering. Returns the stored
+    snapshot, or ``None`` on any failure; it never raises, so it cannot break factory execution.
+    """
+    try:
+        kanban = Path(db_path) if db_path is not None else default_kanban_db_path()
+        metrics = compute_metrics(
+            kanban,
+            range_key=range_key,
+            tenant=tenant if scope_to_tenant and tenant else None,
+            trail_db=trail_db,
+        )
+        return record_metric_snapshot(
+            metrics,
+            source=source,
+            range_key=range_key,
+            repo_slug=repo_slug,
+            tenant=tenant,
+            extra=extra,
+            db_path=trail_db,
+        )
+    except Exception as exc:
+        logger.warning("factonio metrics: failed to capture %s snapshot: %s", source, exc)
+        return None
 
 
 def _empty_panel_counts() -> dict[str, int]:
@@ -604,7 +672,7 @@ def _compute_kanban_metrics(
             "diff": {"pass": 0, "reject": 0, "inconclusive": 0, "pass_rate": None},
             "blackbox": {"pass": 0, "reject": 0, "inconclusive": 0, "pass_rate": None},
         },
-        "rework": {"avg_runs_per_implement_card": None, "cards_with_rework": 0},
+        "rework": {"avg_runs_per_implement_card": None, "cards_with_rework": 0, "first_pass_rate": None},
         "escapes": {"count": 0, "verified_total": 0, "escape_rate": None},
         "verification_panels": _empty_panel_counts(),
     }
@@ -751,6 +819,7 @@ def _compute_kanban_metrics(
                 empty["rework"] = {
                     "avg_runs_per_implement_card": round(sum(impl_run_counts) / len(impl_run_counts), 2),
                     "cards_with_rework": impl_rework_cards,
+                    "first_pass_rate": round((len(impl_run_counts) - impl_rework_cards) / len(impl_run_counts), 3),
                 }
 
             verified_total = max(diff_pass, bb_pass)
