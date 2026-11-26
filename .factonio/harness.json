@@ -121,7 +121,8 @@
       ],
       "scenarios": [
         "Every factonio_* tool in plugin.yaml provides_tools is registered with a JSON schema",
-        "factonio_bootstrap_verify accepts prove (init) and base_ref (check/audit)"
+        "factonio_bootstrap_verify accepts prove (init) and base_ref (check/audit)",
+        "Refused merge/gate trail rows never carry override hints (allow_stacked_merge) in why; only real overrides read as gate_loosening in trail --audit (tests.test_pr_gate_hardening.TestMergeTrailAudit)"
       ]
     },
     {
