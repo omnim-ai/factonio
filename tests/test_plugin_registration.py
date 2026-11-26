@@ -167,6 +167,25 @@ class TestBundledSkillRigorAndAttribution(unittest.TestCase):
         self.assertEqual(positions, sorted(positions), "PR briefing headings out of order")
         self.assertIn("Never search for, open, or reference any `holdout/` directory", text)
 
+    def test_implement_skill_bot_triage_and_safe_replies(self):
+        text = self._read("skills/implement/SKILL.md")
+        triage = text.split("### 3b. Triage PR Review Threads Skeptically", 1)[1].split("### 3c.", 1)[0]
+        self._assert_all_in(triage, (
+            "**Ask-by-default risk boundary:**",
+            "security, privacy, auth, billing, data-retention, migration, schema, idempotency, or concurrency",
+            "**Bot triage rubric:**",
+            "`is_review_bot`",
+            "`comment_id`",
+            "**Upstack usage:**",
+            "**Stale finding already fixed on tip:**",
+            "**Deliberate narrow error handling:**",
+            "`ENOENT`",
+            "**Prose-pinning contract tests first:**",
+            "**Safe replies (never shell-interpolate comment text):**",
+            'gh api --method POST "repos/<owner>/<repo>/pulls/<pr>/comments/<comment_id>/replies" --input',
+            "--body-file",
+        ), "implement skill 3b")
+
     def test_verify_diff_skill_rigor_and_barrier(self):
         text = self._read("skills/verify-diff/SKILL.md")
         self._assert_all_in(text, (
@@ -261,6 +280,20 @@ class TestBundledSkillRigorAndAttribution(unittest.TestCase):
         tiers = [gate.index(t) for t in ("**Merge conflicts**", "**Unresolved review threads:**", "**CI / status rollup:**", "**Merge gates:**")]
         self.assertEqual(tiers, sorted(tiers), "PR gate tiers out of priority order")
         self.assertIn("Never open or quote `holdout/` files in Implementation briefs", text)
+        self._assert_all_in(gate.split("## Decision Trail", 1)[0], (
+            "`review_automation_running`",
+            "`had_previous_passing_ci`",
+            "gh run rerun <run_id> --failed",
+            "Never spawn a fix round for Tier 4 `approval_gates`",
+            "`trunk_drift.policy`",
+            "`overlap_rebase_required`",
+            "`workflow_rebase_required`",
+            "`allow_patch_continuity: true`",
+            "stack_pr_numbers=[...]",
+            "--stack 12,13,14",
+            "`contiguous_ready_run`",
+            "`allow_stacked_merge: true`",
+        ), "orchestrator merge gate")
 
     def test_verify_diff_gate_integrity_must_kill_ladder_and_dropped(self):
         text = self._read("skills/verify-diff/SKILL.md")

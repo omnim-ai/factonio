@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Optional
 
 from .config import (
@@ -33,12 +34,13 @@ from .repos import (
     EDITABLE_REPO_FIELDS,
     add_repo,
     inspect_pr_gate,
+    inspect_stack_gate,
     merge_pr,
     restack_pr,
     restack_stack,
     update_repo,
 )
-from .trail import log_decision, record_transition
+from .trail import _GATE_LOOSENING_TOKENS, _norm_token_text, log_decision, record_transition
 
 
 def _json_ok(payload: dict[str, Any]) -> str:
@@ -57,6 +59,18 @@ def _trail_context(args: dict[str, Any]) -> dict[str, Any]:
         "card_id": args.get("card_id") or worker_card,
         "actor": args.get("actor") or ("worker" if worker_card else "orchestrator"),
     }
+
+
+def _scrub_loosening_hints(why: str, fallback: str) -> str:
+    """Drop clauses that merely *mention* a gate-loosening knob (e.g. a refusal's override hint).
+
+    `trail.audit_trail_evidence` flags `_GATE_LOOSENING_TOKENS` anywhere in `why`; real overrides are
+    recorded in `evidence`, so a hint in refusal prose would be a permanent false positive.
+    """
+    tokens = [_norm_token_text(t) for t in _GATE_LOOSENING_TOKENS]
+    clauses = re.split(r"\s*;\s*|,\s+or\s+", why)
+    kept = [c for c in clauses if c and not any(t in _norm_token_text(c) for t in tokens)]
+    return "; ".join(kept) or fallback
 
 
 def _gate_result(gate: dict[str, Any]) -> str:
@@ -78,7 +92,7 @@ def _record_pr_gate(args: dict[str, Any], gate: dict[str, Any]) -> None:
         "pr_gate",
         repo_slug=str(args.get("repo") or ""),
         phase="gate",
-        why=why[:500],
+        why=_scrub_loosening_hints(why, f"PR gate {result}")[:500],
         evidence={
             "pr_number": int(args["pr_number"]),
             "head_sha": gate.get("head_sha"),
@@ -92,6 +106,34 @@ def _record_pr_gate(args: dict[str, Any], gate: dict[str, Any]) -> None:
     )
 
 
+def _record_stack_gate(args: dict[str, Any], stack: dict[str, Any], pr_numbers: list[int]) -> None:
+    result = _gate_result(stack)
+    next_action = stack.get("next_action") if isinstance(stack.get("next_action"), dict) else {}
+    if result == "ready":
+        why = "All stacked PRs clear every merge gate tier"
+    elif result == "error":
+        why = str(stack.get("error") or "stack gate inspection failed")
+    else:
+        why = f"next_action={next_action.get('action')} on PR #{next_action.get('pr_number')}: " + "; ".join(
+            str(b) for b in (next_action.get("blockers") or [])
+        )
+    record_transition(
+        "pr_gate",
+        repo_slug=str(args.get("repo") or ""),
+        phase="gate",
+        why=_scrub_loosening_hints(why, f"Stack gate {result}")[:500],
+        evidence={
+            "stack_pr_numbers": pr_numbers,
+            "order": stack.get("order"),
+            "contiguous_ready_run": stack.get("contiguous_ready_run"),
+            "ceiling": stack.get("ceiling"),
+            "highest_blocker_tier": stack.get("highest_blocker_tier"),
+        },
+        result=result,
+        **_trail_context(args),
+    )
+
+
 def _record_merge(args: dict[str, Any], res: dict[str, Any], expected_head_sha: Optional[str]) -> None:
     if res.get("merged"):
         result = "merged"
@@ -99,17 +141,28 @@ def _record_merge(args: dict[str, Any], res: dict[str, Any], expected_head_sha: 
         result = "queued"
     else:
         result = "refused"
+    pr_number = int(args["pr_number"])
+    gate = res.get("gate") if isinstance(res.get("gate"), dict) else {}
+    if result == "refused" and gate.get("is_stacked") and not args.get("allow_stacked_merge"):
+        why = f"Refused stacked PR #{pr_number} on {gate.get('base_branch')!r}: merge the stack bottom-up and restack"
+    else:
+        why = str(res.get("error") or f"PR #{pr_number} {result}")
+    method = res.get("method") or args.get("method") or "squash"
     record_transition(
         "merge_pr",
         repo_slug=str(args.get("repo") or ""),
         phase="merge",
-        why=(str(res.get("error") or f"PR #{int(args['pr_number'])} {result}"))[:500],
+        why=_scrub_loosening_hints(why, f"PR #{pr_number} {result}")[:500],
         evidence={
-            "pr_number": int(args["pr_number"]),
-            "head_sha": res.get("head_sha") or (res.get("gate") or {}).get("head_sha"),
+            "pr_number": pr_number,
+            "head_sha": res.get("head_sha") or gate.get("head_sha"),
             "expected_head_sha": expected_head_sha,
-            "method": res.get("method") or args.get("method") or "squash",
+            # merge_pr falls back to squash for unknown methods; never echo caller text into evidence.
+            "method": method if method in ("squash", "merge", "rebase") else "squash",
             "url": res.get("url"),
+            # Overrides are logged only when used so trail audits can flag them.
+            **({"allow_stacked_merge": True} if args.get("allow_stacked_merge") else {}),
+            **({"allow_patch_continuity": True} if args.get("allow_patch_continuity") else {}),
         },
         result=result,
         **_trail_context(args),
@@ -498,10 +551,26 @@ def register_tools(ctx: Any) -> None:
     )
 
     def handle_pr_gate(args: dict[str, Any], **kwargs: Any) -> str:
+        stack_numbers = args.get("stack_pr_numbers")
         try:
-            gate = inspect_pr_gate(str(args["repo"]), int(args["pr_number"]))
+            if stack_numbers:
+                if not isinstance(stack_numbers, list):
+                    raise ValueError("stack_pr_numbers must be a list of PR numbers")
+                stack = inspect_stack_gate(str(args["repo"]), stack_numbers, fetch=bool(args.get("fetch", False)))
+            elif args.get("pr_number") is not None:
+                gate = inspect_pr_gate(
+                    str(args["repo"]),
+                    int(args["pr_number"]),
+                    verified_head_sha=args.get("verified_head_sha") or None,
+                    fetch=bool(args.get("fetch", False)),
+                )
+            else:
+                raise ValueError("pass pr_number or stack_pr_numbers")
         except Exception as exc:
             return _json_err(exc)
+        if stack_numbers:
+            _record_stack_gate(args, stack, list(stack.get("pr_numbers") or stack_numbers))
+            return _json_ok(stack)
         _record_pr_gate(args, gate)
         return _json_ok(gate)
 
@@ -512,17 +581,33 @@ def register_tools(ctx: Any) -> None:
             "name": "factonio_pr_gate",
             "description": (
                 "Check a GitHub PR's live HEAD SHA, draft/mergeable status, and CI status checks via `gh`. "
-                "Always run before reporting a PR ready or merging."
+                "Always run before reporting a PR ready or merging. Reports Tier 4 `approval_gates`, "
+                "`review_automation_running`, `had_previous_passing_ci` (flake signal), tiered `trunk_drift` and "
+                "`patch_continuity`; pass `stack_pr_numbers` to gate a whole stack bottom-to-top in tier-major order."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string", "description": "Registered repo slug or 'owner/repo'."},
-                    "pr_number": {"type": "integer", "description": "GitHub pull request number."},
+                    "pr_number": {"type": "integer", "description": "GitHub pull request number (or use stack_pr_numbers)."},
+                    "stack_pr_numbers": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Gate a stack of PRs (any order; ordered root-to-tip via base/head branches).",
+                    },
+                    "verified_head_sha": {
+                        "type": "string",
+                        "description": "HEAD the verdicts were given on; reports `patch_continuity` against the live head.",
+                    },
+                    "fetch": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Fetch the base branch and PR head into the registered checkout before drift checks.",
+                    },
                     "tenant": {"type": "string", "description": "Workstream tenant for the decision trail (defaults to the worker's tenant)."},
                     "card_id": {"type": "string", "description": "Kanban card id for the decision trail (defaults to the worker's card)."},
                 },
-                "required": ["repo", "pr_number"],
+                "required": ["repo"],
             },
         },
         handler=handle_pr_gate,
@@ -537,6 +622,9 @@ def register_tools(ctx: Any) -> None:
                 method=str(args.get("method") or "squash"),
                 delete_branch=bool(args.get("delete_branch", True)),
                 tenant=_trail_context(args)["tenant"] or None,
+                allow_patch_continuity=bool(args.get("allow_patch_continuity", False)),
+                allow_stacked_merge=bool(args.get("allow_stacked_merge", False)),
+                fetch=bool(args.get("fetch", False)),
             )
         except Exception as exc:
             return _json_err(exc)
@@ -562,6 +650,24 @@ def register_tools(ctx: Any) -> None:
                         "type": "boolean",
                         "default": True,
                         "description": "Delete the head branch after merging (keep it while child PRs still target it).",
+                    },
+                    "allow_stacked_merge": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Merge a stacked PR into its parent branch. Default refuses: land stacks bottom-up.",
+                    },
+                    "allow_patch_continuity": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Accept a live head that differs from expected_head_sha only when `git patch-id --stable` "
+                            "proves the identical verified patch (mechanical rebase)."
+                        ),
+                    },
+                    "fetch": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Fetch base/head into the registered checkout before drift and continuity checks.",
                     },
                     "tenant": {"type": "string", "description": "Workstream tenant for the decision trail (defaults to the worker's tenant)."},
                     "card_id": {"type": "string", "description": "Kanban card id for the decision trail (defaults to the worker's card)."},

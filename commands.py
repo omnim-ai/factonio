@@ -25,6 +25,7 @@ from .repos import (
     add_repo,
     audit_worktrees,
     inspect_pr_gate,
+    inspect_stack_gate,
     prune_safe_worktrees,
     remove_repo,
     restack_pr,
@@ -301,6 +302,31 @@ def _handle_metrics(args: Any, as_json: bool) -> None:
         _print_metrics(metrics)
 
 
+def _print_stack_gate(stack: dict) -> None:
+    if not stack.get("ok"):
+        print(f"Error: {stack.get('error')}")
+        return
+    verdict = "READY" if stack.get("ready_to_merge") else "BLOCKED"
+    tier = stack.get("highest_blocker_tier")
+    if tier and not stack.get("ready_to_merge"):
+        verdict = f"BLOCKED (tier {tier})"
+    order = " -> ".join(f"#{n}" for n in stack.get("order") or [])
+    print(f"{verdict}: {stack.get('repo')} stack {order}")
+    run = ", ".join(f"#{n}" for n in stack.get("contiguous_ready_run") or []) or "none"
+    ceiling = (stack.get("ceiling") or {}).get("pr_number")
+    frontier = (stack.get("lowest_pending_frontier") or {}).get("pr_number")
+    print(f"  Ready run: {run}; ceiling: {f'#{ceiling}' if ceiling else 'none'}; pending frontier: "
+          f"{f'#{frontier}' if frontier else 'none'}")
+    for warning in stack.get("warnings") or []:
+        print(f"  Warning: {warning}")
+    for key, entries in (stack.get("tiers_summary") or {}).items():
+        for entry in entries:
+            print(f"  {key} #{entry['pr_number']}: {'; '.join(entry['blockers'])}")
+    action = stack.get("next_action") or {}
+    target = f" on #{action['pr_number']}" if action.get("pr_number") else ""
+    print(f"  Next action: {action.get('action')}{target}")
+
+
 def register_cli(ctx: Any, plugin_dir: Path) -> None:
     """Register `hermes factonio <subcommand>`."""
 
@@ -391,7 +417,14 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
 
         p_pr = sub.add_parser("pr-gate", help="Inspect a GitHub PR's live HEAD and CI check status.")
         p_pr.add_argument("repo", help="Repo slug or 'owner/repo'.")
-        p_pr.add_argument("pr_number", type=int, help="Pull request number.")
+        p_pr.add_argument("pr_number", type=int, nargs="?", default=None, help="Pull request number (or --stack).")
+        p_pr.add_argument(
+            "--stack",
+            default=None,
+            help="Comma-separated stacked PR numbers (e.g. 12,13,14) gated bottom-to-top in tier-major order.",
+        )
+        p_pr.add_argument("--verified-sha", default=None, help="HEAD the verdicts were given on (patch continuity).")
+        p_pr.add_argument("--fetch", action="store_true", help="Fetch base/head into the registered checkout first.")
 
         p_rs = sub.add_parser(
             "restack",
@@ -694,7 +727,29 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             return
 
         if cmd == "pr-gate":
-            res = inspect_pr_gate(args.repo, args.pr_number)
+            if getattr(args, "stack", None):
+                try:
+                    numbers = [int(tok) for tok in str(args.stack).replace(" ", "").split(",") if tok]
+                    stack = inspect_stack_gate(args.repo, numbers, fetch=bool(args.fetch))
+                except ValueError as exc:
+                    stack = {"ok": False, "error": str(exc), "ready_to_merge": False}
+                if as_json:
+                    print(json.dumps(stack, indent=2, default=str))
+                else:
+                    _print_stack_gate(stack)
+                if not stack.get("ready_to_merge"):
+                    sys.exit(1)
+                return
+            if args.pr_number is None:
+                msg = "pass a pr_number or --stack 12,13,14"
+                if as_json:
+                    print(json.dumps({"ok": False, "error": msg}, indent=2))
+                else:
+                    print(f"Error: {msg}")
+                sys.exit(1)
+            res = inspect_pr_gate(
+                args.repo, args.pr_number, verified_head_sha=args.verified_sha, fetch=bool(args.fetch),
+            )
             if as_json:
                 print(json.dumps(res, indent=2, default=str))
             else:
@@ -712,6 +767,21 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                     f"  Review: decision={res.get('review_decision') or 'NONE'} "
                     f"unresolved_threads={len(res.get('unresolved_threads') or [])}"
                 )
+                if res.get("approval_gates"):
+                    print(f"  Approval gates: {', '.join(res['approval_gates'])}")
+                if res.get("review_automation_running"):
+                    print(f"  Review automation running: {', '.join(res.get('pending_review_automations') or [])}")
+                if res.get("checks", {}).get("failed") and res.get("had_previous_passing_ci"):
+                    print("  Flake signal: an earlier commit on this PR had passing CI (rerun failed jobs once)")
+                drift = res.get("trunk_drift")
+                if isinstance(drift, dict):
+                    print(
+                        f"  Trunk drift: policy={drift.get('policy')} rebase_required={bool(drift.get('rebase_required'))}"
+                        f" ahead={drift.get('trunk_commits_ahead')}"
+                    )
+                cont = res.get("patch_continuity")
+                if isinstance(cont, dict):
+                    print(f"  Patch continuity: continuous={bool(cont.get('continuous'))} ({cont.get('reason') or cont.get('error')})")
                 for b in res["blockers"]:
                     print(f"  Blocker: {b}")
             if not res.get("ready_to_merge"):

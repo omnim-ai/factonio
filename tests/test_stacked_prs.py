@@ -335,7 +335,9 @@ class TestTrueBaseGateMergeAndPatchId(unittest.TestCase):
                 views={7: {"state": "MERGED", "mergedAt": "2026-11-25T00:00:00Z", "baseRefName": "feat/parent"}},
             )
             with mock.patch("factonio.repos._run_gh", gh):
-                res = merge_pr("acme/sample", 7, expected_head_sha=fx.child_sha, delete_branch=False)
+                res = merge_pr(
+                    "acme/sample", 7, expected_head_sha=fx.child_sha, delete_branch=False, allow_stacked_merge=True,
+                )
             self.assertTrue(res["merged"], res)
             self.assertEqual((res["base_branch"], res["is_stacked"], res["delete_branch"]), ("feat/parent", True, False))
             merge_call = next(c for c in gh.calls if c[:2] == ["pr", "merge"])
@@ -346,9 +348,38 @@ class TestTrueBaseGateMergeAndPatchId(unittest.TestCase):
             self.assertEqual(_git(fx.local, "rev-parse", "--abbrev-ref", "HEAD"), "main")
 
             with mock.patch("factonio.repos._run_gh", gh):
-                default = merge_pr("acme/sample", 7)
+                default = merge_pr("acme/sample", 7, allow_stacked_merge=True)
             self.assertIn("--delete-branch", [c for c in gh.calls if c[:2] == ["pr", "merge"]][-1])
             self.assertTrue(default["delete_branch"])
+
+    def test_merge_refuses_stacked_pr_by_default(self):
+        from factonio.repos import merge_pr
+
+        with isolated_hermes_home():
+            gh = StackGh(
+                {7: _pr_node(7, "feat/child", "c" * 40, "feat/parent")},
+                views={7: {"state": "MERGED", "mergedAt": "2026-11-25T00:00:00Z", "baseRefName": "feat/parent"}},
+            )
+            with mock.patch("factonio.repos._run_gh", gh):
+                res = merge_pr("acme/sample", 7, expected_head_sha="c" * 40)
+            self.assertFalse(res["ok"])
+            self.assertFalse(res["merged"])
+            self.assertFalse(res["queued"])
+            self.assertIn("stacked", res["error"])
+            self.assertIn("allow_stacked_merge", res["error"])
+            self.assertTrue(res["gate"]["is_stacked"])
+            self.assertFalse(any(c[:2] == ["pr", "merge"] for c in gh.calls))
+
+            # Explicit override merges into the parent branch; unstacked PRs never need it.
+            with mock.patch("factonio.repos._run_gh", gh):
+                forced = merge_pr("acme/sample", 7, expected_head_sha="c" * 40, allow_stacked_merge=True)
+            self.assertTrue(forced["merged"], forced)
+            plain = StackGh(
+                {8: _pr_node(8, "feat/x", "d" * 40, "main")},
+                views={8: {"state": "MERGED", "mergedAt": "2026-11-25T00:00:00Z", "baseRefName": "main"}},
+            )
+            with mock.patch("factonio.repos._run_gh", plain):
+                self.assertTrue(merge_pr("acme/sample", 8, expected_head_sha="d" * 40)["merged"])
 
     def test_inspect_pr_patch_id_and_drift_use_true_base(self):
         from factonio.repos import assess_trunk_drift, compute_patch_id, inspect_pr_patch_id

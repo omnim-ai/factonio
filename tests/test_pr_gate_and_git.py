@@ -195,7 +195,10 @@ class TestGraphqlPrGate(unittest.TestCase):
                 gate = inspect_pr_gate("acme/sample", 12)
             threads = gate["unresolved_threads"]
             self.assertEqual(len(threads), 51)
-            self.assertEqual(set(threads[0]), {"id", "path", "line", "author", "body", "created_at"})
+            self.assertEqual(
+                set(threads[0]),
+                {"id", "comment_id", "path", "line", "author", "is_review_bot", "body", "created_at"},
+            )
             last = threads[-1]
             self.assertEqual(last["id"], "T-last")
             self.assertEqual(last["path"], "src/db.py")
@@ -312,7 +315,8 @@ class TestGraphqlPrGate(unittest.TestCase):
             "missing pr": _proc(json.dumps({"data": {"repository": {"pullRequest": None}}})),
             "missing repo": _proc(json.dumps({"data": {"repository": None}})),
         }
-        with isolated_hermes_home():
+        # Retryable failures (invalid JSON, rate limits) back off; keep the test instant.
+        with isolated_hermes_home(), mock.patch("factonio.repos._graphql_sleep", lambda _s: None):
             for label, resp in responses.items():
                 with mock.patch("factonio.repos._run_gh", return_value=resp):
                     gate = inspect_pr_gate("acme/sample", "12")
