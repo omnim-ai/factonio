@@ -8,7 +8,7 @@ Open an [issue](https://github.com/omnim-ai/factonio/issues/new/choose) and incl
 
 - Your Hermes Agent version (`hermes --version`)
 - The output of `hermes factonio doctor --json` (redact any local paths you'd rather not share)
-- Your phase model matrix (`hermes factonio models --json`) if the issue involves model selection or verification
+- Your phase model matrix (`hermes factonio --json models`) if the issue involves model selection or verification
 - What you did, what happened, and what you expected instead
 
 Report security vulnerabilities privately through [SECURITY.md](SECURITY.md), not in a public issue.

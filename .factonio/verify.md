@@ -51,8 +51,8 @@ node --check desktop/plugin.js
 uv run --with pyyaml python tools/check_repo_integrity.py
 HERMES_HOME="$FACTONIO_VERIFY_HOME" HERMES_KANBAN_DB="$FACTONIO_VERIFY_HOME/kanban.db" hermes factonio harness check "$PWD" --run-doctor --run-hooks --json
 HERMES_HOME="$FACTONIO_VERIFY_HOME" HERMES_KANBAN_DB="$FACTONIO_VERIFY_HOME/kanban.db" hermes factonio harness audit "$PWD" --json
-HERMES_HOME="$FACTONIO_VERIFY_HOME" HERMES_KANBAN_DB="$FACTONIO_VERIFY_HOME/kanban.db" hermes factonio models --json
-HERMES_HOME="$FACTONIO_VERIFY_HOME" HERMES_KANBAN_DB="$FACTONIO_VERIFY_HOME/kanban.db" hermes factonio list --json
+HERMES_HOME="$FACTONIO_VERIFY_HOME" HERMES_KANBAN_DB="$FACTONIO_VERIFY_HOME/kanban.db" hermes factonio --json models
+HERMES_HOME="$FACTONIO_VERIFY_HOME" HERMES_KANBAN_DB="$FACTONIO_VERIFY_HOME/kanban.db" hermes factonio --json list
 ```
 
 ## Evidence

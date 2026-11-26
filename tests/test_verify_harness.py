@@ -851,6 +851,120 @@ class TestRepoDogfoodHarness(unittest.TestCase):
                 self.assertEqual(audit[key], [], key)
 
 
+def _fenced_block_after(text: str, marker: str) -> str:
+    """Return the body of the first ```bash fenced block that follows ``marker``."""
+    start = text.index(marker)
+    open_at = text.index("```bash\n", start) + len("```bash\n")
+    close_at = text.index("```", open_at)
+    return "\n".join(line.strip() for line in text[open_at:close_at].splitlines())
+
+
+class TestBlackboxIsolationRecipe(unittest.TestCase):
+    """The verify-blackbox HERMES_HOME recipe must isolate Kanban paths even with an inherited home."""
+
+    SENTINEL = "/sentinel-existing-home"
+    PROBE = 'printf "%s\\n%s\\n%s\\n" "$HERMES_HOME" "$HERMES_KANBAN_DB" "$HERMES_KANBAN_WORKSPACES_ROOT"'
+
+    def _recipe(self) -> str:
+        text = (PLUGIN_ROOT / "skills" / "verify-blackbox" / "SKILL.md").read_text(encoding="utf-8")
+        return _fenced_block_after(text, "Pin an isolated Hermes home")
+
+    def test_recipe_resolves_kanban_paths_inside_new_home(self):
+        recipe = self._recipe()
+        for shell in ("bash", "sh"):
+            if not shutil.which(shell):
+                self.fail(f"{shell} is required to execute the documented recipe")
+            with self.subTest(shell=shell), isolated_hermes_home() as scratch:
+                tmpdir = scratch / "tmp"
+                checkout = scratch / "checkout"
+                tmpdir.mkdir()
+                checkout.mkdir()
+                env = {
+                    **os.environ,
+                    "TMPDIR": str(tmpdir),
+                    "HERMES_HOME": self.SENTINEL,
+                    "HERMES_KANBAN_DB": f"{self.SENTINEL}/kanban.db",
+                    "HERMES_KANBAN_WORKSPACES_ROOT": f"{self.SENTINEL}/kanban/workspaces",
+                }
+                proc = subprocess.run(
+                    [shell, "-c", f"set -e\n{recipe}\n{self.PROBE}"],
+                    cwd=str(checkout), env=env, capture_output=True, text=True, timeout=30, check=False,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                home, db, ws_root = proc.stdout.splitlines()
+                self.assertNotEqual(home, self.SENTINEL)
+                self.assertTrue(Path(home).is_dir(), home)
+                self.assertTrue(Path(home).resolve().is_relative_to(tmpdir.resolve()), home)
+                self.assertEqual(db, f"{home}/kanban.db")
+                self.assertEqual(ws_root, f"{home}/kanban/workspaces")
+                for value in (db, ws_root):
+                    self.assertFalse(value.startswith(self.SENTINEL), value)
+
+
+class TestCommittedHarnessCliCommands(unittest.TestCase):
+    """Every committed `hermes factonio ...` Launch/Drive command must parse with the real CLI parser."""
+
+    READ_ONLY = ("models", "list")
+
+    def _hermes_commands(self) -> list[tuple[str, list[str]]]:
+        manifest = json.loads((PLUGIN_ROOT / ".factonio" / "harness.json").read_text(encoding="utf-8"))
+        verify_md = (PLUGIN_ROOT / ".factonio" / "verify.md").read_text(encoding="utf-8")
+        lines = [
+            *(("harness.json", c) for phase in ("launch", "drive") for c in manifest["phases"][phase]),
+            *(("verify.md", c) for marker in ("## Launch", "## Drive")
+              for c in _fenced_block_after(verify_md, marker).splitlines()),
+        ]
+        found = []
+        for source, line in lines:
+            tokens = shlex.split(line)
+            while tokens and "=" in tokens[0] and not tokens[0].startswith("-"):
+                tokens.pop(0)
+            if tokens[:2] == ["hermes", "factonio"]:
+                found.append((source, tokens[2:]))
+        return found
+
+    def _cli(self):
+        from factonio.commands import register_cli
+
+        ctx = _FakeCtx()
+        register_cli(ctx, PLUGIN_ROOT)
+        entry = ctx.cli["factonio"]
+        parser = argparse.ArgumentParser(prog="hermes factonio")
+        entry["setup_fn"](parser)
+        return parser, entry["handler_fn"]
+
+    def test_every_committed_hermes_factonio_command_parses(self):
+        parser, _ = self._cli()
+        commands = self._hermes_commands()
+        subcommands = {next((t for t in argv if not t.startswith("-")), None) for _, argv in commands}
+        self.assertTrue({"harness", *self.READ_ONLY} <= subcommands, subcommands)
+        for source, argv in commands:
+            with self.subTest(source=source, argv=argv):
+                err = io.StringIO()
+                try:
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        parser.parse_args(argv)
+                except SystemExit as exc:
+                    if exc.code not in (0, None):
+                        self.fail(f"{source}: `hermes factonio {shlex.join(argv)}` exits {exc.code}: {err.getvalue()}")
+
+    def test_read_only_drive_commands_exit_zero_with_json(self):
+        parser, handler = self._cli()
+        drive = [argv for source, argv in self._hermes_commands()
+                 if source == "harness.json" and set(self.READ_ONLY) & set(argv)]
+        self.assertEqual(len(drive), len(self.READ_ONLY), drive)
+        for argv in drive:
+            with self.subTest(argv=argv), isolated_hermes_home():
+                out, err, code = io.StringIO(), io.StringIO(), 0
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    try:
+                        handler(parser.parse_args(argv))
+                    except SystemExit as exc:
+                        code = 0 if exc.code is None else exc.code
+                self.assertEqual(code, 0, err.getvalue())
+                json.loads(out.getvalue())
+
+
 class TestVerificationHarnessInjection(unittest.TestCase):
     def test_harness_only_reaches_blackbox_card(self):
         from hermes_cli import kanban_db as kb
