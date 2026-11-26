@@ -18,6 +18,7 @@ import sqlite3
 import stat
 import threading
 import time
+import unicodedata
 import uuid
 from collections import Counter
 from contextlib import closing, contextmanager
@@ -1501,7 +1502,10 @@ _RECALL_STOPWORDS = frozenset(
 )
 _RECALL_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_]{3,}")
 # Recall text can be injected into Definition cards: never echo holdout paths or scenario names.
-_HOLDOUT_RE = re.compile(r"\S*holdout\S*", re.IGNORECASE)
+# Matching runs after NFKC folding with format/control characters removed, so zero-width joiners,
+# full-width letters or "hold-out" spellings cannot smuggle a reference past the barrier.
+_HOLDOUT_RE = re.compile(r"\S*hold[\s_./\\-]*outs?\S*", re.IGNORECASE)
+_HOLDOUT_REDACTED = "[redacted]"
 _RECALL_FIELD_CHARS = 240
 
 
@@ -1514,28 +1518,56 @@ def _recall_terms(query: Optional[str]) -> list[str]:
     return seen[:24]
 
 
+def _recall_fold(text: str) -> str:
+    """NFKC-fold, drop format characters, and turn control characters (newlines included) into spaces."""
+    out = []
+    for ch in unicodedata.normalize("NFKC", text):
+        cat = unicodedata.category(ch)
+        if cat == "Cf":
+            continue
+        out.append(" " if cat in ("Cc", "Zl", "Zp") else ch)
+    return "".join(out)
+
+
+def _recall_redact_text(text: str) -> str:
+    return _HOLDOUT_RE.sub(_HOLDOUT_REDACTED, _recall_fold(text))
+
+
+def contains_holdout_reference(text: Any) -> bool:
+    """True when ``text`` mentions a holdout path or name (after the same folding the redactor uses)."""
+    return bool(_HOLDOUT_RE.search(_recall_fold(str(text or ""))))
+
+
+def _recall_is_holdout_key(key: Any) -> bool:
+    return bool(_HOLDOUT_RE.search(_recall_fold(str(key))))
+
+
 def _recall_scrub(value: Any) -> Any:
+    """Recursively redact holdout references from every string (and drop holdout-named keys)."""
     if isinstance(value, str):
-        return _HOLDOUT_RE.sub("[redacted]", value)
+        return _recall_redact_text(value)
     if isinstance(value, Mapping):
-        return {str(k): _recall_scrub(v) for k, v in value.items() if "holdout" not in str(k).lower()}
+        return {
+            _recall_redact_text(str(k)): _recall_scrub(v) for k, v in value.items() if not _recall_is_holdout_key(k)
+        }
     if isinstance(value, (list, tuple)):
         return [_recall_scrub(v) for v in value]
     return value
 
 
-def _recall_clip(value: Any) -> str:
-    text = " ".join(str(_recall_scrub(value if value is not None else "")).split())
-    return text if len(text) <= _RECALL_FIELD_CHARS else text[: _RECALL_FIELD_CHARS - 1].rstrip() + "…"
+def _recall_clip(value: Any, limit: int = _RECALL_FIELD_CHARS) -> str:
+    text = " ".join(_recall_redact_text(str(value if value is not None else "")).split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
 def _recall_brief(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Every emitted string field is folded, single-lined, clipped and holdout-redacted."""
     return {
-        "id": row["id"],
-        "ts": row["ts"],
-        "tenant": row["tenant"],
-        "phase": row["phase"],
-        "card_id": row["card_id"],
+        "id": _recall_clip(row["id"], 80),
+        "ts": _recall_clip(row["ts"], 40),
+        "tenant": _recall_clip(row["tenant"], 120),
+        "phase": _recall_clip(row["phase"], 60),
+        "card_id": _recall_clip(row["card_id"], 80),
         "decision": _recall_clip(row["decision"]),
         "why": _recall_clip(row["why"]),
         "result": _recall_clip(row["result"]),
@@ -1576,8 +1608,13 @@ def recall_decisions(
 
     Within a category rows matching ``query`` rank first, then newest first; categories are
     interleaved round-robin so one noisy kind cannot crowd out the rest, and the total is capped at
-    ``limit`` (1..100). Correction rows shown inline are never repeated as standalone items. Text is
-    clipped and any ``holdout`` reference is redacted. Returns
+    ``limit`` (1..100). A supersession chain (``A <- B <- C``, branching or even cyclic) is shown once,
+    on its oldest scanned row, with ``corrections`` listing the chain's current (never-superseded)
+    corrections newest first (``correction`` is the newest); intermediate links are never presented
+    as current. Only rows inside the requested ``repo`` and outside ``exclude_tenant`` are ever
+    emitted, inline corrections included; when every current correction is out of scope the item
+    carries ``correction_out_of_scope: true`` and no correction content. Every emitted string is
+    single-lined, clipped, and any ``holdout`` reference is redacted. Returns
     ``{ok, count, items, counts, scanned, query_terms, filters}``.
     """
     try:
@@ -1609,6 +1646,8 @@ def recall_decisions(
     if excluded:
         where_sql = (where_sql + " AND " if where_sql else " WHERE ") + "tenant != ?"
         params.append(excluded)
+    repo_raw = str(repo or "").strip()
+    repo_keys = {_resolve_repo_slug(repo_raw), repo_raw} if repo_raw else set()
     try:
         with closing(_open_trail_ro(path)) as conn:
             conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
@@ -1616,19 +1655,58 @@ def recall_decisions(
                 f"SELECT rowid AS _seq, * FROM decisions{where_sql} ORDER BY ts DESC, rowid DESC LIMIT ?",
                 [*params, _RECALL_SCAN_ROWS],
             ).fetchall()
-            corrections: dict[str, sqlite3.Row] = {}
-            for r in conn.execute(
+            # Lineage is resolved over the whole store, but only in-scope rows are ever emitted.
+            links = conn.execute(
                 "SELECT rowid AS _seq, * FROM decisions WHERE supersedes_id IS NOT NULL ORDER BY ts ASC, rowid ASC"
-            ).fetchall():
-                corrections[r["supersedes_id"]] = r  # latest correction wins
+            ).fetchall()
     except (sqlite3.Error, OSError) as exc:
         return _unreadable(str(exc))
 
-    # A correction is shown inline with the dead end it replaces, never as a standalone item.
-    inline_ids = {corrections[r["id"]]["id"] for r in rows if r["id"] in corrections}
+    def _in_scope(r: sqlite3.Row) -> bool:
+        if excluded and str(r["tenant"] or "") == excluded:
+            return False
+        return not repo_keys or str(r["repo_slug"] or "") in repo_keys
+
+    children: dict[str, list[sqlite3.Row]] = {}
+    parent_of: dict[str, str] = {}
+    for r in links:
+        children.setdefault(r["supersedes_id"], []).append(r)
+        parent_of[r["id"]] = r["supersedes_id"]
+    scanned = {r["id"]: r for r in rows}
+
+    def _chain_root(row_id: str) -> str:
+        """Oldest scanned ancestor (the row whose item shows this chain); a cycle resolves to its oldest member."""
+        root, path, cur = row_id, [row_id], row_id
+        while cur in parent_of:
+            cur = parent_of[cur]
+            if cur in path:
+                cycle = [m for m in path[path.index(cur):] if m in scanned]
+                return min(cycle, key=lambda m: scanned[m]["_seq"]) if cycle else root
+            path.append(cur)
+            if cur in scanned:
+                root = cur
+        return root
+
+    def _terminals(row_id: str) -> list[sqlite3.Row]:
+        """Current (never-superseded) corrections reachable from ``row_id``; cycle-safe."""
+        found: list[sqlite3.Row] = []
+        seen, stack = {row_id}, list(children.get(row_id, ()))
+        while stack:
+            node = stack.pop()
+            if node["id"] in seen:
+                continue
+            seen.add(node["id"])
+            fresh = [c for c in children.get(node["id"], ()) if c["id"] not in seen]
+            if fresh:
+                stack.extend(fresh)
+            else:
+                found.append(node)
+        return sorted(found, key=lambda n: (n["ts"], n["_seq"]), reverse=True)
+
     buckets: dict[str, list[tuple[int, int, dict[str, Any]]]] = {c: [] for c in RECALL_CATEGORIES}
     for order, raw in enumerate(rows):
-        if raw["id"] in inline_ids:
+        # Intermediate and terminal corrections are shown only through their chain's root item.
+        if _chain_root(raw["id"]) != raw["id"]:
             continue
         row = _row_to_dict(raw)
         evidence = row["evidence"]
@@ -1640,8 +1718,9 @@ def recall_decisions(
         decision_l = str(row["decision"] or "").strip().lower()
         result_l = str(row["result"] or "").strip().lower()
         verdict_l = str(evidence.get("verdict") or "").strip().lower()
-        correction = corrections.get(row["id"])
-        if correction is not None:
+        is_superseded = bool(children.get(raw["id"]))
+        current = [t for t in _terminals(raw["id"]) if _in_scope(t)] if is_superseded else []
+        if is_superseded:
             category = "superseded"
         elif _phase_family(row["phase"]) == "escape" or decision_l.startswith("escape"):
             category = "escapes"
@@ -1651,13 +1730,17 @@ def recall_decisions(
             category = "keyword"
         else:
             continue
+        corrections = [_recall_brief(t) for t in current]
         item = {
             "category": category,
             **_recall_brief(raw),
-            "repo_slug": row["repo_slug"],
+            "repo_slug": _recall_clip(row["repo_slug"], 120),
             "evidence": _recall_scrub(evidence),
-            "matched_terms": hits,
-            "correction": _recall_brief(correction) if correction is not None else None,
+            "matched_terms": _recall_scrub(hits),
+            "correction": corrections[0] if corrections else None,
+            "corrections": corrections,
+            # Superseded, but every current correction lies outside this recall's repo/tenant scope.
+            "correction_out_of_scope": is_superseded and not corrections,
         }
         buckets[category].append((-len(hits), order, item))
 
@@ -1696,12 +1779,14 @@ def _recall_line(item: Mapping[str, Any]) -> str:
         text += f" — {item['why']}"
     if item.get("result"):
         text += f" -> {item['result']}"
-    corr = item.get("correction")
-    if corr:
+    corrections = list(item.get("corrections") or ([item["correction"]] if item.get("correction") else []))
+    for corr in corrections:
         text += f"; corrected by `{corr.get('id')}`: {corr.get('decision')}"
         if corr.get("why"):
             text += f" — {corr['why']}"
-    return text.replace("\n", " ")
+    if item.get("correction_out_of_scope"):
+        text += "; corrected outside this recall scope"
+    return _recall_redact_text(text)
 
 
 def render_recall_markdown(recall: Mapping[str, Any], *, max_chars: int = 2500) -> str:
@@ -1728,6 +1813,8 @@ def render_recall_markdown(recall: Mapping[str, Any], *, max_chars: int = 2500) 
                     out += f"- _{len(items) - n} more omitted; run `hermes factonio trail --recall`._\n"
                     break
                 out += line
+    # Final barrier: whatever reached the renderer, no holdout reference leaves it.
+    out = "\n".join(_recall_redact_text(line) for line in out.split("\n"))
     limit = max(0, int(max_chars))
     if len(out) > limit:
         out = out[: max(0, limit - 2)].rstrip() + "…\n" if limit >= 2 else out[:limit]
@@ -1737,7 +1824,7 @@ def render_recall_markdown(recall: Mapping[str, Any], *, max_chars: int = 2500) 
 def render_recall_text(recall: Mapping[str, Any]) -> str:
     """Plain-text recall report for terminals."""
     if not recall.get("ok", True):
-        return f"Recall: ERROR - {recall.get('error') or 'trail.db could not be read'}"
+        return _recall_redact_text(f"Recall: ERROR - {recall.get('error') or 'trail.db could not be read'}")
     items = list(recall.get("items") or [])
     counts = recall.get("counts") or {}
     head = f"Recall: {len(items)} item(s) (" + ", ".join(f"{c}={counts.get(c, 0)}" for c in RECALL_CATEGORIES) + ")"
@@ -1746,4 +1833,4 @@ def render_recall_text(recall: Mapping[str, Any]) -> str:
     lines = [head]
     for item in items:
         lines.append("- " + _recall_line(item).replace("**", "").replace("`", ""))
-    return "\n".join(lines)
+    return "\n".join(_recall_redact_text(line) for line in lines)

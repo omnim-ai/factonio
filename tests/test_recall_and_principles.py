@@ -10,6 +10,7 @@ import os
 import sqlite3
 import sys
 import unittest
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -424,6 +425,209 @@ class TestTrailRecallCli(unittest.TestCase):
             code, out = run("trail", "--recall")
             self.assertEqual(code, 1, out)
             self.assertIn("Recall: ERROR", out)
+
+
+def _blob(res: dict) -> str:
+    """Everything recall emits except the caller's own echoed filters."""
+    from factonio import trail
+
+    body = {k: v for k, v in res.items() if k != "filters"}
+    return json.dumps(body) + trail.render_recall_markdown(res) + trail.render_recall_text(res)
+
+
+class TestRecallSupersessionChains(unittest.TestCase):
+    def test_multi_hop_chain_surfaces_terminal_correction_only(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            a = trail.log_decision("pick_queue", tenant="old", repo_slug="acme-sample", phase="define",
+                                   why="alpha: use redis lists", result="adopted")
+            b = trail.log_decision("pick_queue", tenant="old", repo_slug="acme-sample", phase="define",
+                                   why="beta: use rabbitmq", result="adopted", supersedes_id=a["id"])
+            c = trail.log_decision("pick_queue", tenant="old", repo_slug="acme-sample", phase="define",
+                                   why="gamma: use sqlite outbox", result="adopted", supersedes_id=b["id"])
+            res = trail.recall_decisions(repo="acme-sample")
+            self.assertEqual(res["count"], 1, res)
+            item = res["items"][0]
+            self.assertEqual((item["id"], item["category"]), (a["id"], "superseded"))
+            self.assertEqual(item["correction"]["id"], c["id"])
+            self.assertEqual([x["id"] for x in item["corrections"]], [c["id"]])
+            self.assertFalse(item["correction_out_of_scope"])
+            blob = _blob(res)
+            self.assertIn("gamma", blob)
+            self.assertNotIn(b["id"], blob)
+            self.assertNotIn("beta", blob)
+
+    def test_branching_chain_lists_every_current_leaf(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            a = trail.log_decision("pick_db", tenant="old", repo_slug="acme-sample", why="alpha", result="adopted")
+            b = trail.log_decision("pick_db", tenant="old", repo_slug="acme-sample", why="beta",
+                                   result="adopted", supersedes_id=a["id"])
+            c = trail.log_decision("pick_db", tenant="old", repo_slug="acme-sample", why="gamma",
+                                   result="adopted", supersedes_id=a["id"])
+            d = trail.log_decision("pick_db", tenant="old", repo_slug="acme-sample", why="delta",
+                                   result="adopted", supersedes_id=b["id"])
+            res = trail.recall_decisions(repo="acme-sample")
+            self.assertEqual([i["id"] for i in res["items"]], [a["id"]])
+            ids = [x["id"] for x in res["items"][0]["corrections"]]
+            self.assertEqual(sorted(ids), sorted([c["id"], d["id"]]))
+            self.assertEqual(res["items"][0]["correction"]["id"], ids[0])
+            self.assertNotIn(b["id"], _blob(res))
+            md = trail.render_recall_markdown(res)
+            self.assertIn(c["id"], md)
+            self.assertIn(d["id"], md)
+
+    def test_cyclic_lineage_terminates(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            trail.log_decision("seed", tenant="old", repo_slug="acme-sample", why="schema", result="recorded")
+            cols = "id, ts, tenant, repo_slug, phase, card_id, actor, decision, why, evidence_json, result, supersedes_id"
+            with closing(sqlite3.connect(trail.trail_db_path())) as conn:
+                for rid, ts, sup in (("d_cyc_x", "2026-01-01T00:00:00Z", "d_cyc_y"),
+                                     ("d_cyc_y", "2026-01-02T00:00:00Z", "d_cyc_x"),
+                                     ("d_cyc_z", "2026-01-03T00:00:00Z", "d_cyc_y")):
+                    conn.execute(f"INSERT INTO decisions({cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                                 (rid, ts, "old", "acme-sample", "define", "", "orchestrator", "loop",
+                                  f"why {rid}", "{}", "adopted", sup))
+                conn.commit()
+            res = trail.recall_decisions(repo="acme-sample")
+            self.assertTrue(res["ok"])
+            cyc = [i for i in res["items"] if i["id"].startswith("d_cyc")]
+            self.assertEqual([i["id"] for i in cyc], ["d_cyc_x"])
+            self.assertEqual(sorted(x["id"] for x in cyc[0]["corrections"]), ["d_cyc_z"])
+
+
+class TestRecallCorrectionScope(unittest.TestCase):
+    def test_excluded_tenant_correction_is_never_emitted(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            a = trail.log_decision("pick_auth", tenant="old", repo_slug="probe/repo", phase="define",
+                                   why="use sessions", result="adopted")
+            b = trail.log_decision("pick_auth", tenant="excluded", repo_slug="probe/repo", phase="define",
+                                   why="SECRET-EXCLUDED rationale", result="EXCLUDED-RESULT", supersedes_id=a["id"])
+            res = trail.recall_decisions(repo="probe/repo", exclude_tenant="excluded")
+            self.assertEqual([i["id"] for i in res["items"]], [a["id"]])
+            item = res["items"][0]
+            self.assertEqual(item["category"], "superseded")
+            self.assertIsNone(item["correction"])
+            self.assertEqual(item["corrections"], [])
+            self.assertTrue(item["correction_out_of_scope"])
+            for needle in (b["id"], "excluded", "SECRET-EXCLUDED", "EXCLUDED-RESULT"):
+                self.assertNotIn(needle, _blob(res))
+
+            run = _cli()
+            for fmt in ("--json", "--markdown"):
+                code, out = run("trail", "--recall", "--repo", "probe/repo", "--tenant", "excluded", fmt)
+                self.assertEqual(code, 0, out)
+                if fmt == "--json":
+                    data = json.loads(out)
+                    self.assertEqual(data["filters"]["exclude_tenant"], "excluded")
+                    out = json.dumps(data["items"])
+                self.assertIn(a["id"], out)
+                for needle in (b["id"], "SECRET-EXCLUDED", "EXCLUDED-RESULT"):
+                    self.assertNotIn(needle, out)
+
+    def test_chain_through_excluded_tenant_reaches_in_scope_terminal(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            a = trail.log_decision("pick_auth", tenant="old", repo_slug="probe/repo", why="alpha", result="adopted")
+            b = trail.log_decision("pick_auth", tenant="excluded", repo_slug="probe/repo", why="beta-excluded",
+                                   result="adopted", supersedes_id=a["id"])
+            c = trail.log_decision("pick_auth", tenant="older", repo_slug="probe/repo", why="gamma",
+                                   result="adopted", supersedes_id=b["id"])
+            res = trail.recall_decisions(repo="probe/repo", exclude_tenant="excluded")
+            self.assertEqual([i["id"] for i in res["items"]], [a["id"]])
+            self.assertEqual(res["items"][0]["correction"]["id"], c["id"])
+            self.assertNotIn(b["id"], _blob(res))
+            self.assertNotIn("beta-excluded", _blob(res))
+
+    def test_other_repo_correction_is_never_emitted(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            a = trail.log_decision("pick_cache", tenant="one-i1", repo_slug="scope/one", phase="define",
+                                   why="use memcached", result="adopted")
+            b = trail.log_decision("pick_cache", tenant="two-i1", repo_slug="scope/two", phase="define",
+                                   why="SCOPE-TWO rationale", result="SCOPE-TWO-RESULT", supersedes_id=a["id"])
+            res = trail.recall_decisions(repo="scope/one")
+            self.assertEqual([i["id"] for i in res["items"]], [a["id"]])
+            self.assertTrue(res["items"][0]["correction_out_of_scope"])
+            for needle in (b["id"], "two-i1", "scope/two", "SCOPE-TWO"):
+                self.assertNotIn(needle, _blob(res))
+            run = _cli()
+            for fmt in ("--json", "--markdown"):
+                code, out = run("trail", "--recall", "--repo", "scope/one", fmt)
+                self.assertEqual(code, 0, out)
+                self.assertIn(a["id"], out)
+                for needle in (b["id"], "two-i1", "SCOPE-TWO"):
+                    self.assertNotIn(needle, out)
+            # Without a repo filter the correction is in scope again.
+            both = trail.recall_decisions()
+            self.assertEqual(both["items"][0]["correction"]["id"], b["id"])
+
+
+class TestRecallHoldoutBarrier(unittest.TestCase):
+    def test_holdout_in_metadata_never_reaches_definition_card(self):
+        from factonio import trail
+        from factonio.orchestrator import start_workstream
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            trail.log_decision(
+                "verify_blackbox", tenant="repo-old\n/runs/old/holdout/secret-case.md",
+                phase="verify\nholdout/phase-case.md", card_id="t_1 HOLDOUT/card-case.md", repo_slug="acme-sample",
+                why="caching broke", result="reject", evidence={"note": "see hold\u200bout/zw-case.md"},
+            )
+            a = trail.log_decision("pick_cache", tenant="old", repo_slug="acme-sample", phase="define",
+                                   why="caching via memcached", result="adopted")
+            trail.log_decision(
+                "pick_cache", tenant="old\r\n\uff48\uff4f\uff4c\uff44\uff4f\uff55\uff54/fw-case.md",
+                phase="define", card_id="hold-out/dash-case.md", repo_slug="acme-sample",
+                why="caching via sqlite, not holdout/why-case.md", result="adopted", supersedes_id=a["id"],
+            )
+            res = trail.recall_decisions(repo="acme-sample", query="caching")
+            self.assertEqual(res["count"], 2, res)
+            blob = _blob(res)
+            for needle in ("holdout", "HOLDOUT", "hold-out", "-case.md", "\n/runs"):
+                self.assertNotIn(needle, blob)
+            self.assertFalse(trail.contains_holdout_reference(blob))
+            for item in res["items"]:
+                for key in ("tenant", "phase", "card_id"):
+                    self.assertNotIn("\n", item[key])
+
+            started = start_workstream("acme/sample", "Add caching", kind="feature", issue_number=9)
+            self.assertEqual(started["recall_count"], 2)
+            body = _task(started["task_id"]).body
+            self.assertIn("## Prior Institutional Memory (Recall)", body)
+            section = body.split("## Prior Institutional Memory (Recall)", 1)[1]
+            self.assertFalse(trail.contains_holdout_reference(section))
+            self.assertNotIn("-case.md", section)
+            self.assertIn(a["id"], section)
+
+    def test_definition_card_drops_recall_section_if_renderer_leaks(self):
+        from unittest import mock
+
+        from factonio import trail
+        from factonio.orchestrator import start_workstream
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            _seed()
+            leaky = "## Prior Institutional Memory (Recall)\n\n- see /runs/x/holdout/leak.md\n"
+            with mock.patch("factonio.orchestrator.render_recall_markdown", return_value=leaky):
+                res = start_workstream("acme/sample", "Add write-through caching", kind="feature")
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["recall_count"], 0)
+            body = _task(res["task_id"]).body
+            self.assertNotIn("Prior Institutional Memory", body)
+            self.assertNotIn("leak.md", body)
+            self.assertTrue(trail.contains_holdout_reference("x/Ｈold\u200bOut/y"))
+            self.assertFalse(trail.contains_holdout_reference("hold the line; check out main"))
 
 
 class TestSkillPrinciplesAndCrashPickup(unittest.TestCase):

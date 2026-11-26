@@ -25,7 +25,13 @@ from .config import (
 from .harness import HARNESS_DIR_NAME, HOOK_KINDS, REQUIRED_SECTIONS, VERIFY_MD_NAME, discover_harness
 from .metrics import aggregate_panel_verdicts as aggregate_panel_verdicts  # public re-export
 from .metrics import capture_metrics_snapshot, load_panel_lanes, summarize_panel, thread_cards
-from .trail import query_decisions, recall_decisions, record_transition, render_recall_markdown
+from .trail import (
+    contains_holdout_reference,
+    query_decisions,
+    recall_decisions,
+    record_transition,
+    render_recall_markdown,
+)
 
 logger = logging.getLogger("factonio.orchestrator")
 
@@ -250,7 +256,11 @@ def _definition_recall(slug: str, request: str, tenant: str) -> tuple[str, int]:
         recall = recall_decisions(repo=slug, query=request, exclude_tenant=tenant, limit=8)
         if not recall.get("ok") or not recall.get("items"):
             return "", 0
-        return render_recall_markdown(recall, max_chars=RECALL_SECTION_MAX_CHARS), len(recall["items"])
+        section = render_recall_markdown(recall, max_chars=RECALL_SECTION_MAX_CHARS)
+        if contains_holdout_reference(section):  # information barrier: fail closed, never inject
+            logger.warning("factonio recall dropped for %s: holdout reference survived redaction", tenant)
+            return "", 0
+        return section, len(recall["items"])
     except Exception as exc:  # recall is advisory: it must never block starting a workstream
         logger.warning("factonio recall skipped for %s: %s", tenant, exc)
         return "", 0
