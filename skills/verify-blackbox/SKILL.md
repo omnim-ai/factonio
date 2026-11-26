@@ -33,6 +33,12 @@ This barrier is the entire reason Black-Box Verification runs in an isolated car
    git rev-parse HEAD
    ```
    Verify `git rev-parse HEAD` matches the PR's `head_sha`.
+   **Local unpublished branch mode (`publish_policy: ask`):** a card titled `[verify:blackbox] <owner/repo>@<branch>` has no PR yet; it gives `repo_path`, `branch`, and `head_sha`. Skip `factonio_pr_gate` and `gh pr checkout`, and build an isolated scratch checkout of the exact commit from the local repository instead (no network, never inside the implementer's worktree):
+   ```bash
+   git clone --no-hardlinks <repo_path> app && cd app && git checkout --detach <head_sha>
+   git rev-parse HEAD
+   ```
+   Verify `git rev-parse HEAD` equals the card's `head_sha` (a missing commit or mismatch is `inconclusive` with the exact output, never `pass`), then continue below: run the `.factonio/` harness and acceptance criteria as usual. The barrier is unchanged: never run `git diff`, `git log -p`, or read implementation source files in the clone, and never push, open a PR, or call `factonio_publish_pr`. Report `branch` and `head_sha` (with `pr_number: null`) in metadata.
 3. **Pin an isolated Hermes home before probing CLI/API flows.** Commands such as `hermes factonio init`, `doctor`, `add`, or `harness` read and write `HERMES_HOME` and the Kanban DB. Run them from the scratch checkout only with a throwaway home so real profiles, `kanban.db`, and `plugins/` symlinks are never mutated:
    ```bash
    export HERMES_HOME="$(mktemp -d)"   # own statement: later exports must expand the NEW home
