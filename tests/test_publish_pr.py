@@ -518,6 +518,87 @@ class TestPublishPr(unittest.TestCase):
             self.assertEqual(len(rows), len(cases))
             self.assertEqual({r["result"] for r in rows}, {"refused"})
 
+    def _assert_refused_before_push(self, fx: PublishFixture, res: dict, gh: FakeGh, git_calls: list) -> None:
+        self.assertEqual(
+            (res["ok"], res["published"], res["pushed"], res["created"], res["refused"]),
+            (False, False, False, False, True), res,
+        )
+        self.assertEqual(gh.calls, [])
+        self.assertFalse(any(c[:1] == ["push"] for c in git_calls), git_calls)
+        self.assertIsNone(fx.origin_ref("feat/x"))
+
+    def test_space_named_remote_cannot_smuggle_unconfigured_path_remote(self):
+        with isolated_hermes_home() as home, _git_env():
+            fx = PublishFixture(home)
+            evil = fx.local / "evil.git"
+            _git(fx.local, "init", "-q", "--bare", str(evil))
+            _git(fx.local, "config", 'remote.foo evil.git.url', str(fx.origin))
+            self.assertIn("foo evil.git", _git(fx.local, "remote").splitlines())
+            gh = FakeGh(head=fx.sha)
+            res, git_calls = self._publish(fx, gh, remote="evil.git")
+            self._assert_refused_before_push(fx, res, gh, git_calls)
+            self.assertIn("not a configured git remote", res["error"])
+            self.assertEqual(_git(evil, "for-each-ref"), "")
+            self.assertEqual([r["result"] for r in _publish_rows()], ["refused"])
+
+    def test_nul_in_title_body_and_body_file_content_refused_before_push(self):
+        with isolated_hermes_home() as home, _git_env():
+            fx = PublishFixture(home)
+            nul_file = home / "nul.md"
+            nul_file.write_bytes(b"Summary\x00hidden payload\n")
+            cases = {
+                "inline body": ({"body": "Hello\x00World"}, "body"),
+                "body_file content": ({"body": None, "body_file": str(nul_file)}, "body_file content"),
+                "title": ({"title": "Hello\x00Title"}, "title"),
+                "repo": ({"repo": "acme/sample\x00"}, "repo"),
+                "branch": ({"branch": "feat/x\x00"}, "branch"),
+                "sha": ({"expected_head_sha": fx.sha + "\x00"}, "expected_head_sha"),
+                "base_branch": ({"base_branch": "main\x00"}, "base_branch"),
+                "remote": ({"remote": "origin\x00"}, "remote"),
+            }
+            for name, (kw, needle) in cases.items():
+                with self.subTest(case=name):
+                    gh = FakeGh(head=fx.sha)
+                    res, git_calls = self._publish(fx, gh, **kw)
+                    self._assert_refused_before_push(fx, res, gh, git_calls)
+                    self.assertIn(needle, res["error"])
+                    self.assertIn("NUL", res["error"])
+            rows = _publish_rows()
+            self.assertEqual(len(rows), len(cases))
+            self.assertEqual({r["result"] for r in rows}, {"refused"})
+
+    def test_bad_trail_context_is_refused_and_still_audited(self):
+        with isolated_hermes_home() as home, _git_env():
+            fx = PublishFixture(home)
+            cases = {
+                "tenant surrogate": {"tenant": "ten\ud800"},
+                "tenant NUL": {"tenant": "ten\x00ant"},
+                "tenant non-str": {"tenant": 5},
+                "card surrogate": {"card_id": "t_\udfff"},
+                "card NUL": {"card_id": "t_\x00c"},
+                "card non-str": {"card_id": ["t_c"]},
+                "actor surrogate": {"actor": "\ud800"},
+                "actor NUL": {"actor": "bot\x00"},
+                "actor empty": {"actor": "  "},
+                "actor non-str": {"actor": 3},
+                "all bad": {"tenant": "\ud800\x00", "card_id": "\x00", "actor": "\udc00\x00"},
+            }
+            with self.assertNoLogs("factonio.trail", level="WARNING"):
+                for name, kw in cases.items():
+                    with self.subTest(case=name):
+                        gh = FakeGh(head=fx.sha)
+                        res, git_calls = self._publish(fx, gh, **kw)
+                        self._assert_refused_before_push(fx, res, gh, git_calls)
+                        self.assertEqual(git_calls, [])
+            rows = _publish_rows()
+            self.assertEqual(len(rows), len(cases))
+            self.assertEqual({r["result"] for r in rows}, {"refused"})
+            for r in rows:
+                for key in ("tenant", "card_id", "actor"):
+                    self.assertNotIn("\x00", r[key] or "")
+                    (r[key] or "").encode("utf-8")
+                self.assertTrue(r["actor"])
+
     def test_unexpected_body_write_error_after_push_is_audited(self):
         with isolated_hermes_home() as home, _git_env():
             fx = PublishFixture(home)
@@ -532,7 +613,7 @@ class TestPublishPr(unittest.TestCase):
                 return fd, path
 
             with mock.patch("factonio.repos.tempfile.mkstemp", mkstemp), \
-                    mock.patch("factonio.repos._require_utf8", lambda value, field: None):
+                    mock.patch("factonio.repos._require_clean_str", lambda *a, **k: None):
                 res, _ = self._publish(fx, gh, body="bad \ud800 body")
             self.assertEqual((res["ok"], res["pushed"], res["created"], res["refused"]), (False, True, False, False))
             self.assertIn("gh pr create failed", res["error"])
@@ -825,6 +906,54 @@ class TestPublishToolAndCli(unittest.TestCase):
             self.assertIsNone(fx.origin_ref("feat/x"))
             self.assertEqual({r["result"] for r in _publish_rows()}, {"refused"})
             self.assertEqual(len(_publish_rows()), len(cases))
+
+    def test_publish_tool_and_cli_refuse_nul_bodies_and_titles(self):
+        from factonio.agent_tools import register_tools
+
+        with isolated_hermes_home() as home, _git_env():
+            fx = PublishFixture(home)
+            nul_file = home / "nul.md"
+            nul_file.write_bytes(b"Summary\x00hidden payload\n")
+            ctx = _Ctx()
+            register_tools(ctx)
+            handler = ctx.tools["factonio_publish_pr"]["handler"]
+            good = {"repo": "acme/sample", "branch": "feat/x", "expected_head_sha": fx.sha, "title": "T"}
+            tool_cases = {
+                "body": {**good, "body": "Hello\x00World"},
+                "body_file": {**good, "body_file": str(nul_file)},
+                "title": {**good, "title": "Hello\x00Title"},
+                "tenant": {**good, "tenant": "t\ud800"},
+                "card_id": {**good, "card_id": "c\x00"},
+                "actor": {**good, "actor": 7},
+            }
+            cli_cases = {
+                "body": ["--body", "Hello\x00World"],
+                "body_file": ["--body-file", str(nul_file)],
+                "title": ["--title", "Hello\x00Title"],
+            }
+            with mock.patch("factonio.repos._run_gh") as gh:
+                for name, args in tool_cases.items():
+                    with self.subTest(tool=name):
+                        res = json.loads(handler(args))
+                        self.assertEqual(
+                            (res["ok"], res["refused"], res["published"], res["pushed"], res["created"]),
+                            (False, True, False, False, False), res,
+                        )
+                for name, extra in cli_cases.items():
+                    with self.subTest(cli=name):
+                        argv = ["publish-pr", "acme/sample", "feat/x", "--expected-head-sha", fx.sha, "--json"]
+                        if name != "title":
+                            argv += ["--title", "T"]
+                        code, out, _ = _run_cli(*argv, *extra)
+                        self.assertEqual(code, 1, out)
+                        res = json.loads(out)
+                        self.assertEqual((res["refused"], res["pushed"], res["created"]), (True, False, False))
+                        self.assertIn("NUL", res["error"])
+                gh.assert_not_called()
+            self.assertIsNone(fx.origin_ref("feat/x"))
+            rows = _publish_rows()
+            self.assertEqual(len(rows), len(tool_cases) + len(cli_cases))
+            self.assertEqual({r["result"] for r in rows}, {"refused"})
 
     def test_cli_add_and_list_fail_closed_on_null_or_empty_policy(self):
         from factonio.config import list_repos, save_settings

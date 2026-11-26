@@ -1292,8 +1292,11 @@ def _validate_remote(value: Any) -> str:
 
 def _is_configured_remote(cwd: Path, remote: str) -> bool:
     """True only when ``remote`` is a named remote in ``cwd``'s git config (not a path or URL)."""
+    # Exact line membership: a configured name containing spaces must not tokenize into others.
     proc = _run_git(["remote"], cwd=cwd)
-    return proc.returncode == 0 and remote in (proc.stdout or "").split()
+    if proc.returncode != 0 or remote not in (proc.stdout or "").splitlines():
+        return False
+    return _run_git(["remote", "get-url", "--", remote], cwd=cwd).returncode == 0
 
 
 def _sync_local_default_branch(repo_path: Path, branch: str) -> tuple[bool, str]:
@@ -1720,8 +1723,17 @@ def _validate_full_sha(value: Any, field: str = "expected_head_sha") -> str:
 
 def _echo(value: Any) -> Optional[str]:
     """Bounded echo of caller input into results/trail evidence before it is validated."""
-    # Lone surrogates are replaced so a refusal can still be written to trail.db.
-    return value[:200].encode("utf-8", "replace").decode("utf-8") if isinstance(value, str) else None
+    # Lone surrogates are replaced and NULs dropped so a refusal can still be written to trail.db.
+    if not isinstance(value, str):
+        return None
+    return value[:200].encode("utf-8", "replace").decode("utf-8").replace("\x00", "")
+
+
+def _trail_safe(value: Any) -> str:
+    """Untruncated UTF-8-safe, NUL-free form of a trail context field; non-strings become ``""``."""
+    if not isinstance(value, str):
+        return ""
+    return value.encode("utf-8", "replace").decode("utf-8").replace("\x00", "")
 
 
 def _validate_branch_field(value: Any, field: str) -> str:
@@ -1742,12 +1754,20 @@ def _validate_git_ref_name(cwd: Path, name: str, field: str) -> None:
         raise ValueError(f"{field} {name!r} is not a valid branch name")
 
 
-def _require_utf8(value: Any, field: str) -> None:
-    if isinstance(value, str):
-        try:
-            value.encode("utf-8")
-        except UnicodeError:
-            raise ValueError(f"{field} is not valid UTF-8 (contains unencodable characters)") from None
+def _require_clean_str(value: Any, field: str, *, optional: bool = False, non_empty: bool = False) -> None:
+    """The one preflight check for every caller string that can reach git, gh, a UTF-8 file or trail.db."""
+    if value is None and optional:
+        return
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string; got {type(value).__name__}")
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        raise ValueError(f"{field} is not valid UTF-8 (contains unencodable characters)") from None
+    if "\x00" in value:
+        raise ValueError(f"{field} must not contain NUL (\\x00) characters")
+    if non_empty and not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
 
 
 def _record_publish(result: dict[str, Any], *, outcome: str, reason: str, repo_slug: str,
@@ -1766,13 +1786,14 @@ def _record_publish(result: dict[str, Any], *, outcome: str, reason: str, repo_s
         why = f"Published PR #{result.get('pr_number')} at verified HEAD {result.get('head_sha')}"
     else:
         why = str(result.get("error") or f"publish {outcome}")
+    # Sanitized independently of preflight so the row lands even when these fields were the bad input.
     record_transition(
         "publish_pr",
-        tenant=tenant or "",
+        tenant=_trail_safe(tenant),
         repo_slug=repo_slug,
         phase="publish",
-        card_id=card_id or "",
-        actor=actor,
+        card_id=_trail_safe(card_id),
+        actor=_trail_safe(actor).strip() or "orchestrator",
         why=why[:500],
         evidence=evidence,
         result=outcome,
@@ -1832,10 +1853,15 @@ def publish_pr(
         return result
 
     try:
-        for field, value in (("repo", repo_spec), ("branch", branch), ("title", title), ("body", body),
-                             ("body_file", body_file), ("base_branch", base_branch), ("remote", remote)):
-            _require_utf8(value, field)
-        spec = repo_spec.strip() if isinstance(repo_spec, str) else ""
+        for field, value, optional in (
+            ("repo", repo_spec, False), ("branch", branch, False), ("expected_head_sha", expected_head_sha, False),
+            ("title", title, False), ("body", body, True), ("body_file", body_file, True),
+            ("base_branch", base_branch, True), ("remote", remote, False),
+            ("tenant", tenant, True), ("card_id", card_id, True),
+        ):
+            _require_clean_str(value, field, optional=optional)
+        _require_clean_str(actor, "actor", optional=True, non_empty=True)
+        spec = repo_spec.strip()
         if not spec:
             raise ValueError("repo must be a registered slug or 'owner/repo'")
         if not isinstance(draft, bool):
@@ -1850,8 +1876,6 @@ def publish_pr(
             raise ValueError("title must be a non-empty single line")
         if body is not None and body_file is not None:
             raise ValueError("pass either body or body_file, not both")
-        if body is not None and not isinstance(body, str):
-            raise ValueError("body must be a string")
         clean_base = _validate_branch_field(base_branch, "base_branch") if base_branch is not None else None
     except ValueError as exc:
         return finish("refused", "invalid_input", str(exc))
@@ -1866,7 +1890,7 @@ def publish_pr(
     else:
         body_text = body or ""
     try:
-        _require_utf8(body_text, "body_file" if body_file is not None else "body")
+        _require_clean_str(body_text, "body_file content" if body_file is not None else "body")
     except ValueError as exc:
         return finish("refused", "invalid_input", str(exc))
 
@@ -1890,7 +1914,7 @@ def publish_pr(
         return finish("refused", "invalid_input", str(exc))
     result["base_branch"] = target_base
     try:
-        _require_utf8(target_base, "base_branch")
+        _require_clean_str(target_base, "base_branch")
         _validate_git_ref_name(cwd, clean_branch, "branch")
         _validate_git_ref_name(cwd, target_base, "base_branch")
     except ValueError as exc:
