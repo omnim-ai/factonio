@@ -20,6 +20,7 @@ Every card spawned by Factonio automatically subscribes the calling chat session
 - Runs in `goal_mode: true` on the `factonio_define` model slot.
 - Explores the repository, diagnoses bugs or designs features, and writes `spec.md` (acceptance criteria, technical approach, parallel task DAG, and `has_ui` flag) inside the workstream's run directory.
 - Authors hidden end-to-end acceptance checks under `holdout/`.
+- **Workstream modes (`WORKSTREAM_KINDS`):** `start_workstream` / `factonio_start` / `hermes factonio start <repo> <request> [--kind ...] [--title] [--issue] [--skip-define] [--escaped-from] [--json]` accept `feature`, `bug`, `quick` (unchanged), plus `refactor` (the card embeds a behavior-preservation contract: pin existing contract/characterization tests before internal edits; Diff Check proves zero unintended behavioral drift), `perf` (the card embeds the `benchmark-checklist`: `BENCHMARK_PRE_OPT_QUESTIONS` and `BENCHMARK_MEASUREMENT_MANTRAS`, 7 each), and `investigate`. `refactor` / `perf` with `skip_define` carry the same contract on the Implementation card. `investigate` is strictly read-only: it rejects `skip_define=True` with `ValueError`, spawns a `[define] [investigate] <title>` card (so `metrics.classify_phase` still reports `define`) that writes only `investigation_report_path(tenant)` (`<run_dir>/investigation.md`) and forbids source edits, branches, and PRs. The result gains additive `kind`, `read_only`, and `report_path` (`None` unless `investigate`).
 
 ### Phase 1b — Optional UI/UX Design (`factonio:design`)
 
