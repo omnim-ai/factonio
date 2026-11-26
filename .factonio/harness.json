@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-26T22:15:00Z",
+  "generated_at": "2026-11-26T22:37:17Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -220,7 +220,8 @@
         "Shell-wrapped (`sh -c`, `bash -lc`, argv form) or punctuation-adjacent (`;`, `&&`, `( )`) regeneration flags and raised or removed thresholds in a `visual_diff` command are gate loosening; `check --run-hooks` fails when a hook overwrites a frozen baseline; malformed verify.md hook metadata is harness_gap",
         "Default `audit` keeps a pinned `harness.json` `base_commit` containing a committed harness as the gate bar (later required-hook removal, downgrade, Doctor drop, regeneration flag or unfreeze + baseline overwrite is stale); `--threshold nan`/`inf` is a removed threshold",
         "Every `--threshold` occurrence in a compound `visual_diff` command (`&&`, `;`, newline, `sh -c`) counts: raising, swapping, removing or setting `nan`/`inf` on an earlier one, or masking a raise with a dummy `true --threshold 0.01`, is gate loosening while tightening is not; short `-u` is executable-aware and case-sensitive (`python3 -u script.py`, `bash -u script.sh`, `set -e -u`, `diff -u` allowed; `jest -u`, `npx vitest -u` flagged)",
-        "`env`/`sh -c` unwrap only at command head (`npx jest tests/env -u` and attached `env -S'npx jest -u'` flagged); wrapped interpreters pass (`timeout 30 python3 -u visual_check.py`, `uv run --with pillow python3 -u script.py`) while `timeout 30 npx jest -u` / `uv run pytest --snapshot-update` are flagged; boolean `-u \"\"` / `--snapshot-update none` is regeneration; thresholds align per command signature (swaps and dummy-masked raises flagged, a new `&& c --threshold 0.02` check clean); invariant `covers: ['.factonio/model.cfg']` is inventoried and drifts"
+        "`env`/`sh -c` unwrap only at command head (`npx jest tests/env -u` and attached `env -S'npx jest -u'` flagged); wrapped interpreters pass (`timeout 30 python3 -u visual_check.py`, `uv run --with pillow python3 -u script.py`) while `timeout 30 npx jest -u` / `uv run pytest --snapshot-update` are flagged; boolean `-u \"\"` / `--snapshot-update none` is regeneration; thresholds align per command signature (swaps and dummy-masked raises flagged, a new `&& c --threshold 0.02` check clean); invariant `covers: ['.factonio/model.cfg']` is inventoried and drifts",
+        "A threshold added to an edited command (`python3 check.py --verbose --threshold 0.5`), a new shell OR (double-pipe) fallback, repo-local wrapper-named heads (`tests/env`, `scripts/sh`, `scripts/python3 --update-snapshots`) and bundled `env -iS 'npx jest -u'` are gate loosening; redirections stay in the command (`> output.txt python3 -u check.py` passes, `> output.txt npx jest -u` flagged)"
       ]
     },
     {
