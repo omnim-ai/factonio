@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-26T12:07:00Z",
+  "generated_at": "2026-11-26T14:00:00Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -89,7 +89,7 @@
         "commands.py"
       ],
       "commands": [
-        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_cli_and_tools tests.test_metrics_history -v'"
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_cli_and_tools tests.test_metrics_history tests.test_workstream_modes -v'"
       ],
       "scenarios": [
         "`add` subcommand runs and exits 0 with --help",
@@ -103,11 +103,13 @@
         "`pr-gate` subcommand runs and exits 0 with --help",
         "`remove` subcommand runs and exits 0 with --help",
         "`restack` subcommand runs and exits 0 with --help",
+        "`start` subcommand runs and exits 0 with --help",
         "`status` subcommand runs and exits 0 with --help",
         "`trail` subcommand runs and exits 0 with --help",
         "`update` subcommand runs and exits 0 with --help",
         "`worktrees` subcommand runs and exits 0 with --help",
-        "`trail --audit` exits 0 when clean and 1 with findings, with `--json` / `--markdown` and tenant/repo/phase/card filters"
+        "`trail --audit` exits 0 when clean and 1 with findings, with `--json` / `--markdown` and tenant/repo/phase/card filters",
+        "`start <repo> <request> --kind feature|bug|quick|refactor|perf|investigate --json` starts a workstream with additive kind / read_only / report_path; `--kind investigate --skip-define` exits 1 without creating a card"
       ]
     },
     {
@@ -117,12 +119,13 @@
         "agent_tools.py"
       ],
       "commands": [
-        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_cli_and_tools tests.test_plugin_registration -v'"
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_cli_and_tools tests.test_plugin_registration tests.test_workstream_modes -v'"
       ],
       "scenarios": [
         "Every factonio_* tool in plugin.yaml provides_tools is registered with a JSON schema",
         "factonio_bootstrap_verify accepts prove (init) and base_ref (check/audit)",
-        "Refused merge/gate trail rows never carry override hints (allow_stacked_merge) in why; only real overrides read as gate_loosening in trail --audit (tests.test_pr_gate_hardening.TestMergeTrailAudit)"
+        "Refused merge/gate trail rows never carry override hints (allow_stacked_merge) in why; only real overrides read as gate_loosening in trail --audit (tests.test_pr_gate_hardening.TestMergeTrailAudit)",
+        "factonio_start `kind` enum equals WORKSTREAM_KINDS (feature, bug, quick, refactor, perf, investigate)"
       ]
     },
     {
@@ -132,11 +135,12 @@
         "orchestrator.py"
       ],
       "commands": [
-        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_orchestrator_and_repos tests.test_verify_panel -v'"
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_orchestrator_and_repos tests.test_verify_panel tests.test_workstream_modes -v'"
       ],
       "scenarios": [
         "Black-box cards receive holdout/ and the harness; implement/diff cards never do",
-        "rigor=high panels fail closed unless every expected lane passes"
+        "rigor=high panels fail closed unless every expected lane passes",
+        "refactor cards pin behavior, perf cards embed the 7+7 benchmark checklist, and investigate rejects skip_define and spawns a read-only `[define] [investigate]` card that writes only investigation.md"
       ]
     },
     {
@@ -251,7 +255,8 @@
       "scenarios": [
         "Every SKILL.md has valid frontmatter and keeps the holdout/ information barrier",
         "verify-blackbox drives from the user's point of view and reports verified-unreachable scenarios as inconclusive, never pass",
-        "verify-diff keeps the Gate-Integrity Audit, MUST KILL rule, certainty ladder and `dropped` list; orchestrator section 4 tiers rigor=high fix-round re-verification and runs a pre-handoff `trail --audit` Attention check"
+        "verify-diff keeps the Gate-Integrity Audit, MUST KILL rule, certainty ladder and `dropped` list; orchestrator section 4 tiers rigor=high fix-round re-verification and runs a pre-handoff `trail --audit` Attention check",
+        "define §1c, verify-diff checklist item 11 and orchestrator §1.4 document the refactor, perf and read-only investigate modes"
       ]
     },
     {
@@ -270,7 +275,7 @@
       "scenarios": [
         "Manifest, skill frontmatter and local doc links stay valid",
         "README media regenerates with tools/capture_readme_media.py",
-        "CHANGELOG Unreleased, docs/architecture.md and THIRD_PARTY_NOTICES.md document each Wave 4 unit"
+        "CHANGELOG Unreleased, docs/architecture.md and THIRD_PARTY_NOTICES.md document each Wave 4 and Wave 5 unit"
       ]
     },
     {
@@ -344,6 +349,7 @@
       "pr-gate",
       "remove",
       "restack",
+      "start",
       "status",
       "trail",
       "update",

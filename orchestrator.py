@@ -28,6 +28,28 @@ from .trail import query_decisions, record_transition
 
 _SLUG_RE = re.compile(r"[^a-z0-9-]+")
 
+WORKSTREAM_KINDS: tuple[str, ...] = ("feature", "bug", "quick", "refactor", "perf", "investigate")
+
+BENCHMARK_PRE_OPT_QUESTIONS: tuple[str, ...] = (
+    "Which user-visible or SLO metric is too slow or too costly, and what are the current and target numbers?",
+    "Is there a reproducible benchmark on fixed, realistic input that measures that metric today?",
+    "Where does the time or memory actually go: what does a profiler (not intuition) show as the hot path?",
+    "Is the bottleneck in our code, or in I/O, the network, a dependency, or the environment?",
+    "What is the best-case bound, and how much of the gap is realistically recoverable?",
+    "Which correctness contracts (outputs, ordering, errors, precision) must stay identical after the change?",
+    "What complexity or maintenance cost is acceptable for the gain, and what result means stop?",
+)
+
+BENCHMARK_MEASUREMENT_MANTRAS: tuple[str, ...] = (
+    "No baseline, no optimization: measure before changing anything.",
+    "Same input, same machine, same build: compare before and after on identical inputs.",
+    "Warm up, then repeat: report median and variance over N runs, never a single sample.",
+    "Change one thing at a time and re-measure after each change.",
+    "Profile, don't guess: attribute every gain to the hot path the profiler showed.",
+    "A faster wrong answer is a regression: correctness tests pass before and after.",
+    "Record the exact benchmark command, environment, and raw numbers so anyone can reproduce them.",
+)
+
 
 def make_tenant(repo_slug: str, *, issue_number: Optional[int] = None, label: Optional[str] = None) -> str:
     """Generate a clean kebab-case Kanban tenant slug for a workstream."""
@@ -63,6 +85,11 @@ def design_dir_path(tenant: str) -> Path:
     path = run_data_dir(tenant) / "design"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def investigation_report_path(tenant: str) -> Path:
+    """Output path of a read-only `investigate` workstream's forensic report."""
+    return run_data_dir(tenant) / "investigation.md"
 
 
 def _has_design_artifacts(tenant: str) -> Optional[Path]:
@@ -162,6 +189,45 @@ def verification_gap_section(escaped_from: str) -> str:
     )
 
 
+def mode_contract_section(kind: str, *, report_path: Optional[Path] = None) -> str:
+    """Mode-specific card section for `refactor`, `perf`, and `investigate` workstreams ("" otherwise)."""
+    if kind == "refactor":
+        return (
+            "## Refactor Contract (behavior preservation)\n"
+            "1. Pin current behavior BEFORE any internal edit: identify the existing contract/characterization "
+            "tests covering every touched public surface (functions, CLI output, API responses, schemas, "
+            "persisted data); add missing characterization tests first and prove they pass on the base.\n"
+            "2. Pinned tests stay byte-for-byte unchanged through the refactor; editing or loosening one is a "
+            "behavior change that needs explicit spec authorization.\n"
+            "3. Diff Check verifies zero unintended behavioral drift: same inputs give the same outputs, errors, "
+            "and side effects before and after.\n"
+        )
+    if kind == "perf":
+        questions = "\n".join(f"{i}. {q}" for i, q in enumerate(BENCHMARK_PRE_OPT_QUESTIONS, 1))
+        mantras = "\n".join(f"{i}. {m}" for i, m in enumerate(BENCHMARK_MEASUREMENT_MANTRAS, 1))
+        return (
+            "## Performance Contract (benchmark-checklist)\n"
+            "Answer every pre-optimization question (in `spec.md`, or in the PR body when Definition is skipped) "
+            "before proposing a change, and follow every measurement mantra. Diff Check compares before/after "
+            "benchmarks on identical inputs, checks warmup and variance, and rejects any correctness regression.\n\n"
+            f"### 7 Pre-Optimization Questions\n{questions}\n\n"
+            f"### 7 Measurement Mantras\n{mantras}\n"
+        )
+    if kind == "investigate":
+        return (
+            "## Investigation Contract (read-only)\n"
+            "This is a strictly read-only forensic / root-cause investigation.\n"
+            f"- Write the findings ONLY to `{report_path}` (symptom, reproduction, eliminated hypotheses with the "
+            "probe that killed each, root cause with file/symbol evidence, and recommended next workstream).\n"
+            "- Do NOT edit, create, or delete repository source files; do NOT commit, push, create branches, "
+            "or open pull requests. Speculative fixes are forbidden.\n"
+            "- Do not author a Task DAG or spawn Implementation cards. If a fix is warranted, recommend a "
+            "follow-up `bug`, `feature`, `refactor`, or `perf` workstream in the report.\n"
+            "- Probes run in a scratch directory or a throwaway clone, never in the registered checkout.\n"
+        )
+    return ""
+
+
 def _completion_contract_for_repo(repo: dict[str, Any]) -> str:
     """Use native GitHub PR contract when branch protection defines required checks."""
     ci_mode = str(repo.get("ci_contract") or "auto").lower()
@@ -188,16 +254,22 @@ def start_workstream(
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
 
+    canon_kind = (kind or "feature").strip().lower()
+    if canon_kind not in WORKSTREAM_KINDS:
+        raise ValueError(f"kind must be one of {', '.join(repr(k) for k in WORKSTREAM_KINDS)}, got {kind!r}")
+    read_only = canon_kind == "investigate"
+    if read_only and skip_define:
+        raise ValueError(
+            "kind='investigate' is a read-only Definition-phase workstream and cannot skip_define; "
+            "use kind='bug' or 'quick' for a code change."
+        )
+
     repo = get_repo(repo_spec)
     if repo is None:
         raise ValueError(
             f"Repository {repo_spec!r} is not registered with Factonio. "
             "Run `hermes factonio add owner/repo` or call `factonio_add_repo` first."
         )
-
-    canon_kind = (kind or "feature").strip().lower()
-    if canon_kind not in {"feature", "bug", "quick"}:
-        raise ValueError(f"kind must be 'feature', 'bug', or 'quick', got {kind!r}")
 
     slug = str(repo["slug"])
     full_repo = str(repo["repo"])
@@ -207,6 +279,8 @@ def start_workstream(
     tenant = make_tenant(slug, issue_number=issue_number, label=short_title if issue_number is None else None)
     spec_path = spec_file_path(tenant)
     holdout_dir = holdout_dir_path(tenant)
+    report_path = investigation_report_path(tenant) if read_only else None
+    mode_section = mode_contract_section(canon_kind, report_path=report_path)
 
     go_direct = skip_define or canon_kind == "quick"
     phase = "implement" if go_direct else "define"
@@ -231,30 +305,60 @@ def start_workstream(
             f"run repository tests, push the branch, open a PR against `{repo.get('default_branch', 'main')}`, "
             f"and record `pr_number`, `published_pr`, `head_sha`, and `repo` in completion metadata.\n"
         )
+        if mode_section:
+            card_body += "\n" + mode_section
         skill_name = "factonio:implement"
         goal_mode = False
         workspace_kind = "worktree"
         workspace_path = repo_path
         contract = _completion_contract_for_repo(repo)
     else:
-        mode_label = "bug diagnosis" if canon_kind == "bug" else "feature definition"
-        card_title = f"{escape_prefix}[define] {short_title}"
-        card_body = (
-            f"## Factonio Definition Card ({mode_label})\n"
-            f"- Repository: `{full_repo}` (`{repo_path}`)\n"
-            f"- Workstream tenant: `{tenant}`\n"
-            f"- Mode: `{canon_kind}`\n"
-            f"- Spec output path: `{spec_path}`\n"
-            f"- Hidden holdout directory: `{holdout_dir}`\n"
-            f"{issue_line}{escape_line}\n"
-            f"## Request\n{request.strip()}\n\n"
-            f"## Instructions\n"
-            f"Follow the preloaded `factonio:define` skill. Inspect the repository at `{repo_path}`, "
-            f"write `{spec_path}` (goals, acceptance criteria, technical approach, and parallel task DAG), "
-            f"and write hidden black-box verification scenarios under `{holdout_dir}` (never referenced inside `spec.md`).\n"
-        )
-        if escaped_from:
-            card_body += "\n" + verification_gap_section(str(escaped_from))
+        if read_only:
+            card_title = f"{escape_prefix}[define] [investigate] {short_title}"
+            card_body = (
+                f"## Factonio Definition Card (read-only investigation)\n"
+                f"- Repository: `{full_repo}` (`{repo_path}`)\n"
+                f"- Workstream tenant: `{tenant}`\n"
+                f"- Mode: `{canon_kind}`\n"
+                f"- Investigation report path: `{report_path}`\n"
+                f"{issue_line}{escape_line}\n"
+                f"## Request\n{request.strip()}\n\n"
+                f"## Instructions\n"
+                f"Follow the preloaded `factonio:define` skill (§1c investigate contract). Inspect the repository at "
+                f"`{repo_path}` read-only, reproduce and root-cause the problem, and write the report to "
+                f"`{report_path}`. Complete the card with `report_path` and `root_cause` in metadata.\n\n"
+                + mode_section
+            )
+            if escaped_from:
+                card_body += (
+                    "\n" + verification_gap_section(str(escaped_from))
+                    + f"In investigate mode, write this analysis into `{report_path}` instead of `spec.md`.\n"
+                )
+        else:
+            mode_label = {
+                "bug": "bug diagnosis",
+                "refactor": "behavior-preserving refactor",
+                "perf": "performance optimization",
+            }.get(canon_kind, "feature definition")
+            card_title = f"{escape_prefix}[define] {short_title}"
+            card_body = (
+                f"## Factonio Definition Card ({mode_label})\n"
+                f"- Repository: `{full_repo}` (`{repo_path}`)\n"
+                f"- Workstream tenant: `{tenant}`\n"
+                f"- Mode: `{canon_kind}`\n"
+                f"- Spec output path: `{spec_path}`\n"
+                f"- Hidden holdout directory: `{holdout_dir}`\n"
+                f"{issue_line}{escape_line}\n"
+                f"## Request\n{request.strip()}\n\n"
+                f"## Instructions\n"
+                f"Follow the preloaded `factonio:define` skill. Inspect the repository at `{repo_path}`, "
+                f"write `{spec_path}` (goals, acceptance criteria, technical approach, and parallel task DAG), "
+                f"and write hidden black-box verification scenarios under `{holdout_dir}` (never referenced inside `spec.md`).\n"
+            )
+            if mode_section:
+                card_body += "\n" + mode_section
+            if escaped_from:
+                card_body += "\n" + verification_gap_section(str(escaped_from))
         skill_name = "factonio:define"
         goal_mode = True
         workspace_kind = "dir"
@@ -295,6 +399,7 @@ def start_workstream(
             "skill": skill_name,
             "issue_number": issue_number,
             "skip_define": bool(go_direct),
+            "read_only": read_only,
             "escaped_from": escaped_from,
             "completion_contract": contract,
         },
@@ -325,6 +430,9 @@ def start_workstream(
         "model": model_info["resolved"],
         "completion_contract": contract,
         "subscribed": subscribed,
+        "kind": canon_kind,
+        "read_only": read_only,
+        "report_path": str(report_path) if report_path is not None else None,
     }
 
 

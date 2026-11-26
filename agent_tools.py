@@ -23,6 +23,7 @@ from .harness import (
 )
 from .metrics import capture_metrics_snapshot
 from .orchestrator import (
+    WORKSTREAM_KINDS,
     evaluate_verification_panel,
     spawn_design_card,
     spawn_implementation_card,
@@ -288,14 +289,16 @@ def register_tools(ctx: Any) -> None:
             "description": (
                 "Start a Factonio software factory workstream on a registered GitHub repo. Creates the initial "
                 "Definition card (or direct Implementation card for quick tasks) on the dedicated `factonio` "
-                "worker profile with the configured phase model."
+                "worker profile with the configured phase model. Kinds: feature, bug, quick, refactor "
+                "(behavior-preservation pins), perf (7 pre-optimization questions + 7 measurement mantras), "
+                "investigate (read-only root-cause report at `report_path`; cannot skip_define, no source edits or PRs)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string", "description": "Registered repo slug or 'owner/repo'."},
                     "request": {"type": "string", "description": "Full problem statement, goal, or issue context."},
-                    "kind": {"type": "string", "enum": ["feature", "bug", "quick"], "default": "feature"},
+                    "kind": {"type": "string", "enum": list(WORKSTREAM_KINDS), "default": "feature"},
                     "title": {"type": "string", "description": "Short workstream title."},
                     "issue_number": {"type": "integer", "description": "Optional GitHub issue number."},
                     "skip_define": {"type": "boolean", "default": False, "description": "Skip Definition phase."},

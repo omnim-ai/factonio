@@ -157,6 +157,7 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 | `hermes factonio list [--json]` | List registered repositories and active settings |
 | `hermes factonio remove <repo>` | Unregister a repository (keeps local files intact) |
 | `hermes factonio models [--repo SLUG] [--json]` | Show resolved provider/model per phase, default rigor, the high-rigor verify panel, and cross-model warning |
+| `hermes factonio start <repo> <request> [--kind feature\|bug\|quick\|refactor\|perf\|investigate] [--title T] [--issue N] [--skip-define] [--escaped-from CARD] [--json]` | Start a workstream; `refactor` pins behavior, `perf` embeds the 7+7 benchmark checklist, `investigate` is read-only (writes `investigation.md`, no PRs, rejects `--skip-define`) |
 | `hermes factonio status [--tenant T] [--json]` | Show active Factonio Kanban workstreams and cards |
 | `hermes factonio panel [panel_id] [--tenant T] [--pr N] [--record] [--json]` | Evaluate a `rigor=high` verification panel's fail-closed consensus (`pass` / `reject` / `inconclusive` / `pending`), disagreement summary, and findings; `--record` logs a terminal consensus to `trail.db` (exits non-zero when no panel matches) |
 | `hermes factonio pr-gate <repo> <pr_number> [--json]` | Inspect live PR HEAD SHA, mergeability, and CI check status |
@@ -172,7 +173,7 @@ You can also edit settings from chat via `factonio_update_repo`, or inline on `/
 
 - `factonio_add_repo` — register a GitHub repository and anchor its Hermes Project
 - `factonio_update_repo` — update per-repository settings (`merge_policy`, `max_fix_rounds`, `default_branch`, `design_provider`, `design_approval`, `default_rigor`)
-- `factonio_start` — start a workstream (`feature`, `bug`, `quick`, or `escaped_from` for post-merge regressions)
+- `factonio_start` — start a workstream (`feature`, `bug`, `quick`, behavior-preserving `refactor`, benchmark-checked `perf`, read-only `investigate`, or `escaped_from` for post-merge regressions); CLI: `hermes factonio start <repo> "<request>" --kind ...`
 - `factonio_spawn_design` — spawn a Phase 1b UI/UX Design card
 - `factonio_spawn_implement` — spawn a scoped git-worktree Implementation card (optionally stacked on a parent PR via `base_branch` / `stack_parent_pr`)
 - `factonio_spawn_verify` — spawn mutually isolated Diff Check and Black-Box Check cards in parallel; `rigor: "high"` (or a repo's `default_rigor: high`) fans out one isolated pair per model of a multi-vendor `verify_panel`, failing closed unless it spans >= 2 vendor families

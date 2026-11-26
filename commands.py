@@ -18,7 +18,7 @@ from .config import (
 )
 from .harness import audit_harness, bootstrap_verify_harness, check_harness, show_harness
 from .metrics import RANGE_SECONDS, capture_metrics_snapshot, compute_metrics, default_kanban_db_path
-from .orchestrator import evaluate_verification_panel, workstream_status
+from .orchestrator import WORKSTREAM_KINDS, evaluate_verification_panel, start_workstream, workstream_status
 from .profile_setup import init_factonio_profile, run_doctor
 from .repos import (
     RepoNotFoundError,
@@ -412,6 +412,30 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             help="Output machine-readable JSON.",
         )
 
+        p_start = sub.add_parser(
+            "start",
+            help="Start a workstream (feature, bug, quick, refactor, perf, or read-only investigate).",
+        )
+        p_start.add_argument("repo", help="Registered repo slug or 'owner/repo'.")
+        p_start.add_argument("request", help="Full problem statement, goal, or issue context.")
+        p_start.add_argument("--kind", choices=list(WORKSTREAM_KINDS), default="feature", help="Workstream mode.")
+        p_start.add_argument("--title", default=None, help="Short workstream title.")
+        p_start.add_argument("--issue", dest="issue_number", type=int, default=None, help="GitHub issue number.")
+        p_start.add_argument(
+            "--skip-define",
+            action="store_true",
+            help="Skip Definition and open an Implementation card (rejected for --kind investigate).",
+        )
+        p_start.add_argument(
+            "--escaped-from", default=None, help="Verification card id the regression escaped from."
+        )
+        p_start.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Output machine-readable JSON.",
+        )
+
         p_status = sub.add_parser("status", help="Show active Factonio Kanban workstreams and cards.")
         p_status.add_argument("--tenant", default=None, help="Filter by workstream tenant.")
 
@@ -544,7 +568,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
 
         if not cmd:
             print(
-                "Usage: hermes factonio {init|add|update|remove|list|models|status|panel|pr-gate|restack|worktrees"
+                "Usage: hermes factonio {init|add|update|remove|list|models|start|status|panel|pr-gate|restack|worktrees"
                 "|harness|trail|metrics|doctor} [--json]"
             )
             return
@@ -707,6 +731,34 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                 _print_panel(res)
             if not res.get("ok"):
                 sys.exit(1)
+            return
+
+        if cmd == "start":
+            try:
+                res = start_workstream(
+                    args.repo,
+                    args.request,
+                    kind=args.kind,
+                    title=args.title,
+                    issue_number=args.issue_number,
+                    skip_define=bool(args.skip_define),
+                    escaped_from=args.escaped_from,
+                )
+            except ValueError as exc:
+                if as_json:
+                    print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+                else:
+                    print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            if as_json:
+                print(json.dumps(res, indent=2, default=str))
+                return
+            print(f"Started {res['kind']} workstream {res['tenant']} on {res['repo']}")
+            print(f"  Card: {res['task_id']} ({res['phase']}, skill {res['skill']})")
+            if res.get("read_only"):
+                print(f"  Read-only investigation report: {res['report_path']}")
+            elif res["phase"] == "define":
+                print(f"  Spec: {res['spec_path']}")
             return
 
         if cmd == "status":
@@ -934,7 +986,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         "factonio",
         help=(
             "Manage the Factonio pure-Hermes software factory "
-            "(init, add, update, models, status, panel, restack, worktrees, harness, trail, metrics, doctor)."
+            "(init, add, update, models, start, status, panel, restack, worktrees, harness, trail, metrics, doctor)."
         ),
         setup_fn=setup_parser,
         handler_fn=handle_cli,
