@@ -596,6 +596,12 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
 
         p_status = sub.add_parser("status", help="Show active Factonio Kanban workstreams and cards.")
         p_status.add_argument("--tenant", default=None, help="Filter by workstream tenant.")
+        p_status.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Output machine-readable JSON.",
+        )
 
         p_pr = sub.add_parser("pr-gate", help="Inspect a GitHub PR's live HEAD and CI check status.")
         p_pr.add_argument("repo", help="Repo slug or 'owner/repo'.")

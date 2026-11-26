@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shlex
 import sqlite3
 import time
 import uuid
@@ -854,6 +855,7 @@ def _diff_card_body(
     design_note = f" and `{design_dir}`" if design_dir else ""
     if local is not None:
         branch, base, sha = local["branch"], local["base_branch"], local["head_sha"]
+        cmds = _local_verify_commands(repo_path, local)
         return (
             f"## Factonio Diff Verification Card (local branch target)\n"
             f"- Repository: `{full_repo}` (`{repo_path}`)\n"
@@ -864,10 +866,13 @@ def _diff_card_body(
             f"- Spec: `{spec_path}`\n"
             f"{design_line}\n"
             f"## Local Target (unpublished; no pull request)\n"
-            f"1. Confirm `git -C {repo_path} rev-parse refs/heads/{branch}` prints exactly `{sha}` "
-            f"(expected_head_sha). Any other value is a `reject` with finding `head_drift`; never verify a moving tip.\n"
-            f"2. Audit `git -C {repo_path} diff <base_ref>...{sha}`, where `<base_ref>` is `origin/{base}` when that "
-            f"remote-tracking ref exists (`git -C {repo_path} fetch origin {base}` first), otherwise `refs/heads/{base}`.\n"
+            f"1. Confirm this command prints exactly `{sha}` (expected_head_sha). Any other value is a `reject` "
+            f"with finding `head_drift`; never verify a moving tip.\n"
+            f"{_shell_block(cmds['rev_parse'])}"
+            f"2. Audit the diff against `origin/{base}` when that remote-tracking ref exists (fetch it first):\n"
+            f"{_shell_block(cmds['fetch_base'] + chr(10) + cmds['diff_remote'])}"
+            f"   otherwise against `refs/heads/{base}`:\n"
+            f"{_shell_block(cmds['diff_local'])}"
             f"3. There is no PR: skip `gh pr diff`, `factonio_pr_gate` and GitHub CI. Do not push, create branches "
             f"or edit the checkout; run probes in a scratch clone.\n\n"
             f"## Information Barrier\n"
@@ -913,6 +918,7 @@ def _blackbox_card_body(
     design_note = f", comparing rendered UI fidelity against `{design_dir}`" if design_dir else ""
     if local is not None:
         branch, base, sha = local["branch"], local["base_branch"], local["head_sha"]
+        cmds = _local_verify_commands(repo_path, local)
         return (
             f"## Factonio Black-Box Verification Card (local branch target)\n"
             f"- Repository: `{full_repo}` (`{repo_path}`)\n"
@@ -926,7 +932,7 @@ def _blackbox_card_body(
             f"{hint_section}\n"
             f"## Local Target (unpublished; no pull request)\n"
             f"Build an isolated scratch checkout of the exact commit from the local repository (no network, no PR):\n"
-            f"`git clone --no-hardlinks {repo_path} app && cd app && git checkout --detach {sha}`\n"
+            f"{_shell_block(cmds['checkout'])}"
             f"Confirm `git rev-parse HEAD` prints exactly `{sha}` before running anything; a mismatch is `inconclusive`. "
             f"Never modify `{repo_path}` or its worktrees, and never push.\n\n"
             f"## Information Barrier\n"
@@ -955,6 +961,29 @@ def _blackbox_card_body(
         f"Return structured metadata with `verdict: pass|reject|inconclusive`, `pr_number: {pr_number}`, "
         f"`repo: {full_repo}`, `scenarios_run`, and `findings: [...]`.\n"
     )
+
+
+def _local_verify_commands(repo_path: str, local: dict[str, str]) -> dict[str, str]:
+    """Runnable shell commands for a local-branch target; every dynamic argument is ``shlex.quote``-d.
+
+    Git ref validation guarantees a well-formed ref, not a shell-safe word: names such as
+    ``feat/x;id`` or ``feat/$(id)`` are valid refs, so quoting is required independently.
+    """
+    q = shlex.quote
+    repo, branch, base, sha = q(str(repo_path)), local["branch"], local["base_branch"], local["head_sha"]
+    return {
+        "rev_parse": f"git -C {repo} rev-parse {q(f'refs/heads/{branch}')}",
+        "fetch_base": f"git -C {repo} fetch origin {q(base)}",
+        "diff_remote": f"git -C {repo} diff {q(f'origin/{base}...{sha}')}",
+        "diff_local": f"git -C {repo} diff {q(f'refs/heads/{base}...{sha}')}",
+        "checkout": f"git clone --no-hardlinks {repo} app && cd app && git checkout --detach {q(sha)}",
+    }
+
+
+def _shell_block(command: str) -> str:
+    longest = max((len(m) for m in re.findall(r"`+", command)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}sh\n{command}\n{fence}\n"
 
 
 def _local_target_lines(local: dict[str, str]) -> str:

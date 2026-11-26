@@ -349,8 +349,9 @@ class TestLocalVerifyCards(unittest.TestCase):
                 self.assertEqual(task.workspace_kind, "scratch")
 
             self.assertEqual(diff.skills, ["factonio:verify-diff"])
-            self.assertIn(f"git -C {repo} rev-parse refs/heads/feat/x", diff.body)
-            self.assertIn(f"git -C {repo} diff <base_ref>...{SHA256}", diff.body)
+            self.assertIn(f"```sh\ngit -C {repo} rev-parse refs/heads/feat/x\n```", diff.body)
+            self.assertIn(f"git -C {repo} fetch origin develop\ngit -C {repo} diff origin/develop...{SHA256}\n", diff.body)
+            self.assertIn(f"git -C {repo} diff refs/heads/develop...{SHA256}\n", diff.body)
             self.assertIn("`origin/develop`", diff.body)
             self.assertIn("`refs/heads/develop`", diff.body)
             self.assertIn("skip `gh pr diff`, `factonio_pr_gate`", diff.body)
@@ -361,7 +362,7 @@ class TestLocalVerifyCards(unittest.TestCase):
 
             self.assertEqual(bb.skills, ["factonio:verify-blackbox"])
             self.assertIn(
-                f"git clone --no-hardlinks {repo} app && cd app && git checkout --detach {SHA256}", bb.body
+                f"```sh\ngit clone --no-hardlinks {repo} app && cd app && git checkout --detach {SHA256}\n```", bb.body
             )
             self.assertIn("`git rev-parse HEAD`", bb.body)
             self.assertIn(holdout, bb.body)
@@ -423,13 +424,75 @@ class TestLocalVerifyCards(unittest.TestCase):
                         self.assertIn(f"- Local branch target: `feat/x` (base=`main`, head=`{SHA}`)", task.body)
                         self.assertIn("## Verification Panel Lane", task.body)
                     self.assertNotIn(holdout, diff.body)
-                    self.assertIn(f"git -C {repo} diff <base_ref>...{SHA}", diff.body)
+                    self.assertIn(f"git -C {repo} diff origin/main...{SHA}", diff.body)
                     self.assertIn(holdout, bb.body)
                     self.assertIn("## Repo Verification Harness", bb.body)
                     self.assertIn("--no-hardlinks", bb.body)
             ev = _trail_rows("spawn_verify", "t-hl")[0]["evidence"]
             self.assertEqual((ev["panel_id"], ev["target_mode"], ev["branch"], ev["head_sha"]),
                              (panel["panel_id"], "local", "feat/x", SHA))
+
+    def test_generated_commands_are_shell_quoted_and_execute_exactly(self):
+        import re as _re
+        import shlex
+
+        from factonio.orchestrator import spawn_verification_pair
+        from factonio.repos import add_repo
+
+        fences = _re.compile(r"^```sh\n(.*?)\n```$", _re.MULTILINE | _re.DOTALL)
+        with isolated_hermes_home() as home, _git_env():
+            root = home / "dir with spaces" / "it's $HOME;x"
+            repo = root / "svc repo"
+            repo.mkdir(parents=True)
+            _git(repo, "init", "-q", "-b", "main")
+            (repo / "a.txt").write_text("a\n", encoding="utf-8")
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-q", "-m", "init")
+            base = "base|touch${IFS}pwned-base"
+            branch = "feat/x$(touch${IFS}pwned-sub);touch${IFS}pwned-semi"
+            for name in (base, branch):
+                subprocess.run(["git", "check-ref-format", "--branch", name], check=True, capture_output=True)
+            _git(repo, "branch", base)
+            _git(repo, "checkout", "-q", "-b", branch)
+            (repo / "b.txt").write_text("b\n", encoding="utf-8")
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-q", "-m", "feature")
+            sha = _git(repo, "rev-parse", "HEAD")
+            _git(repo, "remote", "add", "origin", str(repo))
+            add_repo("acme/svc", local_path=str(repo), clone=False, inspect_remote=False)
+
+            res = spawn_verification_pair("acme/svc", "t-sh", branch=branch, base_branch=base, head_sha=sha)
+            diff_body = _get_task(res["verify_diff_task_id"]).body
+            bb_body = _get_task(res["verify_blackbox_task_id"]).body
+            diff_cmds, bb_cmds = fences.findall(diff_body), fences.findall(bb_body)
+            self.assertEqual(len(diff_cmds), 3, diff_body)
+            self.assertEqual(len(bb_cmds), 1, bb_body)
+            q = shlex.quote
+            self.assertEqual(diff_cmds[0], f"git -C {q(str(repo))} rev-parse {q('refs/heads/' + branch)}")
+
+            scratch = home / "scratch dir"
+            scratch.mkdir()
+
+            def sh(cmd: str) -> subprocess.CompletedProcess:
+                return subprocess.run(["sh", "-c", cmd], cwd=str(scratch), capture_output=True, text=True, check=False)
+
+            proc = sh(diff_cmds[0])
+            self.assertEqual((proc.returncode, proc.stdout.strip()), (0, sha), proc.stderr)
+            expected_remote = subprocess.run(
+                ["git", "-C", str(repo), "diff", f"refs/heads/{base}...{sha}"], capture_output=True, text=True, check=True
+            ).stdout
+            self.assertIn("b.txt", expected_remote)
+            proc = sh(diff_cmds[1])
+            self.assertEqual((proc.returncode, proc.stdout), (0, expected_remote), proc.stderr)
+            self.assertEqual(_git(repo, "rev-parse", f"refs/remotes/origin/{base}"), _git(repo, "rev-parse", f"refs/heads/{base}"))
+            proc = sh(diff_cmds[2])
+            self.assertEqual((proc.returncode, proc.stdout), (0, expected_remote), proc.stderr)
+            proc = sh(bb_cmds[0] + " && git rev-parse HEAD")
+            self.assertEqual((proc.returncode, proc.stdout.strip()), (0, sha), proc.stderr)
+            self.assertTrue((scratch / "app" / "b.txt").is_file())
+
+            planted = list(home.rglob("pwned*")) + list(Path.cwd().glob("pwned*"))
+            self.assertEqual(planted, [])
 
     def test_blackbox_checkout_command_isolates_unpushed_worktree_commit(self):
         with tempfile.TemporaryDirectory() as tmp, _git_env():
@@ -588,6 +651,69 @@ class TestLocalTargetMetrics(unittest.TestCase):
             code, text, _ = run("--json", "status", "--tenant", "t-lp")
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(text)["settings_publish_policy"], "auto")
+
+    def test_pr_panel_worker_metadata_never_shadows_local_branch_panel(self):
+        from factonio.metrics import load_panel_lanes, thread_cards
+        from factonio.orchestrator import evaluate_verification_panel, spawn_verification_pair
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            loc = spawn_verification_pair(
+                "acme/svc", "t-sh2", branch="feat/x", head_sha=SHA, rigor="high", panel_models=TWO_VENDORS,
+            )
+            for lane in loc["panel"]["lanes"]:
+                _complete(lane["verify_diff_task_id"], "pass", branch="feat/x", head_sha=SHA)
+                _complete(lane["verify_blackbox_task_id"], "pass", scenarios_run=1)
+            pr = spawn_verification_pair("acme/svc", "t-sh2", 9, head_sha=SHA, rigor="high", panel_models=TWO_VENDORS)
+            leaked = pr["panel"]["lanes"][0]["verify_diff_task_id"]
+            _complete(leaked, "pass", branch="feat/x", head_sha=SHA)
+
+            ev = evaluate_verification_panel(tenant="t-sh2", branch="feat/x", record_trail=False)
+            self.assertTrue(ev["ok"], ev)
+            self.assertEqual((ev["panel_id"], ev["consensus"], ev["pr"]), (loc["panel"]["panel_id"], "pass", None))
+            self.assertEqual(ev["missing_lane_ids"], [])
+
+            grouped = load_panel_lanes(home / "kanban.db", tenant="t-sh2")
+            pr_lanes = grouped[pr["panel"]["panel_id"]]
+            self.assertEqual(len(pr_lanes), 4)
+            for lane in pr_lanes:
+                self.assertEqual(lane["pr"]["number"], 9)
+                self.assertIsNone(lane["local_target"])
+            self.assertEqual(
+                set(load_panel_lanes(home / "kanban.db", tenant="t-sh2", branch="feat/x")), {loc["panel"]["panel_id"]}
+            )
+            card = next(c for c in thread_cards(home / "kanban.db", tenant="t-sh2")["cards"] if c["id"] == leaked)
+            self.assertEqual((card["pr"]["number"], card["local_target"]), (9, None))
+
+    def test_newer_published_run_hides_stale_local_target(self):
+        from factonio.metrics import _card_targets, _extract_local_target
+
+        task = {"title": "[implement] Unit", "body": "impl", "skills": json.dumps(["factonio:implement"])}
+        run1 = {"metadata": json.dumps({"branch": "feat/x", "base_branch": "main", "head_sha": SHA, "repo": "acme/svc"})}
+        for run2_meta in (
+            {"pr_number": 9, "repo": "acme/svc", "head_sha": SHA256},
+            {"published_pr": "https://github.com/acme/svc/pull/9", "branch": "feat/x", "head_sha": SHA256},
+            {"pr_url": "https://github.com/acme/svc/pull/9"},
+        ):
+            with self.subTest(run2=run2_meta):
+                runs = [run1, {"metadata": json.dumps(run2_meta)}]
+                self.assertIsNone(_extract_local_target(task, runs))
+                pr, local = _card_targets(task, runs)
+                self.assertEqual((pr["repo"], pr["number"]), ("acme/svc", 9))
+                self.assertIsNone(local)
+        pr, local = _card_targets(task, [run1])
+        self.assertIsNone(pr)
+        self.assertEqual((local["branch"], local["source"]), ("feat/x", "metadata"))
+
+    def test_status_json_after_subcommand(self):
+        with isolated_hermes_home() as home:
+            _register(home, publish_policy="ask")
+            run = _cli()
+            for argv in (("status", "--tenant", "t-js", "--json"), ("--json", "status", "--tenant", "t-js")):
+                with self.subTest(argv=argv):
+                    code, text, err = run(*argv)
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(json.loads(text)["settings_publish_policy"], "auto")
 
     def test_implementation_handoff_local_target_and_settings_policy(self):
         from factonio.config import save_settings

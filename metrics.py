@@ -398,24 +398,36 @@ def _extract_local_target(task: dict[str, Any], runs: list[dict[str, Any]]) -> O
 
     The orchestrator-written ``Local branch target:`` card stamp wins over worker-reported metadata;
     metadata (latest run first) counts only with a full commit SHA and no PR reference, e.g. a
-    ``publish_policy: ask`` Implementation card's completion handoff.
+    ``publish_policy: ask`` Implementation card's completion handoff. Scanning stops at the newest
+    run that published a PR, so an earlier unpublished run's handoff never reads as current.
     """
     stamped = _local_target_from_body(task.get("body"))
     if stamped is not None:
         return stamped
     for run in reversed(runs):
-        found = _local_target_from_metadata(_parse_json_dict(run.get("metadata")))
+        meta = _parse_json_dict(run.get("metadata"))
+        if meta.get("pr_number") or meta.get("published_pr") or meta.get("pr_url"):
+            return None
+        found = _local_target_from_metadata(meta)
         if found is not None:
             return found
     return None
 
 
 def _card_targets(task: dict[str, Any], runs: list[dict[str, Any]]) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
-    """``(pr, local_target)``; a stamped local card has no PR, even if its branch name looks like ``a/b#1``."""
-    local = _extract_local_target(task, runs)
-    if local is not None and local.get("source") == "card":
-        return None, local
-    return _extract_pr_ref(task, runs), local
+    """``(pr, local_target)``; at most one is set.
+
+    A stamped local card has no PR, even if its branch name looks like ``a/b#1``. Verification cards
+    only ever take their target from the orchestrator stamp: worker-reported ``branch`` / ``head_sha``
+    metadata on a PR-target lane must never turn it into a local-branch lane.
+    """
+    stamped = _local_target_from_body(task.get("body"))
+    if stamped is not None:
+        return None, stamped
+    pr = _extract_pr_ref(task, runs)
+    if pr is not None or classify_phase(task) in _VERIFY_PHASES:
+        return pr, None
+    return None, _extract_local_target(task, runs)
 
 
 def _panel_lane(task: dict[str, Any], runs: list[dict[str, Any]], tag: dict[str, str]) -> dict[str, Any]:
@@ -548,8 +560,10 @@ def load_panel_lanes(
         lane = _panel_lane(task, runs_by_task.get(task["id"], []), tag)
         if pr_number is not None and int((lane.get("pr") or {}).get("number") or -1) != int(pr_number):
             continue
-        if branch is not None and (lane.get("local_target") or {}).get("branch") != branch:
-            continue
+        if branch is not None:
+            local = lane.get("local_target") or {}
+            if lane.get("pr") is not None or local.get("source") != "card" or local.get("branch") != branch:
+                continue
         grouped.setdefault(tag["panel_id"], []).append(lane)
     return grouped
 
