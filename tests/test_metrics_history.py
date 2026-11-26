@@ -840,6 +840,32 @@ class TestBestEffortLockBudget(unittest.TestCase):
                 self.assertLess(time.monotonic() - start, 2.0)
             self.assertEqual(len(trail.query_metric_snapshots()), 2)
 
+    def test_spent_budget_still_completes_uncontended_cold_init_but_fails_fast_when_held(self):
+        """Regression for the CI flake: slow uncontended cold init must not read as lock contention.
+
+        A spent best-effort budget (``lock_budget_s=0``) stands in for a slow CI disk eating 0.75 s
+        in the WAL switch + schema creation; the empty `trail.db` mirrors what earlier refused
+        attempts leave behind.
+        """
+        from factonio import trail
+        from factonio.metrics import capture_metrics_snapshot
+
+        with isolated_hermes_home() as home, _no_worker_env():
+            _seed_kanban_db(home / "kanban.db", time.time())
+            db = trail.trail_db_path()
+            db.parent.mkdir(parents=True, exist_ok=True)
+            db.touch()
+            lock = db.with_name(db.name + ".lock")
+            with _flock_held_by_child(lock), self.assertLogs("factonio.metrics", level="WARNING") as logs:
+                start = time.monotonic()
+                self.assertIsNone(capture_metrics_snapshot(source="merge", tenant="t1", lock_budget_s=0.0))
+                self.assertLess(time.monotonic() - start, 1.0)
+            self.assertIn("locked", "\n".join(logs.output))
+
+            snap = capture_metrics_snapshot(source="merge", tenant="t1", lock_budget_s=0.0)
+            self.assertIsNotNone(snap)
+            self.assertEqual([r["id"] for r in trail.query_metric_snapshots()], [snap["id"]])
+
     def test_sqlite_exclusive_lock_degrades_capture_within_budget(self):
         from factonio import trail
         from factonio.metrics import capture_metrics_snapshot

@@ -799,8 +799,9 @@ class TestTrailAudit(unittest.TestCase):
             closed = log("verify_verdict", tenant="w", phase="verify", card_id="t_a", why="bug", evidence=ev,
                          result="reject")
             log("merge_pr", tenant="w", phase="merge", card_id="t_a", why="fixed", evidence=ev, result="merged")
-            other_card = log("verify_verdict", tenant="w", phase="verify", card_id="t_b", why="bug", evidence=ev,
-                             result="inconclusive")
+            # A different PR, so the later PR #1 `ready` row cannot close it via PR-scoped closure.
+            other_card = log("verify_verdict", tenant="w", phase="verify", card_id="t_b", why="bug",
+                             evidence={"pr_number": 2}, result="inconclusive")
             tenant_wide = log("pr_gate", tenant="w", phase="gate", why="conflict", evidence=ev, result="blocked")
             log("pr_gate", tenant="w", phase="gate", card_id="t_c", why="green", evidence=ev, result="ready")
             # A resolution logged before the escalation does not close it.
@@ -824,8 +825,127 @@ class TestTrailAudit(unittest.TestCase):
             self.assertEqual(self._kinds(scoped)["unclosed_escalation"], {other_card["id"]})
             self.assertEqual(scoped["filters"], {"tenant": "w", "repo": None, "phase": "verify", "card_id": None})
 
-            log("verify_verdict", tenant="w", phase="verify", card_id="t_b", why="fixed", evidence=ev, result="pass")
+            log("verify_verdict", tenant="w", phase="verify", card_id="t_b", why="fixed", evidence={"pr_number": 2},
+                result="pass")
             self.assertTrue(trail.audit_trail_evidence(tenant="w", card_id="t_b")["clean"])
+
+    def test_pr_scoped_escalations_close_across_cards_only_for_the_same_pr(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            log = trail.log_decision
+            gate = log("pr_gate", tenant="w", phase="gate", card_id="t_verify", why="CI red",
+                       evidence={"pr_number": 26, "head_sha": "a" * 40}, result="blocked")
+            nested = log("verify_verdict", tenant="w", phase="verify", card_id="t_panel", why="bug",
+                         evidence={"gate": {"pr_number": 27}}, result="reject")
+            other_pr = log("pr_gate", tenant="w", phase="gate", card_id="t_other", why="CI red",
+                           evidence={"pr_number": 28}, result="blocked")
+            no_pr = log("verify_verdict", tenant="w", phase="verify", card_id="t_nopr", why="bug",
+                        evidence={"tests_run": 3}, result="reject")
+            cross_tenant = log("pr_gate", tenant="v", phase="gate", card_id="t_v", why="CI red",
+                               evidence={"pr_number": 26}, result="blocked")
+            stale = log("pr_gate", tenant="w", phase="gate", card_id="t_stale", why="CI red",
+                        evidence={"pr_number": 29}, result="blocked")
+            wrong = log("merge_pr", tenant="w", phase="merge", card_id="t_rebase", why="merged",
+                        evidence={"pr_number": 29}, result="merged")
+            log("merge_pr", tenant="w", phase="merge", card_id="t_rebase", why="merged",
+                evidence={"pr_number": 29, "head_sha": "b" * 40}, result="blocked", supersedes_id=wrong["id"])
+
+            # Later rebase/merge cards and a tenant-wide row resolve PRs 26/27 (plus a no-PR resolver).
+            log("merge_pr", tenant="w", phase="merge", card_id="t_rebase", why="merged",
+                evidence={"pr_number": 26, "head_sha": "c" * 40}, result="merged")
+            log("pr_gate", tenant="w", phase="gate", why="green", evidence={"pr_number": "27"}, result="ready")
+            log("merge_pr", tenant="w", phase="merge", card_id="t_x", why="merged", evidence={"tests_run": 3},
+                result="merged")
+            log("merge_pr", tenant="w", phase="merge", card_id="t_y", why="merged",
+                evidence={"pr_number": True}, result="merged")
+
+            unclosed = self._kinds(trail.audit_trail_evidence())["unclosed_escalation"]
+            self.assertNotIn(gate["id"], unclosed)
+            self.assertNotIn(nested["id"], unclosed)
+            # Different PR, no PR (strict card scope), other tenant, superseded resolver: all stay open.
+            self.assertEqual(unclosed, {other_pr["id"], no_pr["id"], cross_tenant["id"], stale["id"]})
+
+        # A resolution logged before the escalation never closes it, even for the same PR.
+        with isolated_hermes_home():
+            trail.log_decision("merge_pr", tenant="w", phase="merge", card_id="t_m", why="merged",
+                               evidence={"pr_number": 30}, result="merged")
+            late = trail.log_decision("pr_gate", tenant="w", phase="gate", card_id="t_g", why="CI red",
+                                      evidence={"pr_number": 30}, result="blocked")
+            self.assertEqual(self._kinds(trail.audit_trail_evidence())["unclosed_escalation"], {late["id"]})
+
+    def test_malformed_pr_numbers_are_treated_as_absent_without_crashing_audit(self):
+        from factonio import trail
+
+        for bad in ("²", "9" * 5000, "١٢", " 0 ", "-3"):
+            with self.subTest(pr_number=bad[:8]), isolated_hermes_home():
+                esc = trail.log_decision("pr_gate", tenant="w", phase="gate", card_id="t_g", why="CI red",
+                                         evidence={"pr_number": bad}, result="blocked")
+                trail.log_decision("merge_pr", tenant="w", phase="merge", card_id="t_m", why="merged",
+                                   evidence={"gate": {"pr_number": bad}}, result="merged")
+                audit = trail.audit_trail_evidence()
+                self.assertTrue(audit["ok"])
+                self.assertEqual(audit["counts"]["unclosed_escalation"], 1)
+                self.assertEqual(self._kinds(audit)["unclosed_escalation"], {esc["id"]})
+
+        # A malformed resolver in an unrelated tenant must not break a scoped audit.
+        with isolated_hermes_home():
+            trail.log_decision("merge_pr", tenant="w", phase="merge", card_id="t_m", why="merged",
+                               evidence={"pr_number": "²"}, result="merged")
+            esc = trail.log_decision("pr_gate", tenant="other", phase="gate", card_id="t_o", why="CI red",
+                                     evidence={"pr_number": 5}, result="blocked")
+            audit = trail.audit_trail_evidence(tenant="other")
+            self.assertTrue(audit["ok"])
+            self.assertEqual(self._kinds(audit)["unclosed_escalation"], {esc["id"]})
+
+    def test_non_enacting_rows_flag_only_explicit_override_keys(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            log = trail.log_decision
+            quiet = [
+                log("start", tenant="w", phase="define", why="Wave 4: harden gate_loosening detection",
+                    evidence={"request": "fix gate_loosening and allow_stacked_merge false positives"},
+                    result="started"),
+                log("spawn_implement", tenant="w", phase="implement", card_id="t_i",
+                    why="Implement gate-loosening detector", evidence={"title": "gate_loosening audit",
+                                                                     "allow_stacked_merge": False},
+                    result="spawned"),
+                log("spawn_design", tenant="w", phase="design", card_id="t_d", why="skip test UI",
+                    evidence={"title": "design"}, result="spawned"),
+                log("spawn_verify", tenant="w", phase="verify", card_id="t_v", why="verify force_merge fix",
+                    evidence={"pr_number": 5, "skip_test": "false"}, result="spawned"),
+                log("verify_panel_consensus", tenant="w", phase="verify", card_id="t_p",
+                    why="Blocked: refused merge still logs allow_stacked_merge=True (gate_loosening)",
+                    evidence={"pr_number": 5, "findings": ["allow_stacked_merge hint in why"]}, result="reject"),
+                log("merge_pr", tenant="w", phase="merge", card_id="t_m", why="needs allow_stacked_merge",
+                    evidence={"pr_number": 5, "error": "pass allow_stacked_merge=True"}, result="refused"),
+            ]
+            loud = [
+                log("spawn_implement", tenant="w", phase="implement", card_id="t_i2", why="dispatch",
+                    evidence={"title": "x", "bypass_gate": True}, result="spawned"),
+                log("verify_panel_consensus", tenant="w", phase="verify", card_id="t_p2", why="reject",
+                    evidence={"pr_number": 6, "skip-gate": "yes"}, result="reject"),
+                log("merge_pr", tenant="w", phase="merge", card_id="t_m2", why="refused",
+                    evidence={"pr_number": 6, "allow_patch_continuity": True}, result="refused"),
+                # Enacting rows keep full prose + evidence scanning.
+                log("verify_panel_consensus", tenant="w", phase="verify", card_id="t_p3", why="ok to force merge",
+                    evidence={"pr_number": 7}, result="pass"),
+                log("note", tenant="w", phase="implement", card_id="t_n", why="raise timeout for CI",
+                    evidence={"files": ["ci.yml"]}),
+                log("merge_pr", tenant="w", phase="merge", card_id="t_m3", why="continuity",
+                    evidence={"pr_number": 8, "allow_patch_continuity": True}, result="merged"),
+            ]
+
+            audit = trail.audit_trail_evidence(tenant="w")
+            flagged = {f["decision_id"]: f["tokens"] for f in audit["findings"] if f["kind"] == "gate_loosening"}
+            self.assertEqual(set(flagged), {r["id"] for r in loud}, flagged)
+            for row in quiet:
+                self.assertNotIn(row["id"], flagged)
+            self.assertEqual(flagged[loud[0]["id"]], ["bypass_gate"])
+            self.assertEqual(flagged[loud[1]["id"]], ["skip_gate"])
+            self.assertEqual(flagged[loud[2]["id"]], ["allow_patch_continuity"])
+            self.assertEqual(flagged[loud[5]["id"]], ["allow_patch_continuity"])
 
     def test_inspects_every_row_beyond_display_limit_and_is_read_only(self):
         import hashlib
