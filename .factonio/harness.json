@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-26T21:34:58Z",
+  "generated_at": "2026-11-26T22:15:00Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -63,7 +63,8 @@
         "plugin.yaml declares every factonio_* tool and bundled skill",
         "harness-audit blueprint pairs `harness audit` with a live `harness check --run-doctor --run-hooks` and the doc_drift / harness_gap / product_regression rubric",
         "plugin.yaml config_schema declares `initial_progress_minutes` (default 10) and the retro blueprint maintains the AGENTS.md Rule-to-Enforcer ledger",
-        "ORCHESTRATOR_PROMPT_SECTION stays under 2,900 characters and documents publish_policy, local-only Implementation and local-branch verification on `ask`, and `factonio_publish_pr` only after explicit human approval"
+        "ORCHESTRATOR_PROMPT_SECTION stays under 2,900 characters and documents publish_policy, local-only Implementation and local-branch verification on `ask`, and `factonio_publish_pr` only after explicit human approval",
+        "issue-intake blueprint runs stop-the-line -> allowlist -> dedup -> .factonio/ translation -> 2x repro -> verify-existing-fix -> factonio_start(kind=\"bug\", issue_number=N), with no Slack or IDE glue"
       ]
     },
     {
@@ -99,6 +100,7 @@
         "`doctor` subcommand runs and exits 0 with --help",
         "`harness` subcommand runs and exits 0 with --help",
         "`init` subcommand runs and exits 0 with --help",
+        "`issues` subcommand runs and exits 0 with --help",
         "`list` subcommand runs and exits 0 with --help",
         "`metrics` subcommand runs and exits 0 with --help",
         "`models` subcommand runs and exits 0 with --help",
@@ -132,7 +134,8 @@
         "factonio_bootstrap_verify accepts prove (init) and base_ref (check/audit)",
         "Refused merge/gate trail rows never carry override hints (allow_stacked_merge) in why; only real overrides read as gate_loosening in trail --audit (tests.test_pr_gate_hardening.TestMergeTrailAudit)",
         "factonio_start `kind` enum equals WORKSTREAM_KINDS (feature, bug, quick, refactor, perf, investigate)",
-        "factonio_publish_pr passes raw arguments to repos.publish_pr (no coercion; title=None, non-boolean draft, empty base_branch/remote and missing keys are refused); factonio_add_repo / factonio_update_repo accept publish_policy auto|ask, an omitted publish_policy inherits/preserves and an explicit null is refused without mutating repos.json"
+        "factonio_publish_pr passes raw arguments to repos.publish_pr (no coercion; title=None, non-boolean draft, empty base_branch/remote and missing keys are refused); factonio_add_repo / factonio_update_repo accept publish_policy auto|ask, an omitted publish_policy inherits/preserves and an explicit null is refused without mutating repos.json",
+        "factonio_triage_issues supports action triage | verify_existing_fix, is listed in plugin.yaml provides_tools, and rejects boolean or sub-minimum integers (required_runs >= 2; pr_number, issue_number, limit >= 1)"
       ]
     },
     {
@@ -209,6 +212,28 @@
         "`harness check --base <ref>` fails when a required hook is removed or downgraded to optional or a Doctor command is dropped; `audit` reports gate_loosening as stale",
         "`audit` drift_classification ranks product_regression > harness_gap > doc_drift > clean",
         "Malformed `harness.json` (invalid JSON or unsupported schema_version) makes `audit` stale and classifies as harness_gap; removing a required hook a hook-less `harness.json` inherits from verify.md is gate loosening"
+      ]
+    },
+    {
+      "id": "issue-intake",
+      "surface": "GitHub Issues intake & verify-existing-fix",
+      "paths": [
+        "issues.py"
+      ],
+      "commands": [
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_issue_intake -v'"
+      ],
+      "scenarios": [
+        "`issues <repo> --json` triages open issues read-only (paginated gh REST issue reads + cursor-paginated `gh api graphql` open-PR reads only) and sorts stop-the-line labels (security, cve, p0, sev0, sev1, outage, data-loss, critical) first",
+        "Deny labels, a missing `--require-label` opt-in, or a non-allowlisted author/association make an issue skip_denied / skip_not_allowed; stop-the-line issues still escalate (even with a deny label) but never automate over a denied, claimed, duplicate or PR-linked issue; closed issues are skip_closed",
+        "Active `<slug>-i<N>` cards, open PRs that Fixes/Closes/Resolves #N (same-repo closingIssuesReferences only), and `duplicate of #M` / older look-alike titles yield in_progress, verify_existing_fix and duplicate; a corrupt, directory or dangling-symlink kanban.db fails closed as blocked_dedup_error; REST issue reads paginate past pull requests",
+        "Issue text is untrusted data: never executed, quarantined with injection_signals, and commands come only from the .factonio/ harness committed at HEAD (dirty, staged or untracked working-tree copies are ignored and flagged)",
+        "Reproduction needs >= 2 runs with explicit fresh_state true and distinct non-blank run_ids (1-of-2 is flaky; bare booleans never count); verify_existing_fix needs full 40-char head_sha/base_sha, 2 before-runs on one full base commit SHA (never the PR head; missing, abbreviated or mixed commits are rejected) and 2 after-runs at the exact PR head_sha with no run_id reuse, and any still-reproducing head run after a deterministic base is fix_incomplete, the only verdict that allows a duplicate fix",
+        "issue_intake_triage / issue_intake_verify_fix rows land in trail.db without issue text",
+        "Every open issue and PR is enumerated before `--limit`: a newer stop-the-line issue is triaged first even behind 30+ older issues or outside a `--label` filter, and duplicate detection always uses the unfiltered open-issue pool",
+        "Linked PRs beyond the first 100 open PRs are found in list and `--issue N` modes; hitting the issue or PR page safety cap sets issues_truncated / pr_dedup_truncated and blocks automation",
+        "Every open PR's closingIssuesReferences is paginated (100 per page, then per-PR follow-up pages up to 20): a 51st or 105th closing reference routes to verify_existing_fix in list and `--issue N` modes; a nested page cap, an outer open-PR or nested page with missing, null, non-object or non-boolean-hasNextPage pageInfo, hasNextPage without a non-empty endCursor, or a failed follow-up query sets pr_dedup_truncated (with pr_dedup_reason) and blocks automation, and `--json` always prints valid JSON (never an AttributeError); same-repo `Fixes https://github.com/<owner>/<repo>/issues/N` URLs count as links, other repos never do",
+        "A malformed `pullRequests.nodes` entry (null, number, string, no positive integer `number`, null, missing or non-string title/body (GitHub `String!`; an empty string is valid), or a present non-string url/headRefName/headRefOid/baseRefName or non-boolean isDraft) or `closingIssuesReferences` container/node (missing, null, non-object, boolean/non-positive/non-integer `number`, present non-string `url`, non-object non-null `repository`, present non-string `repository.nameWithOwner`) on any inline or follow-up page is never skipped: `pr_dedup_truncated` true with a `pr_dedup_reason`, every issue `blocked_dedup_error` / `automate: false` in `issues --json`, `--issue N` and `factonio_triage_issues`; valid empty `nodes: []` pages and PRs with `title: \"Fix bug\", body: \"\"` stay ready"
       ]
     },
     {
@@ -340,7 +365,8 @@
         "recall, crash-pickup and core-principle contracts are covered in tests.test_recall_and_principles",
         "spaced and tab-interleaved holdout recall paths are covered end to end (log_decision -> trail --recall --json/--markdown -> Definition card) in tests.test_recall_and_principles",
         "ANSI CSI, OSC, DCS and C1 escape sequences inside holdout recall paths are covered end to end (log_decision -> trail --recall --json/--markdown -> Definition card) in tests.test_recall_and_principles",
-        "publish_policy prompt, skill, docs and plugin.yaml contracts are covered in tests.test_plugin_registration"
+        "publish_policy prompt, skill, docs and plugin.yaml contracts are covered in tests.test_plugin_registration",
+        "Malformed GraphQL open-PR and closing-reference nodes (inline and follow-up pages) fail closed across triage, CLI and tool entrypoints in tests.test_issue_intake.TestMalformedGraphqlNodes"
       ]
     }
   ],
@@ -393,6 +419,7 @@
       "doctor",
       "harness",
       "init",
+      "issues",
       "list",
       "metrics",
       "models",

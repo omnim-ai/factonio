@@ -20,6 +20,7 @@ from .config import (
     resolve_verify_panel,
 )
 from .harness import audit_harness, bootstrap_verify_harness, check_harness, show_harness
+from .issues import triage_repo_issues
 from .metrics import RANGE_SECONDS, capture_metrics_snapshot, compute_metrics, default_kanban_db_path
 from .orchestrator import WORKSTREAM_KINDS, evaluate_verification_panel, start_workstream, workstream_status
 from .profile_setup import init_factonio_profile, run_doctor
@@ -424,6 +425,36 @@ def _handle_arena(args: Any, as_json: bool) -> None:
         sys.exit(1)
 
 
+def _print_issue_triage(res: dict[str, Any]) -> None:
+    summary = res["summary"]
+    counts = ", ".join(f"{k}={v}" for k, v in summary["counts"].items() if v)
+    print(f"Issue intake for {res['repo']} (read-only): {summary['total']} issue(s){': ' + counts if counts else ''}")
+    for item in res["issues"]:
+        flag = " [STOP THE LINE]" if item["stop_the_line"] else ""
+        print(f"  #{item['number']} {item['disposition']}{flag} (untrusted title: {item['title']!r})")
+        print(f"      next: {item['next_action']}")
+        for pr in item["dedup"]["linked_prs"]:
+            print(f"      linked PR #{pr['number']} head={str(pr.get('head_sha') or '?')[:12]}")
+        for dup in item["dedup"]["duplicate_of"]:
+            print(f"      duplicate of #{dup['number']} ({dup['reason']})")
+        env = item.get("environment") or {}
+        if env.get("matched_features"):
+            print("      .factonio/ features: " + ", ".join(f["id"] for f in env["matched_features"]))
+        signals = item["untrusted_issue"]["injection_signals"]
+        if signals:
+            print("      untrusted-text signals (ignored): " + ", ".join(signals))
+    if summary.get("stop_the_line_outside_filter"):
+        print("Stop-the-line issues outside --label filter (included): "
+              + ", ".join(f"#{n}" for n in summary["stop_the_line_outside_filter"]))
+    if res.get("issues_truncated"):
+        print("WARNING: open issues exceeded the enumeration safety cap; automation is blocked for every issue.")
+    if res.get("pr_dedup_truncated"):
+        why = res.get("pr_dedup_reason") or "open pull requests exceeded the enumeration safety cap"
+        print(f"WARNING: {why}; automation is blocked for every issue.")
+    if res.get("trail_decision_id"):
+        print(f"Logged issue_intake_triage to trail.db ({res['trail_decision_id']}).")
+
+
 def register_cli(ctx: Any, plugin_dir: Path) -> None:
     """Register `hermes factonio <subcommand>`."""
 
@@ -703,6 +734,36 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             help="Output machine-readable JSON.",
         )
 
+        p_iss = sub.add_parser(
+            "issues",
+            help="Read-only GitHub Issues intake triage (stop-the-line, allowlist, dedup, .factonio/ translation).",
+        )
+        p_iss.add_argument("repo", help="Registered repo slug or 'owner/repo'.")
+        p_iss.add_argument("--issue", type=int, default=None, help="Triage one issue number only.")
+        p_iss.add_argument("--label", action="append", default=None, help="Only non-urgent open issues with this label (repeatable; stop-the-line issues are always included).")
+        p_iss.add_argument("--require-label", default=None, help="Opt-in label every automated issue must carry.")
+        p_iss.add_argument(
+            "--allow-author", action="append", default=None, help="Login allowed regardless of association (repeatable)."
+        )
+        p_iss.add_argument(
+            "--allow-label", action="append", default=None, help="Maintainer label that passes the author gate (repeatable)."
+        )
+        p_iss.add_argument(
+            "--limit",
+            type=int,
+            default=30,
+            help=(
+                "Total issues to triage (default 30, max 100): every stop-the-line issue is always included, even "
+                "beyond the limit, and the remaining slots go to the oldest non-urgent issues."
+            ),
+        )
+        p_iss.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Output machine-readable JSON.",
+        )
+
         sub.add_parser("doctor", help="Verify git, gh auth, worker profile, Kanban config, and phase models.")
 
         p_ar = sub.add_parser(
@@ -746,7 +807,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         if not cmd:
             print(
                 "Usage: hermes factonio {init|add|update|remove|list|models|start|status|panel|pr-gate|publish-pr|restack|worktrees"
-                "|harness|trail|metrics|arena|doctor} [--json]"
+                "|harness|issues|trail|metrics|arena|doctor} [--json]"
             )
             return
 
@@ -1224,6 +1285,29 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
             _handle_arena(args, as_json)
             return
 
+        if cmd == "issues":
+            try:
+                res = triage_repo_issues(
+                    args.repo,
+                    issue_number=args.issue,
+                    labels=args.label,
+                    require_opt_in_label=args.require_label,
+                    allowed_authors=args.allow_author,
+                    allowed_labels=args.allow_label,
+                    limit=args.limit,
+                )
+            except (ValueError, RuntimeError) as exc:
+                if as_json:
+                    print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+                else:
+                    print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            if as_json:
+                print(json.dumps(res, indent=2, default=str))
+            else:
+                _print_issue_triage(res)
+            return
+
         if cmd == "doctor":
             res = run_doctor(plugin_dir)
             if as_json:
@@ -1243,8 +1327,8 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         "factonio",
         help=(
             "Manage the Factonio pure-Hermes software factory "
-            "(init, add, update, models, start, status, panel, publish-pr, restack, worktrees, harness, trail, metrics, "
-            "arena, doctor)."
+            "(init, add, update, models, start, status, panel, publish-pr, restack, worktrees, harness, issues, trail, "
+            "metrics, arena, doctor)."
         ),
         setup_fn=setup_parser,
         handler_fn=handle_cli,
