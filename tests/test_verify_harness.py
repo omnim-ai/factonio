@@ -905,8 +905,11 @@ class TestRepoDogfoodHarness(unittest.TestCase):
             self.assertEqual((audit["severity"], audit["drifted"]), ("clean", False), audit)
             self.assertEqual(audit["base_source"], "last commit touching .factonio/")
             for key in ("uncovered_changed_files", "orphaned_globs", "new_routes", "removed_routes",
-                        "new_cli_commands", "removed_cli_commands"):
+                        "new_cli_commands", "removed_cli_commands", "stale_invariants", "dead_cover_globs",
+                        "unresolved_sync_commits", "visual_baseline_changes"):
                 self.assertEqual(audit[key], [], key)
+            self.assertTrue(chk["formal_invariants"]["checked"])
+            self.assertEqual(chk["formal_invariants"]["dead_cover_globs"], [])
 
 
 def _fenced_block_after(text: str, marker: str) -> str:
@@ -1290,7 +1293,7 @@ class TestGateLoosening(unittest.TestCase):
             self.assertEqual(_git(repo, "status", "--porcelain"), before_status)
             self.assertEqual(set(res), {"checked", "loosened", "base_ref", "base_commit", "baseline_source",
                                         "removed_required_hooks", "downgraded_hooks", "removed_doctor_commands",
-                                        "findings"})
+                                        "loosened_visual_hooks", "visual_baseline_changes", "findings"})
             self.assertTrue(res["checked"] and res["loosened"])
             self.assertEqual(res["removed_required_hooks"], ["lint"])
             self.assertEqual(res["downgraded_hooks"], ["types"])
@@ -1623,6 +1626,1022 @@ class TestHybridBaselineAndMalformedManifest(unittest.TestCase):
             self.assertEqual(audit["manifest_errors"], [])
             self.assertEqual((audit["severity"], audit["drifted"]), ("clean", False))
             self.assertEqual(audit["drift_classification"]["classification"], "clean")
+
+
+class TestFormalInvariantHookMetadata(unittest.TestCase):
+    """Optional `covers`/`sync_commit` (invariant) and `baseline_paths`/`frozen_baseline` (visual_diff) metadata."""
+
+    def test_validate_accepts_normalizes_and_rejects_by_kind(self):
+        from factonio.harness import validate_hooks
+
+        hooks = validate_hooks([
+            {"name": "model", "kind": "invariant", "command": "true", "covers": [" api/** ", "svc/*.py"],
+             "sync_commit": " abc123 "},
+            {"name": "pixels", "kind": "visual_diff", "command": "true", "baseline_paths": ["snapshots/**"]},
+            {"name": "thawed", "kind": "visual_diff", "command": "true", "baseline_paths": ["s/**"], "frozen_baseline": False},
+            {"name": "plain", "kind": "invariant", "command": "true", "covers": None},
+        ])
+        self.assertEqual((hooks[0]["covers"], hooks[0]["sync_commit"]), (["api/**", "svc/*.py"], "abc123"))
+        self.assertEqual((hooks[1]["baseline_paths"], hooks[1]["frozen_baseline"]), (["snapshots/**"], True))
+        self.assertIs(hooks[2]["frozen_baseline"], False)
+        self.assertEqual(set(hooks[3]), {"name", "kind", "command", "optional"})
+
+        bad = [
+            {"kind": "custom", "covers": ["a/**"]},
+            {"kind": "visual_diff", "sync_commit": "HEAD", "covers": ["a"]},
+            {"kind": "invariant", "baseline_paths": ["s/**"]},
+            {"kind": "custom", "frozen_baseline": True},
+            {"kind": "invariant", "covers": []},
+            {"kind": "invariant", "covers": ["ok", " "]},
+            {"kind": "invariant", "covers": "a/**"},
+            {"kind": "invariant", "sync_commit": "HEAD"},
+            {"kind": "invariant", "covers": ["a"], "sync_commit": "--output=x"},
+            {"kind": "invariant", "covers": ["a"], "sync_commit": "a b"},
+            {"kind": "invariant", "covers": ["a"], "sync_commit": "a\x07"},
+            {"kind": "invariant", "covers": ["a"], "sync_commit": "  "},
+            {"kind": "invariant", "covers": ["a"], "sync_commit": 7},
+            {"kind": "visual_diff", "baseline_paths": []},
+            {"kind": "visual_diff", "baseline_paths": ["s/**"], "frozen_baseline": "yes"},
+        ]
+        for extra in bad:
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                validate_hooks([{"name": "h", "command": "true", **extra}])
+
+    def test_render_parse_round_trip_and_force_preserves_metadata(self):
+        from factonio.harness import HOOK_KINDS, _HOOK_LINE_RE, bootstrap_verify_harness, discover_harness
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            _write(repo, "snapshots/home.png", "png-v1\n")
+            hooks = [
+                {"name": "model", "kind": "invariant", "command": "true", "covers": ["api/**"], "sync_commit": "HEAD"},
+                {"name": "pixels", "kind": "visual_diff", "command": "true", "baseline_paths": ["snapshots/**"]},
+            ]
+            bootstrap_verify_harness(str(repo), hooks=hooks)
+            md = (repo / ".factonio" / "verify.md").read_text(encoding="utf-8")
+            self.assertIn("- **model** (`invariant`, required): `true` [covers: `api/**`; sync_commit: `HEAD`]", md)
+            self.assertIn(
+                "- **pixels** (`visual_diff`, required): `true` [baseline_paths: `snapshots/**`; frozen_baseline: `true`]", md
+            )
+            self.assertEqual([m.group("cmd") for m in _HOOK_LINE_RE.finditer(md)], ["true", "true"])
+            self.assertEqual(len(HOOK_KINDS), 3)
+
+            res = bootstrap_verify_harness(str(repo), force=True)
+            self.assertTrue(res["preserved_hooks"])
+            saved = {h["name"]: h for h in json.loads((repo / ".factonio" / "harness.json").read_text())["hooks"]}
+            self.assertEqual((saved["model"]["covers"], saved["model"]["sync_commit"]), (["api/**"], "HEAD"))
+            self.assertEqual((saved["pixels"]["baseline_paths"], saved["pixels"]["frozen_baseline"]), (["snapshots/**"], True))
+
+            (repo / ".factonio" / "harness.json").unlink()
+            parsed = {h["name"]: h for h in discover_harness(repo)["hooks"]}
+            self.assertEqual((parsed["model"]["covers"], parsed["model"]["sync_commit"]), (["api/**"], "HEAD"))
+            self.assertEqual((parsed["pixels"]["baseline_paths"], parsed["pixels"]["frozen_baseline"]), (["snapshots/**"], True))
+
+
+class TestFormalInvariantDrift(unittest.TestCase):
+    """Read-only `stale_invariants` drift vs unresolved `sync_commit` vs failing required hook."""
+
+    def _repo(self, home: Path, hooks: list[dict[str, Any]]) -> tuple[Path, str]:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home)
+        initial = _git(repo, "rev-parse", "HEAD")
+        bootstrap_verify_harness(str(repo), hooks=hooks)
+        _commit_all(repo, "harness")
+        return repo, initial
+
+    def test_covered_change_after_sync_commit_is_stale_doc_drift_and_read_only(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            sync = _git(repo, "rev-parse", "HEAD")
+            from factonio.harness import bootstrap_verify_harness
+
+            bootstrap_verify_harness(str(repo), hooks=[
+                {"name": "api-model", "kind": "invariant", "command": "true", "covers": ["api/**"], "sync_commit": sync},
+                {"name": "cli-model", "kind": "invariant", "command": "true", "covers": ["svc/**"], "optional": True},
+            ])
+            _commit_all(repo, "harness")
+            chk = check_harness(str(repo), run_doctor=True, run_hooks=True)
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual(chk["warnings"], [])
+            formal = chk["formal_invariants"]
+            self.assertTrue(formal["checked"])
+            self.assertEqual([(i["name"], i["status"]) for i in formal["invariants"]],
+                             [("api-model", "in_sync"), ("cli-model", "in_sync")])
+            self.assertEqual(formal["invariants"][1]["sync_source"], "harness.json base_commit")
+            clean = audit_harness(str(repo))
+            self.assertEqual((clean["severity"], clean["stale_invariants"]), ("clean", []))
+
+            _write(repo, "api/server.py", "# changed\n")
+            _commit_all(repo, "touch api")
+            _write(repo, "svc/cli.py", "# changed\n")
+            before_status = _git(repo, "status", "--porcelain")  # also refreshes the stat cache before fingerprinting
+            before_index = _index_fingerprint(repo)
+            audit = audit_harness(str(repo))
+            self.assertEqual(_index_fingerprint(repo), before_index)
+            self.assertEqual(_git(repo, "status", "--porcelain"), before_status)
+            self.assertEqual((audit["drifted"], audit["severity"]), (True, "stale"))
+            stale = {i["name"]: i for i in audit["stale_invariants"]}
+            self.assertEqual(stale["api-model"], {
+                "name": "api-model", "sync_commit": sync, "sync_source": "sync_commit", "covers": ["api/**"],
+                "changed_files": ["api/server.py"], "optional": False,
+            })
+            self.assertEqual(stale["cli-model"]["changed_files"], ["svc/cli.py"])
+            self.assertTrue(stale["cli-model"]["optional"])
+            self.assertEqual((audit["unresolved_sync_commits"], audit["manifest_errors"]), ([], []))
+            self.assertEqual(audit["drift_classification"]["classification"], "doc_drift")
+            self.assertTrue(any("formal invariants" in r for r in audit["drift_classification"]["reasons"]))
+            self.assertTrue(any("bump `sync_commit`" in r for r in audit["recommendations"]))
+            chk = check_harness(str(repo))
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual({i["name"] for i in chk["formal_invariants"]["stale_invariants"]}, {"api-model", "cli-model"})
+
+            run = TestSurfaces()._cli()
+            code, out, _ = run("harness", "audit", str(repo), "--json")
+            self.assertEqual(code, 1)
+            self.assertEqual(len(json.loads(out)["stale_invariants"]), 2)
+            code, out, _ = run("harness", "audit", str(repo))
+            self.assertIn("stale_invariants: api-model (sync_commit", out)
+            code, out, _ = run("harness", "check", str(repo))
+            self.assertEqual(code, 0, out)
+            self.assertIn("Invariant: [stale] api-model covers api/**", out)
+
+    def test_unresolved_sync_commit_is_harness_gap_but_hooks_still_run(self):
+        from factonio.harness import audit_harness, check_harness, classify_harness_drift
+
+        with isolated_hermes_home() as home:
+            repo, _ = self._repo(home, [
+                {"name": "model", "kind": "invariant", "command": "true", "covers": ["api/**"], "sync_commit": "ab" * 20},
+                {"name": "tests", "kind": "custom", "command": "true"},
+            ])
+            chk = check_harness(str(repo), run_doctor=True, run_hooks=True)
+            self.assertFalse(chk["valid"])
+            self.assertEqual(chk["formal_invariants"]["unresolved_sync_commits"], [{"name": "model", "sync_commit": "ab" * 20}])
+            self.assertTrue(any("does not resolve" in e for e in chk["manifest_errors"]))
+            self.assertEqual(chk["hook_results"]["ran"], 2)
+            self.assertEqual(classify_harness_drift(None, chk)["classification"], "harness_gap")
+            audit = audit_harness(str(repo))
+            self.assertEqual((audit["drifted"], audit["severity"]), (True, "stale"))
+            self.assertEqual(audit["drift_classification"]["classification"], "harness_gap")
+            self.assertEqual(audit["stale_invariants"], [])
+
+    def test_failing_required_formal_hook_outranks_as_product_regression(self):
+        from factonio.harness import audit_harness, check_harness, classify_harness_drift
+
+        with isolated_hermes_home() as home:
+            repo, _ = self._repo(home, [
+                {"name": "model", "kind": "invariant", "command": "exit 1", "covers": ["api/**"], "sync_commit": "no-such"},
+            ])
+            _write(repo, "api/server.py", "# drift\n")
+            audit = audit_harness(str(repo))
+            chk = check_harness(str(repo), run_doctor=True, run_hooks=True)
+            self.assertEqual(chk["hook_results"]["failed_required"], ["model"])
+            res = classify_harness_drift(audit, chk)
+            self.assertEqual(res["classification"], "product_regression")
+            self.assertEqual(res["classifications"], ["product_regression", "harness_gap", "doc_drift"])
+
+    def test_dead_cover_glob_is_check_error_and_doc_drift(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo, _ = self._repo(home, [{"name": "model", "kind": "invariant", "command": "true", "covers": ["nope/**"]}])
+            chk = check_harness(str(repo))
+            self.assertFalse(chk["valid"])
+            self.assertEqual(chk["formal_invariants"]["dead_cover_globs"], [{"hook": "model", "glob": "nope/**"}])
+            self.assertTrue(any("covers glob `nope/**` matches no files" in e for e in chk["errors"]))
+            self.assertEqual(chk["manifest_errors"], [])
+            audit = audit_harness(str(repo))
+            self.assertEqual(audit["dead_cover_globs"], [{"hook": "model", "glob": "nope/**"}])
+            self.assertEqual(audit["drift_classification"]["classification"], "doc_drift")
+
+    def test_every_git_probe_is_no_optional_locks(self):
+        import factonio.harness as harness
+
+        with isolated_hermes_home() as home:
+            repo, sync = self._repo(home, [
+                {"name": "model", "kind": "invariant", "command": "true", "covers": ["api/**"], "sync_commit": "HEAD~1"},
+                {"name": "pixels", "kind": "visual_diff", "command": "true", "baseline_paths": ["api/**"]},
+            ])
+            _write(repo, "api/server.py", "# drift\n")
+            calls: list[list[str]] = []
+            real_run = subprocess.run
+
+            def spy(cmd, *args, **kwargs):
+                if isinstance(cmd, list) and cmd and cmd[0] == "git":
+                    calls.append(list(cmd))
+                return real_run(cmd, *args, **kwargs)
+
+            with mock.patch.object(harness.subprocess, "run", side_effect=spy):
+                audit = harness.audit_harness(str(repo))
+                harness.check_harness(str(repo), base_ref=sync)
+            self.assertTrue(audit["stale_invariants"] and audit["visual_baseline_changes"])
+            self.assertTrue(any("diff" in c for c in calls))
+            self.assertEqual([c for c in calls if c[1] != "--no-optional-locks"], [])
+
+
+class TestFrozenVisualBaselines(unittest.TestCase):
+    """`visual_diff` anti-shortcut: regenerated/loosened commands and tampered frozen baselines."""
+
+    COMMAND = "npx playwright test --max-diff-pixels=0"
+
+    def _repo(self, home: Path, **meta: Any) -> tuple[Path, str]:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "lint", "kind": "invariant", "command": "true"},
+            {"name": "pixels", "kind": "visual_diff", "command": self.COMMAND,
+             "baseline_paths": ["snapshots/**"], **meta},
+        ])
+        return repo, _commit_all(repo, "harness + baselines")
+
+    @staticmethod
+    def _set_pixels(repo: Path, **changes: Any) -> None:
+        hj = repo / ".factonio" / "harness.json"
+        manifest = json.loads(hj.read_text(encoding="utf-8"))
+        for hook in manifest["hooks"]:
+            if hook["name"] == "pixels":
+                for key, value in changes.items():
+                    if value is None:
+                        hook.pop(key, None)
+                    else:
+                        hook[key] = value
+        hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    def test_regeneration_and_threshold_mutations_are_gate_loosening(self):
+        from factonio.harness import audit_harness, check_harness, detect_harness_gate_loosening
+
+        with isolated_hermes_home() as home:
+            repo, _ = self._repo(home)
+            clean = detect_harness_gate_loosening(repo)
+            self.assertEqual((clean["loosened"], clean["loosened_visual_hooks"], clean["visual_baseline_changes"]),
+                             (False, [], []))
+            hj = repo / ".factonio" / "harness.json"
+            committed = hj.read_text(encoding="utf-8")
+            loosening = {
+                "--update-snapshots": {"command": self.COMMAND + " --update-snapshots"},
+                "-u": {"command": self.COMMAND + " -u"},
+                "--update": {"command": self.COMMAND + " --update"},
+                "--regenerate": {"command": self.COMMAND + " --regenerate"},
+                "UPDATE_SNAPSHOTS=1": {"command": "UPDATE_SNAPSHOTS=1 " + self.COMMAND},
+                "max-diff-pixels": {"command": "npx playwright test --max-diff-pixels=500"},
+                "threshold": {"command": self.COMMAND + " --threshold 0.3"},
+                "unfrozen": {"frozen_baseline": False},
+                "unpinned": {"baseline_paths": None, "frozen_baseline": None},
+            }
+            for label, change in loosening.items():
+                with self.subTest(label):
+                    hj.write_text(committed, encoding="utf-8")
+                    self._set_pixels(repo, **change)
+                    before_index = _index_fingerprint(repo)
+                    gate = detect_harness_gate_loosening(repo)
+                    self.assertEqual(_index_fingerprint(repo), before_index)
+                    self.assertTrue(gate["loosened"], gate)
+                    self.assertEqual(gate["loosened_visual_hooks"], ["pixels"])
+                    self.assertTrue(any("visual_diff hook 'pixels'" in f for f in gate["findings"]), gate["findings"])
+                    chk = check_harness(str(repo))
+                    self.assertFalse(chk["valid"])
+                    audit = audit_harness(str(repo))
+                    self.assertEqual(audit["gate_loosening"]["loosened_visual_hooks"], ["pixels"])
+                    self.assertEqual(audit["drift_classification"]["classification"], "doc_drift")
+
+            for label, change in {
+                "tightened": {"command": "npx playwright test --max-diff-pixels=0 --threshold 0"},
+                "reworded": {"command": "npx playwright test --reporter=line --max-diff-pixels=0"},
+                "zero-env": {"command": "UPDATE_SNAPSHOTS=0 " + self.COMMAND},
+            }.items():
+                with self.subTest(label):
+                    hj.write_text(committed, encoding="utf-8")
+                    self._set_pixels(repo, **change)
+                    gate = detect_harness_gate_loosening(repo)
+                    self.assertFalse(gate["loosened"], gate["findings"])
+
+    def test_tampered_frozen_baseline_is_flagged_but_new_or_unfrozen_is_not(self):
+        from factonio.harness import audit_harness, check_harness, detect_harness_gate_loosening
+
+        with isolated_hermes_home() as home:
+            repo, harness_commit = self._repo(home)
+            _write(repo, "snapshots/new-screen.png", "png-new\n")
+            self.assertFalse(detect_harness_gate_loosening(repo)["loosened"])
+            self.assertEqual(audit_harness(str(repo))["visual_baseline_changes"], [])
+
+            _write(repo, "snapshots/home.png", "png-regenerated\n")
+            before_index = _index_fingerprint(repo)
+            gate = detect_harness_gate_loosening(repo)
+            self.assertEqual(_index_fingerprint(repo), before_index)
+            self.assertEqual(gate["visual_baseline_changes"], [
+                {"name": "pixels", "baseline_paths": ["snapshots/**"], "changed_files": ["snapshots/home.png"]}
+            ])
+            self.assertTrue(gate["loosened"])
+            chk = check_harness(str(repo))
+            self.assertFalse(chk["valid"])
+            self.assertEqual(chk["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+            audit = audit_harness(str(repo))
+            self.assertEqual(audit["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+            self.assertEqual((audit["drifted"], audit["drift_classification"]["classification"]), (True, "doc_drift"))
+            self.assertTrue(any("Restore the modified frozen visual baselines" in r for r in audit["recommendations"]))
+
+            _commit_all(repo, "regenerate baselines")
+            self.assertTrue(check_harness(str(repo))["valid"])
+            committed = check_harness(str(repo), base_ref=harness_commit)
+            self.assertFalse(committed["valid"])
+            self.assertEqual(committed["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+            self.assertEqual(audit_harness(str(repo))["visual_baseline_changes"][0]["name"], "pixels")
+
+        with isolated_hermes_home() as home:
+            repo, _ = self._repo(home, frozen_baseline=False)
+            _write(repo, "snapshots/home.png", "png-regenerated\n")
+            self.assertFalse(detect_harness_gate_loosening(repo)["loosened"])
+            self.assertEqual(audit_harness(str(repo))["visual_baseline_changes"], [])
+
+    def _assert_tampered(self, repo: Path, base_ref: Any = None, path: str = "snapshots/home.png") -> None:
+        from factonio.harness import audit_harness, check_harness, detect_harness_gate_loosening
+
+        before_index = _index_fingerprint(repo)
+        gate = detect_harness_gate_loosening(repo, base_ref=base_ref) if base_ref else detect_harness_gate_loosening(repo)
+        chk = check_harness(str(repo), base_ref=base_ref)
+        audit = audit_harness(str(repo), base_ref=base_ref)
+        self.assertEqual(_index_fingerprint(repo), before_index)
+        self.assertTrue(gate["loosened"], gate)
+        self.assertIn(path, gate["visual_baseline_changes"][0]["changed_files"])
+        self.assertFalse(chk["valid"])
+        self.assertIn(path, chk["visual_baseline_changes"][0]["changed_files"])
+        self.assertTrue(audit["drifted"])
+        self.assertEqual(audit["severity"], "stale")
+        self.assertIn(path, audit["visual_baseline_changes"][0]["changed_files"])
+
+    def test_staged_removal_or_rename_with_replacement_is_flagged(self):
+        from factonio.harness import detect_harness_gate_loosening
+
+        scenarios = {
+            "rm-cached": [("git", "rm", "-q", "--cached", "snapshots/home.png")],
+            "rm-cached+regenerated": [("git", "rm", "-q", "--cached", "snapshots/home.png"),
+                                      ("write", "snapshots/home.png")],
+            "rm+recreated": [("git", "rm", "-q", "snapshots/home.png"), ("write", "snapshots/home.png")],
+            "mv+recreated": [("git", "mv", "snapshots/home.png", "snapshots/home_backup.png"),
+                             ("write", "snapshots/home.png")],
+            "rm-cached+recreated+add": [("git", "rm", "-q", "--cached", "snapshots/home.png"),
+                                        ("write", "snapshots/home.png"), ("git", "add", "snapshots/home.png")],
+        }
+        for label, steps in scenarios.items():
+            with self.subTest(label), isolated_hermes_home() as home:
+                repo, _ = self._repo(home)
+                for step in steps:
+                    if step[0] == "write":
+                        _write(repo, step[1], "png-regenerated\n")
+                    else:
+                        _git(repo, *step[1:])
+                self._assert_tampered(repo)
+
+        for replacement in ("untracked", "staged"):
+            with self.subTest(f"committed-untrack+{replacement}"), isolated_hermes_home() as home:
+                repo, harness_commit = self._repo(home)
+                _git(repo, "rm", "-q", "--cached", "snapshots/home.png")
+                _git(repo, "commit", "-q", "-m", "untrack baseline")
+                _write(repo, "snapshots/home.png", "png-regenerated\n")
+                if replacement == "staged":
+                    _git(repo, "add", "snapshots/home.png")
+                self._assert_tampered(repo, base_ref=harness_commit)
+
+        with isolated_hermes_home() as home:
+            repo, harness_commit = self._repo(home)
+            _write(repo, "snapshots/brand_new.png", "png-new\n")
+            self.assertFalse(detect_harness_gate_loosening(repo)["loosened"])
+            _git(repo, "add", "snapshots/brand_new.png")
+            self.assertFalse(detect_harness_gate_loosening(repo)["loosened"])
+            _git(repo, "commit", "-q", "-m", "new baseline")
+            self.assertFalse(detect_harness_gate_loosening(repo, base_ref=harness_commit)["loosened"])
+            _write(repo, "snapshots/brand_new.png", "png-new-v2\n")
+            self.assertEqual(
+                detect_harness_gate_loosening(repo, base_ref=harness_commit)["visual_baseline_changes"], []
+            )
+
+    def test_disabled_regeneration_values_are_not_active_regeneration(self):
+        from factonio.harness import detect_harness_gate_loosening
+
+        hj_cases = {
+            "=none -> =all": ("--update-snapshots=none", "--update-snapshots=all", True),
+            "=none -> bare": ("--update-snapshots=none", "--update-snapshots", True),
+            "none -> all (separate)": ("--update-snapshots none", "--update-snapshots all", True),
+            "=false -> =all": ("--update-snapshots=false", "--update-snapshots=all", True),
+            "plain -> =none": ("", "--update-snapshots=none", False),
+            "plain -> =false": ("", "--update-snapshots=false", False),
+            "plain -> none (separate)": ("", "--update-snapshots none", False),
+        }
+        for label, (base_flag, live_flag, loosened) in hj_cases.items():
+            with self.subTest(label), isolated_hermes_home() as home:
+                base_cmd = (self.COMMAND + " " + base_flag).strip()
+                repo, _ = self._repo(home, command=base_cmd)
+                self._set_pixels(repo, command=self.COMMAND + " " + live_flag)
+                gate = detect_harness_gate_loosening(repo)
+                self.assertEqual(gate["loosened"], loosened, gate["findings"])
+                self.assertEqual(gate["loosened_visual_hooks"], ["pixels"] if loosened else [])
+
+    def test_repos_without_optional_fields_stay_clean(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo, _ = TestFormalInvariantDrift()._repo(home, [
+                {"name": "lint", "kind": "invariant", "command": "true"},
+                {"name": "pixels", "kind": "visual_diff", "command": "true -u"},
+            ])
+            _write(repo, "snapshots/home.png", "x\n")
+            chk = check_harness(str(repo), run_doctor=True, run_hooks=True)
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual(chk["warnings"], [])
+            self.assertFalse(chk["formal_invariants"]["checked"])
+            self.assertEqual(chk["visual_baseline_changes"], [])
+            self.assertFalse(chk["gate_loosening"]["loosened"])
+            (repo / "snapshots" / "home.png").unlink()
+            audit = audit_harness(str(repo))
+            self.assertEqual((audit["severity"], audit["drifted"]), ("clean", False))
+            for key in ("stale_invariants", "dead_cover_globs", "unresolved_sync_commits", "visual_baseline_changes"):
+                self.assertEqual(audit[key], [], key)
+
+    def test_agent_tool_schema_and_handler_surface_metadata(self):
+        from factonio.agent_tools import register_tools
+
+        with isolated_hermes_home() as home:
+            ctx = _FakeCtx()
+            register_tools(ctx)
+            tool = ctx.tools["factonio_bootstrap_verify"]
+            props = tool["schema"]["parameters"]["properties"]["hooks"]["items"]["properties"]
+            for key in ("covers", "sync_commit", "baseline_paths", "frozen_baseline"):
+                self.assertIn(key, props)
+            repo = _make_repo(home)
+            _write(repo, "snapshots/home.png", "png-v1\n")
+            res = json.loads(tool["handler"]({"action": "init", "repo": str(repo), "hooks": [
+                {"name": "pixels", "kind": "visual_diff", "command": "true", "baseline_paths": ["snapshots/**"]},
+                {"name": "model", "kind": "invariant", "command": "true", "covers": ["api/**"]},
+            ]}))
+            self.assertTrue(res["written"], res)
+            self.assertIs(res["manifest"]["hooks"][0]["frozen_baseline"], True)
+            _commit_all(repo, "harness")
+            _write(repo, "snapshots/home.png", "png-v2\n")
+            chk = json.loads(tool["handler"]({"action": "check", "repo": str(repo)}))
+            self.assertFalse(chk["valid"])
+            self.assertEqual(chk["visual_baseline_changes"][0]["name"], "pixels")
+            self.assertTrue(chk["formal_invariants"]["checked"])
+            bad = json.loads(tool["handler"]({"action": "init", "repo": str(repo), "force": True, "hooks": [
+                {"name": "x", "kind": "custom", "command": "true", "covers": ["api/**"]},
+            ]}))
+            self.assertFalse(bad.get("ok", True))
+
+
+class TestFixRound2VisualGuardAndHarnessGaps(unittest.TestCase):
+    """Shell-aware visual_diff guard, post-hook baseline re-check, verify.md hook validation, audit gate base."""
+
+    @staticmethod
+    def _visual_repo(home: Path, command: Any, *, name: str = "svc") -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness + baselines")
+        return repo
+
+    @staticmethod
+    def _set_command(repo: Path, command: Any) -> None:
+        hj = repo / ".factonio" / "harness.json"
+        manifest = json.loads(hj.read_text(encoding="utf-8"))
+        manifest["hooks"][0]["command"] = command
+        hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    def test_shell_wrapped_and_punctuation_adjacent_commands(self):
+        from factonio.harness import check_harness, detect_harness_gate_loosening
+
+        pw, jest, thr = "npx playwright test", "npx jest", "true --threshold 0.01"
+        cases = {
+            "sh -c string": (f"sh -c '{pw}'", f'sh -c "{pw} --update-snapshots"', True),
+            "bash -lc jest -u": (jest, "bash -lc 'npx jest -u'", True),
+            "bash -euo pipefail -c": (pw, f"bash -euo pipefail -c '{pw} --update-snapshots'", True),
+            "argv sh -c": (["sh", "-c", pw], ["sh", "-c", f"{pw} --update-snapshots"], True),
+            "argv /bin/bash -ec": (pw, ["/bin/bash", "-ec", f"{pw} -u"], True),
+            "nested sh in bash": (pw, f"""bash -c "sh -c '{pw} --update-snapshots'" """, True),
+            "; after flag": (pw, f"{pw} --update-snapshots; echo ok", True),
+            "&& glued": (pw, f"{pw} --update-snapshots&&true", True),
+            "subshell": (pw, f"({pw} --update-snapshots)", True),
+            "jest -u;": (jest, "npx jest -u; echo ok", True),
+            "env -S": (pw, f"env -S '{pw} -u'", True),
+            "threshold sh -c": (thr, 'sh -c "true --threshold 0.5"', True),
+            "threshold ;": (thr, "true --threshold 0.5; echo ok", True),
+            "threshold removed": (thr, "true", True),
+            "threshold removed in sh -c": (thr, "sh -c 'true --update-snapshots=none'", True),
+            "=none ;": (pw, f"{pw} --update-snapshots=none; echo ok", False),
+            "none separate ;": (pw, f"{pw} --update-snapshots none; echo ok", False),
+            "env none ;": (pw, f"UPDATE_SNAPSHOTS=none; {pw}", False),
+            "env 0 ;": (pw, f"UPDATE_SNAPSHOTS=0; {pw}", False),
+            "sh -c env 0": (pw, f"sh -c 'UPDATE_SNAPSHOTS=0 {pw}'", False),
+            "sh -c env none": (pw, f"sh -c 'UPDATE_SNAPSHOTS=none {pw}'", False),
+            "bash -u is nounset": (pw, f"bash -u -c '{pw}'", False),
+            "env -u unsets": (pw, f"env -u CI {pw}", False),
+            "same threshold wrapped": (thr, "sh -c 'true --threshold 0.01'", False),
+            "tightened threshold ;": (thr, "true --threshold 0.001; echo ok", False),
+        }
+        with isolated_hermes_home() as home:
+            repos: dict[str, Path] = {}
+            for label, (base, live, loosened) in cases.items():
+                with self.subTest(label):
+                    key = json.dumps(base)
+                    if key not in repos:
+                        repos[key] = self._visual_repo(home, base, name=f"svc{len(repos)}")
+                    repo = repos[key]
+                    self._set_command(repo, live)
+                    gate = detect_harness_gate_loosening(repo)
+                    self.assertEqual(gate["loosened"], loosened, gate["findings"])
+                    self.assertEqual(gate["loosened_visual_hooks"], ["pixels"] if loosened else [])
+                    if label in ("sh -c string", "threshold removed", "sh -c env none"):
+                        chk = check_harness(str(repo))
+                        self.assertEqual(chk["valid"], not loosened, chk["errors"])
+            self._set_command(repos[json.dumps(thr)], "true")
+            removed = detect_harness_gate_loosening(repos[json.dumps(thr)])
+            self.assertTrue(any("removes threshold `threshold=0.01`" in f for f in removed["findings"]), removed)
+
+    def test_check_run_hooks_rechecks_frozen_baselines_after_hooks(self):
+        from factonio.harness import check_harness, classify_harness_drift
+
+        with isolated_hermes_home() as home:
+            repo = self._visual_repo(home, "printf png-regenerated > snapshots/home.png")
+            before = check_harness(str(repo))
+            self.assertTrue(before["valid"], before["errors"])
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertEqual((repo / "snapshots" / "home.png").read_text(encoding="utf-8"), "png-regenerated")
+            self.assertEqual(chk["hook_results"]["failed_required"], [])
+            self.assertFalse(chk["valid"])
+            self.assertFalse(chk["ok"])
+            self.assertTrue(chk["gate_loosening"]["loosened"])
+            self.assertEqual(chk["visual_baseline_changes"], [
+                {"name": "pixels", "baseline_paths": ["snapshots/**"], "changed_files": ["snapshots/home.png"]}
+            ])
+            self.assertEqual(chk["gate_loosening"]["visual_baseline_changes"], chk["visual_baseline_changes"])
+            self.assertTrue(any("frozen baseline of visual_diff hook 'pixels'" in e for e in chk["errors"]))
+            self.assertEqual(classify_harness_drift(None, chk)["classification"], "doc_drift")
+
+        with isolated_hermes_home() as home:
+            repo = self._visual_repo(home, "printf png-new > snapshots/brand_new.png")
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual(chk["visual_baseline_changes"], [])
+
+    def _assert_md_hooks_harness_gap(self, repo: Path) -> None:
+        from factonio.harness import audit_harness, check_harness, classify_harness_drift
+
+        for kwargs in ({}, {"run_doctor": True, "run_hooks": True}):
+            chk = check_harness(str(repo), **kwargs)
+            self.assertFalse(chk["valid"], kwargs)
+            self.assertTrue(any(e.startswith("verify.md hooks invalid:") for e in chk["errors"]), chk["errors"])
+            self.assertTrue(any(e.startswith("verify.md hooks invalid:") for e in chk["manifest_errors"]), chk)
+            res = classify_harness_drift(None, chk)
+            self.assertEqual(res["classification"], "harness_gap", res)
+            self.assertTrue(res["reasons"][0].startswith("harness_gap: Malformed .factonio/verify.md"), res)
+        audit = audit_harness(str(repo))
+        self.assertEqual((audit["drifted"], audit["severity"]), (True, "stale"))
+        self.assertTrue(any(e.startswith("verify.md hooks invalid:") for e in audit["manifest_errors"]), audit)
+        self.assertEqual(audit["drift_classification"]["classification"], "harness_gap")
+
+    def test_malformed_verify_md_hook_metadata_is_harness_gap(self):
+        from factonio.harness import bootstrap_verify_harness
+
+        md_line = "- **lint** (`custom`, required): `true`"
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            bootstrap_verify_harness(str(repo), hooks=[{"name": "lint", "kind": "custom", "command": "true"}])
+            hj = repo / ".factonio" / "harness.json"
+            manifest = json.loads(hj.read_text(encoding="utf-8"))
+            del manifest["hooks"]
+            hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            md = repo / ".factonio" / "verify.md"
+            text = md.read_text(encoding="utf-8")
+            self.assertIn(md_line, text)
+            md.write_text(text.replace(md_line, md_line + " [covers: `api/**`]"), encoding="utf-8")
+            _commit_all(repo, "hook-less harness.json + malformed verify.md hook")
+            self._assert_md_hooks_harness_gap(repo)
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            bootstrap_verify_harness(str(repo), hooks=[{"name": "model", "kind": "invariant", "command": "true"}])
+            (repo / ".factonio" / "harness.json").unlink()
+            md = repo / ".factonio" / "verify.md"
+            line = "- **model** (`invariant`, required): `true`"
+            text = md.read_text(encoding="utf-8")
+            self.assertIn(line, text)
+            md.write_text(text.replace(line, line + " [sync_commit: `HEAD`]"), encoding="utf-8")
+            _commit_all(repo, "verify.md-only harness with sync_commit but no covers")
+            self._assert_md_hooks_harness_gap(repo)
+
+    def test_default_audit_after_init_gates_against_last_harness_commit(self):
+        from factonio.harness import audit_harness, bootstrap_verify_harness
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            _write(repo, "snapshots/home.png", "png-v1\n")
+            c1 = _commit_all(repo, "baseline")
+            bootstrap_verify_harness(str(repo), hooks=[
+                {"name": "pixels", "kind": "visual_diff", "command": "true", "baseline_paths": ["snapshots/**"]},
+            ])
+            self.assertEqual(json.loads((repo / ".factonio" / "harness.json").read_text())["base_commit"], c1)
+            c2 = _commit_all(repo, "harness")
+            clean = audit_harness(str(repo))
+            self.assertEqual((clean["severity"], clean["gate_loosening"]["checked"]), ("clean", True))
+            self.assertEqual(clean["gate_loosening"]["base_commit"], c2)
+            _write(repo, "snapshots/home.png", "png-regenerated\n")
+            _commit_all(repo, "regenerate baseline")
+            audit = audit_harness(str(repo))
+            self.assertEqual(audit["base_commit"], c1)
+            gate = audit["gate_loosening"]
+            self.assertEqual((gate["checked"], gate["loosened"], gate["base_commit"]), (True, True, c2))
+            self.assertEqual(gate["visual_baseline_changes"], audit["visual_baseline_changes"])
+            self.assertEqual(audit["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+            self.assertTrue(any("frozen baseline" in f for f in gate["findings"]))
+
+            run = TestSurfaces()._cli()
+            code, out, _ = run("harness", "audit", str(repo), "--json")
+            self.assertEqual(code, 1)
+            self.assertTrue(json.loads(out)["gate_loosening"]["loosened"])
+
+
+class TestFixRound3PinnedAuditBase(unittest.TestCase):
+    """Default audit keeps a pinned approved `base_commit`; non-finite thresholds; missing-harness baselines."""
+
+    @staticmethod
+    def _pinned_repo(home: Path) -> tuple[Path, str]:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _commit_all(repo, "baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "req-inv", "kind": "invariant", "command": "true"},
+            {"name": "ui-snap", "kind": "visual_diff", "command": "true", "baseline_paths": ["snapshots/**"],
+             "frozen_baseline": True},
+        ])
+        approved = _commit_all(repo, "approved harness")
+        hj = repo / ".factonio" / "harness.json"
+        manifest = json.loads(hj.read_text(encoding="utf-8"))
+        manifest["base_commit"] = approved
+        hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        _commit_all(repo, "pin base_commit")
+        return repo, approved
+
+    @staticmethod
+    def _edit(repo: Path, mutate: Any) -> None:
+        hj = repo / ".factonio" / "harness.json"
+        manifest = json.loads(hj.read_text(encoding="utf-8"))
+        mutate(manifest)
+        hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    def test_default_audit_gates_against_pinned_base_commit(self):
+        from factonio.harness import audit_harness
+
+        def drop_hook(m):
+            m["hooks"] = [h for h in m["hooks"] if h["name"] != "req-inv"]
+
+        def downgrade_and_drop_doctor(m):
+            for h in m["hooks"]:
+                if h["name"] == "req-inv":
+                    h["optional"] = True
+            m["phases"]["doctor"] = m["phases"]["doctor"][1:]
+
+        def regenerate(m):
+            for h in m["hooks"]:
+                if h["name"] == "ui-snap":
+                    h["command"] = "true --update-snapshots"
+
+        def unfreeze(m):
+            for h in m["hooks"]:
+                if h["name"] == "ui-snap":
+                    h["frozen_baseline"] = False
+
+        cases = {
+            "removed": (drop_hook, "removed_required_hooks"),
+            "downgraded": (downgrade_and_drop_doctor, "downgraded_hooks"),
+            "regenerate": (regenerate, "loosened_visual_hooks"),
+            "unfreeze": (unfreeze, "visual_baseline_changes"),
+        }
+        for label, (mutate, field) in cases.items():
+            with self.subTest(label), isolated_hermes_home() as home:
+                repo, approved = self._pinned_repo(home)
+                clean = audit_harness(str(repo))
+                self.assertEqual((clean["severity"], clean["gate_loosening"]["base_commit"]), ("clean", approved))
+                self._edit(repo, mutate)
+                if label == "unfreeze":
+                    _write(repo, "snapshots/home.png", "png-regenerated\n")
+                _commit_all(repo, f"loosen: {label}")
+                audit = audit_harness(str(repo))
+                gate = audit["gate_loosening"]
+                self.assertEqual((audit["base_commit"], audit["base_source"]), (approved, "harness.json base_commit"))
+                self.assertEqual((gate["checked"], gate["loosened"], gate["base_commit"]), (True, True, approved))
+                self.assertTrue(gate[field], gate)
+                self.assertTrue(gate["findings"])
+                self.assertEqual((audit["drifted"], audit["severity"]), (True, "stale"))
+                if label == "downgraded":
+                    self.assertTrue(gate["removed_doctor_commands"], gate)
+                if label == "unfreeze":
+                    self.assertEqual(audit["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+                code, out, _ = TestSurfaces()._cli()("harness", "audit", str(repo), "--json")
+                self.assertEqual(code, 1)
+                self.assertTrue(json.loads(out)["gate_loosening"]["loosened"])
+
+    def test_non_finite_threshold_is_threshold_removal(self):
+        from factonio.harness import detect_harness_gate_loosening
+
+        for value in ("nan", "inf", "-inf", "NaN%"):
+            with self.subTest(value), isolated_hermes_home() as home:
+                repo = TestFixRound2VisualGuardAndHarnessGaps._visual_repo(home, "true --threshold 0.01")
+                TestFixRound2VisualGuardAndHarnessGaps._set_command(repo, f"true --threshold {value}")
+                gate = detect_harness_gate_loosening(repo)
+                self.assertTrue(gate["loosened"], gate)
+                self.assertEqual(gate["loosened_visual_hooks"], ["pixels"])
+                self.assertTrue(any("threshold" in f for f in gate["findings"]), gate["findings"])
+
+    def test_missing_harness_reports_top_level_baseline_changes(self):
+        from factonio.harness import audit_harness
+
+        with isolated_hermes_home() as home:
+            repo = TestFixRound2VisualGuardAndHarnessGaps._visual_repo(home, "true")
+            (repo / ".factonio" / "verify.md").unlink()
+            _write(repo, "snapshots/home.png", "png-regenerated\n")
+            audit = audit_harness(str(repo))
+            self.assertEqual(audit["severity"], "missing")
+            changes = audit["gate_loosening"]["visual_baseline_changes"]
+            self.assertTrue(changes)
+            self.assertEqual(audit["visual_baseline_changes"], changes)
+            self.assertIn("snapshots/home.png", audit["visual_baseline_changes"][0]["changed_files"])
+
+
+class TestFixRound4CompoundThresholdsAndShortFlags(unittest.TestCase):
+    """Every threshold occurrence in compound commands counts; short `-u` is executable-aware and case-sensitive."""
+
+    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+
+    def _assert_cases(self, cases: dict[str, tuple[Any, Any, bool]]) -> None:
+        from factonio.harness import detect_harness_gate_loosening
+
+        with isolated_hermes_home() as home:
+            repos: dict[str, Path] = {}
+            for label, (base, live, loosened) in cases.items():
+                with self.subTest(label):
+                    key = json.dumps(base)
+                    if key not in repos:
+                        repos[key] = self._visual_repo(home, base, name=f"svc{len(repos)}")
+                    self._set_command(repos[key], live)
+                    gate = detect_harness_gate_loosening(repos[key])
+                    self.assertEqual(gate["loosened"], loosened, gate["findings"])
+                    self.assertEqual(gate["loosened_visual_hooks"], ["pixels"] if loosened else [])
+
+    def test_compound_threshold_occurrences_are_all_compared(self):
+        a, b = "python3 check_snap.py a", "python3 check_snap.py b"
+        same = f"{a} --threshold 0.01 && {b} --threshold 0.01"
+        mixed = f"{a} --threshold 0.01 && {b} --threshold 0.05"
+        single = "python3 check_ui.py --threshold 0.01"
+        self._assert_cases({
+            "earlier raised &&": (same, f"{a} --threshold 0.50 && {b} --threshold 0.01", True),
+            "earlier raised ;": (same, f"{a} --threshold 0.50; {b} --threshold 0.01", True),
+            "earlier raised newline": (same, f"{a} --threshold 0.50\n{b} --threshold 0.01", True),
+            "earlier raised sh -c": (same, f"sh -c '{a} --threshold 0.50 && {b} --threshold 0.01'", True),
+            "earlier raised below later": (mixed, f"{a} --threshold 0.04 && {b} --threshold 0.05", True),
+            "swapped": (mixed, f"{a} --threshold 0.05 && {b} --threshold 0.01", True),
+            "dummy trailing threshold": (single, "python3 check_ui.py --threshold 0.50 && true --threshold 0.01", True),
+            "extra dummy hides raise": (mixed, f"{a} --threshold 0.04 && {b} --threshold 0.05 && true --threshold 0.01",
+                                        True),
+            "earlier removed": (same, f"{a} && {b} --threshold 0.01", True),
+            "earlier nan": (same, f"{a} --threshold nan && {b} --threshold 0.01", True),
+            "earlier inf": (same, f"{a} --threshold inf && {b} --threshold 0.01", True),
+            "earlier -inf sh -c": (same, f"sh -c '{a} --threshold -inf; {b} --threshold 0.01'", True),
+            "nan beside unchanged": (same, f"{same} && true --threshold nan", True),
+            "unchanged": (same, same, False),
+            "tightened earlier": (f"{a} --threshold 0.05 && {b} --threshold 0.05",
+                                  f"{a} --threshold 0.01 && {b} --threshold 0.05", False),
+            "added stricter check": (mixed, f"{mixed} && python3 check_snap.py c --threshold 0.001", False),
+        })
+
+    def test_short_u_is_executable_aware_and_case_sensitive(self):
+        base, pw = "true", "npx playwright test"
+        self._assert_cases({
+            "python3 -u": (base, "python3 -u scripts/check_ui.py", False),
+            "argv python3 -u": (base, ["python3", "-u", "scripts/check_ui.py"], False),
+            "python -u": (base, "python -u scripts/check_ui.py", False),
+            "python3.14 -u": (base, "python3.14 -u scripts/check_ui.py", False),
+            "argv /usr/bin/python3.14 -u": (base, ["/usr/bin/python3.14", "-u", "scripts/check_ui.py"], False),
+            "python3 -u -m pytest": (base, "python3 -u -m pytest tests/test_ui.py", False),
+            "python3 -X dev -u": (base, "env CI=1 python3 -X dev -u scripts/check_ui.py", False),
+            "sh -c python3 -u": (base, "sh -c 'python3 -u check.py'", False),
+            "bash -u script": (base, "bash -u scripts/check_ui.sh", False),
+            "set -e -u": (base, f"sh -c 'set -e -u; {pw}'", False),
+            "set -euo pipefail newline": (base, f"set -euo pipefail\n{pw}", False),
+            "diff -u": (base, "diff -u a.txt b.txt", False),
+            "-U is not -u": (base, "npx jest -U", False),
+            "jest -u": (base, "jest -u", True),
+            "vitest -u": (base, "vitest -u", True),
+            "npx jest -u": (base, "npx jest -u", True),
+            "npx vitest -u": (base, "npx vitest -u", True),
+            "npm test -- -u": (base, "npm test -- -u", True),
+            "--update-snapshots": (base, f"{pw} --update-snapshots", True),
+            "--UPDATE-SNAPSHOTS": (base, f"{pw} --UPDATE-SNAPSHOTS", True),
+            "python script --update-snapshots": (base, "python3 -u scripts/check_ui.py --update-snapshots", True),
+            "python -m pytest --snapshot-update": (base, "python3 -u -m pytest --snapshot-update", True),
+            "python script -u": (base, "python3 scripts/check_ui.py -u", True),
+            "bash script -u": (base, "bash scripts/check_ui.sh -u", True),
+            "set -u then jest -u": (base, "sh -c 'set -u; npx jest -u'", True),
+            "diff -u then jest -u": (base, "diff -u a b && npx jest -u", True),
+        })
+
+    def test_compound_threshold_loosening_fails_check_and_audit(self):
+        from factonio.harness import audit_harness, check_harness
+
+        script = ("import sys\n"
+                  "diff = {'a': 0.25, 'b': 0.0}[sys.argv[1]]\n"
+                  "sys.exit(1 if diff > float(sys.argv[sys.argv.index('--threshold') + 1]) else 0)\n")
+        a, b = "python3 check_snap.py a", "python3 check_snap.py b"
+        with isolated_hermes_home() as home:
+            repo = self._visual_repo(home, f"{a} --threshold 0.01 && {b} --threshold 0.01", name="svc")
+            _write(repo, "check_snap.py", script)
+            _commit_all(repo, "visual check script")
+            failing = check_harness(str(repo), run_hooks=True)
+            self.assertEqual(failing["hook_results"]["failed_required"], ["pixels"], failing["hook_results"])
+            self._set_command(repo, f"{a} --threshold 0.50 && {b} --threshold 0.01")
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertEqual(chk["hook_results"]["failed_required"], [])
+            self.assertFalse(chk["valid"])
+            self.assertTrue(chk["gate_loosening"]["loosened"])
+            self.assertTrue(any("loosens threshold `threshold` from 0.01 to 0.5" in e for e in chk["errors"]),
+                            chk["errors"])
+            audit = audit_harness(str(repo))
+            self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("stale", True), audit)
+            self.assertEqual(audit["gate_loosening"]["loosened_visual_hooks"], ["pixels"])
+
+
+class TestFixRound5WrappersBooleanFlagsSegmentsAndHarnessCovers(unittest.TestCase):
+    """Command-head-only unwrapping, execution wrappers, boolean regeneration flags, per-command threshold
+    alignment, and formal invariants covering `.factonio/` files."""
+
+    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_cases = TestFixRound4CompoundThresholdsAndShortFlags._assert_cases
+
+    def test_env_and_shells_unwrap_only_at_command_head(self):
+        pw, base = "npx playwright test", "true"
+        self._assert_cases({
+            "path ending in env": (base, f"{pw} tests/env --update-snapshots --threshold 0.99", True),
+            "jest path ending in env -u": (base, "npx jest tests/env -u", True),
+            "grep env -u": (base, "npx jest --grep env -u", True),
+            "positional bash -u": (base, "npx jest bash -u", True),
+            "positional sh -c": (base, "npx jest sh -c x -u", True),
+            "attached env -S": (base, "env -S'npx jest -u'", True),
+            "env -S spaced": (base, "env -S 'npx jest -u'", True),
+            "env --split-string=": (base, "env --split-string='npx jest -u'", True),
+            "env -S appends trailing args": (base, "env -S'npx jest' -u", True),
+            "env -u NAME": (base, "env -u CI npx jest", False),
+            "env after &&": (base, "true && env -u CI npx jest", False),
+            "VAR=val env -u": (base, "CI=1 env -u HOME python3 -u check.py", False),
+        })
+
+    def test_execution_wrappers_resolve_interpreter_flags(self):
+        self._assert_cases({
+            "timeout 30 python3 -u": ("true", "timeout 30 python3 -u visual_check.py", False),
+            "timeout -k 5 30 python3 -u": ("true", "timeout -k 5 30 python3 -u visual_check.py", False),
+            "timeout --signal=TERM": ("true", "timeout --signal=TERM 30 python3 -u visual_check.py", False),
+            "timeout -s KILL": ("true", "timeout -s KILL 30 python3 -u visual_check.py", False),
+            "uv run python3 -u": ("true", "uv run python3 -u script.py", False),
+            "uv run --with pillow": ("true", "uv run --with pillow python3 -u script.py", False),
+            "uv run --python 3.12 --": ("true", "uv run --python 3.12 -- python3 -u script.py", False),
+            "nice -n 5": ("true", "nice -n 5 python3 -u script.py", False),
+            "nohup": ("true", "nohup python3 -u script.py", False),
+            "time -p": ("true", "time -p python3 -u script.py", False),
+            "stdbuf -oL": ("true", "stdbuf -oL python3 -u script.py", False),
+            "stdbuf -o L": ("true", "stdbuf -o L python3 -u script.py", False),
+            "command -p": ("true", "command -p python3 -u script.py", False),
+            "exec -a": ("true", "exec -a ui python3 -u script.py", False),
+            "argv timeout": ("true", ["timeout", "30", "python3", "-u", "visual_check.py"], False),
+            "timeout sh -c": ("true", "timeout 30 sh -c 'python3 -u visual_check.py'", False),
+            "timeout bash -u script": ("true", "timeout 30 bash -u check.sh", False),
+            "timeout 30 npx jest -u": ("true", "timeout 30 npx jest -u", True),
+            "uv run pytest --snapshot-update": ("true", "uv run pytest --snapshot-update", True),
+            "uv run python3 -m pytest": ("true", "uv run python3 -m pytest --snapshot-update", True),
+            "uv run -m pytest": ("true", "uv run -m pytest --snapshot-update", True),
+            "nice timeout jest -u": ("true", "nice -n 5 timeout 30 npx jest -u", True),
+            "timeout python script -u": ("true", "timeout 30 python3 check.py -u", True),
+        })
+
+    def test_boolean_regeneration_flags_ignore_trailing_words(self):
+        pw = "npx playwright test"
+        self._assert_cases({
+            'jest -u ""': ("true", 'npx jest -u ""', True),
+            'vitest -u ""': ("true", 'npx vitest -u ""', True),
+            "jest -u none": ("true", "npx jest -u none", True),
+            "jest -u false": ("true", "npx jest -u false", True),
+            "--updateSnapshot false": ("true", "npx jest --updateSnapshot false", True),
+            'pytest --snapshot-update ""': ("true", 'python3 -m pytest --snapshot-update ""', True),
+            "--accept no": ("true", "cargo insta test --accept no", True),
+            '--update-snapshots ""': ("true", f'{pw} --update-snapshots ""', True),
+            "--update-snapshots=": ("true", f"{pw} --update-snapshots=", True),
+            "--update-snapshots none": ("true", f"{pw} --update-snapshots none", False),
+            "--update-snapshots=none": ("true", f"{pw} --update-snapshots=none", False),
+            "--updateSnapshot=false": ("true", "npx jest --updateSnapshot=false", False),
+            "UPDATE_SNAPSHOTS= empty": ("true", f"UPDATE_SNAPSHOTS= {pw}", False),
+        })
+
+    def test_thresholds_align_per_command_signature(self):
+        a, b, c = "python3 check_snap.py a", "python3 check_snap.py b", "python3 check_snap.py c"
+        mixed = f"{a} --threshold 0.01 && {b} --threshold 0.05"
+        single = f"{a} --threshold 0.01"
+        self._assert_cases({
+            "swap + dummy trailing": (mixed, f"{a} --threshold 0.05 && {b} --threshold 0.01 && true --threshold 0.01",
+                                      True),
+            "raise below later + dummy": (mixed, f"{a} --threshold 0.04 && {b} --threshold 0.05 && "
+                                          "true --threshold 0.01", True),
+            "new check appended": (mixed, f"{mixed} && {c} --threshold 0.02", False),
+            "new check prepended": (mixed, f"{c} --threshold 0.02 && {mixed}", False),
+            "new check between": (mixed, f"{a} --threshold 0.01 && {c} --threshold 0.02 && {b} --threshold 0.05",
+                                  False),
+            "single raised + dummy": (single, f"{a} --threshold 0.50 && true --threshold 0.01", True),
+            "renamed raised + dummy": (single, "other --threshold 0.50 && true --threshold 0.01", True),
+            "renamed same": (single, "other --threshold 0.01", False),
+            "tightened later": (mixed, f"{a} --threshold 0.01 && {b} --threshold 0.02", False),
+            "command removed": (mixed, single, True),
+            "extra same-flag occurrence raised": (single, f"{single} --threshold 0.5", True),
+            "threshold added to existing command": (f"{a}", f"{a} --threshold 0.5", True),
+            "new check nan": (mixed, f"{mixed} && {c} --threshold nan", True),
+        })
+
+    def test_wrapped_interpreter_flags_pass_check_harness_end_to_end(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo = self._visual_repo(home, "python3 visual_check.py", name="svc")
+            _write(repo, "visual_check.py", "print('ok')\n")
+            _commit_all(repo, "visual check script")
+            for command in ("timeout 30 python3 -u visual_check.py", "timeout -k 5 30 python3 -u visual_check.py",
+                            "uv run --no-project python3 -u visual_check.py"):
+                if command.startswith("uv ") and not shutil.which("uv"):
+                    continue  # the parser cases above cover `uv run` without the binary
+                with self.subTest(command):
+                    self._set_command(repo, command)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(chk["hook_results"]["failed_required"], [], chk["hook_results"])
+                    self.assertTrue(chk["valid"], chk["errors"])
+                    self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+                    audit = audit_harness(str(repo))
+                    self.assertFalse(audit["gate_loosening"]["loosened"], audit["gate_loosening"])
+            self._set_command(repo, "timeout 30 npx jest -u")
+            chk = check_harness(str(repo))
+            self.assertFalse(chk["valid"])
+            self.assertEqual(chk["gate_loosening"]["loosened_visual_hooks"], ["pixels"])
+
+    def test_invariant_covering_harness_dir_file_is_inventoried_and_drifts(self):
+        from factonio.harness import audit_harness, bootstrap_verify_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            _write(repo, ".factonio/model.cfg", "states = 3\n")
+            _commit_all(repo, "model")
+            sync = _git(repo, "rev-parse", "HEAD")
+            bootstrap_verify_harness(str(repo), hooks=[
+                {"name": "model", "kind": "invariant", "command": "true", "covers": [".factonio/model.cfg"],
+                 "sync_commit": sync},
+            ])
+            _commit_all(repo, "harness")
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual(chk["formal_invariants"]["dead_cover_globs"], [])
+            self.assertEqual([i["status"] for i in chk["formal_invariants"]["invariants"]], ["in_sync"])
+            clean = audit_harness(str(repo))
+            self.assertEqual((clean["severity"], clean["dead_cover_globs"], clean["stale_invariants"]),
+                             ("clean", [], []))
+
+            _write(repo, ".factonio/model.cfg", "states = 4\n")
+            _commit_all(repo, "change model")
+            before_index = _index_fingerprint(repo)
+            chk = check_harness(str(repo))
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual([i["status"] for i in chk["formal_invariants"]["invariants"]], ["stale"])
+            self.assertEqual([i["changed_files"] for i in chk["formal_invariants"]["stale_invariants"]],
+                             [[".factonio/model.cfg"]])
+            audit = audit_harness(str(repo))
+            self.assertEqual(_index_fingerprint(repo), before_index)
+            self.assertEqual((audit["drifted"], audit["severity"]), (True, "stale"))
+            self.assertEqual([i["changed_files"] for i in audit["stale_invariants"]], [[".factonio/model.cfg"]])
+            self.assertEqual(audit["drift_classification"]["classification"], "doc_drift")
+            self.assertEqual(audit["orphaned_globs"], [])
+
+    def test_harness_dir_stays_out_of_general_inventory(self):
+        from factonio.harness import _changed_files, _list_repo_files
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            base = _git(repo, "rev-parse", "HEAD")
+            _write(repo, ".factonio/model.cfg", "x\n")
+            _write(repo, ".venv/lib/x.py", "x\n")
+            self.assertNotIn(".factonio/model.cfg", _list_repo_files(repo)[0])
+            self.assertNotIn(".factonio/model.cfg", _changed_files(repo, base))
+            self.assertIn(".factonio/model.cfg", _changed_files(repo, base, include_harness_dir=True))
 
 
 if __name__ == "__main__":

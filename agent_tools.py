@@ -962,8 +962,10 @@ def register_tools(ctx: Any) -> None:
                 "rollback); check validates it (optionally running Doctor commands and hooks) and fails when required "
                 "hooks or Doctor commands were removed/downgraded vs base_ref (default HEAD); show returns it; audit "
                 "reports read-only drift (uncovered changed files, stale features, new/removed routes and CLI "
-                "commands, orphaned globs, gate_loosening) with a drift_classification (clean, doc_drift, "
-                "harness_gap, product_regression). Black-Box Verification cards receive the harness automatically."
+                "commands, orphaned globs, gate_loosening, stale_invariants for formal `invariant` hooks whose `covers` "
+                "changed since `sync_commit`, visual_baseline_changes for tampered frozen `visual_diff` baselines) with "
+                "a drift_classification (clean, doc_drift, harness_gap, product_regression). Black-Box Verification "
+                "cards receive the harness automatically."
             ),
             "parameters": {
                 "type": "object",
@@ -989,6 +991,26 @@ def register_tools(ctx: Any) -> None:
                                 "command": {"type": "string", "description": "Shell command run in the repo root."},
                                 "optional": {"type": "boolean", "default": False},
                                 "timeout": {"type": "integer", "minimum": 1},
+                                "covers": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "invariant only: globs of the files this formal invariant/model covers.",
+                                },
+                                "sync_commit": {
+                                    "type": "string",
+                                    "description": "invariant only (needs covers): commit the invariant was last proven "
+                                    "against; covered files changed after it are reported as stale_invariants.",
+                                },
+                                "baseline_paths": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "visual_diff only: globs of the committed baseline images/snapshots.",
+                                },
+                                "frozen_baseline": {
+                                    "type": "boolean",
+                                    "description": "visual_diff only: baselines may not be regenerated or modified "
+                                    "(default true when baseline_paths is set).",
+                                },
                             },
                             "required": ["name", "kind", "command"],
                         },

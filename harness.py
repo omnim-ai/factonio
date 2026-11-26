@@ -3,17 +3,21 @@
 Pure stdlib + the `git` CLI. Detects a repository's stack and black-box surfaces
 (HTTP routes, CLI commands), bootstraps a versioned Launch / Doctor / Drive /
 Evidence / Cleanup playbook, validates and shows it, runs optional repo-defined
-hooks, proves a freshly generated harness (`prove`), detects loosened gates, classifies drift
-(`doc_drift` / `harness_gap` / `product_regression`), and audits drift read-only (every git probe uses
+hooks, proves a freshly generated harness (`prove`), detects loosened gates (including regenerated or
+tampered frozen `visual_diff` baselines), tracks formal-invariant drift (`covers` / `sync_commit`), classifies
+drift (`doc_drift` / `harness_gap` / `product_regression`), and audits drift read-only (every git probe uses
 `--no-optional-locks`).
 """
 
 from __future__ import annotations
 
+import difflib
 import json
+import math
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -291,7 +295,7 @@ def _any_match(patterns: Iterable[str], rel_path: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _walk_files(repo_path: Path) -> tuple[list[str], bool]:
+def _walk_files(repo_path: Path, skip_dirs: frozenset[str] = SKIP_DIRS) -> tuple[list[str], bool]:
     """Bounded walk returning POSIX relative paths (skipping vendored/cache dirs)."""
     files: list[str] = []
     truncated = False
@@ -299,7 +303,7 @@ def _walk_files(repo_path: Path) -> tuple[list[str], bool]:
     for dirpath, dirnames, filenames in os.walk(repo_path):
         depth = len(Path(dirpath).parts) - root_depth
         dirnames[:] = sorted(
-            d for d in dirnames if d not in SKIP_DIRS and not d.endswith(".egg-info") and depth < MAX_DEPTH
+            d for d in dirnames if d not in skip_dirs and not d.endswith(".egg-info") and depth < MAX_DEPTH
         )
         for name in sorted(filenames):
             rel = (Path(dirpath) / name).relative_to(repo_path).as_posix()
@@ -309,7 +313,7 @@ def _walk_files(repo_path: Path) -> tuple[list[str], bool]:
     return files, truncated
 
 
-def _list_repo_files(repo_path: Path) -> tuple[list[str], bool]:
+def _list_repo_files(repo_path: Path, skip_dirs: frozenset[str] = SKIP_DIRS) -> tuple[list[str], bool]:
     """Tracked + untracked (non-ignored) files via read-only git, else a bounded walk."""
     if _is_git_repo(repo_path):
         proc = _git_ro(repo_path, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], timeout=60)
@@ -319,7 +323,7 @@ def _list_repo_files(repo_path: Path) -> tuple[list[str], bool]:
             for rel in proc.stdout.split("\0"):
                 if not rel or rel in seen:
                     continue
-                if any(part in SKIP_DIRS for part in rel.split("/")[:-1]):
+                if any(part in skip_dirs for part in rel.split("/")[:-1]):
                     continue
                 if not (repo_path / rel).exists():
                     continue
@@ -328,7 +332,16 @@ def _list_repo_files(repo_path: Path) -> tuple[list[str], bool]:
             files.sort()
             truncated = len(files) > MAX_SCAN_FILES
             return files[:MAX_SCAN_FILES], truncated
-    return _walk_files(repo_path)
+    return _walk_files(repo_path, skip_dirs)
+
+
+# Formal invariants may cover the harness's own files (e.g. `.factonio/model.cfg`), so their inventory keeps
+# `.factonio/` while every other skipped directory (`.git/`, venvs, build output) stays excluded.
+_INVARIANT_SKIP_DIRS = SKIP_DIRS - {HARNESS_DIR_NAME}
+
+
+def _invariant_files(root: Path) -> list[str]:
+    return _list_repo_files(root, _INVARIANT_SKIP_DIRS)[0]
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -588,9 +601,85 @@ def validate_hooks(hooks: Any) -> list[dict[str, Any]]:
             hook["timeout"] = timeout
         if raw.get("description"):
             hook["description"] = str(raw["description"])
+        hook.update(_validate_hook_metadata(raw, kind, f"hooks[{idx}] ({name})"))
         seen.add(name)
         out.append(hook)
     return out
+
+
+# Optional per-kind hook metadata: formal invariants (`covers` / `sync_commit`) and frozen visual baselines.
+INVARIANT_META_KEYS: tuple[str, ...] = ("covers", "sync_commit")
+VISUAL_META_KEYS: tuple[str, ...] = ("baseline_paths", "frozen_baseline")
+HOOK_META_KEYS: tuple[str, ...] = (*INVARIANT_META_KEYS, *VISUAL_META_KEYS)
+
+
+def _glob_list(value: Any, label: str) -> list[str]:
+    if not isinstance(value, list) or not value or not all(isinstance(v, str) and v.strip() for v in value):
+        raise ValueError(f"{label} must be a non-empty list of non-empty glob strings; got {value!r}")
+    return [v.strip() for v in value]
+
+
+def _validate_hook_metadata(raw: dict[str, Any], kind: str, label: str) -> dict[str, Any]:
+    """Normalize the optional kind-specific metadata of one hook; ``ValueError`` on misuse."""
+    present = {k: raw[k] for k in HOOK_META_KEYS if raw.get(k) is not None}
+    for key in present:
+        owner = "invariant" if key in INVARIANT_META_KEYS else "visual_diff"
+        if kind != owner:
+            raise ValueError(f"{label}.{key} is only allowed on `{owner}` hooks; got kind {kind!r}")
+    meta: dict[str, Any] = {}
+    if "covers" in present:
+        meta["covers"] = _glob_list(present["covers"], f"{label}.covers")
+    if "sync_commit" in present:
+        if "covers" not in meta:
+            raise ValueError(f"{label}.sync_commit requires a non-empty `covers` glob list")
+        value = present["sync_commit"]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label}.sync_commit must be a non-empty git commit SHA or ref; got {value!r}")
+        ref = value.strip()
+        if ref.startswith("-") or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in ref):
+            raise ValueError(
+                f"{label}.sync_commit must not start with '-' or contain whitespace/control characters; got {value!r}"
+            )
+        meta["sync_commit"] = ref
+    if "baseline_paths" in present:
+        meta["baseline_paths"] = _glob_list(present["baseline_paths"], f"{label}.baseline_paths")
+    if "frozen_baseline" in present:
+        if not isinstance(present["frozen_baseline"], bool):
+            raise ValueError(f"{label}.frozen_baseline must be a boolean")
+        meta["frozen_baseline"] = present["frozen_baseline"]
+    elif "baseline_paths" in meta:
+        meta["frozen_baseline"] = True
+    return meta
+
+
+def _hook_metadata_md(hook: dict[str, Any]) -> str:
+    """Trailing ` [covers: `a/**`; sync_commit: `abc`]` rendered after a hook's backticked command."""
+    parts: list[str] = []
+    for key in HOOK_META_KEYS:
+        value = hook.get(key)
+        if value is None:
+            continue
+        if isinstance(value, list):
+            parts.append(f"{key}: " + ", ".join(f"`{v}`" for v in value))
+        else:
+            parts.append(f"{key}: `{str(value).lower() if isinstance(value, bool) else value}`")
+    return f" [{'; '.join(parts)}]" if parts else ""
+
+
+_HOOK_META_RE = re.compile(r"\b(covers|sync_commit|baseline_paths|frozen_baseline):\s*((?:`[^`\n]*`\s*,?\s*)+)")
+
+
+def _parse_hook_metadata_md(rest: str) -> dict[str, Any]:
+    meta: dict[str, Any] = {}
+    for key, raw in _HOOK_META_RE.findall(rest):
+        values = re.findall(r"`([^`\n]*)`", raw)
+        if key in ("covers", "baseline_paths"):
+            meta[key] = values
+        elif key == "frozen_baseline":
+            meta[key] = {"true": True, "false": False}.get(values[0].strip().lower(), values[0]) if values else None
+        elif values:
+            meta[key] = values[0]
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -716,7 +805,9 @@ def render_verify_md(manifest: dict[str, Any]) -> str:
     hooks = manifest.get("hooks") or []
     for hook in hooks:
         req = "optional" if hook.get("optional") else "required"
-        lines.append(f"- **{hook['name']}** (`{hook['kind']}`, {req}): `{_fmt_cmd(hook['command'])}`")
+        lines.append(
+            f"- **{hook['name']}** (`{hook['kind']}`, {req}): `{_fmt_cmd(hook['command'])}`{_hook_metadata_md(hook)}"
+        )
     if not hooks:
         lines.append("_No hooks declared._")
     lines.append("")
@@ -1001,11 +1092,13 @@ def _section_commands(body: str) -> list[str]:
 def _parse_md_hooks(body: str) -> list[dict[str, Any]]:
     hooks: list[dict[str, Any]] = []
     for m in _HOOK_LINE_RE.finditer(body):
+        eol = body.find("\n", m.end())
         hooks.append({
             "name": m.group("name").strip(),
             "kind": m.group("kind"),
             "command": m.group("cmd").strip(),
             "optional": m.group("opt") == "optional",
+            **_parse_hook_metadata_md(body[m.end(): eol if eol >= 0 else len(body)]),
         })
     return hooks
 
@@ -1302,18 +1395,19 @@ def check_harness(
             errors.append(f"feature_map `{d['feature']}` glob `{d['glob']}` matches no files")
     elif info["present"]:
         warnings.append(f"No {HARNESS_DIR_NAME}/{HARNESS_JSON_NAME}; using hand-authored verify.md only")
-    if info["present"] and info["hooks"]:
-        try:
-            validate_hooks(info["hooks"])
-        except ValueError as exc:
-            if info["manifest"] is None:
-                errors.append(f"verify.md hooks invalid: {exc}")
+    md_hook_errors = _verify_md_hook_errors(info)
+    errors.extend(md_hook_errors)
+    formal = _check_formal_invariants(root, info)
+    errors.extend(formal["errors"])
 
     doctor = None
     hooks_res = None
     if manifest_errors and (run_doctor or run_hooks):
         warnings.append("Skipped Doctor commands and hooks: harness.json is malformed")
         run_doctor = run_hooks = False
+    # Unresolved sync_commits and malformed verify.md hooks are harness gaps too, but they must not mask a real
+    # hook failure.
+    manifest_errors = manifest_errors + md_hook_errors + formal["manifest_errors"]
     if run_doctor:
         cmds = info["phases"].get("doctor") or []
         doctor = _run_doctor(root, cmds)
@@ -1329,7 +1423,11 @@ def check_harness(
             for name in hooks_res["failed_required"]:
                 errors.append(f"Required hook {name!r} failed")
         except ValueError as exc:
-            errors.append(str(exc))
+            if not md_hook_errors:
+                errors.append(str(exc))
+    if run_doctor or run_hooks:
+        # A Doctor command or hook may regenerate a frozen baseline while it runs: re-check after execution.
+        gate = _merge_gate(gate, detect_harness_gate_loosening(root, base_ref))
     if gate["loosened"]:
         errors.extend(gate["findings"])
 
@@ -1354,7 +1452,655 @@ def check_harness(
         "doctor": doctor,
         "hook_results": hooks_res,
         "gate_loosening": gate,
+        "formal_invariants": formal,
+        "visual_baseline_changes": list(gate.get("visual_baseline_changes") or []),
     }
+
+
+def _verify_md_hook_errors(info: dict[str, Any]) -> list[str]:
+    """Schema errors of hooks sourced from verify.md (no harness.json, or one without `hooks`), which
+    `_validate_manifest` never sees."""
+    manifest = info.get("manifest")
+    if not info.get("present") or not info.get("hooks") or (manifest is not None and manifest.get("hooks") is not None):
+        return []
+    try:
+        validate_hooks(info["hooks"])
+    except ValueError as exc:
+        return [f"{VERIFY_MD_NAME} hooks invalid: {exc}"]
+    return []
+
+
+def _merge_gate(gate: dict[str, Any], later: dict[str, Any]) -> dict[str, Any]:
+    """Union of two gate-loosening results for the same base (e.g. before and after hooks ran)."""
+    if not later.get("checked"):
+        return gate
+    merged = dict(gate) if gate.get("checked") else dict(later)
+    for key in ("removed_required_hooks", "downgraded_hooks", "removed_doctor_commands", "loosened_visual_hooks",
+                "findings"):
+        merged[key] = list(dict.fromkeys([*(gate.get(key) or []), *(later.get(key) or [])]))
+    merged["visual_baseline_changes"] = _merge_baseline_changes(
+        list(gate.get("visual_baseline_changes") or []), list(later.get("visual_baseline_changes") or [])
+    )
+    merged["loosened"] = bool(merged["findings"])
+    return merged
+
+
+def _check_formal_invariants(root: Path, info: dict[str, Any]) -> dict[str, Any]:
+    """`_audit_formal_invariants` for `check_harness`: stale invariants since the harness base (warnings-free)."""
+    if not info["present"] or not _formal_invariant_hooks(info["hooks"]):
+        return _audit_formal_invariants(root, [], files=[], harness_base=None, harness_base_source=None, is_git=False)
+    is_git = _is_git_repo(root)
+    base_sha, base_source = _audit_base(root, None, info["manifest"]) if is_git else (None, None)
+    return _audit_formal_invariants(
+        root, info["hooks"], files=_invariant_files(root), harness_base=base_sha, harness_base_source=base_source,
+        is_git=is_git,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Formal invariants (`covers` / `sync_commit`) and frozen visual baselines (read-only)
+# ---------------------------------------------------------------------------
+
+
+def _safe_ref(value: Any) -> Optional[str]:
+    try:
+        return _validate_ref(value)
+    except ValueError:
+        return None
+
+
+def _formal_invariant_hooks(hooks: Iterable[Any]) -> list[dict[str, Any]]:
+    """Well-typed `invariant` hooks declaring a non-empty `covers` glob list (malformed ones are schema errors)."""
+    return [
+        h for h in hooks
+        if isinstance(h, dict) and h.get("kind") == "invariant"
+        and _is_str_list(h.get("covers"), non_empty_items=True) and h.get("covers")
+    ]
+
+
+def _audit_formal_invariants(
+    root: Path,
+    hooks: Iterable[Any],
+    *,
+    files: list[str],
+    harness_base: Optional[str],
+    harness_base_source: Optional[str],
+    is_git: bool,
+) -> dict[str, Any]:
+    """Read-only formal-invariant drift: dead `covers` globs, unresolved `sync_commit`s, and invariants whose
+    covered files changed since `sync_commit` (or the harness base when omitted). Every git probe is `_git_ro`."""
+    result: dict[str, Any] = {
+        "checked": False,
+        "invariants": [],
+        "dead_cover_globs": [],
+        "unresolved_sync_commits": [],
+        "stale_invariants": [],
+        "errors": [],
+        "manifest_errors": [],
+    }
+    invariants = _formal_invariant_hooks(hooks)
+    if not invariants:
+        return result
+    result["checked"] = True
+    changed_cache: dict[str, list[str]] = {}
+    for hook in invariants:
+        name = str(hook.get("name") or "").strip()
+        covers = [c.strip() for c in hook["covers"]]
+        raw_sync = hook.get("sync_commit")
+        declared = raw_sync.strip() if isinstance(raw_sync, str) and raw_sync.strip() else None
+        entry: dict[str, Any] = {
+            "name": name, "covers": covers, "sync_commit": declared, "sync_source": None, "base_commit": None,
+            "changed_files": [], "optional": bool(hook.get("optional", False)), "status": "unchecked",
+        }
+        result["invariants"].append(entry)
+        for glob in covers:
+            if not any(glob_matches(glob, f) for f in files):
+                result["dead_cover_globs"].append({"hook": name, "glob": glob})
+                result["errors"].append(f"Formal invariant {name!r} covers glob `{glob}` matches no files")
+        if declared is not None:
+            ref = _safe_ref(declared)
+            sha = _resolve_commit(root, ref) if is_git and ref else None
+            if not sha:
+                entry["status"] = "unresolved"
+                result["unresolved_sync_commits"].append({"name": name, "sync_commit": declared})
+                msg = f"Formal invariant {name!r} sync_commit `{declared}` does not resolve to a commit"
+                result["errors"].append(msg)
+                result["manifest_errors"].append(msg)
+                continue
+            entry.update(sync_source="sync_commit", base_commit=sha)
+        elif is_git and harness_base:
+            sha = harness_base
+            entry.update(sync_commit=harness_base, sync_source=harness_base_source, base_commit=harness_base)
+        else:
+            continue
+        if sha not in changed_cache:
+            changed_cache[sha] = _changed_files(root, sha, include_harness_dir=True)
+        hits = [p for p in changed_cache[sha] if _any_match(covers, p)]
+        entry["changed_files"] = hits
+        entry["status"] = "stale" if hits else "in_sync"
+        if hits:
+            result["stale_invariants"].append(
+                {k: entry[k] for k in ("name", "sync_commit", "sync_source", "covers", "changed_files", "optional")}
+            )
+    return result
+
+
+def _frozen_baseline_globs(hook: dict[str, Any]) -> list[str]:
+    """`baseline_paths` of a `visual_diff` hook whose baseline is frozen (the default once paths are set)."""
+    if not isinstance(hook, dict) or hook.get("kind") != "visual_diff" or hook.get("frozen_baseline") is False:
+        return []
+    paths = hook.get("baseline_paths")
+    return [p.strip() for p in paths] if _is_str_list(paths, non_empty_items=True) and paths else []
+
+
+def _changed_status(root: Path, base_sha: Optional[str]) -> dict[str, str]:
+    """path -> `A`/`M`/`D`/`T` for commits ``base_sha..HEAD`` plus the working tree (read-only probes)."""
+    out: dict[str, str] = {}
+    if base_sha:
+        proc = _git_ro(root, ["diff", "--name-status", "-z", "--no-renames", base_sha, "HEAD"], timeout=60)
+        if proc.returncode == 0:
+            parts = proc.stdout.split("\0")
+            for status, path in zip(parts[0::2], parts[1::2]):
+                if path:
+                    out[path] = status[:1]
+    proc = _git_ro(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"], timeout=60)
+    worktree: dict[str, str] = {}
+    if proc.returncode == 0:
+        for rec in proc.stdout.split("\0"):
+            if len(rec) <= 3:
+                continue
+            xy, path = rec[:2], rec[3:]
+            status = "A" if xy == "??" or "A" in xy else ("D" if "D" in xy else "M")
+            prior = worktree.get(path)
+            # A staged deletion plus an untracked/re-added file at the same path replaces an existing file.
+            worktree[path] = status if prior is None or prior == status else "M"
+    for path, status in worktree.items():
+        prior = out.get(path)
+        if prior == "A" and status == "D":
+            out.pop(path)  # added after the base and deleted again: no net change to a frozen baseline
+        elif prior == "A" or prior is None:
+            out[path] = prior or status
+        else:
+            out[path] = "M" if status == "A" else status
+    return out
+
+
+def _existed_at(root: Path, ref: str, path: str) -> bool:
+    return _git_ro(root, ["cat-file", "-e", f"{ref}:{path}"]).returncode == 0
+
+
+def _frozen_baseline_changes(root: Path, frozen: dict[str, list[str]], base_sha: Optional[str]) -> list[dict[str, Any]]:
+    """Existing frozen baseline files modified or deleted since ``base_sha`` (committed or in the working tree).
+    Baseline files absent from ``base_sha`` (``HEAD`` when no base) are new surfaces, not tampering."""
+    if not frozen:
+        return []
+    status = _changed_status(root, base_sha)
+    ref = base_sha or "HEAD"
+    out: list[dict[str, Any]] = []
+    for name, globs in frozen.items():
+        hits = sorted(
+            p for p, st in status.items()
+            if _any_match(globs, p) and (st != "A" or _existed_at(root, ref, p))
+        )
+        if hits:
+            out.append({"name": name, "baseline_paths": globs, "changed_files": hits})
+    return out
+
+
+def _merge_baseline_changes(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        for item in group:
+            cur = merged.setdefault(item["name"], {**item, "changed_files": []})
+            cur["changed_files"] = sorted({*cur["changed_files"], *item["changed_files"]})
+    return list(merged.values())
+
+
+_REGEN_FLAGS = frozenset({
+    "-u", "--update", "--update-snapshots", "--update-snapshot", "--updatesnapshot", "--snapshot-update",
+    "--update-baseline", "--update-baselines", "--regenerate", "--regen", "--update-goldens", "--update-golden",
+    "--overwrite-baselines", "--force-update-snapshots", "--accept", "--accept-snapshots",
+})
+_REGEN_ENV_RE = re.compile(
+    r"^(?:[A-Z0-9_]*_)?(?:UPDATE_?SNAPSHOTS?|SNAPSHOTS?_?UPDATE|UPDATE_?BASELINES?|UPDATE_?GOLDENS?|"
+    r"REGENERATE(?:_[A-Z0-9_]+)?)=(.*)$",
+    re.IGNORECASE,
+)
+_THRESHOLD_KEY_RE = re.compile(
+    r"threshold|toleran|max[-_]?diff|fuzz|max[-_]?pixel|diff[-_]?ratio|mismatch", re.IGNORECASE
+)
+_ENV_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+
+
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "busybox"})
+_SHELL_PUNCT = frozenset("();<>|&\n")
+_MAX_SHELL_DEPTH = 4
+
+
+def _is_shell_op(tok: str) -> bool:
+    return bool(tok) and all(ch in _SHELL_PUNCT for ch in tok)
+
+
+def _split_shell(text: str) -> list[str]:
+    """POSIX words with shell operators (`;`, `&&`, `|`, `(`, `)`, ...) split into their own tokens."""
+    lexer = shlex.shlex(text, posix=True, punctuation_chars="();<>|&\n")
+    lexer.whitespace_split = True
+    lexer.whitespace = " \t\r"  # an unquoted newline separates commands like `;`
+    lexer.commenters = ""
+    try:
+        return list(lexer)
+    except ValueError:
+        return re.findall(r"[();<>|&\n]+|[^\s();<>|&]+", text)
+
+
+# Execution wrappers that run their trailing argv as the real command: name -> (short options taking a
+# value, long options taking a value, required positional args before the command). `uv` only wraps `uv run`.
+_EXEC_WRAPPERS: dict[str, tuple[frozenset[str], frozenset[str], int]] = {
+    "timeout": (frozenset("sk"), frozenset({"--signal", "--kill-after"}), 1),
+    "nice": (frozenset("n"), frozenset({"--adjustment"}), 0),
+    "nohup": (frozenset(), frozenset(), 0),
+    "time": (frozenset("fo"), frozenset({"--format", "--output"}), 0),
+    "stdbuf": (frozenset("ioe"), frozenset({"--input", "--output", "--error"}), 0),
+    "command": (frozenset(), frozenset(), 0),
+    "exec": (frozenset("a"), frozenset(), 0),
+    "xvfb-run": (frozenset("efnpsw"), frozenset({
+        "--error-file", "--auth-file", "--server-num", "--xauth-protocol", "--server-args", "--wait",
+    }), 0),
+}
+_UV_RUN_VALUE_OPTS = frozenset({
+    "--with", "--with-editable", "--with-requirements", "--python", "--directory", "--project", "--group",
+    "--no-group", "--extra", "--no-extra", "--env-file", "--from", "--index", "--default-index", "--index-url",
+    "--extra-index-url", "--find-links", "--package", "--cache-dir", "--config-file", "--python-platform",
+    "--only-group", "--prerelease", "--resolution", "--index-strategy", "--keyring-provider", "--exclude-newer",
+    "--link-mode", "--refresh-package", "--reinstall-package", "--upgrade-package", "--no-binary-package",
+    "--no-build-package", "--allow-insecure-host", "--color", "-p", "-C", "-w", "-f", "-i",
+})
+_ENV_VALUE_OPTS = frozenset({"-u", "--unset", "-C", "--chdir"})
+# Shell reserved words that precede a command without being its executable.
+_SHELL_PREFIX_WORDS = frozenset({"!", "{", "}", "if", "then", "elif", "else", "do", "while", "until"})
+
+
+def _skip_options(tokens: list[str], i: int, short_vals: frozenset[str], long_vals: frozenset[str]) -> int:
+    """Index after a wrapper's options starting at ``i`` (``--`` consumed; value-taking options skip their value)."""
+    while i < len(tokens) and tokens[i].startswith("-") and len(tokens[i]) > 1:
+        tok = tokens[i]
+        i += 1
+        if tok == "--":
+            break
+        if tok.startswith("--"):
+            if "=" not in tok and tok in long_vals:
+                i += 1
+        elif tok[1] in short_vals and len(tok) == 2:
+            i += 1
+    return i
+
+
+def _skip_exec_wrapper(tokens: list[str], i: int) -> Optional[int]:
+    """Index of the wrapped command when ``tokens[i]`` is a supported execution wrapper, else None."""
+    name = os.path.basename(tokens[i])
+    if name == "uv":
+        j = _skip_options(tokens, i + 1, frozenset("pCw"), frozenset({"--directory", "--project", "--cache-dir",
+                                                                         "--config-file", "--color"}))
+        if j >= len(tokens) or tokens[j] != "run":
+            return None
+        j += 1
+        while j < len(tokens) and tokens[j].startswith("-") and len(tokens[j]) > 1:
+            tok = tokens[j]
+            j += 1
+            if tok == "--":
+                break
+            if tok in ("-m", "--module"):
+                break  # `uv run -m pytest ...`: the module name is the command head
+            if "=" not in tok and tok in _UV_RUN_VALUE_OPTS:
+                j += 1
+        return j
+    spec = _EXEC_WRAPPERS.get(name)
+    if spec is None:
+        return None
+    short_vals, long_vals, positional = spec
+    return _skip_options(tokens, i + 1, short_vals, long_vals) + positional
+
+
+def _env_split_script(opt: str, tokens: list[str], j: int) -> tuple[Optional[str], int]:
+    """The `env -S` script carried by option ``opt`` (attached `-S'...'`, `-S <s>` or `--split-string[=]<s>`)."""
+    if opt in ("-S", "--split-string"):
+        return (tokens[j], j + 1) if j < len(tokens) else (None, j)
+    if opt.startswith("--split-string="):
+        return opt.partition("=")[2], j
+    if opt.startswith("-S") and len(opt) > 2:
+        return opt[2:], j
+    return None, j
+
+
+def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
+    """Expand command-head `sh|bash ... -c <script>` and `env -S <script>` into their tokens and drop command-head
+    `env [opts]` and execution wrappers (`timeout 30`, `uv run`, `nice -n 5`, ...), so wrapper options such as
+    bash's or env's `-u` are never read as a regeneration flag. Only the command-head position (start, after a
+    shell operator, `VAR=val` or a wrapper) is unwrapped: a positional argument such as `tests/env` is data."""
+    out: list[str] = []
+    at_head = True
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if _is_shell_op(tok):
+            out.append(tok)
+            at_head, i = True, i + 1
+            continue
+        if not at_head:
+            out.append(tok)
+            i += 1
+            continue
+        base = os.path.basename(tok)
+        if _ENV_ASSIGN_RE.match(tok):
+            out.append(tok)
+            i += 1
+            continue
+        if tok in _SHELL_PREFIX_WORDS:
+            i += 1
+            continue
+        if base == "env" and depth < _MAX_SHELL_DEPTH:
+            j = i + 1
+            script: Optional[str] = None
+            while j < len(tokens) and tokens[j].startswith("-") and script is None:
+                opt = tokens[j]
+                j += 1
+                if opt == "--":
+                    break
+                if opt in _ENV_VALUE_OPTS:
+                    j += 1  # `env -u NAME` unsets a variable; it is not jest's `-u`
+                    continue
+                script, j = _env_split_script(opt, tokens, j)
+            if script is not None:
+                # GNU env splits the script into argv and appends the remaining arguments to it.
+                out.extend(_unwrap_shell_scripts(_split_shell(script) + tokens[j:], depth + 1))
+                return out
+            i = j
+            continue
+        wrapped = _skip_exec_wrapper(tokens, i)
+        if wrapped is not None:
+            i = wrapped
+            continue
+        if depth < _MAX_SHELL_DEPTH and base in _SHELLS:
+            j, has_c = i + 1, False
+            if base == "busybox" and j < len(tokens) and tokens[j] in _SHELLS:
+                j += 1
+            while j < len(tokens) and tokens[j][:1] in ("-", "+") and len(tokens[j]) > 1 and tokens[j] != "--":
+                opt = tokens[j]
+                j += 1
+                if opt.startswith("--"):
+                    continue
+                has_c = has_c or "c" in opt[1:]
+                if opt[-1] in ("o", "O") and j < len(tokens):
+                    j += 1  # `-o pipefail` / `-euo pipefail`: the option takes the next word
+            if j < len(tokens) and tokens[j] == "--":
+                j += 1
+            if has_c and j < len(tokens):
+                out.extend([";", *_unwrap_shell_scripts(_split_shell(tokens[j]), depth + 1), ";"])
+                i = j + 1
+                continue
+        out.append(tok)
+        at_head = False
+        i += 1
+    return out
+
+
+def _command_tokens(command: Any) -> list[str]:
+    """Shell-aware tokens of a hook command: operators split out and `sh -c` style scripts expanded inline."""
+    if isinstance(command, list):
+        tokens = [str(c) for c in command]
+    else:
+        tokens = _split_shell(str(command or ""))
+    return _unwrap_shell_scripts(tokens, 0)
+
+
+_REGEN_DISABLED = frozenset({"0", "false", "no", "off", "none"})
+# Long regeneration options that take a mode word (`--update-snapshots none`); every other regeneration flag
+# is boolean, so a following word (even `""` or `none`) is a positional argument, never a disable value.
+_REGEN_MODE_FLAGS = frozenset({"--update-snapshots", "--update-snapshot", "--update"})
+
+
+def _value_after(tokens: list[str], i: int) -> Optional[str]:
+    nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+    return None if nxt is None or nxt.startswith("-") or _is_shell_op(nxt) else nxt
+
+
+_PYTHON_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|pypy3?)$")
+_PYTHON_VALUE_OPTS = frozenset("WXQ")
+_SHORT_FLAG_EXEMPT = frozenset({"set", "diff"})  # `set -u` (nounset), `diff -u` (unified output)
+
+
+def _command_segments(tokens: list[str]) -> list[list[str]]:
+    """Simple commands of a token stream, split on shell operators (`&&`, `||`, `;`, `|`, `&`, `(`, `)`, newline)."""
+    segments: list[list[str]] = [[]]
+    for tok in tokens:
+        if _is_shell_op(tok):
+            segments.append([])
+        else:
+            segments[-1].append(tok)
+    return [seg for seg in segments if seg]
+
+
+def _command_head(seg: list[str]) -> int:
+    """Index of the executable in ``seg`` after leading `VAR=val` assignments, `env [opts]` and execution
+    wrappers (`timeout 30`, `uv run [opts]`, `nice -n 5`, `stdbuf -oL`, ...)."""
+    i = 0
+    while i < len(seg):
+        if _ENV_ASSIGN_RE.match(seg[i]) or seg[i] in _SHELL_PREFIX_WORDS:
+            i += 1
+        elif os.path.basename(seg[i]) == "env":
+            i += 1
+            while i < len(seg) and seg[i].startswith("-") and len(seg[i]) > 1:
+                i += 2 if seg[i] in _ENV_VALUE_OPTS else 1
+        else:
+            wrapped = _skip_exec_wrapper(seg, i)
+            if wrapped is None:
+                break
+            i = wrapped
+    return i
+
+
+def _python_args_start(seg: list[str], i: int) -> int:
+    """First index after a Python interpreter's own options and its script, `-m <module>` or `-c <code>`."""
+    while i < len(seg):
+        tok = seg[i]
+        if tok == "--":
+            return i + 2
+        if not tok.startswith("-") or tok == "-":
+            return i + 1
+        i += 1
+        if tok.startswith("--"):
+            if tok == "--check-hash-based-pycs":
+                i += 1
+            continue
+        for k, ch in enumerate(tok[1:], start=1):
+            if ch in "cm":
+                return i if k < len(tok) - 1 else i + 1
+            if ch in _PYTHON_VALUE_OPTS:
+                if k == len(tok) - 1:
+                    i += 1
+                break
+    return i
+
+
+def _shell_args_start(seg: list[str], i: int) -> int:
+    """First index after a non-`-c` shell's own options and its script path (`bash -u script.sh ARGS`)."""
+    while i < len(seg) and seg[i][:1] in ("-", "+") and len(seg[i]) > 1 and seg[i] != "--":
+        i += 2 if seg[i][-1] in ("o", "O") else 1
+    if i < len(seg) and seg[i] == "--":
+        i += 1
+    return i + 1
+
+
+def _regen_flags(tokens: list[str]) -> set[str]:
+    found: set[str] = set()
+    for tok in tokens:
+        m = _REGEN_ENV_RE.match(tok)
+        if m and m.group(1).strip().lower() not in _REGEN_DISABLED | {""}:
+            found.add(tok.split("=", 1)[0].upper() + "=" + m.group(1))
+    for seg in _command_segments(tokens):
+        head = _command_head(seg)
+        if head >= len(seg):
+            continue
+        name = os.path.basename(seg[head])
+        if name == "busybox" and head + 1 < len(seg) and seg[head + 1] in _SHELLS:
+            head, name = head + 1, seg[head + 1]
+        start, short_ok = head + 1, name not in _SHORT_FLAG_EXEMPT
+        if _PYTHON_RE.match(name):
+            start = _python_args_start(seg, head + 1)
+        elif name in _SHELLS:
+            start = _shell_args_start(seg, head + 1)
+        for i in range(start, len(seg)):
+            tok = seg[i]
+            if not tok.startswith("-"):
+                continue
+            flag, eq, value = tok.partition("=")
+            if flag.startswith("--"):
+                flag = flag.lower()
+            elif not short_ok:
+                continue
+            if flag not in _REGEN_FLAGS:
+                continue
+            if not eq and flag in _REGEN_MODE_FLAGS and _value_after(seg, i) is not None:
+                if seg[i + 1].strip().lower() in _REGEN_DISABLED:
+                    continue  # e.g. Playwright `--update-snapshots none`
+            elif eq and value.strip().lower() in _REGEN_DISABLED:
+                continue
+            found.add(flag if eq else tok)
+    return found
+
+
+_Occurrences = dict[str, list[tuple[str, Optional[float]]]]
+
+
+def _threshold_occurrences(tokens: list[str]) -> tuple[_Occurrences, set[int]]:
+    """Every threshold-like option/assignment in command order as ``(raw, finite value or None)`` plus the token
+    indexes they occupy; nothing is overwritten, so a loosened, removed or non-finite earlier occurrence cannot
+    hide behind a later one."""
+    found: _Occurrences = {}
+    used: set[int] = set()
+    for i, tok in enumerate(tokens):
+        span = {i}
+        if tok.startswith("-"):
+            key, eq, val = tok.lstrip("-").partition("=")
+            if not eq:
+                val = _value_after(tokens, i) or ""
+                if val:
+                    span.add(i + 1)
+        else:
+            m = _ENV_ASSIGN_RE.match(tok)
+            if not m:
+                continue
+            key, val = m.group(1), m.group(2)
+        if not key or not _THRESHOLD_KEY_RE.search(key):
+            continue
+        raw = val.strip()
+        try:
+            parsed: Optional[float] = float(raw.rstrip("%"))
+        except ValueError:
+            parsed = None
+        if parsed is not None and not math.isfinite(parsed):
+            parsed = None
+        found.setdefault(key.lower().replace("_", "-"), []).append((raw, parsed))
+        used |= span
+    return found, used
+
+
+def _threshold_segments(tokens: list[str]) -> list[tuple[tuple[str, ...], _Occurrences]]:
+    """Per simple command: its normalized signature (tokens minus every threshold option and value) and its
+    threshold occurrences, so base and live checks are compared command by command."""
+    out: list[tuple[tuple[str, ...], _Occurrences]] = []
+    for seg in _command_segments(tokens):
+        occ, used = _threshold_occurrences(seg)
+        out.append((tuple(t.strip() for k, t in enumerate(seg) if k not in used), occ))
+    return out
+
+
+def _compare_thresholds(key: str, base_vals: list[float], live_vals: list[float], where: str) -> list[str]:
+    """Reasons ``live_vals`` loosen ``base_vals`` (positional, with any extra occurrence capped by the base max)."""
+    if not base_vals:
+        return []
+    base_s, live_s = ", ".join(f"{v:g}" for v in base_vals), ", ".join(f"{v:g}" for v in live_vals)
+    if not live_vals:
+        return [f"removes threshold `{key}={base_s}`{where} (falls back to the tool default)"]
+    reasons: list[str] = []
+    if len(live_vals) < len(base_vals):
+        reasons.append(f"removes {len(base_vals) - len(live_vals)} of {len(base_vals)} `{key}` threshold(s) "
+                       f"({base_s} -> {live_s}){where}")
+    if max(live_vals) > max(base_vals) or any(c > b for b, c in zip(base_vals, live_vals)):
+        reasons.append(f"loosens threshold `{key}` from {base_s} to {live_s}{where}")
+    return reasons
+
+
+def _threshold_loosening(base_tokens: list[str], live_tokens: list[str]) -> list[str]:
+    """Threshold loosening, aligning base and live simple commands by normalized signature: a matched command
+    must keep every threshold at or below its base value, while thresholds of commands that no longer match
+    (renamed, restructured, removed) are pooled and may not shrink in count, rise above the base max, or rise
+    positionally. A brand-new command may carry its own threshold; a non-finite one is always loosening."""
+    reasons: list[str] = []
+    base_segs, live_segs = _threshold_segments(base_tokens), _threshold_segments(live_tokens)
+
+    base_bad = [raw for _, occ in base_segs for vals in occ.values() for raw, v in vals if v is None]
+    for _, occ in live_segs:
+        for key, vals in sorted(occ.items()):
+            for raw in (raw for raw, v in vals if v is None):
+                if raw in base_bad:
+                    base_bad.remove(raw)
+                else:
+                    reasons.append(f"sets non-finite or unparseable threshold `{key}={raw}`")
+
+    def finite(occ: _Occurrences, key: str) -> list[float]:
+        return [v for _, v in occ.get(key, []) if v is not None]
+
+    matcher = difflib.SequenceMatcher(None, [sig for sig, _ in base_segs], [sig for sig, _ in live_segs],
+                                      autojunk=False)
+    matched_base: set[int] = set()
+    matched_live: set[int] = set()
+    for block in matcher.get_matching_blocks():
+        for k in range(block.size):
+            bi, li = block.a + k, block.b + k
+            matched_base.add(bi)
+            matched_live.add(li)
+            (sig, b_occ), (_, l_occ) = base_segs[bi], live_segs[li]
+            where = f" in `{' '.join(sig)[:80]}`"
+            for key in sorted({*b_occ, *l_occ}):
+                b_vals, l_vals = finite(b_occ, key), finite(l_occ, key)
+                if not b_vals and any(v > 0 for v in l_vals) and not any(v is None for _, v in b_occ.get(key, [])):
+                    reasons.append(f"adds loosening threshold `{key}={max(l_vals):g}`{where}")
+                reasons.extend(_compare_thresholds(key, b_vals, l_vals, where))
+
+    pool_base: dict[str, list[float]] = {}
+    pool_live: dict[str, list[float]] = {}
+    for idx, (_, occ) in enumerate(base_segs):
+        if idx not in matched_base:
+            for key in occ:
+                pool_base.setdefault(key, []).extend(finite(occ, key))
+    for idx, (_, occ) in enumerate(live_segs):
+        if idx not in matched_live:
+            for key in occ:
+                pool_live.setdefault(key, []).extend(finite(occ, key))
+    for key in sorted(pool_base):
+        reasons.extend(_compare_thresholds(key, pool_base[key], pool_live.get(key, []), " in a changed command"))
+    return reasons
+
+
+def _visual_hook_loosening(base_hook: dict[str, Any], live_hook: dict[str, Any]) -> list[str]:
+    """Ways ``live_hook`` weakens the committed `visual_diff` ``base_hook`` (empty when it does not)."""
+    reasons: list[str] = []
+    base_tokens, live_tokens = _command_tokens(base_hook.get("command")), _command_tokens(live_hook.get("command"))
+    added_regen = sorted(_regen_flags(live_tokens) - _regen_flags(base_tokens))
+    if added_regen:
+        reasons.append("adds snapshot-regeneration flag(s) " + ", ".join(f"`{f}`" for f in added_regen))
+    reasons.extend(_threshold_loosening(base_tokens, live_tokens))
+    base_frozen = _frozen_baseline_globs(base_hook)
+    if base_frozen:
+        live_frozen = _frozen_baseline_globs(live_hook) if live_hook.get("kind") == "visual_diff" else []
+        if not live_frozen:
+            reasons.append("no longer freezes its baseline (`frozen_baseline`/`baseline_paths` removed)")
+        else:
+            dropped = [g for g in base_frozen if g not in live_frozen]
+            if dropped:
+                reasons.append("drops frozen baseline glob(s) " + ", ".join(f"`{g}`" for g in dropped))
+    return reasons
 
 
 # ---------------------------------------------------------------------------
@@ -1389,8 +2135,10 @@ def _baseline_gates(root: Path, sha: str) -> Optional[dict[str, Any]]:
 
 
 def detect_harness_gate_loosening(repo_path: str | Path, base_ref: Optional[str] = None) -> dict[str, Any]:
-    """Strictly read-only: flag required hooks removed or downgraded to optional, and dropped Doctor
-    commands, in the live `.factonio/` compared with the harness committed at ``base_ref`` (default ``HEAD``)."""
+    """Strictly read-only: flag required hooks removed or downgraded to optional, dropped Doctor commands,
+    `visual_diff` hooks mutated to regenerate baselines or loosen thresholds (or unfreeze them), and frozen
+    baseline files modified since ``base_ref`` (default ``HEAD``: working-tree edits only), comparing the live
+    `.factonio/` with the harness committed at ``base_ref``."""
     root = Path(repo_path).expanduser()
     result: dict[str, Any] = {
         "checked": False,
@@ -1401,6 +2149,8 @@ def detect_harness_gate_loosening(repo_path: str | Path, base_ref: Optional[str]
         "removed_required_hooks": [],
         "downgraded_hooks": [],
         "removed_doctor_commands": [],
+        "loosened_visual_hooks": [],
+        "visual_baseline_changes": [],
         "findings": [],
     }
     ref = _validate_ref(base_ref) if base_ref is not None else None
@@ -1447,6 +2197,26 @@ def detect_harness_gate_loosening(repo_path: str | Path, base_ref: Optional[str]
         if cmd.strip() not in live_doctor_set and cmd not in result["removed_doctor_commands"]:
             result["removed_doctor_commands"].append(cmd)
             result["findings"].append(f"Gate loosening: Doctor command `{cmd}` (present at {short}) was removed")
+    frozen: dict[str, list[str]] = {}
+    for hook in baseline["hooks"]:
+        name = str(hook.get("name") or "").strip()
+        if not name or hook.get("kind") != "visual_diff":
+            continue
+        if _frozen_baseline_globs(hook):
+            frozen.setdefault(name, _frozen_baseline_globs(hook))
+        current = live_by_name.get(name)
+        reasons = _visual_hook_loosening(hook, current) if current is not None else []
+        if reasons and name not in result["loosened_visual_hooks"]:
+            result["loosened_visual_hooks"].append(name)
+            result["findings"].extend(
+                f"Gate loosening: visual_diff hook {name!r} {why} (vs {short})" for why in reasons
+            )
+    result["visual_baseline_changes"] = _frozen_baseline_changes(root, frozen, sha)
+    for change in result["visual_baseline_changes"]:
+        files = ", ".join(change["changed_files"][:5])
+        result["findings"].append(
+            f"Gate loosening: frozen baseline of visual_diff hook {change['name']!r} was modified since {short}: {files}"
+        )
     result["loosened"] = bool(result["findings"])
     return result
 
@@ -1475,7 +2245,7 @@ def _audit_base(root: Path, base_ref: Optional[str], manifest: Optional[dict[str
     return None, "none"
 
 
-def _changed_files(root: Path, base_sha: Optional[str]) -> list[str]:
+def _changed_files(root: Path, base_sha: Optional[str], *, include_harness_dir: bool = False) -> list[str]:
     changed: set[str] = set()
     if base_sha:
         proc = _git_ro(root, ["diff", "--name-only", "-z", "--no-renames", base_sha, "HEAD"], timeout=60)
@@ -1486,6 +2256,8 @@ def _changed_files(root: Path, base_sha: Optional[str]) -> list[str]:
         for rec in proc.stdout.split("\0"):
             if len(rec) > 3:
                 changed.add(rec[3:])
+    if include_harness_dir:
+        return sorted(changed)
     return sorted(p for p in changed if not (p == HARNESS_DIR_NAME or p.startswith(HARNESS_DIR_NAME + "/")))
 
 
@@ -1514,6 +2286,10 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
         "removed_routes": [],
         "new_cli_commands": [],
         "removed_cli_commands": [],
+        "stale_invariants": [],
+        "dead_cover_globs": [],
+        "unresolved_sync_commits": [],
+        "visual_baseline_changes": [],
         "warnings": [],
         "manifest_errors": [],
         "recommendations": [],
@@ -1528,7 +2304,13 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
         if gate["loosened"]:
             result["warnings"].extend(gate["findings"])
             recs.append(_GATE_LOOSENING_RECOMMENDATION)
-        result.update(drifted=True, severity="missing", recommendations=recs, gate_loosening=gate)
+        result.update(
+            drifted=True,
+            severity="missing",
+            recommendations=recs,
+            gate_loosening=gate,
+            visual_baseline_changes=list(gate.get("visual_baseline_changes") or []),
+        )
         result["drift_classification"] = classify_harness_drift(result)
         return result
 
@@ -1537,6 +2319,7 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
         result["manifest_errors"] = [info["manifest_error"]]
     elif manifest is not None:
         result["manifest_errors"] = _validate_manifest(manifest)
+    result["manifest_errors"].extend(_verify_md_hook_errors(info))
     result["warnings"].extend(result["manifest_errors"])
     is_git = _is_git_repo(root)
     if not is_git:
@@ -1590,6 +2373,17 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
     else:
         result["warnings"].append("No harness.json discovered_surfaces baseline: route/CLI drift not computed")
 
+    formal = _audit_formal_invariants(
+        root, info["hooks"], files=_invariant_files(root), harness_base=base_sha, harness_base_source=base_source,
+        is_git=is_git,
+    )
+    result["formal_invariants"] = formal
+    for key in ("stale_invariants", "dead_cover_globs", "unresolved_sync_commits"):
+        result[key] = formal[key]
+    if formal["manifest_errors"]:
+        result["manifest_errors"].extend(formal["manifest_errors"])
+        result["warnings"].extend(formal["manifest_errors"])
+
     recs: list[str] = result["recommendations"]
     if result["uncovered_changed_files"]:
         recs.append(
@@ -1612,11 +2406,28 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
             "Update Drive CLI checks (new: " + (", ".join(result["new_cli_commands"]) or "-")
             + "; removed: " + (", ".join(result["removed_cli_commands"]) or "-") + ")"
         )
+    if result["stale_invariants"]:
+        recs.append(
+            "Re-prove formal invariant(s) "
+            + ", ".join(i["name"] for i in result["stale_invariants"])
+            + " against their changed covered files, then bump `sync_commit` to the re-proven commit."
+        )
+    if result["dead_cover_globs"]:
+        recs.append(
+            "Fix or remove dead formal-invariant `covers` globs: "
+            + ", ".join(f"{d['hook']}:{d['glob']}" for d in result["dead_cover_globs"])
+        )
+    if result["unresolved_sync_commits"]:
+        recs.append(
+            "Point `sync_commit` at a commit reachable in this checkout (squash merges rewrite SHAs): "
+            + ", ".join(u["name"] for u in result["unresolved_sync_commits"])
+        )
     doc_drifted = any(
         result[k]
         for k in (
             "uncovered_changed_files", "stale_features", "orphaned_globs",
             "new_routes", "removed_routes", "new_cli_commands", "removed_cli_commands",
+            "stale_invariants", "dead_cover_globs",
         )
     )
     if doc_drifted:
@@ -1625,20 +2436,37 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
             "or edit .factonio/ by hand, then commit it so the audit baseline moves forward."
         )
     gate = detect_harness_gate_loosening(root, base_sha) if base_sha else _unchecked_gate(base_ref)
+    tried = {base_sha}
+    if not gate["checked"] and is_git:
+        # A generated `base_commit` usually predates `.factonio/` itself: gate against the last committed harness,
+        # but only then, so a pinned approved harness stays the bar for later commits that loosen it.
+        fallback = _frozen_baseline_base(root, base_ref, base_sha)
+        if fallback and fallback not in tried:
+            tried.add(fallback)
+            gate = detect_harness_gate_loosening(root, fallback)
     head = result["head_commit"]
-    if not gate["checked"] and head and head != base_sha:
-        # The audit base often predates the harness (generated base_commit); gate against the committed one.
+    if not gate["checked"] and head and head not in tried:
         gate = detect_harness_gate_loosening(root, head)
     result["gate_loosening"] = gate
     if gate["loosened"]:
         result["warnings"].extend(gate["findings"])
         recs.append(_GATE_LOOSENING_RECOMMENDATION)
+    if is_git:
+        frozen = {str(h.get("name")): _frozen_baseline_globs(h) for h in info["hooks"] if _frozen_baseline_globs(h)}
+        result["visual_baseline_changes"] = _merge_baseline_changes(
+            list(gate.get("visual_baseline_changes") or []),
+            _frozen_baseline_changes(root, frozen, _frozen_baseline_base(root, base_ref, base_sha)),
+        )
+    if result["visual_baseline_changes"]:
+        recs.append(_FROZEN_BASELINE_RECOMMENDATION)
     if result["manifest_errors"]:
         recs.append(
-            f"Repair the malformed {HARNESS_DIR_NAME}/{HARNESS_JSON_NAME} ({len(result['manifest_errors'])} "
+            f"Repair the malformed {HARNESS_DIR_NAME}/ manifest or hooks ({len(result['manifest_errors'])} "
             f"error(s)); `hermes factonio harness check {target['repo']}` lists them."
         )
-    drifted = doc_drifted or gate["loosened"] or bool(result["manifest_errors"])
+    drifted = (
+        doc_drifted or gate["loosened"] or bool(result["manifest_errors"]) or bool(result["visual_baseline_changes"])
+    )
     result["drifted"] = drifted
     result["severity"] = "stale" if drifted else "clean"
     classification = classify_harness_drift(result)
@@ -1672,10 +2500,27 @@ _GATE_LOOSENING_RECOMMENDATION = (
 )
 
 
+_FROZEN_BASELINE_RECOMMENDATION = (
+    "Restore the modified frozen visual baselines; regenerating a frozen baseline (or loosening a visual threshold) "
+    "to turn a failing visual_diff green needs explicit spec/design approval and a `factonio_log_decision` countersign."
+)
+
+
+def _frozen_baseline_base(root: Path, base_ref: Optional[str], base_sha: Optional[str]) -> Optional[str]:
+    """Audit baseline for frozen files: ``base_ref`` when given, else the last commit touching `.factonio/`
+    (baselines committed together with the harness are the frozen bar), else the audit base."""
+    if base_ref:
+        return base_sha
+    proc = _git_ro(root, ["log", "-1", "--format=%H", "--", HARNESS_DIR_NAME])
+    sha = proc.stdout.strip()
+    return sha if proc.returncode == 0 and sha else base_sha
+
+
 def _unchecked_gate(base_ref: Optional[str]) -> dict[str, Any]:
     return {
         "checked": False, "loosened": False, "base_ref": base_ref, "base_commit": None, "baseline_source": None,
-        "removed_required_hooks": [], "downgraded_hooks": [], "removed_doctor_commands": [], "findings": [],
+        "removed_required_hooks": [], "downgraded_hooks": [], "removed_doctor_commands": [],
+        "loosened_visual_hooks": [], "visual_baseline_changes": [], "findings": [],
     }
 
 
@@ -1685,9 +2530,9 @@ def classify_harness_drift(
     """Classify audit/check findings as `clean`, `doc_drift`, `harness_gap`, or `product_regression`.
 
     `doc_drift`: `.factonio/` no longer describes the repo (missing/stale harness, section errors, dead globs,
-    loosened gates). `harness_gap`: the harness itself is broken or a gate could not run (malformed
-    harness.json: invalid JSON or schema/`schema_version` errors; Doctor failure, hook timeout or
-    command-not-found). `product_regression`: a required hook ran and failed. Priority:
+    stale formal invariants, loosened gates or tampered frozen baselines). `harness_gap`: the harness itself is
+    broken or a gate could not run (malformed harness.json: invalid JSON, schema/`schema_version` errors or an
+    unresolved `sync_commit`; Doctor failure, hook timeout or command-not-found). `product_regression`: a required hook ran and failed. Priority:
     product_regression > harness_gap > doc_drift > clean.
     """
     audit = audit_result if isinstance(audit_result, dict) else {}
@@ -1701,7 +2546,10 @@ def classify_harness_drift(
     manifest_errors.extend(
         e for e in _str_list(check.get("errors")) if e.startswith(f"{HARNESS_JSON_NAME} ") and e not in manifest_errors
     )
-    reasons["harness_gap"].extend(f"Malformed {HARNESS_DIR_NAME}/{HARNESS_JSON_NAME}: {e}" for e in manifest_errors)
+    reasons["harness_gap"].extend(
+        f"Malformed {HARNESS_DIR_NAME}/{VERIFY_MD_NAME if e.startswith(VERIFY_MD_NAME + ' ') else HARNESS_JSON_NAME}: {e}"
+        for e in manifest_errors
+    )
 
     severity = audit.get("severity")
     if severity == "missing" or (check and check.get("present") is False):
@@ -1718,6 +2566,15 @@ def classify_harness_drift(
         items = _str_list(audit.get(key))
         if items:
             reasons["doc_drift"].append(f"{len(items)} {label}: " + ", ".join(items[:5]))
+    for key, label in (
+        ("stale_invariants", "formal invariants whose covered files changed since their sync_commit"),
+        ("dead_cover_globs", "formal-invariant covers globs matching no files"),
+        ("visual_baseline_changes", "frozen visual_diff baselines modified"),
+    ):
+        items = [i for i in audit.get(key) or [] if isinstance(i, dict)]
+        if items:
+            names = sorted({str(i.get("name") or i.get("hook")) for i in items})
+            reasons["doc_drift"].append(f"{len(items)} {label}: " + ", ".join(names[:5]))
     gate_findings: list[str] = []
     for source in (audit, check):
         gate = _as_dict(source.get("gate_loosening"))

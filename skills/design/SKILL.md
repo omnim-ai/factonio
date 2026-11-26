@@ -73,6 +73,11 @@ When `Design provider` is `hermes`:
 2. Confirm `<design_dir>/DESIGN.md` exists and names every preview file, design token, and binding UI acceptance requirement for Implementation.
 3. Confirm `git status` in `<repo_path>` is clean (zero uncommitted edits left in the repository).
 
+### 3b. Frozen Visual Baselines and Formal Invariants
+
+- **Approved previews become frozen baselines.** When the repo declares a `visual_diff` hook in `.factonio/harness.json`, name in `DESIGN.md` which screenshots should become its `baseline_paths` (frozen by default via `frozen_baseline: true`). Later phases must never regenerate those baselines (`--update-snapshots`, `-u`, `UPDATE_SNAPSHOTS=1`) or loosen visual thresholds to turn a failure green; `hermes factonio harness check` flags that as gate loosening. Changing an approved baseline needs a new Design round.
+- **Formal invariants:** when a design fixes a state machine or UI contract that a repo-defined `invariant` hook models, record the hook's `covers` globs (the files the model describes) in `DESIGN.md`. `sync_commit` is set by whoever re-proves the model, so `harness audit` can report `stale_invariants` when covered files drift.
+
 ### 4. Complete the Card
 
 Call `kanban_complete` with a concise `summary` and structured `metadata`:
