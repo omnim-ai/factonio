@@ -28,6 +28,15 @@ Deliver one scoped, tested change inside your assigned git worktree and publish 
 2. Read the card's Work Unit section, `spec.md` (if present), and the repository's `AGENTS.md` or contributing guidelines.
 3. Inspect existing code and tests before editing; match repository conventions and reuse existing utilities.
 
+### 1b. Crash-Pickup Protocol
+
+A card may be a retry of a crashed or reclaimed run. Before writing code, inspect what already exists: prior attempts and comments in `kanban_show`, `git status`, `git log origin/<base>..HEAD`, the remote branch, and any open PR for it (`gh pr list --head <branch>`).
+
+- **Resume** when the existing state is coherent: commits build, tests run, and the PR (if any) matches the work unit. Continue from it; never open a second PR for the same branch.
+- **Cold-restart** when the state is corrupted or circular (half-applied edits that do not build, a fix loop reverting itself, a branch diverged from the unit): note why in a card comment, reset the worktree to `origin/<base>`, and redo the unit cleanly, reusing the existing PR with `--force-with-lease`.
+
+Working rules: **Idempotency** (every step is safe to re-run: check before creating branches, PRs, comments, or files); **Minimize Reader Load** (commits, PR bodies, and comments state results, not narration); **Build the Lever** (when you repeat a manual check, turn it into a test or script in the PR when it is in scope).
+
 ### 2. Implement and Verify Locally
 
 1. Write failing tests (or a reproducing test for bugs) first when the repository has a test suite.
