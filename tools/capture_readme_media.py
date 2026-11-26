@@ -613,7 +613,51 @@ export const MODELS_DATA = {
     watchdog:  { provider: 'google',    model: 'gemini-2.5-flash',  source: 'auxiliary.factonio_watchdog' },
   },
   cross_model_warning: null,
+  // GET /models additive v0.2.0 fields (config.resolve_verify_panel + resolve_rigor).
+  verify_panel: {
+    entries: [
+      { provider: 'openai', model: 'gpt-5', label: 'openai/gpt-5', vendor: 'openai', source: 'settings.verify_panel', index: 0 },
+      { provider: 'google', model: 'gemini-2.5-pro', label: 'google/gemini-2.5-pro', vendor: 'google', source: 'settings.verify_panel', index: 1 },
+    ],
+    vendors: ['openai', 'google'],
+    distinct_vendor_count: 2,
+    duplicate_vendors: [],
+    unknown_vendor_models: [],
+    valid: true,
+    warning: null,
+    source: 'settings.verify_panel',
+    advisories: [],
+  },
+  default_rigor: 'standard',
 };
+
+// GET /metrics/history ({snapshots, summary, filters}; trail.metrics_history_payload), oldest -> newest.
+export function metricsHistory(path = '') {
+  const params = new URLSearchParams(String(path).split('?')[1] || '');
+  const since = params.get('since') || 'all';
+  const days = { '7d': 7, '30d': 30, '90d': 90 }[since] ?? null;
+  const SRC = ['merge', 'merge', 'retro', 'merge', 'panel_consensus', 'merge', 'merge', 'retro', 'merge', 'panel_consensus', 'merge', 'merge', 'panel_consensus', 'merge'];
+  const DIFF = [0.78, 0.80, 0.79, 0.82, 0.83, 0.81, 0.84, 0.85, 0.84, 0.86, 0.87, 0.86, 0.88, 0.88];
+  const BB = [0.70, 0.72, 0.73, 0.72, 0.75, 0.76, 0.75, 0.78, 0.79, 0.78, 0.80, 0.81, 0.80, 0.82];
+  const ESC = [0.15, 0.14, 0.14, 0.13, 0.12, 0.12, 0.11, 0.11, 0.10, 0.10, 0.09, 0.09, 0.08, 0.05];
+  const WS = [6, 7, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
+  const DONE = [21, 22, 24, 25, 27, 30, 33, 37, 42, 48, 54, 61, 67, 74];
+  const all = SRC.map((source, i) => ({
+    id: `ms_${(0x3f71b0c2a000 + i).toString(16)}`,
+    ts: new Date(Date.now() - (13 - i) * 2 * 86400000 - 3600000).toISOString().replace('Z', '+00:00'),
+    source, range_key: 'all', repo_slug: 'omnim-ai-factonio', tenant: null,
+    workstreams_total: WS[i], cards_done: DONE[i], cards_total: DONE[i] + 3,
+    diff_pass_rate: DIFF[i], blackbox_pass_rate: BB[i], escape_rate: ESC[i],
+    first_pass_rate: Math.min(0.95, 0.6 + i * 0.02), panels_total: Math.floor(i / 3), panels_disagreements: i > 9 ? 1 : 0,
+  }));
+  const snapshots = days == null ? all : all.filter(s => Date.parse(s.ts) >= Date.now() - days * 86400000);
+  const by = snapshots.reduce((acc, s) => ({ ...acc, [s.source]: (acc[s.source] || 0) + 1 }), {});
+  return {
+    snapshots,
+    summary: { total: snapshots.length, snapshot_count: snapshots.length, first_ts: snapshots[0]?.ts ?? null, latest_ts: snapshots[snapshots.length - 1]?.ts ?? null, by_source: by, latest: snapshots[snapshots.length - 1] ?? null },
+    filters: { tenant: null, repo: null, source: null, since, limit: Number(params.get('limit') || 100) },
+  };
+}
 
 export const METRICS_BY_RANGE = {
   '30d': {
@@ -624,7 +668,9 @@ export const METRICS_BY_RANGE = {
       blackbox: { pass: 20, reject: 5, pass_rate: 0.80 },
     },
     escapes: { count: 1, verified_total: 20, escape_rate: 0.05 },
-    rework: { avg_runs_per_implement_card: 1.28, cards_with_rework: 5 },
+    rework: { avg_runs_per_implement_card: 1.28, cards_with_rework: 5, first_pass_rate: 0.79 },
+    verification_panels: { total: 4, pass: 2, reject: 1, inconclusive: 0, pending: 1, disagreements: 1 },
+    history: { snapshot_count: 14, latest_ts: null },
     phases: {
       define:            { count: 18, done: 18, median_seconds: 195,  p90_seconds: 380 },
       design:            { count: 7,  done: 7,  median_seconds: 410,  p90_seconds: 690 },
@@ -641,7 +687,9 @@ export const METRICS_BY_RANGE = {
       blackbox: { pass: 7, reject: 2, pass_rate: 0.778 },
     },
     escapes: { count: 0, verified_total: 7, escape_rate: 0.0 },
-    rework: { avg_runs_per_implement_card: 1.17, cards_with_rework: 1 },
+    rework: { avg_runs_per_implement_card: 1.17, cards_with_rework: 1, first_pass_rate: 0.83 },
+    verification_panels: { total: 2, pass: 1, reject: 1, inconclusive: 0, pending: 0, disagreements: 1 },
+    history: { snapshot_count: 4, latest_ts: null },
     phases: {
       define:            { count: 6, done: 6, median_seconds: 175, p90_seconds: 310 },
       design:            { count: 3, done: 3, median_seconds: 390, p90_seconds: 560 },
@@ -659,6 +707,7 @@ export function initialReposState() {
       max_fix_rounds: 3,
       design_provider: 'auto',
       design_approval: 'ask',
+      default_rigor: 'standard',
     },
     repos: [
       {
@@ -674,6 +723,8 @@ export function initialReposState() {
         effective_design_provider: 'auto',
         effective_design_approval: 'ask',
         resolved_design_provider: 'claude-design',
+        default_rigor: null,
+        effective_default_rigor: 'standard',
         has_required_checks: true,
         models: {},
       },
@@ -690,6 +741,8 @@ export function initialReposState() {
         effective_design_provider: 'off',
         effective_design_approval: 'ask',
         resolved_design_provider: 'off',
+        default_rigor: 'high',
+        effective_default_rigor: 'high',
         has_required_checks: true,
         models: {},
       },
@@ -706,6 +759,8 @@ export function initialReposState() {
         effective_design_provider: 'hermes',
         effective_design_approval: 'auto',
         resolved_design_provider: 'hermes',
+        default_rigor: 'standard',
+        effective_default_rigor: 'standard',
         has_required_checks: true,
         models: {},
       },
@@ -772,6 +827,7 @@ export const SIDEBAR_TRAIL = [
   d({ id: 'd_5b10c2e4a804', ts: trailIso(67), tenant: SB_WS, repo_slug: 'omnim-ai-factonio', phase: 'verify', card_id: 't_4ab36a10', decision: 'verify_diff_verdict', why: 'Diff matches spec.md; no scope creep.', evidence: { pr_number: 44, head_sha: '7c1e9a04d2', tests_passed: 61 }, result: 'pass' }),
   d({ id: 'd_5b10c2e4a805', ts: trailIso(62), tenant: SB_WS, repo_slug: 'omnim-ai-factonio', phase: 'verify', card_id: 't_4ab36a11', decision: 'verify_blackbox_verdict', why: 'Headless browser timed out before the keyboard scenarios ran.', evidence: { pr_number: 44, head_sha: '7c1e9a04d2' }, result: 'inconclusive' }),
   d({ id: 'd_5b10c2e4a806', ts: trailIso(55), tenant: SB_WS, repo_slug: 'omnim-ai-factonio', phase: 'verify', card_id: 't_4ab36a11', decision: 'verify_blackbox_verdict', why: 'Rerun: Tab skips the collapsed workstream header (focus order).', evidence: { pr_number: 44, head_sha: '7c1e9a04d2', tests_passed: 11, tests_failed: 1 }, result: 'reject', supersedes_id: 'd_5b10c2e4a805' }),
+  d({ id: 'd_5b10c2e4a809', ts: trailIso(54), tenant: SB_WS, repo_slug: 'omnim-ai-factonio', phase: 'verify', card_id: '', decision: 'verify_panel_consensus', why: 'Panel lanes disagree -- pass: verify-blackbox/google (t_4ab36a12); reject: verify-blackbox/openai (t_4ab36a11).', evidence: { panel_id: 'vp_9a4c1e', pr_number: 44, vendors: ['openai', 'google'], merge_allowed: false, has_disagreement: true, disagreement_summary: 'Panel lanes disagree -- pass: verify-blackbox/google (t_4ab36a12); reject: verify-blackbox/openai (t_4ab36a11). Dissenting evidence: [verify-blackbox/openai (t_4ab36a11)] finding: Tab skips the collapsed workstream header.' }, result: 'reject' }),
   d({ id: 'd_5b10c2e4a807', ts: trailIso(53), tenant: SB_WS, repo_slug: 'omnim-ai-factonio', phase: 'implement', card_id: 't_4ab36a14', decision: 'spawn_fix_round', why: 'Fix Round 1 of 3 for the focus-order finding.', evidence: { pr_number: 44, fix_round: 1 }, result: 'spawned' }),
   d({ id: 'd_5b10c2e4a808', ts: trailIso(38), tenant: SB_WS, repo_slug: 'omnim-ai-factonio', phase: 'watchdog', card_id: 't_4ab36a14', actor: 'watchdog', decision: 'needs_input', why: 'Worker paused on a product question; no side effects since.', evidence: { worker_pid: 48219, side_effect_age_s: 1380 }, result: 'blocked' }),
   d({ id: 'd_7d21c0e5a901', ts: trailIso(95), tenant: SB_META, repo_slug: 'omnim-ai-factonio', phase: 'implement', card_id: 't_a1b2c3d4', actor: 'worker', decision: 'spawn_implement', why: 'Enrich /cards metadata.', evidence: { card_id: 't_a1b2c3d4' }, result: 'spawned' }),
@@ -871,12 +927,13 @@ DASHBOARD_HTML = f"""<!doctype html>
   </div>
   <script type="module">
     import {{ __mount }} from 'react';
-    import {{ MODELS_DATA, METRICS_BY_RANGE, initialReposState, bootPlugin, trailPayload, DASHBOARD_TRAIL }} from '/__harness/mock-data.js';
+    import {{ MODELS_DATA, METRICS_BY_RANGE, initialReposState, bootPlugin, trailPayload, DASHBOARD_TRAIL, metricsHistory }} from '/__harness/mock-data.js';
 
     const reposState = initialReposState();
     window.__fcMock = {{ sessionId: 'sess_dash', visible: true, __version: 1 }};
 
     const {{ regs }} = await bootPlugin((path, opts) => {{
+      if (path.startsWith('/metrics/history')) return metricsHistory(path);
       if (path.startsWith('/metrics')) {{
         const m = /[?&]range=([^&]+)/.exec(path);
         const key = m ? decodeURIComponent(m[1]) : '30d';
@@ -983,7 +1040,8 @@ SIDEBAR_HTML = f"""<!doctype html>
       c({{ id: 't_4ab36a0b', tenant: SIDEBAR, session_id: 'sess_demo', phase: 'design', status: 'done', title: '[design] Phase 1b sidebar previews', parents: ['t_4ab36a09'], created_at: T(8400), started_at: T(8390), completed_at: T(7100), elapsed_seconds: 1290, active_duration_seconds: 744 }}),
       c({{ id: 't_4ab36a0d', tenant: SIDEBAR, session_id: 'sess_demo', phase: 'implement', status: 'done', title: '[implement] Tabbed sidebar pane with filters', parents: ['t_4ab36a0b'], pr: PR44, created_at: T(7000), started_at: T(6990), completed_at: T(4600), elapsed_seconds: 2390, active_duration_seconds: 1505 }}),
       c({{ id: 't_4ab36a10', tenant: SIDEBAR, session_id: 'sess_demo', phase: 'verify-diff', status: 'done', verdict: 'pass', title: '[verify-diff] Review PR #44 against spec.md', model: 'gpt-5', provider: 'openai', parents: ['t_4ab36a0d'], pr: PR44, created_at: T(4500), started_at: T(4490), completed_at: T(4010), elapsed_seconds: 480, active_duration_seconds: 402 }}),
-      c({{ id: 't_4ab36a11', tenant: SIDEBAR, session_id: 'sess_demo', phase: 'verify-blackbox', status: 'done', verdict: 'reject', last_outcome: 'changes_requested', title: '[verify-blackbox] Keyboard and theme acceptance run', model: 'gpt-5', provider: 'openai', parents: ['t_4ab36a0d'], pr: PR44, created_at: T(4500), started_at: T(4480), completed_at: T(3300), elapsed_seconds: 1180, active_duration_seconds: 960, summary: 'Collapsed workstream header is skipped by Tab key.' }}),
+      c({{ id: 't_4ab36a11', tenant: SIDEBAR, session_id: 'sess_demo', phase: 'verify-blackbox', status: 'done', verdict: 'reject', last_outcome: 'changes_requested', title: '[verify-blackbox] Keyboard and theme acceptance run', model: 'gpt-5', provider: 'openai', panel_id: 'vp_9a4c1e', panel_vendor: 'openai', parents: ['t_4ab36a0d'], pr: PR44, created_at: T(4500), started_at: T(4480), completed_at: T(3300), elapsed_seconds: 1180, active_duration_seconds: 960, summary: 'Collapsed workstream header is skipped by Tab key.' }}),
+      c({{ id: 't_4ab36a12', tenant: SIDEBAR, session_id: 'sess_demo', phase: 'verify-blackbox', status: 'done', verdict: 'pass', title: '[verify-blackbox] Keyboard and theme acceptance run', model: 'gemini-2.5-pro', provider: 'google', panel_id: 'vp_9a4c1e', panel_vendor: 'google', parents: ['t_4ab36a0d'], pr: PR44, created_at: T(4500), started_at: T(4470), completed_at: T(3420), elapsed_seconds: 1050, active_duration_seconds: 880, summary: 'All 12 keyboard and theme scenarios pass in dark and light.' }}),
       c({{ id: 't_4ab36a14', tenant: SIDEBAR, session_id: 'sess_demo', phase: 'implement', status: 'blocked', block_kind: 'needs_input', block_reason: 'Should expanded/collapsed workstreams persist across app restarts?', last_outcome: null, title: '[implement] Fix round 1: focus order and callout contrast', parents: ['t_4ab36a11'], pr: PR44, created_at: T(3200), started_at: T(3190), elapsed_seconds: 3190, active_duration_seconds: 212 }}),
       c({{ id: 't_7d21c0e5', tenant: META, session_id: 'sess_demo', phase: 'define', status: 'done', title: '[define] Spec: additive /cards metadata fields', created_at: T(6200), started_at: T(6190), completed_at: T(5900), elapsed_seconds: 290, active_duration_seconds: 240 }}),
       c({{ id: 't_a1b2c3d4', tenant: META, session_id: 'sess_demo', phase: 'implement', status: 'done', runs: 2, title: '[implement] Enrich /cards metadata in metrics.py', parents: ['t_7d21c0e5'], pr: PR42, created_at: T(5100), started_at: T(1200), completed_at: T(800), elapsed_seconds: 412, active_duration_seconds: 185, summary: 'Added additive card fields and updated unit tests.' }}),
@@ -997,7 +1055,7 @@ SIDEBAR_HTML = f"""<!doctype html>
 
     window.__fcMock = {{ sessionId: 'sess_demo', visible: true, __version: 1 }};
     const {{ regs }} = await bootPlugin((path) => {{
-      if (path.startsWith('/cards')) return {{ cards: CARDS, counts: {{ running: 2, blocked: 1, triage: 0, rejected: 1, attention: 2, done: 11, total: 14 }} }};
+      if (path.startsWith('/cards')) return {{ cards: CARDS, counts: {{ running: 2, blocked: 1, triage: 0, rejected: 1, attention: 2, done: 12, total: 15 }} }};
       if (path.startsWith('/trail')) return trailPayload(SIDEBAR_TRAIL, path);
       return {{}};
     }});
@@ -1008,12 +1066,11 @@ SIDEBAR_HTML = f"""<!doctype html>
     const cardBtn = document.querySelector('article[data-id="t_4ab36a11"] button[data-action="toggle-card"]');
     if (cardBtn) cardBtn.click();
     await new Promise(r => setTimeout(r, 60));
-    // Scroll so the drawer's Decisions rows and the workstream's Decision Trail strip share the frame.
+    // Scroll so the workstream's verification panel strip and the opened lane's drawer share the frame.
     const sbBody = document.querySelector('.fc-sb-body');
-    const decisionsDt = document.querySelector('article[data-id="t_4ab36a11"] .fc-sb-trail-dt');
-    if (sbBody && decisionsDt) {{
-      decisionsDt.scrollIntoView({{ block: 'start' }});
-      sbBody.scrollTop -= 140;
+    const panelStrip = document.querySelector(`section[data-tenant="${{SIDEBAR}}"] .fc-sb-pipe`);
+    if (sbBody && panelStrip) {{
+      sbBody.scrollTop = Math.max(0, panelStrip.getBoundingClientRect().top - sbBody.getBoundingClientRect().top + sbBody.scrollTop - 6);
     }}
     window.__ready = true;
   </script>
@@ -1367,7 +1424,7 @@ REPO_EDITOR_DEMO_HTML = f"""<!doctype html>
   <meta charset="utf-8" />
   <title>Factonio Inline Repo Settings Demo</title>
   <style>{DESKTOP_SHELL_CSS}
-    .fc-head, .fc-grid, .fc-sec:not(.fc-repos-sec) {{ display: none !important; }}
+    .fc-head, .fc-grid, .fc-trend, .fc-sec:not(.fc-repos-sec) {{ display: none !important; }}
     .fc-wrap {{ padding: 18px 24px 28px !important; }}
     .fc-repos-sec {{ margin-top: 0 !important; }}
   </style>
@@ -1423,6 +1480,7 @@ REPO_EDITOR_DEMO_HTML = f"""<!doctype html>
             next.effective_design_provider = next.design_provider || reposState.defaults.design_provider;
             next.effective_design_approval = next.design_approval || reposState.defaults.design_approval;
             next.resolved_design_provider = next.effective_design_provider === 'auto' ? 'claude-design' : next.effective_design_provider;
+            next.effective_default_rigor = next.default_rigor || reposState.defaults.default_rigor;
             updated = next;
             return next;
           }})
@@ -1482,12 +1540,12 @@ REPO_EDITOR_DEMO_HTML = f"""<!doctype html>
           await new Promise(r => setTimeout(r, 40));
           scrollToRepos();
         }} else if (i === 4) {{
-          setCaption(5, 'Override Design provider to hermes — live counter tracks 3 unsaved changes');
-          setControlValue('design_provider', 'hermes');
+          setCaption(5, 'Raise Default rigor to High — a multi-vendor verification panel; live counter tracks 3 unsaved changes');
+          setControlValue('default_rigor', 'high');
           await new Promise(r => setTimeout(r, 40));
           scrollToRepos();
         }} else if (i === 5) {{
-          setCaption(6, 'Save sends PATCH with only changed fields — table updates live with solid override badge');
+          setCaption(6, 'Save sends PATCH with only changed fields — table updates live with solid high-rigor override badge');
           const saveBtn = document.querySelector('button[data-action="save-repo"]');
           if (saveBtn) saveBtn.click();
           await new Promise(r => setTimeout(r, 80));

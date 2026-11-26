@@ -214,7 +214,10 @@
       ],
       "scenarios": [
         "Zero-build ESM importing only @hermes/plugin-sdk, react and react/jsx-runtime",
-        "Dashboard, sidebar and repo editor render with host theme tokens only"
+        "Dashboard, sidebar and repo editor render with host theme tokens only",
+        "Repo editor sends default_rigor standard/high, or null to inherit, with partial-diff dirty tracking",
+        "Trends strip renders populated/empty/loading/error states from GET /metrics/history",
+        "Sidebar verification panel consensus is fail-closed and never shows pass without the recorded verify_panel_consensus"
       ]
     },
     {

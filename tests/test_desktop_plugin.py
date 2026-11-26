@@ -168,6 +168,10 @@ globalThis.__fcUseQuery = opts => {
     globalThis.__fcModelsQueries.push({ key: opts.queryKey, interval: opts.refetchInterval, fn: typeof opts.queryFn })
     return queryState
   }
+  if (opts.queryKey[1] === 'metrics-history') {
+    historyQueries.push({ key: opts.queryKey, interval: opts.refetchInterval, fn: opts.queryFn })
+    return globalThis.__fcHistoryState || { data: undefined, isLoading: true, isError: false }
+  }
   if (opts.queryKey[1] === 'metrics' && globalThis.__fcMetricsState) {
     return globalThis.__fcMetricsState
   }
@@ -182,8 +186,10 @@ globalThis.__fcUseQuery = opts => {
     cardsQueries.push({ key: opts.queryKey, enabled: opts.enabled !== false, interval: opts.refetchInterval, fn: opts.queryFn })
     return typeof cardsState === 'function' ? cardsState(opts) : cardsState
   }
+  otherQueries.push(key)
   return { data: undefined, isLoading: true, isError: false }
 }
+const otherQueries = []
 globalThis.__fcModelsQueries = []
 
 function expand(node, p = 'root') {
@@ -1506,6 +1512,372 @@ async function runTrailLineageScenarios(report) {
   globalThis.__fcReposState = undefined
   globalThis.__fcQueryClient = undefined
 }
+// ---------------------------------------------------------------------------
+// v0.2.0 polish: default_rigor, verification panels, /metrics/history trends
+// ---------------------------------------------------------------------------
+const historyQueries = []
+const RIGOR_DEFAULTS = { ...REPO_DEFAULTS, default_rigor: 'standard' }
+const RIGOR_REPOS = [
+  { ...REPOS[0], default_rigor: null, effective_default_rigor: 'standard' },
+  { ...REPOS[1], default_rigor: 'high', effective_default_rigor: 'high' },
+  { ...REPOS[2], default_rigor: 'standard', effective_default_rigor: 'standard' }
+]
+const readRigorCells = tree => Object.fromEntries(findAll(reposSec(tree).node, n => n.type === 'td' && n.props['data-field'] === 'default_rigor').map(h => {
+  const tr = findAll(reposSec(tree).node, n => n.type === 'tr' && n.props['data-slug'] && n.props.className !== 'fc-repo-ed').find(r => find(r.node, x => x === h.node))
+  const t = find(h.node, n => String(n.props.className || '').startsWith('fc-tag fc-tag--')).node
+  return [tr.node.props['data-slug'], { cls: t.props.className, text: norm(t), title: t.props.title, rigor: t.props['data-rigor'] ?? null, glyph: !!find(t, n => n.type === 'svg') }]
+}))
+const cls = c => n => n.props && n.props.className === c
+const clsStarts = c => n => n.props && String(n.props.className || '').startsWith(c)
+
+function readKpi(tree) {
+  const k = find(tree, clsStarts('fc-card fc-kpi-vp'))
+  if (!k) return null
+  const bar = find(k.node, cls('fc-kpi-bar'))
+  const flag = find(k.node, cls('fc-kpi-flag'))
+  return {
+    flag: k.node.props['data-flag'] ?? null,
+    state: k.node.props['data-state'] ?? null,
+    text: norm(k.node),
+    flagText: flag ? norm(flag.node) : null,
+    bar: bar ? { role: bar.node.props.role, label: bar.node.props['aria-label'], segs: bar.node.props.children.map(s => [s.props['data-tone'], s.props.style.flex]) } : null,
+    grid: find(tree, n => n.props && String(n.props.className || '').startsWith('fc-grid'))?.node.props.className
+  }
+}
+function readVp(tree) {
+  const v = find(tree, clsStarts('fc-card fc-vp'))
+  if (!v) return null
+  const tag = find(v.node, clsStarts('fc-tag fc-rigor'))
+  const ready = find(v.node, cls('fc-ready'))
+  const src = find(v.node, cls('fc-vp-src'))
+  const warn = find(v.node, cls('fc-vp-warn'))
+  const empty = find(v.node, cls('fc-vp-empty'))
+  return {
+    state: v.node.props['data-state'],
+    busy: v.node.props['aria-busy'] ?? null,
+    label: v.node.props['aria-label'] ?? null,
+    skel: !!find(v.node, cls('fc-vp-skel')),
+    rigor: tag ? { rigor: tag.node.props['data-rigor'], text: norm(tag.node) } : null,
+    ready: ready ? { tone: ready.node.props['data-tone'], text: norm(ready.node) } : null,
+    src: src ? norm(src.node) : null,
+    members: findAll(v.node, cls('fc-vp-member')).map(h => ({ idx: norm(find(h.node, cls('fc-vp-idx')).node), label: norm(find(h.node, cls('fc-mono')).node), vendor: norm(find(h.node, cls('fc-vendor')).node), dup: find(h.node, cls('fc-vendor')).node.props['data-dup'] })),
+    warn: warn ? { role: warn.node.props.role, text: norm(warn.node), advisories: findAll(warn.node, n => n.type === 'li').map(h => norm(h.node)) } : null,
+    empty: empty ? norm(empty.node) : null
+  }
+}
+function readSpark(h) {
+  const n = h.node
+  const plot = find(n, cls('fc-spark-plot')).node
+  const svg = find(n, n2 => n2.type === 'svg' && n2.props.className === 'fc-spark-svg')?.node
+  const delta = find(n, cls('fc-spark-delta')).node
+  const read = find(n, cls('fc-spark-read')).node
+  const hover = svg ? find(svg, cls('fc-spark-hover')) : null
+  return {
+    metric: n.props['data-metric'],
+    title: norm(find(n, cls('fc-k')).node),
+    value: norm(find(n, cls('fc-spark-v')).node),
+    delta: { tone: delta.props['data-tone'], text: norm(delta), arrow: !!find(delta, x => x.type === 'svg') },
+    plot: { tabIndex: plot.props.tabIndex, role: plot.props.role, label: plot.props['aria-label'] },
+    svg: svg ? {
+      viewBox: svg.props.viewBox,
+      par: svg.props.preserveAspectRatio,
+      hidden: svg.props['aria-hidden'],
+      paths: findAll(svg, x => x.type === 'path').map(p => [p.node.props.className, p.node.props.d]),
+      circles: findAll(svg, x => x.type === 'circle').map(c => [c.node.props.className, c.node.props.cx, c.node.props.cy, c.node.props.r]),
+      lines: findAll(svg, x => x.type === 'line').map(l => [l.node.props.className, l.node.props.y1, l.node.props.strokeDasharray ?? null]),
+      hover: hover ? hover.node.props.visibility : null
+    } : null,
+    legend: (() => { const l = find(n, cls('fc-spark-legend')); return l ? norm(l.node) : null })(),
+    read: { live: read.props['aria-live'], text: norm(read) }
+  }
+}
+function readTrend(tree) {
+  const s = find(tree, n => n.type === 'section' && n.props.className === 'fc-trend')
+  if (!s) return null
+  const sec = s.node
+  const sub = find(sec, cls('fc-sec-sub'))
+  const alert = find(sec, n => n.props.role === 'alert')
+  const box = find(sec, cls('fc-trail-state'))
+  return {
+    state: sec.props['data-state'],
+    busy: sec.props['aria-busy'] ?? null,
+    stale: sec.props['data-stale'] ?? null,
+    labelledBy: sec.props['aria-labelledby'],
+    heading: norm(find(sec, n => n.type === 'h2').node),
+    sub: sub ? norm(sub.node) : null,
+    srcs: findAll(sec, n => n.props.className === 'fc-trail-pill' && !!find(n, cls('fc-trail-k'))).map(h => norm(h.node)),
+    alert: alert ? { text: norm(alert.node), retry: !!find(alert.node, byAttr('data-action', 'retry-history')) } : null,
+    empty: box ? { kind: box.node.props['data-state'], title: norm(find(box.node, n => n.type === 'h3').node), cmd: norm(find(box.node, cls('fc-trend-cmd')).node), text: norm(box.node) } : null,
+    skeletons: (() => { const k = find(sec, cls('fc-trend-skel')); return k ? k.node.props.children.length : 0 })(),
+    grid: !!find(sec, cls('fc-trend-grid')),
+    cards: findAll(sec, cls('fc-card fc-spark')).map(readSpark)
+  }
+}
+const TREND_TS = i => `2026-11-${String(1 + i * 2).padStart(2, '0')}T12:00:00.000000+00:00`
+const SNAP_SRC = ['merge', 'merge', 'retro', 'merge', 'panel_consensus', 'merge', 'merge', 'retro', 'merge', 'panel_consensus', 'merge', 'merge', 'panel_consensus', 'merge']
+const SNAPS = Array.from({ length: 14 }, (_, i) => ({
+  id: `ms_${String(i).padStart(12, '0')}`,
+  ts: TREND_TS(i),
+  source: SNAP_SRC[i],
+  diff_pass_rate: [0.78, 0.8, 0.79, 0.82, 0.83, 0.81, 0.84, 0.85, 0.84, 0.86, 0.87, 0.86, 0.88, 0.88][i],
+  blackbox_pass_rate: [0.7, 0.72, 0.73, 0.72, 0.75, 0.76, 0.75, 0.78, 0.79, 0.78, 0.8, 0.81, 0.8, 0.82][i],
+  escape_rate: [0.15, 0.14, 0.14, 0.13, 0.12, 0.12, 0.11, 0.11, 0.1, 0.1, 0.09, 0.09, 0.08, 0.08][i],
+  workstreams_total: [4, 4, 5, 6, 6, 7, 8, 8, 9, 10, 10, 11, 12, 12][i],
+  cards_done: [12, 14, 17, 19, 21, 29, 34, 36, 39, 48, 52, 55, 58, 61][i]
+}))
+const HISTORY = snaps => ({ snapshots: snaps, summary: { total: snaps.length, snapshot_count: snaps.length, first_ts: snaps[0]?.ts ?? null, latest_ts: snaps[snaps.length - 1]?.ts ?? null, by_source: snaps.reduce((a, s) => ({ ...a, [s.source]: (a[s.source] || 0) + 1 }), {}) }, filters: { since: '30d', limit: 100 } })
+const PANEL_OK = { entries: [{ label: 'openai/gpt-5.4', vendor: 'openai', index: 0 }, { label: 'google/gemini-3-pro', vendor: 'google', index: 1 }], vendors: ['openai', 'google'], distinct_vendor_count: 2, duplicate_vendors: [], unknown_vendor_models: [], valid: true, warning: null, source: 'settings.verify_panel', advisories: [] }
+const PANEL_BAD = { entries: [{ label: 'openai/gpt-5.4', vendor: 'openai', index: 0 }, { label: 'openai/o4-mini', vendor: 'openai', index: 1 }, { label: 'mystery-model', vendor: null, index: 2 }], vendors: ['openai'], distinct_vendor_count: 1, duplicate_vendors: ['openai'], unknown_vendor_models: ['mystery-model'], valid: false, warning: 'rigor=high verify panel collapses to a single vendor family (openai).', source: 'auxiliary.factonio_verify_panel', advisories: ['Ignored 1 malformed panel entry.'] }
+const PANEL_NONE = { entries: [], vendors: [], distinct_vendor_count: 0, duplicate_vendors: [], unknown_vendor_models: [], valid: false, warning: 'rigor=high requires a verification panel of at least 2 models from distinct vendor families, but no verify_panel is configured.', source: 'unset', advisories: [] }
+const POLISH_METRICS = (vp, extra = {}) => ({
+  range: '30d', tenant: null,
+  totals: { cards: 9, done: 7, running: 1, blocked: 1, triage: 0, workstreams: 3 },
+  phases: {},
+  verification: { diff: { pass: 4, reject: 1, inconclusive: 0, pass_rate: 0.8 }, blackbox: { pass: 3, reject: 1, inconclusive: 1, pass_rate: 0.6 } },
+  rework: { avg_runs_per_implement_card: 1.2, cards_with_rework: 1, first_pass_rate: 0.8 },
+  escapes: { count: 0, verified_total: 4, escape_rate: 0 },
+  ...(vp === undefined ? {} : { verification_panels: vp }),
+  ...extra
+})
+
+const lane = o => card({ status: 'done', phase: 'verify-diff', title: '[verify-diff] lane', created_at: 500, ...o })
+const consensusRow = (tenant, panel_id, result, evidence = {}, extra = {}) => dec({ id: `d_vpc_${panel_id}_${result}`, ts: '2026-11-25T17:00:00.000000Z', tenant, phase: 'verify', actor: 'orchestrator', decision: 'verify_panel_consensus', why: 'panel', result, evidence: { panel_id, has_disagreement: false, disagreement_summary: null, ...evidence }, ...extra })
+
+async function runPolishScenarios(report) {
+  const P = report.polish = {}
+  // --- pure helpers ---------------------------------------------------------
+  P.verdictTone = Object.fromEntries(['pass', 'reject', 'fail', 'inconclusive', 'INCONCLUSIVE', 'weird', null].map(v => [String(v), mod.verdictTone(v)]))
+  P.spark = {
+    one: mod.sparkPoints([0.5], 0, 1),
+    fourteen: mod.sparkPoints(SNAPS.map(s => s.diff_pass_rate), 0.6, 1),
+    flat: mod.sparkPoints([3, 3], 3, 3),
+    gapPath: mod.sparkPath(mod.sparkPoints([0.1, null, 0.3, 0.4], 0, 1)),
+    path14: mod.sparkPath(mod.sparkPoints(SNAPS.map(s => s.diff_pass_rate), 0.6, 1))
+  }
+  const T0 = 'acme-api-panel'
+  const two = (a, b) => [
+    lane({ id: 't_l1', tenant: T0, panel_id: 'vp_aa', panel_vendor: 'openai', provider: 'openai', model: 'gpt-5.4', ...a }),
+    lane({ id: 't_l2', tenant: T0, panel_id: 'vp_aa', panel_vendor: 'google', provider: 'google', model: 'gemini-3-pro', ...b })
+  ]
+  const cw = (cards, trail) => JSON.parse(JSON.stringify(mod.computeWorkstreamPanels(cards, trail)))
+  P.panels = {
+    passNoTrail: cw(two({ verdict: 'pass' }, { verdict: 'pass' }), []),
+    passRecorded: cw(two({ verdict: 'pass' }, { verdict: 'pass' }), [consensusRow(T0, 'vp_aa', 'pass')]),
+    rejectDisagree: cw(two({ verdict: 'pass' }, { verdict: 'reject', summary: 'migration drops idx_cards_tenant without a backfill' }), []),
+    inconclusive: cw(two({ verdict: 'pass' }, { verdict: 'inconclusive', summary: 'No browser available' }), []),
+    pending: cw(two({ verdict: 'pass' }, { status: 'running', verdict: null }), []),
+    pendingRecordedReject: cw(two({ verdict: 'pass' }, { status: 'running', verdict: null }), [consensusRow(T0, 'vp_aa', 'reject', { has_disagreement: true, disagreement_summary: 'Panel lanes disagree -- pass: verify-diff/openai; reject: verify-diff/google.' })]),
+    singleVendor: cw([lane({ id: 't_s1', panel_id: 'vp_sv', panel_vendor: 'openai', verdict: 'pass' }), lane({ id: 't_s2', panel_id: 'vp_sv', panel_vendor: 'openai', verdict: 'pass' })], [consensusRow(T0, 'vp_sv', 'pass')]),
+    supersededIgnored: cw(two({ verdict: 'pass' }, { verdict: 'pass' }), [consensusRow(T0, 'vp_aa', 'pass', {}, { is_superseded: true })]),
+    newestFirst: cw([...two({ verdict: 'pass' }, { verdict: 'pass' }), lane({ id: 't_n1', panel_id: 'vp_bb', panel_vendor: 'openai', verdict: null, status: 'running', created_at: 900 })], []).map(p => p.id),
+    none: cw([card({ id: 't_x', tenant: T0, phase: 'implement', status: 'done' })], []),
+    nullInputs: cw(null, null)
+  }
+
+  // --- Registered Repositories: Rigor column + Default rigor editor field ----
+  const client = { invalidateQueries: () => Promise.resolve() }
+  const R = P.rigor = {}
+  let m = mountRepos({ data: { repos: RIGOR_REPOS, defaults: RIGOR_DEFAULTS }, client })
+  let tree = m.render()
+  R.cells = readRigorCells(tree)
+  R.sub = norm(find(tree, n => n.props.className === 'fc-sec-sub' && norm(n).startsWith('Global defaults')).node)
+  // inherit -> high
+  fire(find(tree, n => n.type === 'button' && n.props['aria-label'] === 'Edit tozes/factonio')); tree = m.render()
+  R.opened = readEditor(tree).fields.default_rigor
+  change(tree, 'default_rigor', 'high'); tree = m.render()
+  R.high = { field: readEditor(tree).fields.default_rigor, msg: readEditor(tree).msg.text, save: readEditor(tree).save }
+  change(tree, 'default_rigor', ''); tree = m.render()
+  R.revert = { field: readEditor(tree).fields.default_rigor, msg: readEditor(tree).msg.text, save: readEditor(tree).save }
+  change(tree, 'default_rigor', 'standard'); tree = m.render()
+  R.standardHint = readEditor(tree).fields.default_rigor.hint
+  change(tree, 'default_rigor', 'high'); tree = m.render()
+  await submitForm(tree); tree = m.render()
+  R.saveHigh = { rests: [...m.rests], closed: readEditor(tree) === null }
+  // high override -> inherit (null)
+  m = mountRepos({ data: { repos: RIGOR_REPOS, defaults: RIGOR_DEFAULTS }, client })
+  tree = m.render()
+  fire(find(tree, n => n.type === 'button' && n.props['aria-label'] === 'Edit acme/web-dashboard')); tree = m.render()
+  R.openedHigh = readEditor(tree).fields.default_rigor
+  change(tree, 'default_rigor', ''); tree = m.render()
+  R.inheritHint = readEditor(tree).fields.default_rigor.hint
+  await submitForm(tree); tree = m.render()
+  R.clearRests = [...m.rests]
+  // standard override -> high, together with another field
+  m = mountRepos({ data: { repos: RIGOR_REPOS, defaults: RIGOR_DEFAULTS }, client })
+  tree = m.render()
+  fire(find(tree, n => n.type === 'button' && n.props['aria-label'] === 'Edit acme/cli-tools')); tree = m.render()
+  change(tree, 'merge_policy', 'ask'); change(tree, 'default_rigor', 'high'); tree = m.render()
+  R.twoDirty = readEditor(tree).msg.text
+  await submitForm(tree); tree = m.render()
+  R.twoRests = [...m.rests]
+  // older backend without default_rigor fields: inherited standard, nothing PATCHed for rigor
+  m = mountRepos({ data: { repos: REPOS, defaults: REPO_DEFAULTS }, client })
+  tree = m.render()
+  R.legacyCells = readRigorCells(tree)
+  R.changesHelper = {
+    toHigh: mod.repoDraftChanges({ default_rigor: 'high' }, RIGOR_REPOS[0]),
+    toInherit: mod.repoDraftChanges({ default_rigor: '' }, RIGOR_REPOS[1]),
+    untouched: mod.repoDraftChanges({ merge_policy: 'ask' }, RIGOR_REPOS[1]),
+    same: mod.repoDraftChanges({ default_rigor: 'high' }, RIGOR_REPOS[1])
+  }
+
+  // --- /factonio dashboard: KPI card, verify_panel status, trend strip -------
+  const D = P.dash = {}
+  const savedModels = queryState
+  const dash = (metrics, models, history) => {
+    globalThis.__fcMetricsState = metrics
+    queryState = models
+    globalThis.__fcHistoryState = history
+    historyQueries.length = 0
+    const mm = mountRepos({ data: { repos: RIGOR_REPOS, defaults: RIGOR_DEFAULTS }, client })
+    return { m: mm, tree: mm.render() }
+  }
+  const ok = data => ({ data, isLoading: false, isError: false })
+  let r = dash(ok(POLISH_METRICS({ total: 5, pass: 2, reject: 1, inconclusive: 1, pending: 1, disagreements: 2 })), ok({ ...MODELS, verify_panel: PANEL_OK, default_rigor: 'standard' }), ok(HISTORY(SNAPS)))
+  D.populated = { kpi: readKpi(tree = r.tree), vp: readVp(tree), trend: readTrend(tree), order: findAll(tree, n => n.type === 'h2').map(h => norm(h.node)) }
+  D.historyQuery = historyQueries.map(q => ({ key: q.key, interval: q.interval }))[0]
+  await historyQueries[0].fn()
+  D.historyRest = r.m.rests[r.m.rests.length - 1].path
+  // keyboard + focus readout on the pass-rate chart
+  const plotOf = (t, metric) => find(find(t, n => n.props.className === 'fc-card fc-spark' && n.props['data-metric'] === metric).node, cls('fc-spark-plot')).node
+  const key = (metric, k) => { let prevented = false; plotOf(tree, metric).props.onKeyDown({ key: k, preventDefault() { prevented = true }, currentTarget: { blur() {} } }); tree = r.m.render(); return prevented }
+  D.keys = {}
+  D.keys.homePrevented = key('pass', 'Home')
+  D.keys.home = readTrend(tree).cards[0]
+  key('pass', 'ArrowRight')
+  D.keys.right = readTrend(tree).cards[0].read.text
+  key('pass', 'ArrowLeft'); key('pass', 'ArrowLeft')
+  D.keys.leftClamped = readTrend(tree).cards[0].read.text
+  key('pass', 'End')
+  D.keys.end = readTrend(tree).cards[0].read.text
+  D.keys.otherKeyPrevented = key('pass', 'a')
+  plotOf(tree, 'escape').props.onFocus(); tree = r.m.render()
+  D.keys.focusEscape = readTrend(tree).cards[1].svg.hover
+  plotOf(tree, 'escape').props.onBlur(); tree = r.m.render()
+  D.keys.blurEscape = readTrend(tree).cards[1].svg.hover
+  plotOf(tree, 'throughput').props.onPointerMove({ clientX: 10, currentTarget: { getBoundingClientRect: () => ({ left: 0, width: 240 }) } }); tree = r.m.render()
+  D.keys.pointer = readTrend(tree).cards[2].read.text
+  plotOf(tree, 'throughput').props.onPointerLeave({ currentTarget: {} }); tree = r.m.render()
+  D.keys.pointerLeave = readTrend(tree).cards[2].read.text
+
+  r = dash(ok(POLISH_METRICS({ total: 3, pass: 3, reject: 0, inconclusive: 0, pending: 0, disagreements: 0 })), ok({ ...MODELS, verify_panel: PANEL_BAD, default_rigor: 'high' }), ok(HISTORY(SNAPS.slice(-1))))
+  D.single = { kpi: readKpi(r.tree), vp: readVp(r.tree), trend: readTrend(r.tree) }
+  r = dash(ok(POLISH_METRICS({ total: 0, pass: 0, reject: 0, inconclusive: 0, pending: 0, disagreements: 0 })), ok({ ...MODELS, verify_panel: PANEL_NONE, default_rigor: 'standard' }), ok(HISTORY([])))
+  D.empty = { kpi: readKpi(r.tree), vp: readVp(r.tree), trend: readTrend(r.tree) }
+  r = dash({ data: undefined, isLoading: true, isError: false }, { data: undefined, isLoading: true, isError: false }, { data: undefined, isLoading: true, isError: false })
+  D.loading = { kpi: readKpi(r.tree), vp: readVp(r.tree), trend: readTrend(r.tree), text: norm(r.tree) }
+  const refetches = []
+  r = dash(ok(POLISH_METRICS(undefined)), { data: undefined, isLoading: false, isError: true, error: new Error('500') }, { data: undefined, isLoading: false, isError: true, error: new Error('503: {"detail":"trail.db is locked"}'), refetch: () => refetches.push('h') })
+  D.errorNoData = { kpi: readKpi(r.tree), vp: readVp(r.tree), trend: readTrend(r.tree) }
+  fire(find(r.tree, byAttr('data-action', 'retry-history')))
+  D.retry = [...refetches]
+  r = dash(ok(POLISH_METRICS({ total: 1, pass: 0, reject: 0, inconclusive: 0, pending: 1, disagreements: 0 })), ok({ ...MODELS }), { data: HISTORY(SNAPS.slice(0, 4)), isLoading: false, isError: true, error: new Error('fetch failed'), dataUpdatedAt: Date.now() - 4 * 60000 })
+  D.errorStale = { kpi: readKpi(r.tree), vp: readVp(r.tree), trend: readTrend(r.tree) }
+  // Partial / null KPI values and unsorted snapshots never crash the strip.
+  const partial = [
+    { id: 'ms_c', ts: '2026-11-20T00:00:00Z', source: 'retro', diff_pass_rate: null, blackbox_pass_rate: 0.5, escape_rate: null, workstreams_total: 3, cards_done: null },
+    { id: 'ms_a', ts: '2026-11-10T00:00:00Z', source: 'merge', diff_pass_rate: 0.9, blackbox_pass_rate: null, escape_rate: 0.25, workstreams_total: null, cards_done: 4 },
+    { id: 'ms_b', ts: '2026-11-15T00:00:00Z', source: 'merge' }
+  ]
+  try {
+    r = dash(ok(POLISH_METRICS(null)), ok({ ...MODELS, verify_panel: null }), ok({ snapshots: partial, summary: {}, filters: {} }))
+    D.partial = { kpi: readKpi(r.tree), vp: readVp(r.tree), trend: readTrend(r.tree) }
+  } catch (e) { D.partialError = String(e && e.stack || e) }
+  queryState = savedModels
+  globalThis.__fcMetricsState = undefined
+  globalThis.__fcHistoryState = undefined
+
+  // --- sidebar: panel strip, vendor chips, inconclusive tones, drawer rows ---
+  const S = P.sidebar = {}
+  const WS_DIS = 'omnim-ai-factonio-tenant-card-index'
+  const WS_PEND = 'omnim-ai-factonio-watchdog-liveness'
+  const WS_REC = 'omnim-ai-factonio-recorded-panel'
+  const PR214 = { repo: 'omnim-ai/factonio', number: 214, url: 'https://github.com/omnim-ai/factonio/pull/214' }
+  const PANEL_CARDS = [
+    card({ id: 't_imp', tenant: WS_DIS, phase: 'implement', status: 'done', title: '[implement] index migration', pr: PR214, created_at: 100 }),
+    lane({ id: 't_8f2a', tenant: WS_DIS, panel_id: 'vp_9a4c1e', panel_vendor: 'google', provider: 'google', model: 'gemini-3-pro', verdict: 'reject', pr: PR214, title: '[verify-diff] lane google', summary: 'migration drops idx_cards_tenant without a backfill; rollback leaves orphaned rows', created_at: 500 }),
+    lane({ id: 't_8f2b', tenant: WS_DIS, panel_id: 'vp_9a4c1e', panel_vendor: 'openai', provider: 'openai', model: 'gpt-5.4', verdict: 'pass', pr: PR214, title: '[verify-diff] lane openai', created_at: 500 }),
+    lane({ id: 't_8f2c', tenant: WS_DIS, panel_id: 'vp_9a4c1e', panel_vendor: 'anthropic', provider: 'anthropic', model: 'claude-opus-5-5', verdict: 'inconclusive', pr: PR214, title: '[verify-diff] lane anthropic', summary: 'Could not reproduce locally', created_at: 501 }),
+    card({ id: 't_w1', tenant: WS_PEND, phase: 'implement', status: 'done', title: '[implement] liveness', created_at: 100 }),
+    lane({ id: 't_w2', tenant: WS_PEND, panel_id: 'vp_c20d55', panel_vendor: 'openai', provider: 'openai', model: 'gpt-5.4', verdict: 'pass', title: '[verify-blackbox] lane openai', phase: 'verify-blackbox', created_at: 500 }),
+    lane({ id: 't_w3', tenant: WS_PEND, panel_id: 'vp_c20d55', panel_vendor: 'google', provider: 'google', model: 'gemini-3-pro', verdict: null, status: 'running', title: '[verify-blackbox] lane google', phase: 'verify-blackbox', created_at: 500 }),
+    lane({ id: 't_r1', tenant: WS_REC, panel_id: 'vp_3f71b0', panel_vendor: 'openai', verdict: 'pass', created_at: 500 }),
+    lane({ id: 't_r2', tenant: WS_REC, panel_id: 'vp_3f71b0', panel_vendor: 'google', verdict: 'pass', created_at: 500 }),
+    lane({ id: 't_r3', tenant: WS_REC, panel_id: 'vp_3f71b0', panel_vendor: 'openai', verdict: 'pass', phase: 'verify-blackbox', created_at: 500 }),
+    lane({ id: 't_r4', tenant: WS_REC, panel_id: 'vp_3f71b0', panel_vendor: 'google', verdict: 'pass', phase: 'verify-blackbox', created_at: 500 })
+  ]
+  const PANEL_TRAIL = { decisions: [consensusRow(WS_REC, 'vp_3f71b0', 'pass')], summary: { total: 1 }, filters: {} }
+  const readStrip = (t, tenant) => {
+    const sec = find(t, n => n.type === 'section' && n.props['data-tenant'] === tenant)
+    const st = sec && find(sec.node, cls('fc-sb-panel'))
+    if (!st) return null
+    const tag = find(st.node, n => n.props.className === 'fc-sb-tag')
+    const callout = find(st.node, cls('fc-sb-callout'))
+    const body = sec.node.props.children[1].props.children.filter(Boolean).map(ch => ch.props.className || ch.type)
+    return {
+      label: st.node.props['aria-label'], role: st.node.props.role,
+      consensus: st.node.props['data-consensus'], disagree: st.node.props['data-disagree'],
+      tag: { tone: tag.node.props['data-tone'], text: norm(tag.node) },
+      id: norm(find(st.node, cls('fc-sb-panel-id fc-sb-mono')).node),
+      lanes: norm(find(st.node, cls('fc-sb-panel-lanes')).node),
+      vendors: findAll(st.node, cls('fc-sb-vendor')).map(h => [h.node.props['data-verdict'], norm(h.node), h.node.props.title]),
+      callout: callout ? { tone: callout.node.props['data-tone'], kind: callout.node.props['data-kind'], role: callout.node.props.role, text: norm(callout.node), title: find(callout.node, cls('fc-sb-callout-body')).node.props.title, quote: !!find(callout.node, n => n.type === 'q') } : null,
+      bodyOrder: body
+    }
+  }
+  const cardTop = (t, id) => {
+    const a = find(t, n => n.type === 'article' && n.props['data-id'] === id).node
+    return {
+      attn: a.props['data-attn'],
+      dot: find(a, cls('fc-sb-dot')).node.props['data-status'],
+      dotLabel: find(a, cls('fc-sb-dot')).node.props['aria-label'],
+      vendor: (() => { const v = find(find(a, cls('fc-sb-card-top')).node, cls('fc-sb-vendor')); return v ? { text: norm(v.node), title: v.node.props.title } : null })(),
+      verdictTone: find(a, n => n.props['data-verdict'] != null)?.node.props['data-tone'] ?? null
+    }
+  }
+  cardsState = { data: { cards: PANEL_CARDS }, isLoading: false, isError: false }
+  trailState = { data: PANEL_TRAIL, isLoading: false, isError: false }
+  m = mountPane({ storage: makeStorage({ 'sidebar.scope': 'all' }), focused: null })
+  tree = m.render()
+  for (const sec of sectionsOf(tree)) {
+    if (sec.expanded === 'false') { fire(find(find(tree, n => n.type === 'section' && n.props['data-tenant'] === sec.tenant).node, byAttr('data-action', 'toggle-ws'))); tree = m.render() }
+  }
+  for (const sec of sectionsOf(tree)) {
+    const tg = find(find(tree, n => n.type === 'section' && n.props['data-tenant'] === sec.tenant).node, cls('fc-sb-done-toggle'))
+    if (tg && tg.node.props['aria-expanded'] === 'false') { fire(tg); tree = m.render() }
+  }
+  S.sections = sectionsOf(tree).map(x => ({ tenant: x.tenant, state: x.state, stages: x.stages }))
+  S.header = headerOf(tree).tiles
+  S.dis = readStrip(tree, WS_DIS)
+  S.pend = readStrip(tree, WS_PEND)
+  S.rec = readStrip(tree, WS_REC)
+  S.cards = Object.fromEntries(['t_8f2a', 't_8f2b', 't_8f2c', 't_w3', 't_imp'].map(id => [id, cardTop(tree, id)]))
+  fire(find(find(tree, n => n.type === 'article' && n.props['data-id'] === 't_8f2a').node, byAttr('data-action', 'toggle-card'))); tree = m.render()
+  const dl = find(find(tree, n => n.type === 'article' && n.props['data-id'] === 't_8f2a').node, n => n.type === 'dl').node
+  S.drawer = {
+    order: findAll(dl, n => n.type === 'dd').map(h => h.node.props['data-field']),
+    fields: Object.fromEntries(findAll(dl, n => n.type === 'dd').map(h => [h.node.props['data-field'], norm(h.node)])),
+    labels: findAll(dl, n => n.type === 'dt').map(h => norm(h.node)),
+    panelTone: find(findAll(dl, n => n.type === 'dd' && n.props['data-field'] === 'panel')[0].node, cls('fc-sb-tag')).node.props['data-tone'],
+    peers: findAll(findAll(dl, n => n.type === 'dd' && n.props['data-field'] === 'peers')[0].node, cls('fc-sb-vendor')).map(h => h.node.props['data-verdict'])
+  }
+  fire(find(find(tree, n => n.type === 'article' && n.props['data-id'] === 't_imp').node, byAttr('data-action', 'toggle-card'))); tree = m.render()
+  S.nonPanelDrawer = findAll(find(find(tree, n => n.type === 'article' && n.props['data-id'] === 't_imp').node, n => n.type === 'dl').node, n => n.type === 'dd').map(h => h.node.props['data-field'])
+  // trail still loading: panel strip renders from /cards alone (no extra requests)
+  trailState = { data: undefined, isLoading: true, isError: false }
+  m = mountPane({ storage: makeStorage({ 'sidebar.scope': 'all' }), focused: null })
+  tree = m.render()
+  fire(find(find(tree, n => n.type === 'section' && n.props['data-tenant'] === WS_REC).node, byAttr('data-action', 'toggle-ws'))); tree = m.render()
+  S.trailLoading = { rec: readStrip(tree, WS_REC) }
+  otherQueries.length = 0
+  trailQueries.length = 0
+  tree = m.render()
+  S.paneQueries = { cards: cardsQueries.map(q => q.key.join('/')), trail: trailQueries.map(q => q.key.join('/')), other: [...otherQueries] }
+  cardsState = { data: undefined, isLoading: true, isError: false }
+  trailState = { data: undefined, isLoading: true, isError: false }
+  globalThis.__fcReposState = undefined
+  globalThis.__fcQueryClient = undefined
+}
 const mod = await import(process.env.FC_PLUGIN_URL)
 const plugin = mod.default
 const report = { id: plugin.id, name: plugin.name }
@@ -1604,6 +1976,8 @@ await runTrailLineageScenarios(report)
   } catch (e) { tri.sidebarError = String(e && e.stack || e) }
   cardsState = { data: undefined, isLoading: true, isError: false }
 }
+
+await runPolishScenarios(report)
 
 process.stdout.write(JSON.stringify(report))
 """
@@ -2167,7 +2541,7 @@ class TestDesktopPlugin(unittest.TestCase):
         d = self.report["trail"]["dashboard"]
         self.assertEqual(d["query"], {"key": ["factonio", "trail", 200], "interval": 30000})
         self.assertEqual(d["restPath"], "/trail?limit=200")
-        self.assertEqual(d["sectionOrder"], ["Phase Durations", "Decision Trail", "Phase Model Configuration", "Registered Repositories"])
+        self.assertEqual(d["sectionOrder"], ["Trends", "Phase Durations", "Decision Trail", "Phase Model Configuration", "Registered Repositories"])
 
     def test_trail_dashboard_loading_state(self):
         t = self.report["trail"]["dashboard"]["loading"]
@@ -2523,20 +2897,20 @@ class TestDesktopPlugin(unittest.TestCase):
         r = self.report["repos"]["read"]
         self.assertEqual(r["sectionClass"], "fc-sec fc-repos-sec")
         self.assertEqual(r["title"], "Registered Repositories")
-        self.assertEqual(r["sub"], "Global defaults: design provider auto · design approval ask")
+        self.assertEqual(r["sub"], "Global defaults: design provider auto · design approval ask · rigor standard")
         self.assertEqual(r["legend"], "value · global inherited value override")
         self.assertEqual(r["legendTags"], ["fc-tag fc-tag--inherit", "fc-tag fc-tag--set"])
         self.assertEqual(r["tableClass"], "fc-table fc-repos")
         self.assertEqual(
             r["cols"],
-            ["fc-col-repo", "fc-col-branch", "fc-col-merge", "fc-col-rounds", "fc-col-prov", "fc-col-appr", "fc-col-act"],
+            ["fc-col-repo", "fc-col-branch", "fc-col-merge", "fc-col-rounds", "fc-col-prov", "fc-col-appr", "fc-col-rigor", "fc-col-act"],
         )
         self.assertEqual(
             [h["text"] for h in r["headers"]],
-            ["Repository Local path", "Branch", "Merge policy", "Max fix rounds", "Design provider", "Design approval", "Actions"],
+            ["Repository Local path", "Branch", "Merge policy", "Max fix rounds", "Design provider", "Design approval", "Rigor", "Actions"],
         )
         self.assertEqual(r["headers"][3]["className"], "fc-num")
-        self.assertEqual(r["headers"][6]["className"], "fc-act")
+        self.assertEqual(r["headers"][7]["className"], "fc-act")
         self.assertEqual(r["order"], ["row:tozes-factonio", "row:acme-web-dashboard", "row:acme-cli-tools"])
         self.assertIsNone(r["editor"])
         # No Add / Remove repository controls: only one Edit button per row.
@@ -2669,7 +3043,7 @@ class TestDesktopPlugin(unittest.TestCase):
         # Untouched fields reconcile to refreshed values; the user's edit is preserved.
         self.assertEqual(
             self._ed_vals(b["after"]),
-            {"default_branch": "user-feature", "merge_policy": "ask", "max_fix_rounds": "3", "design_provider": "hermes", "design_approval": ""},
+            {"default_branch": "user-feature", "merge_policy": "ask", "max_fix_rounds": "3", "design_provider": "hermes", "design_approval": "", "default_rigor": ""},
         )
         self.assertEqual(
             b["rests"],
@@ -2706,13 +3080,13 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual(row["edit"]["active"], "true")
         self.assertEqual(row["edit"]["controls"], ed["formId"])
         self.assertEqual(ed["editing"], "true")
-        self.assertEqual(ed["colSpan"], 7)
+        self.assertEqual(ed["colSpan"], 8)
         self.assertEqual(ed["formLabel"], "Edit settings for tozes/factonio")
         self.assertTrue(ed["noValidate"])
         self.assertEqual(ed["identity"], "Editing tozes-factonio Path /home/tozes/dev/factonio")
         self.assertEqual(ed["fieldsetClass"], "fc-ed-grid")
-        self.assertEqual(ed["fieldOrder"], ["default_branch", "merge_policy", "max_fix_rounds", "design_provider", "design_approval"])
-        self.assertEqual(self._ed_vals(ed), {"default_branch": "main", "merge_policy": "auto", "max_fix_rounds": "3", "design_provider": "", "design_approval": ""})
+        self.assertEqual(ed["fieldOrder"], ["default_branch", "merge_policy", "max_fix_rounds", "design_provider", "design_approval", "default_rigor"])
+        self.assertEqual(self._ed_vals(ed), {"default_branch": "main", "merge_policy": "auto", "max_fix_rounds": "3", "design_provider": "", "design_approval": "", "default_rigor": ""})
         for name, f in ed["fields"].items():
             with self.subTest(field=name):
                 self.assertEqual(f["labelFor"], f["id"])
@@ -2789,7 +3163,7 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertFalse(ed["save"]["disabled"])
         self.assertIsNone(ed["busy"])
         self.assertFalse(ed["fieldsetDisabled"])
-        self.assertEqual(self._ed_vals(ed), {"default_branch": " develop ", "merge_policy": "auto", "max_fix_rounds": "4", "design_provider": "hermes", "design_approval": ""})
+        self.assertEqual(self._ed_vals(ed), {"default_branch": " develop ", "merge_policy": "auto", "max_fix_rounds": "4", "design_provider": "hermes", "design_approval": "", "default_rigor": ""})
         self.assertEqual(ae["notifications"], [])
         self.assertEqual(ae["invalidations"], [])
         self.assertFalse(ae["table"]["rows"][0]["edit"]["disabled"])
@@ -2853,6 +3227,341 @@ class TestDesktopPlugin(unittest.TestCase):
             self.assertNotRegex(line, r"#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(", line)
         for needed in (".fc-tag--inherit", ".fc-tag--set", "border: 1px dashed", ".fc-ed-grid", "@container (max-width: 640px)", '.fc-input[aria-invalid="true"]', ".fc-spin", ".fc-alert"):
             self.assertIn(needed, styles)
+
+    # --- v0.2.0 polish: default_rigor ------------------------------------------
+    def test_rigor_column_inherited_vs_override_badges(self):
+        r = self.report["polish"]["rigor"]
+        self.assertEqual(r["sub"], "Global defaults: design provider auto · design approval ask · rigor standard")
+        cells = r["cells"]
+        self.assertEqual(cells["tozes-factonio"], {"cls": "fc-tag fc-tag--inherit", "text": "standard · global", "title": "Inherited from global default", "rigor": None, "glyph": False})
+        self.assertEqual(cells["acme-web-dashboard"], {"cls": "fc-tag fc-tag--set", "text": "high", "title": "Repository override · multi-vendor panel", "rigor": "high", "glyph": True})
+        self.assertEqual(cells["acme-cli-tools"], {"cls": "fc-tag fc-tag--set", "text": "standard", "title": "Repository override", "rigor": "standard", "glyph": False})
+        # Older backends without default_rigor still render an inherited badge.
+        for slug, cell in r["legacyCells"].items():
+            with self.subTest(slug=slug):
+                self.assertEqual(cell["cls"], "fc-tag fc-tag--inherit")
+                self.assertEqual(cell["text"], "standard · global")
+
+    def test_repo_editor_default_rigor_field_dirty_tracking_and_hints(self):
+        r = self.report["polish"]["rigor"]
+        f = r["opened"]
+        self.assertEqual(f["label"], "Default rigor")
+        self.assertEqual(f["tag"], "select")
+        self.assertEqual(f["labelFor"], f["id"])
+        self.assertEqual(f["describedBy"], f["hint"]["id"])
+        self.assertEqual(f["value"], "")
+        self.assertEqual(f["options"], [["", "Inherit global (standard)"], ["standard", "Standard"], ["high", "High (multi-vendor panel)"]])
+        self.assertEqual(f["hint"]["text"], "Single cross-model diff check + black-box check. (inherited)")
+        h = r["high"]
+        self.assertEqual(h["field"]["value"], "high")
+        self.assertEqual(h["field"]["hint"]["text"], "Multi-vendor panel: needs ≥2 verify models from distinct vendor families; fails closed on disagreement.")
+        self.assertEqual(h["msg"], "1 unsaved change")
+        self.assertFalse(h["save"]["disabled"])
+        # Choosing the live value again drops the edit.
+        self.assertEqual(r["revert"]["msg"], "")
+        self.assertTrue(r["revert"]["save"]["disabled"])
+        self.assertEqual(r["standardHint"]["text"], "Single cross-model diff check + black-box check.")
+        self.assertEqual(r["openedHigh"]["value"], "high")
+        self.assertEqual(r["inheritHint"]["text"], "Single cross-model diff check + black-box check. (inherited)")
+        self.assertEqual(r["twoDirty"], "2 unsaved changes")
+
+    def test_repo_editor_default_rigor_patch_bodies(self):
+        r = self.report["polish"]["rigor"]
+        self.assertEqual(r["saveHigh"]["rests"], [{"path": "/repos/tozes-factonio", "opts": {"method": "PATCH", "body": {"default_rigor": "high"}}}])
+        self.assertTrue(r["saveHigh"]["closed"])
+        self.assertEqual(r["clearRests"], [{"path": "/repos/acme-web-dashboard", "opts": {"method": "PATCH", "body": {"default_rigor": None}}}])
+        self.assertEqual(r["twoRests"], [{"path": "/repos/acme-cli-tools", "opts": {"method": "PATCH", "body": {"merge_policy": "ask", "default_rigor": "high"}}}])
+        c = r["changesHelper"]
+        self.assertEqual(c["toHigh"], {"default_rigor": "high"})
+        self.assertEqual(c["toInherit"], {"default_rigor": None})  # "" -> null
+        self.assertEqual(c["untouched"], {})  # an edit equal to the live value is not sent; rigor untouched
+        self.assertEqual(c["same"], {})
+
+    # --- v0.2.0 polish: verification panels on /factonio ------------------------
+    def test_verification_panels_kpi_card(self):
+        d = self.report["polish"]["dash"]
+        k = d["populated"]["kpi"]
+        self.assertEqual(k["grid"], "fc-grid fc-grid--6")
+        self.assertEqual(k["flag"], "disagree")
+        self.assertEqual(k["flagText"], "2 disagreements")
+        self.assertEqual(k["bar"]["role"], "img")
+        self.assertEqual(k["bar"]["label"], "2 pass, 1 reject, 1 inconclusive, 1 pending")
+        self.assertEqual(k["bar"]["segs"], [["ok", 2], ["bad", 1], ["warn", 1], ["pending", 1]])
+        self.assertIn("5 panels", k["text"])
+        self.assertIn("2 pass 1 reject 1 inconcl. 1 pending", k["text"])
+        one = d["single"]["kpi"]
+        self.assertIsNone(one["flag"])  # no amber flag without disagreements
+        self.assertEqual(one["bar"]["segs"], [["ok", 3]])  # zero counts omitted
+        self.assertEqual(d["errorStale"]["kpi"]["text"], "Verification Panels 1 panel 0 pass 0 reject 0 inconcl. 1 pending")
+        for state in ("empty", "errorNoData", "partial"):
+            with self.subTest(state=state):
+                self.assertEqual(d[state]["kpi"]["text"], "Verification Panels 0 No panels yet · repos with rigor high run one")
+                self.assertIsNone(d[state]["kpi"]["bar"])
+        self.assertEqual(d["loading"]["kpi"]["text"], "Verification Panels — Loading")
+
+    def test_phase_models_verify_panel_status(self):
+        d = self.report["polish"]["dash"]
+        ok = d["populated"]["vp"]
+        self.assertEqual(ok["label"], "Verification panel and rigor status")
+        self.assertEqual(ok["state"], "ready")
+        self.assertEqual(ok["rigor"], {"rigor": "standard", "text": "standard"})
+        self.assertEqual(ok["ready"], {"tone": "ok", "text": "Ready · 2 vendors"})
+        self.assertEqual(ok["src"], "settings.verify_panel")
+        self.assertEqual(ok["members"], [
+            {"idx": "1", "label": "openai/gpt-5.4", "vendor": "openai", "dup": "false"},
+            {"idx": "2", "label": "google/gemini-3-pro", "vendor": "google", "dup": "false"},
+        ])
+        self.assertIsNone(ok["warn"])
+        bad = d["single"]["vp"]
+        self.assertEqual(bad["state"], "incomplete")
+        self.assertEqual(bad["rigor"], {"rigor": "high", "text": "high"})
+        self.assertEqual(bad["ready"], {"tone": "warn", "text": "Incomplete"})
+        self.assertEqual([m["dup"] for m in bad["members"]], ["true", "true", "true"])
+        self.assertEqual(bad["members"][2]["vendor"], "unknown")
+        self.assertEqual(bad["warn"]["role"], "status")
+        self.assertIn("collapses to a single vendor family", bad["warn"]["text"])
+        self.assertEqual(bad["warn"]["advisories"], ["Ignored 1 malformed panel entry."])
+        none = d["empty"]["vp"]
+        self.assertEqual(none["ready"], {"tone": "muted", "text": "Unconfigured"})
+        self.assertIsNone(none["src"])  # "unset" source is not shown
+        self.assertIn("No panel members", none["empty"])
+        self.assertIn("no verify_panel is configured", none["warn"]["text"])
+        lo = d["loading"]["vp"]
+        self.assertEqual((lo["busy"], lo["skel"], lo["state"]), ("true", True, "loading"))
+        # Query error or an older backend without verify_panel renders nothing (ModelsQueryStatus covers it).
+        self.assertIsNone(d["errorNoData"]["vp"])
+        self.assertIsNone(d["errorStale"]["vp"])
+        self.assertIsNone(d["partial"]["vp"])
+
+    # --- v0.2.0 polish: /metrics/history trend strip --------------------------
+    def test_trend_strip_query_and_placement(self):
+        d = self.report["polish"]["dash"]
+        self.assertEqual(d["historyQuery"], {"key": ["factonio", "metrics-history", "30d"], "interval": 30000})
+        self.assertEqual(d["historyRest"], "/metrics/history?since=30d&limit=100")
+        self.assertEqual(d["populated"]["order"], ["Trends", "Phase Durations", "Decision Trail", "Phase Model Configuration", "Registered Repositories"])
+
+    def test_trend_strip_populated_inline_svg(self):
+        t = self.report["polish"]["dash"]["populated"]["trend"]
+        self.assertEqual((t["state"], t["labelledBy"], t["heading"]), ("populated", "fc-trend-h", "Trends"))
+        self.assertIsNone(t["busy"])
+        self.assertIsNone(t["alert"])
+        self.assertRegex(t["sub"], r"^14 snapshots · \w+ \d+ – \w+ \d+$")
+        self.assertEqual(t["srcs"], ["merge 9", "retro 2", "panel_consensus 3"])
+        cards = {c["metric"]: c for c in t["cards"]}
+        self.assertEqual(list(cards), ["pass", "escape", "throughput"])
+        p = cards["pass"]
+        self.assertEqual(p["title"], "Verification Pass Rate")
+        self.assertEqual(p["value"], "88% BB 82%")
+        self.assertEqual(p["delta"], {"tone": "ok", "text": "+10 pts", "arrow": True})
+        self.assertEqual(p["svg"]["viewBox"], "0 0 240 56")
+        self.assertEqual(p["svg"]["par"], "none")
+        self.assertEqual(p["svg"]["hidden"], "true")
+        self.assertEqual(p["svg"]["hover"], "hidden")
+        self.assertEqual([c for c, _ in p["svg"]["paths"]], ["fc-spark-line fc-spark-line--2", "fc-spark-line"])
+        self.assertTrue(p["svg"]["paths"][1][1].startswith("M4,30.2 L21.8,28 "))
+        self.assertTrue(p["svg"]["paths"][1][1].endswith(" L236,19.2"))
+        self.assertEqual(p["svg"]["circles"], [["fc-spark-end", 236, 19.2, 2.75]])
+        self.assertEqual(p["svg"]["lines"][0], ["fc-spark-base", 50, None])  # baseline at H - PB
+        self.assertEqual(p["plot"], {"tabIndex": 0, "role": "group", "label": "Verification Pass Rate: 14 snapshots, latest 88%. Use left and right arrow keys to read each snapshot."})
+        self.assertEqual(p["legend"], "Diff check Black-box")
+        self.assertEqual(p["read"]["live"], "polite")
+        self.assertRegex(p["read"]["text"], r"^Latest · \w+ \d+ merge Diff 88% BB 82%$")
+        e = cards["escape"]
+        self.assertEqual(e["delta"], {"tone": "ok", "text": "−7 pts", "arrow": True})  # escape going down is good
+        self.assertEqual([c for c, _ in e["svg"]["paths"]], ["fc-spark-area", "fc-spark-line"])
+        self.assertTrue(e["svg"]["paths"][0][1].endswith(" L236,50 L4,50 Z"))
+        w = cards["throughput"]
+        self.assertEqual(w["value"], "12 61 cards done")
+        self.assertEqual(w["delta"], {"tone": "ok", "text": "+8", "arrow": True})
+        self.assertEqual(w["legend"], "Workstreams Cards done")
+
+    def test_trend_strip_keyboard_pointer_readout(self):
+        k = self.report["polish"]["dash"]["keys"]
+        self.assertTrue(k["homePrevented"])
+        self.assertEqual(k["home"]["svg"]["hover"], "visible")
+        self.assertIn(["fc-spark-hot", 4, 30.2, 3.25], k["home"]["svg"]["circles"])
+        self.assertRegex(k["home"]["read"]["text"], r"^\w+ \d+ merge Diff 78% BB 70%$")
+        self.assertRegex(k["right"], r"^\w+ \d+ merge Diff 80% BB 72%$")
+        self.assertRegex(k["leftClamped"], r"Diff 78% BB 70%$")
+        self.assertRegex(k["end"], r"^Latest · .* Diff 88% BB 82%$")
+        self.assertFalse(k["otherKeyPrevented"])
+        self.assertEqual((k["focusEscape"], k["blurEscape"]), ("visible", "hidden"))
+        self.assertRegex(k["pointer"], r"WS 4 Cards 12$")
+        self.assertRegex(k["pointerLeave"], r"^Latest · .* WS 12 Cards 61$")
+
+    def test_trend_strip_single_snapshot(self):
+        t = self.report["polish"]["dash"]["single"]["trend"]
+        self.assertRegex(t["sub"], r"^1 snapshot · \w+ \d+$")
+        for c in t["cards"]:
+            with self.subTest(metric=c["metric"]):
+                self.assertEqual(c["delta"], {"tone": "flat", "text": "first snapshot", "arrow": False})
+                self.assertEqual(c["svg"]["paths"], [])  # never a 1-point path
+                self.assertEqual(len(c["svg"]["circles"]), 1)
+                cls, cx, cy, r = c["svg"]["circles"][0]
+                self.assertEqual((cls, cx, r), ("fc-spark-end", 120, 3.5))
+                self.assertEqual(c["svg"]["lines"], [["fc-spark-base", cy, "2 3"]])
+
+    def test_trend_strip_empty_loading_and_error_states(self):
+        d = self.report["polish"]["dash"]
+        e = d["empty"]["trend"]
+        self.assertEqual(e["state"], "empty")
+        self.assertEqual(e["empty"]["title"], "Snapshots appear automatically as PRs merge")
+        self.assertEqual(e["empty"]["cmd"], "hermes factonio metrics --snapshot")
+        self.assertEqual(e["cards"], [])
+        lo = d["loading"]["trend"]
+        self.assertEqual((lo["state"], lo["busy"], lo["sub"], lo["skeletons"]), ("loading", "true", "Loading snapshots…", 3))
+        self.assertEqual(lo["cards"], [])
+        er = d["errorNoData"]["trend"]
+        self.assertEqual(er["state"], "error")
+        self.assertEqual(er["alert"], {"text": "Couldn’t refresh snapshots (HTTP 503). The history endpoint could not be loaded. Retry", "retry": True})
+        self.assertEqual(er["cards"], [])
+        self.assertEqual(d["retry"], ["h"])
+        st = d["errorStale"]["trend"]
+        self.assertEqual((st["state"], st["stale"]), ("populated", "true"))
+        self.assertEqual(st["alert"]["text"], "Couldn’t refresh snapshots. Showing data from 4 min ago. Retry")
+        self.assertEqual(len(st["cards"]), 3)
+
+    def test_trend_strip_partial_null_kpis_do_not_crash(self):
+        d = self.report["polish"]["dash"]
+        self.assertNotIn("partialError", d)
+        t = d["partial"]["trend"]
+        self.assertEqual(t["state"], "populated")
+        self.assertRegex(t["sub"], r"^3 snapshots · ")
+        cards = {c["metric"]: c for c in t["cards"]}
+        self.assertEqual(cards["pass"]["value"], "— BB 50%")
+        self.assertEqual(cards["escape"]["value"], "—")
+        self.assertEqual(cards["throughput"]["value"], "3 — cards done")
+        for c in t["cards"]:
+            with self.subTest(metric=c["metric"]):
+                self.assertEqual(c["delta"]["tone"], "flat")
+                for _, path in c["svg"]["paths"]:
+                    self.assertNotIn("NaN", path)
+                    self.assertNotIn("undefined", path)
+        # Snapshots are re-sorted oldest -> newest before plotting.
+        self.assertRegex(cards["pass"]["read"]["text"], r"^Latest · \w+ 20 retro")
+
+    def test_sparkline_math_and_verdict_tone_helpers(self):
+        p = self.report["polish"]
+        self.assertEqual(p["verdictTone"], {"pass": "pass", "reject": "reject", "fail": "reject", "inconclusive": "warn", "INCONCLUSIVE": "warn", "weird": None, "null": None})
+        sp = p["spark"]
+        self.assertEqual(sp["one"], [[120, 28]])  # n=1: centred x, y(v) mid-plot
+        pts = sp["fourteen"]
+        self.assertEqual(len(pts), 14)
+        self.assertEqual(pts[0], [4, 30.2])
+        self.assertEqual(pts[-1], [236, 19.2])
+        xs = [x for x, _ in pts]
+        self.assertEqual(xs, sorted(xs))
+        self.assertTrue(all(6 <= y <= 50 for _, y in pts))
+        self.assertEqual(sp["flat"], [[4, 50], [236, 50]])  # hi == lo never divides by zero
+        self.assertEqual(sp["gapPath"], "M4,45.6 M158.7,36.8 L236,32.4")  # a missing value breaks the line
+        self.assertTrue(sp["path14"].startswith("M4,30.2 L"))
+        self.assertEqual(sp["path14"].count(" L"), 13)
+
+    # --- v0.2.0 polish: sidebar verification panels ----------------------------
+    def test_compute_workstream_panels_fail_closed_consensus(self):
+        pn = self.report["polish"]["panels"]
+        self.assertEqual(pn["passNoTrail"][0]["consensus"], "pending")  # a pass needs the recorded consensus
+        self.assertEqual(pn["passRecorded"][0]["consensus"], "pass")
+        self.assertEqual(pn["passRecorded"][0]["vendors"], ["openai", "google"])
+        rj = pn["rejectDisagree"][0]
+        self.assertEqual((rj["consensus"], rj["hasDisagreement"]), ("reject", True))
+        self.assertEqual(rj["dissent"], {"lead": "google reject vs openai pass", "quote": "migration drops idx_cards_tenant without a backfill"})
+        inc = pn["inconclusive"][0]
+        self.assertEqual((inc["consensus"], inc["hasDisagreement"]), ("inconclusive", True))
+        self.assertEqual(inc["dissent"]["lead"], "google inconclusive vs openai pass")
+        pe = pn["pending"][0]
+        self.assertEqual((pe["consensus"], pe["hasDisagreement"], pe["decided"], len(pe["lanes"])), ("pending", False, 1, 2))
+        rr = pn["pendingRecordedReject"][0]
+        self.assertEqual((rr["consensus"], rr["recorded"], rr["hasDisagreement"]), ("reject", "reject", True))
+        self.assertEqual(rr["dissent"], {"lead": "Panel lanes disagree -- pass: verify-diff/openai; reject: verify-diff/google.", "quote": None})
+        # Degenerate single-vendor panel stays inconclusive even with a recorded pass.
+        self.assertEqual(pn["singleVendor"][0]["consensus"], "inconclusive")
+        self.assertEqual(pn["supersededIgnored"][0]["consensus"], "pending")
+        self.assertEqual(pn["newestFirst"], ["vp_bb", "vp_aa"])
+        self.assertEqual(pn["none"], [])
+        self.assertEqual(pn["nullInputs"], [])
+
+    def test_sidebar_panel_strip_badges_and_disagreement_callout(self):
+        sb = self.report["polish"]["sidebar"]
+        dis = sb["dis"]
+        self.assertEqual(dis["bodyOrder"], ["fc-sb-pipe", "fc-sb-panel", "fc-sb-ws-cards"])
+        self.assertEqual(dis["role"], "group")
+        self.assertEqual(dis["label"], "Verification panel vp_9a4c1e: reject, 3 of 3 lanes, lanes disagree")
+        self.assertEqual((dis["consensus"], dis["disagree"]), ("reject", "true"))
+        self.assertEqual(dis["tag"], {"tone": "reject", "text": "reject"})
+        self.assertEqual((dis["id"], dis["lanes"]), ("vp_9a4c1e", "3/3 lanes"))
+        self.assertEqual([v[:2] for v in dis["vendors"]], [["reject", "google"], ["pass", "openai"], ["inconclusive", "anthropic"]])
+        self.assertEqual(dis["vendors"][0][2], "diff · google/gemini-3-pro: reject")
+        co = dis["callout"]
+        self.assertEqual((co["tone"], co["kind"], co["role"]), ("warn", "disagree", "note"))
+        self.assertTrue(co["quote"])
+        self.assertIn("google reject vs openai pass, anthropic inconclusive", co["text"])
+        self.assertIn("migration drops idx_cards_tenant", co["text"])
+        self.assertEqual(co["title"], "google reject vs openai pass, anthropic inconclusive: “migration drops idx_cards_tenant without a backfill; rollback leaves orphaned rows”")
+        pend = sb["pend"]
+        self.assertEqual(pend["tag"], {"tone": "info", "text": "pending"})
+        self.assertEqual(pend["lanes"], "1/2 lanes")
+        self.assertEqual([v[0] for v in pend["vendors"]], ["pass", "pending"])
+        self.assertIsNone(pend["callout"])
+        rec = sb["rec"]
+        self.assertEqual(rec["tag"], {"tone": "pass", "text": "pass"})
+        # Mixed diff + black-box lanes name the phase on each chip.
+        self.assertEqual([v[1] for v in rec["vendors"]], ["openai · diff", "google · diff", "openai · black-box", "google · black-box"])
+        # While /trail is still loading a pass is never claimed from /cards alone.
+        self.assertEqual(sb["trailLoading"]["rec"]["consensus"], "pending")
+        stages = {s["tenant"]: s["stages"][3] for s in sb["sections"]}
+        self.assertEqual(stages["omnim-ai-factonio-tenant-card-index"], "Verify: diff rejected, black-box pending")
+        # No new polling endpoints: the pane only queries /cards and /trail.
+        self.assertEqual(sb["paneQueries"]["cards"], ["factonio/cards/all"])
+        self.assertEqual(sb["paneQueries"]["trail"], ["factonio/trail/200"])
+        self.assertEqual(sb["paneQueries"]["other"], [])
+
+    def test_sidebar_card_vendor_badges_and_inconclusive_tone(self):
+        c = self.report["polish"]["sidebar"]["cards"]
+        self.assertEqual(c["t_8f2a"]["vendor"], {"text": "google", "title": "Panel lane vendor"})
+        self.assertEqual((c["t_8f2a"]["attn"], c["t_8f2a"]["dot"], c["t_8f2a"]["verdictTone"]), ("true", "reject", "reject"))
+        self.assertEqual((c["t_8f2b"]["attn"], c["t_8f2b"]["verdictTone"]), ("false", "pass"))
+        inc = c["t_8f2c"]
+        self.assertEqual((inc["attn"], inc["dot"], inc["dotLabel"], inc["verdictTone"]), ("warn", "inconclusive", "Status: inconclusive", "warn"))
+        self.assertIsNone(c["t_imp"]["vendor"])
+        self.assertEqual(c["t_w3"]["dot"], "running")
+        sb = self.report["polish"]["sidebar"]
+        # inconclusive counts as attention alongside the unresolved reject
+        self.assertEqual(sb["header"]["attention"]["n"], "2")
+        tri = {t["verdict"]: t for t in self.report["triState"]["verdictTags"]}
+        self.assertEqual(tri["inconclusive"]["tone"], "warn")
+
+    def test_card_drawer_panel_rows(self):
+        sb = self.report["polish"]["sidebar"]
+        d = sb["drawer"]
+        self.assertEqual(d["order"][:4], ["model", "panel", "vendor", "peers"])
+        self.assertEqual(d["labels"][:4], ["Model", "Panel", "Vendor", "Peers"])
+        self.assertTrue(all(len(lbl) <= 7 for lbl in d["labels"][1:4]))
+        self.assertEqual(d["fields"]["panel"], "vp_9a4c1e reject")
+        self.assertEqual(d["panelTone"], "reject")
+        self.assertEqual(d["fields"]["vendor"], "google lane 1/3")
+        self.assertEqual(d["fields"]["peers"], "openai anthropic")
+        self.assertEqual(d["peers"], ["pass", "inconclusive"])
+        for field in ("panel", "vendor", "peers"):
+            self.assertNotIn(field, sb["nonPanelDrawer"])
+
+    def test_polish_styles_use_theme_tokens_only(self):
+        source = PLUGIN_JS.read_text(encoding="utf-8")
+        start = source.index("const STYLES = `")
+        styles = source[start : source.index("`", start + len("const STYLES = `"))]
+        block = styles[styles.index("/* v0.2.0 polish") :]
+        self.assertNotRegex(block, r"#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(")
+        # The sidebar's warn tone now resolves through the shared host-token alias.
+        self.assertIn("--fc-sb-warn: var(--fc-warn);", styles)
+        self.assertNotIn("#f59e0b", styles)
+        for needed in (".fc-grid--6", ".fc-kpi-bar", ".fc-trend-grid", ".fc-spark-line", "vector-effect: non-scaling-stroke", ".fc-vp-warn",
+                       ".fc-col-rigor { width: 15%; }", ".fc-sb-panel", '.fc-sb-dot[data-status="inconclusive"]', '.fc-sb-card[data-attn="warn"]',
+                       "@container (max-width: 700px)", ".fc-trend-skel span, .fc-vp-skel { animation: none !important; }"):
+            self.assertIn(needed, styles)
+        cols = re.findall(r"\.fc-col-[a-z]+ \{ width: (\d+)%; \}", styles)
+        self.assertEqual(sum(int(c) for c in cols), 100)
+        for imp in re.findall(r"^import .* from '([^']+)'", source, re.M):
+            self.assertIn(imp, ("@hermes/plugin-sdk", "react", "react/jsx-runtime"))
 
 if __name__ == "__main__":
     unittest.main()
