@@ -3355,5 +3355,226 @@ class TestFixRound10FirstHarnessFrozenBaselinesEvalAndEnvThresholdClears(unittes
             self.assertEqual(chk["hook_results"]["failed_required"], ["pixels"], chk["hook_results"])
             self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
 
+
+class TestFixRound11FrozenContractExportScopeEnvSplitUnsetAndBuiltin(unittest.TestCase):
+    """The frozen-baseline contract fixed before Doctor/hooks run, thresholds that actually reach the check's
+    environment (exported, in scope, before it), `env -S` words re-parsed as env options, `unset --` and bash's
+    command-head `builtin`."""
+
+    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_cases = TestFixRound4CompoundThresholdsAndShortFlags._assert_cases
+    _assert_end_to_end = TestFixRound7TargetAwareThresholdsUnitsEnvAndShellArgs._assert_end_to_end
+    _assert_reset_still_enforced = TestFixRound10FirstHarnessFrozenBaselinesEvalAndEnvThresholdClears._assert_reset_still_enforced
+    _uncommitted_harness = staticmethod(TestFixRound10FirstHarnessFrozenBaselinesEvalAndEnvThresholdClears._uncommitted_harness)
+    _CHECK = TestFixRound9LiveFrozenShellArgsWordFlagsCommentsAndOverrides._CHECK
+    _ENV = TestFixRound10FirstHarnessFrozenBaselinesEvalAndEnvThresholdClears._ENV
+    # run by a hook or Doctor command: drop the `pixels` hook's frozen contract, then regenerate its baseline
+    _MUTATE = ("import json, pathlib, sys\n"
+               "hj = pathlib.Path('.factonio/harness.json')\n"
+               "m = json.loads(hj.read_text())\n"
+               "if sys.argv[1] == 'remove':\n"
+               "    m['hooks'] = [h for h in m['hooks'] if h['name'] != 'pixels']\n"
+               "else:\n"
+               "    for h in m['hooks']:\n"
+               "        if h['name'] == 'pixels':\n"
+               "            h['frozen_baseline'] = False\n"
+               "hj.write_text(json.dumps(m, indent=2))\n"
+               "pathlib.Path('snapshots/home.png').write_text('regenerated')\n")
+    _EXPECTED = [{"name": "pixels", "baseline_paths": ["snapshots/**"], "changed_files": ["snapshots/home.png"]}]
+
+    def _assert_contract_kept(self, repo: Path, **run: bool) -> None:
+        from factonio.harness import check_harness
+
+        chk = check_harness(str(repo), **run)
+        self.assertEqual((repo / "snapshots" / "home.png").read_text(encoding="utf-8"), "regenerated")
+        self.assertFalse(chk["ok"])
+        self.assertFalse(chk["valid"])
+        self.assertTrue(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+        self.assertEqual(chk["visual_baseline_changes"], self._EXPECTED)
+        self.assertTrue(any("removed or unfrozen while Doctor/hooks ran" in e for e in chk["errors"]), chk["errors"])
+
+    def test_first_harness_hook_cannot_unfreeze_itself_and_regenerate(self):
+        for mode in ("unfreeze", "remove"):
+            with self.subTest(mode=mode), isolated_hermes_home() as home:
+                repo, _ = self._uncommitted_harness(home, f"python3 mutate.py {mode}")
+                _write(repo, "mutate.py", self._MUTATE)
+                self._assert_contract_kept(repo, run_hooks=True)
+
+    def test_live_added_hook_cannot_unfreeze_itself_and_regenerate(self):
+        from factonio.harness import bootstrap_verify_harness
+
+        for mode in ("unfreeze", "remove"):
+            with self.subTest(mode=mode), isolated_hermes_home() as home:
+                repo = _make_repo(home)
+                _write(repo, "snapshots/home.png", "png-v1\n")
+                _write(repo, "mutate.py", self._MUTATE)
+                bootstrap_verify_harness(str(repo), hooks=[{"name": "lint", "kind": "invariant", "command": "true"}])
+                _commit_all(repo, "committed harness without a visual hook")
+                hj = repo / ".factonio" / "harness.json"
+                manifest = json.loads(hj.read_text(encoding="utf-8"))
+                manifest["hooks"].append({"name": "pixels", "kind": "visual_diff", "baseline_paths": ["snapshots/**"],
+                                          "command": f"python3 mutate.py {mode}"})
+                hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+                self._assert_contract_kept(repo, run_hooks=True)
+
+    def test_doctor_command_cannot_unfreeze_and_regenerate(self):
+        for mode in ("unfreeze", "remove"):
+            for committed in (False, True):
+                with self.subTest(mode=mode, committed=committed), isolated_hermes_home() as home:
+                    repo, _ = self._uncommitted_harness(home, "true")
+                    _write(repo, "mutate.py", self._MUTATE)
+                    hj = repo / ".factonio" / "harness.json"
+                    manifest = json.loads(hj.read_text(encoding="utf-8"))
+                    manifest.setdefault("phases", {})["doctor"] = [f"python3 mutate.py {mode}"]
+                    hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+                    if committed:
+                        _commit_all(repo, "harness with a mutating Doctor command")
+                    self._assert_contract_kept(repo, run_doctor=True)
+
+    def test_frozen_contract_controls_stay_clean(self):
+        from factonio.harness import check_harness
+
+        with isolated_hermes_home() as home:  # a new baseline file is a new surface, not tampering
+            repo, _ = self._uncommitted_harness(home, "printf new > snapshots/new.png")
+            chk = check_harness(str(repo), run_doctor=True, run_hooks=True)
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual(chk["visual_baseline_changes"], [])
+        with isolated_hermes_home() as home:  # unfrozen before anything ran: the Wave 4 contract
+            repo, _ = self._uncommitted_harness(home, "python3 mutate.py unfreeze", frozen_baseline=False)
+            _write(repo, "mutate.py", self._MUTATE)
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+
+    _EXPORTED = "export THRESHOLD=0.01; python3 check.py"
+    _UNEXPORTED = ("THRESHOLD=0.01; python3 check.py", "python3 check.py; export THRESHOLD=0.01",
+                   "(export THRESHOLD=0.01); python3 check.py", "sh -c 'export THRESHOLD=0.01'; python3 check.py",
+                   "export THRESHOLD=0.01 | true; python3 check.py", "declare THRESHOLD=0.01; python3 check.py",
+                   "readonly THRESHOLD=0.01; python3 check.py", "THRESHOLD=0.01; set -a; python3 check.py")
+
+    def test_threshold_must_still_be_exported_before_the_check(self):
+        from factonio.harness import _visual_hook_loosening
+
+        base = self._EXPORTED
+        cases = {live: (base, live, True) for live in self._UNEXPORTED}
+        cases.update({
+            "export kept": (base, base, False),
+            "export tightened": (base, "export THRESHOLD=0.005; python3 check.py", False),
+            "assign then export": (base, "THRESHOLD=0.01; export THRESHOLD; python3 check.py", False),
+            "export name first": (base, "export THRESHOLD; THRESHOLD=0.01; python3 check.py", False),
+            "declare -x": (base, "declare -x THRESHOLD=0.01; python3 check.py", False),
+            "set -a": (base, "set -a; THRESHOLD=0.01; python3 check.py", False),
+            "same subshell": (base, "(export THRESHOLD=0.01; python3 check.py)", False),
+            "same sh -c": (base, "sh -c 'export THRESHOLD=0.01; python3 check.py'", False),
+            "exported into sh -c": (base, "export THRESHOLD=0.01; sh -c 'python3 check.py'", False),
+            "loosened in subshell": (base, "(export THRESHOLD=0.9; python3 check.py)", True),
+            "prefix unchanged": ("THRESHOLD=0.01 python3 check.py", "THRESHOLD=0.01 python3 check.py", False),
+            "bare assign + export loosens": ("python3 check.py", "THRESHOLD=0.5; export THRESHOLD; python3 check.py",
+                                             True),
+            "unexported base kept": ("THRESHOLD=0.01; python3 check.py", "THRESHOLD=0.01; python3 check.py", False),
+        })
+        self._assert_cases(cases)
+        reasons = _visual_hook_loosening({"command": base}, {"command": "python3 check.py; export THRESHOLD=0.01"})
+        self.assertTrue(any("no longer exports threshold `threshold=0.01`" in r for r in reasons), reasons)
+        # `declare`/`readonly` and `set -a` are exercised by the parser cases; dash runs these POSIX forms
+        executed = [live for live in self._UNEXPORTED if not live.startswith(("declare", "readonly"))]
+        self._assert_end_to_end(self._ENV, base, executed, [
+            base, "export THRESHOLD=0.005; python3 check.py", "THRESHOLD=0.01; export THRESHOLD; python3 check.py",
+            "(export THRESHOLD=0.01; python3 check.py)", "set -a; THRESHOLD=0.01; python3 check.py",
+        ])
+        for live in ("THRESHOLD=0.01; export THRESHOLD; python3 check.py", "set -a; THRESHOLD=0.01; python3 check.py",
+                     "export THRESHOLD=0.01; sh -c 'python3 check.py'"):
+            with self.subTest(still_enforced=live):
+                self._assert_reset_still_enforced(base, live)
+
+    _ENV_SPLIT_CLEARS = ("env -S '-u THRESHOLD python3 check.py'", "env -S '-i python3 check.py'",
+                         "env -S'-i python3 check.py'", "env -S '- python3 check.py'",
+                         "env -S '--unset=THRESHOLD python3 check.py'", "env --split-string='-i python3 check.py'",
+                         "env --split-string '-u THRESHOLD python3 check.py'")
+
+    def test_env_split_string_words_are_parsed_as_env_options(self):
+        from factonio.harness import _command_tokens, _regen_flags
+
+        base = self._EXPORTED
+        cases = {live: (base, f"export THRESHOLD=0.01; {live}", True) for live in self._ENV_SPLIT_CLEARS}
+        cases.update({
+            "-i before -S": (base, "export THRESHOLD=0.01; env -i -S 'PATH=/usr/bin:/bin python3 check.py'", True),
+            "-u before -S": (base, "export THRESHOLD=0.01; env -u THRESHOLD -S 'python3 check.py'", True),
+            "-iS bundle": (base, "export THRESHOLD=0.01; env -iS 'python3 check.py'", True),
+            "nested -S": (base, "export THRESHOLD=0.01; env -S \"-S '-u THRESHOLD python3 check.py'\"", True),
+            "-i re-assigns": (base, "export THRESHOLD=0.01; env -S '-i THRESHOLD=0.01 python3 check.py'", False),
+            "-i before -S re-assigns": (base, "export THRESHOLD=0.01; env -i -S 'THRESHOLD=0.01 python3 check.py'",
+                                        False),
+            "-u FOO": (base, "export THRESHOLD=0.01; env -S '-u FOO python3 check.py'", False),
+            "unbuffered -u FOO": ("python3 check.py", "env -S '-u FOO python3 -u check.py'", False),
+            "unbuffered -i PATH": ("python3 check.py", "env -S '-i PATH=/usr/bin:/bin python3 -u check.py'", False),
+            "regen still caught": ("python3 check.py", "env -S '-u FOO python3 check.py -u'", True),
+        })
+        self._assert_cases(cases)
+        self.assertEqual(_regen_flags(_command_tokens("env -S '-u FOO python3 -u check.py'")), set())
+        self.assertEqual(_regen_flags(_command_tokens("env -S '-i PATH=/usr/bin:/bin npx jest -u'")), {"-u"})
+        # `-i`/`-` keep PATH for the executed hooks so `python3` resolves on any runner
+        executed = [live.replace("-i ", '-i PATH=$PATH ').replace("'- ", "'- PATH=$PATH ").replace("'", '"')
+                    for live in self._ENV_SPLIT_CLEARS]
+        self._assert_end_to_end(self._ENV, base, [f"export THRESHOLD=0.01; {live}" for live in executed], [])
+        self._assert_reset_still_enforced(base, 'export THRESHOLD=0.01; env -S "-i PATH=$PATH THRESHOLD=0.01 '
+                                                'python3 check.py"')
+        from factonio.harness import check_harness
+
+        for live in ("env -S '-u FOO python3 -u check.py'", 'env -S "-i PATH=$PATH python3 -u check.py"'):
+            with self.subTest(valid=live), isolated_hermes_home() as home:
+                repo = self._visual_repo(home, "python3 check.py")
+                _write(repo, "check.py", self._ENV)  # THRESHOLD unset: the committed check passes
+                _commit_all(repo, "visual check script")
+                self._set_command(repo, live)
+                chk = check_harness(str(repo), run_hooks=True)
+                self.assertTrue(chk["valid"], chk["errors"])
+                self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+
+    def test_unset_double_dash_makes_every_word_an_operand(self):
+        base = self._EXPORTED
+        self._assert_cases({
+            "unset -- -f": (base, "export THRESHOLD=0.01; unset -- -f THRESHOLD; python3 check.py", True),
+            "bash unset -- -f": (base, "export THRESHOLD=0.01; bash -c 'unset -- -f THRESHOLD; python3 check.py'",
+                                 True),
+            "unset -f": (base, "export THRESHOLD=0.01; unset -f THRESHOLD; python3 check.py", False),
+            "unset -f --": (base, "export THRESHOLD=0.01; unset -f -- THRESHOLD; python3 check.py", False),
+        })
+        # dash aborts on `unset -- -f` (bad variable name); bash unsets THRESHOLD and runs the check
+        self._assert_end_to_end(self._ENV, base,
+                                ["export THRESHOLD=0.01; bash -c 'unset -- -f THRESHOLD; python3 check.py'"],
+                                ["export THRESHOLD=0.01; bash -c 'unset -f THRESHOLD; python3 check.py'"])
+
+    _BUILTIN_REGEN = ("bash -c 'builtin eval \"python3 check.py -u\"'", "builtin eval 'python3 check.py -u'")
+    _BUILTIN_CLEARS = ("export THRESHOLD=0.01; bash -c 'builtin unset THRESHOLD; python3 check.py'",
+                       "export THRESHOLD=0.01; builtin export -n THRESHOLD; python3 check.py",
+                       "export THRESHOLD=0.01; bash -c 'builtin declare +x THRESHOLD; python3 check.py'")
+
+    def test_command_head_builtin_is_unwrapped_like_command(self):
+        from factonio.harness import _command_tokens, _regen_flags
+
+        self.assertEqual(_regen_flags(_command_tokens("builtin eval 'python3 check.py -u'")), {"-u"})
+        self.assertEqual(_regen_flags(_command_tokens("npx jest builtin -u")), {"-u"})
+        self.assertEqual(_regen_flags(_command_tokens("python3 check.py builtin")), set())
+        cases = {live: ("python3 check.py", live, True) for live in self._BUILTIN_REGEN}
+        cases.update({live: (self._EXPORTED, live, True) for live in self._BUILTIN_CLEARS})
+        cases.update({
+            "builtin -- eval": ("python3 check.py", "builtin -- eval 'python3 check.py -u'", True),
+            "builtin unset FOO": (self._EXPORTED, "export THRESHOLD=0.01; bash -c 'builtin unset FOO; "
+                                                  "python3 check.py'", False),
+            "builtin export kept": (self._EXPORTED, "builtin export THRESHOLD=0.01; python3 check.py", False),
+            "builtin eval plain": ("python3 check.py", "bash -c 'builtin eval \"python3 check.py\"'", False),
+        })
+        self._assert_cases(cases)
+        # `builtin` is a bash builtin (dash has none): execute through `bash -c`
+        self._assert_end_to_end(self._CHECK, "python3 check.py", [self._BUILTIN_REGEN[0]],
+                                ["bash -c 'builtin eval \"python3 check.py\"'"])
+        self._assert_end_to_end(self._ENV, self._EXPORTED, [
+            self._BUILTIN_CLEARS[0], self._BUILTIN_CLEARS[2],
+            "export THRESHOLD=0.01; bash -c 'builtin export -n THRESHOLD; python3 check.py'",
+        ], ["export THRESHOLD=0.01; bash -c 'builtin unset FOO; python3 check.py'"])
+
+
 if __name__ == "__main__":
     unittest.main()

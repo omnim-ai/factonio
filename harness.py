@@ -1409,6 +1409,8 @@ def check_harness(
     # Unresolved sync_commits and malformed verify.md hooks are harness gaps too, but they must not mask a real
     # hook failure.
     manifest_errors = manifest_errors + md_hook_errors + formal["manifest_errors"]
+    pre_sha, pre_frozen = (_pre_execution_frozen_contract(root, gate, info["hooks"]) if run_doctor or run_hooks
+                           else (None, {}))
     if run_doctor:
         cmds = info["phases"].get("doctor") or []
         doctor = _run_doctor(root, cmds)
@@ -1427,8 +1429,12 @@ def check_harness(
             if not md_hook_errors:
                 errors.append(str(exc))
     if run_doctor or run_hooks:
-        # A Doctor command or hook may regenerate a frozen baseline while it runs: re-check after execution.
+        # A Doctor command or hook may regenerate a frozen baseline while it runs: re-check after execution,
+        # both against the live harness and against the contract fixed before anything ran (execution may also
+        # unfreeze, remove or rewrite the hook, or move HEAD).
         gate = _merge_gate(gate, detect_harness_gate_loosening(root, base_ref))
+        if pre_frozen and pre_sha:
+            gate = _merge_gate(gate, _frozen_contract_gate(root, pre_sha, pre_frozen, base_ref))
     if gate["loosened"]:
         errors.extend(gate["findings"])
 
@@ -1724,9 +1730,12 @@ def _split_shell(text: str) -> list[str]:
     lexer.whitespace = " \t\r"  # an unquoted newline separates commands like `;`
     lexer.commenters = ""
     try:
-        return list(lexer)
+        tokens = list(lexer)
     except ValueError:
-        return re.findall(r"[();<>|&\n]+|[^\s();<>|&]+", text)
+        tokens = re.findall(r"[();<>|&\n]+|[^\s();<>|&]+", text)
+    # shlex groups adjacent punctuation (`);`, `((`): keep each subshell paren a token of its own
+    return [part for tok in tokens
+            for part in (re.findall(r"[()]|[^()]+", tok) if _is_shell_op(tok) and len(tok) > 1 else [tok])]
 
 
 _REDIRECT_OPS = frozenset({">", ">>", "<", "<>", ">|", ">&", "<&", "&>", "&>>", "<<", "<<<"})
@@ -1779,6 +1788,7 @@ _EXEC_WRAPPERS: dict[str, tuple[frozenset[str], frozenset[str], int]] = {
     "time": (frozenset("fo"), frozenset({"--format", "--output"}), 0),
     "stdbuf": (frozenset("ioe"), frozenset({"--input", "--output", "--error"}), 0),
     "command": (frozenset(), frozenset(), 0),
+    "builtin": (frozenset(), frozenset(), 0),  # bash `builtin eval|unset|export ...`; a builtin, never a path
     "exec": (frozenset("a"), frozenset(), 0),
     "xvfb-run": (frozenset("efnpsw"), frozenset({
         "--error-file", "--auth-file", "--server-num", "--xauth-protocol", "--server-args", "--wait",
@@ -1837,7 +1847,7 @@ def _skip_exec_wrapper(tokens: list[str], i: int) -> Optional[int]:
                 j += 1
         return j
     spec = _EXEC_WRAPPERS.get(name or "")
-    if spec is None:
+    if spec is None or (name == "builtin" and tokens[i] != "builtin"):
         return None
     short_vals, long_vals, positional = spec
     j = _skip_options(tokens, i + 1, short_vals, long_vals)
@@ -1944,15 +1954,19 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int,
                 at_head, i = False, i + 1
                 continue
             end = next((k for k in range(j, len(tokens)) if _is_shell_op(tokens[k])), len(tokens))
-            rest = (_split_shell(script) if script is not None else []) + tokens[j:end]
-            if env_calls is not None and (clears or unset):
-                assigns = list(itertools.takewhile(lambda t: bool(_ENV_ASSIGN_RE.match(t)), rest))
-                env_calls.append({"clears": clears, "unset": unset, "assigns": assigns})
             if script is not None:
-                # GNU env splits the script into argv and appends the arguments up to the next shell operator.
-                out.extend(_unwrap_shell_scripts(rest, depth + 1, env_calls))
+                # GNU env splits the script into argv, appends the arguments up to the next shell operator and
+                # parses the result as env's own arguments again (`env -S '-u T cmd'`): re-run it through `env`,
+                # carrying the effects of the options before `-S` so one call records them all.
+                carried = (["-i"] if clears else []) + [f"--unset={n}" for n in unset]
+                inner = ["env", *carried, *_split_shell(script), *tokens[j:end]]
+                out.extend(_unwrap_shell_scripts(inner, depth + 1, env_calls))
                 at_head, i = False, end
                 continue
+            if env_calls is not None and (clears or unset):
+                rest = tokens[j:end]
+                assigns = list(itertools.takewhile(lambda t: bool(_ENV_ASSIGN_RE.match(t)), rest))
+                env_calls.append({"clears": clears, "unset": unset, "assigns": assigns})
             i = j
             continue
         if tok == "eval" and depth < _MAX_SHELL_DEPTH:  # a builtin: never a path
@@ -1986,7 +2000,8 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int,
             if j < len(tokens) and tokens[j] in ("--", "-"):  # POSIX: a lone `-` also ends the options
                 j += 1
             if has_c and j < len(tokens):
-                out.extend([";", *_unwrap_shell_scripts(_split_shell(tokens[j]), depth + 1, env_calls), ";"])
+                # a child shell: its own `export`s never reach the commands after it (`(` ... `)` scope)
+                out.extend(["(", *_unwrap_shell_scripts(_split_shell(tokens[j]), depth + 1, env_calls), ")"])
                 # `sh -c SCRIPT $0 $1...`: the script reads them as "$0"/"$@", so they are scanned as arguments
                 # of a non-exempt placeholder command rather than letting `$0` pose as an exempt command head.
                 end = next((k for k in range(j + 1, len(tokens)) if _is_shell_op(tokens[k])), len(tokens))
@@ -2255,6 +2270,103 @@ def _is_env_modifier(sig: tuple[str, ...]) -> bool:
     return k == len(sig) or sig[k] == _SH_ARGS_HEAD or _system_name(sig[k]) in _ENV_BUILTINS
 
 
+_PIPE_OPS = frozenset({"|", "|&"})
+_ExportedEnv = dict[str, Optional[_Threshold]]
+
+
+def _exported_thresholds(tokens: list[str]) -> list[_ExportedEnv]:
+    """Per simple command (in `_command_segments` order): the threshold variables actually in its process
+    environment, i.e. exported in an enclosing scope before it (`export V=x`, `declare|typeset -x V=x`, `V=x`
+    then `export V`, `set -a`) or given as its own `V=x` prefix. An unexported `V=x;`, a later `export`, and an
+    `export` inside a `( ... )` subshell, `sh -c` script, pipeline element or `&` job never reach it."""
+    items: list[tuple[str, Any]] = []
+    for tok in tokens:
+        if _is_shell_op(tok):
+            items.append(("op", tok))
+        elif items and items[-1][0] == "seg":
+            items[-1][1].append(tok)
+        else:
+            items.append(("seg", [tok]))
+    # scope: (shell variable values, exported names, allexport)
+    scopes: list[tuple[dict[str, Optional[_Threshold]], set[str], list[bool]]] = [({}, set(), [False])]
+    out: list[_ExportedEnv] = []
+    prefix_into_subshell: dict[str, Optional[_Threshold]] = {}
+
+    def assign(tok: str) -> Optional[tuple[str, Optional[_Threshold]]]:
+        m = _ENV_ASSIGN_RE.match(tok)
+        if not m or not _THRESHOLD_KEY_RE.search(m.group(1)):
+            return None
+        return _threshold_key(m.group(1)), _parse_threshold(m.group(2).strip())
+
+    for n, (kind, val) in enumerate(items):
+        if kind == "op":
+            if val == "(":
+                vals, exported, allexport = scopes[-1]
+                scopes.append(({**vals, **prefix_into_subshell}, exported | set(prefix_into_subshell),
+                               [allexport[0]]))
+            elif val == ")" and len(scopes) > 1:
+                scopes.pop()
+            prefix_into_subshell = {}
+            continue
+        prev_op = items[n - 1][1] if n and items[n - 1][0] == "op" else None
+        next_op = items[n + 1][1] if n + 1 < len(items) and items[n + 1][0] == "op" else None
+        vals, exported, allexport = scopes[-1]
+        if prev_op in _PIPE_OPS or next_op in _PIPE_OPS or next_op == "&":
+            vals, exported, allexport = dict(vals), set(exported), [allexport[0]]  # runs in a subshell
+        k = 0
+        while k < len(val) and val[k] in _SHELL_PREFIX_WORDS:
+            k += 1
+        prefix = []
+        while k < len(val) and _ENV_ASSIGN_RE.match(val[k]):
+            prefix.append(val[k])
+            k += 1
+        verb = val[k] if k < len(val) else None
+        args = val[k + 1:]
+        if verb is None or verb in _ENV_BUILTINS or verb == "set":
+            out.append({})
+            if verb is None and next_op == "(":
+                # `V=x sh -c '...'` (expanded to `V=x ( ... )`): the prefix reaches only that child shell
+                prefix_into_subshell = dict(a for a in map(assign, prefix) if a)
+                continue
+            for a in filter(None, map(assign, prefix)):
+                vals[a[0]] = a[1]
+                if allexport[0]:
+                    exported.add(a[0])
+            if verb == "set":
+                for i, arg in enumerate(args):
+                    if arg[:1] in ("-", "+") and "a" in arg[1:] and not arg.startswith("--"):
+                        allexport[0] = arg[0] == "-"
+                    elif arg in ("-o", "+o") and i + 1 < len(args) and args[i + 1] == "allexport":
+                        allexport[0] = arg == "-o"
+                continue
+            if verb is None:
+                continue
+            opts = [a for a in args if a[:1] in ("-", "+") and len(a) > 1 and "=" not in a]
+            if verb == "export":
+                exports = not any(o.startswith("-") and "n" in o for o in opts)
+            elif verb in ("declare", "typeset", "local"):
+                exports = any(o.startswith("-") and "x" in o for o in opts)
+            else:
+                exports = False
+            exports = exports or allexport[0]
+            for arg in args:
+                if arg in opts or arg == "--":
+                    continue
+                name, eq, raw = arg.partition("=")
+                key = _threshold_key(name)
+                if not _THRESHOLD_KEY_RE.search(name) or not _ENV_ASSIGN_RE.match(f"{name}=x"):
+                    continue
+                if eq:
+                    vals[key] = _parse_threshold(raw.strip())
+                if exports:
+                    exported.add(key)
+            continue
+        env: _ExportedEnv = {key: vals[key] for key in exported if key in vals}
+        env.update(a for a in map(assign, prefix) if a)
+        out.append(env)
+    return out
+
+
 def _threshold_loosening(base_tokens: list[str], live_tokens: list[str]) -> list[str]:
     """Threshold loosening, aligning base and live simple commands: first by identical signature (in any order),
     then a single edited command or a unique target (executable + positional words) on each side. Each aligned
@@ -2290,6 +2402,21 @@ def _threshold_loosening(base_tokens: list[str], live_tokens: list[str]) -> list
         bar = min(env_vals, key=lambda t: t[0]) if env_vals else None
         return bar is not None and not any(_looser(v, bar) for v in l_vals)
 
+    base_exp, live_exp = _exported_thresholds(base_tokens), _exported_thresholds(live_tokens)
+
+    def exported_reasons(bi: int, live_envs: list[_ExportedEnv], where: str) -> list[str]:
+        """Thresholds exported to base command ``bi`` that no live candidate still receives at or below the
+        committed value (an unexported, later or subshell-scoped `export` leaves it on the tool default)."""
+        out: list[str] = []
+        for key, b_val in sorted(base_exp[bi].items()):
+            if b_val is None:
+                continue  # unparseable: reported above
+            got = [env[key] for env in live_envs if key in env]
+            if not any(v is None or not _looser(v, b_val) for v in got):
+                out.append(f"no longer exports threshold `{key}={_fmt_threshold(b_val)}` to the check{where} "
+                           "(an unexported, later or subshell-scoped assignment leaves it on the tool default)")
+        return out
+
     def compare_pair(bi: int, li: int) -> None:
         (sig, b_occ), (_, l_occ) = base_segs[bi], live_segs[li]
         where = f" in `{' '.join(sig)[:80]}`"
@@ -2299,6 +2426,7 @@ def _threshold_loosening(base_tokens: list[str], live_tokens: list[str]) -> list
                     and not env_capped(bi, key, l_vals)):
                 reasons.append(f"adds loosening threshold `{key}={_fmt_threshold(max(l_vals))}`{where}")
             reasons.extend(_compare_thresholds(key, b_vals, l_vals, where))
+        reasons.extend(exported_reasons(bi, [live_exp[li]], where))
 
     def ident(sig: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(t for t in sig if not t.startswith("-"))
@@ -2339,6 +2467,11 @@ def _threshold_loosening(base_tokens: list[str], live_tokens: list[str]) -> list
                                    f"{_fmt_threshold(strictest)}{where} (cannot align edited commands by target)")
             elif any(v[0] > 0 for v in l_vals):
                 reasons.append(f"adds loosening threshold `{key}={_fmt_threshold(max(l_vals))}`{where}")
+        if unmatched_live:
+            reasons.extend(dict.fromkeys(
+                why for bi in unmatched_base for why in exported_reasons(bi, [live_exp[li] for li in unmatched_live],
+                                                                         where)
+            ))
 
     env_base, env_live = pooled(base_segs, base_env), pooled(live_segs, live_env)
     base_cmds = [k for k in range(len(base_segs)) if k not in base_env]
@@ -2414,10 +2547,12 @@ def _threshold_env_clears(tokens: list[str], env_calls: list[dict[str, Any]],
             continue
         opts: list[str] = []
         names: list[str] = []
+        end_opts = False
         for arg in seg[k + 1:]:
-            if not names and arg == "--":
+            if not end_opts and not names and arg == "--":
+                end_opts = True  # every later word is an operand, even `-f`
                 continue
-            if not names and arg[:1] in ("-", "+") and len(arg) > 1:
+            if not end_opts and not names and arg[:1] in ("-", "+") and len(arg) > 1:
                 opts.append(arg)
             else:
                 names.append(arg)
@@ -2582,8 +2717,6 @@ def detect_harness_gate_loosening(repo_path: str | Path, base_ref: Optional[str]
         name = str(hook.get("name") or "").strip()
         if not name or hook.get("kind") != "visual_diff":
             continue
-        if _frozen_baseline_globs(hook):
-            frozen.setdefault(name, _frozen_baseline_globs(hook))
         current = live_by_name.get(name)
         reasons = _visual_hook_loosening(hook, current) if current is not None else []
         if reasons and name not in result["loosened_visual_hooks"]:
@@ -2592,16 +2725,62 @@ def detect_harness_gate_loosening(repo_path: str | Path, base_ref: Optional[str]
                 f"Gate loosening: visual_diff hook {name!r} {why} (vs {short})" for why in reasons
             )
     # A live hook may freeze more files than the committed one (or be new): its existing baselines count too.
-    for hook in live_hooks:
-        name = str(hook.get("name") or "").strip() if isinstance(hook, dict) else ""
-        globs = _frozen_baseline_globs(hook) if name else []
-        if globs:
-            frozen[name] = list(dict.fromkeys([*frozen.get(name, []), *globs]))
+    frozen = _collect_frozen_globs(baseline["hooks"], live_hooks)
     result["visual_baseline_changes"] = _frozen_baseline_changes(root, frozen, sha)
     for change in result["visual_baseline_changes"]:
         files = ", ".join(change["changed_files"][:5])
         result["findings"].append(
             f"Gate loosening: frozen baseline of visual_diff hook {change['name']!r} was modified since {short}: {files}"
+        )
+    result["loosened"] = bool(result["findings"])
+    return result
+
+
+def _collect_frozen_globs(committed_hooks: Iterable[Any], live_hooks: Iterable[Any]) -> dict[str, list[str]]:
+    """hook name -> frozen `baseline_paths` of the committed hooks unioned with the live ones."""
+    frozen: dict[str, list[str]] = {}
+    for hook in [*committed_hooks, *live_hooks]:
+        name = str(hook.get("name") or "").strip() if isinstance(hook, dict) else ""
+        globs = _frozen_baseline_globs(hook) if name else []
+        if globs:
+            frozen[name] = list(dict.fromkeys([*frozen.get(name, []), *globs]))
+    return frozen
+
+
+def _pre_execution_frozen_contract(root: Path, gate: dict[str, Any],
+                                   live_hooks: list[Any]) -> tuple[Optional[str], dict[str, list[str]]]:
+    """The base commit and effective frozen globs (committed union live) fixed before Doctor/hooks run."""
+    sha = gate.get("base_commit")
+    if not sha:
+        return None, {}
+    committed = _baseline_gates(root, sha)
+    return sha, _collect_frozen_globs((committed or {}).get("hooks") or [], live_hooks)
+
+
+def _frozen_contract_gate(root: Path, sha: str, frozen: dict[str, list[str]],
+                          base_ref: Optional[str]) -> dict[str, Any]:
+    """Re-check the pre-execution frozen contract after Doctor/hooks ran, whatever they did to `.factonio/`: a
+    frozen hook removed or unfrozen meanwhile is flagged, and its baselines are still compared with ``sha``."""
+    result: dict[str, Any] = {
+        "checked": True, "loosened": False, "base_ref": base_ref, "base_commit": sha,
+        "baseline_source": "pre-execution", "removed_required_hooks": [], "downgraded_hooks": [],
+        "removed_doctor_commands": [], "loosened_visual_hooks": [], "visual_baseline_changes": [], "findings": [],
+    }
+    now = _collect_frozen_globs([], discover_harness(root)["hooks"])
+    for name, globs in frozen.items():
+        dropped = [g for g in globs if g not in now.get(name, [])]
+        if dropped:
+            result["loosened_visual_hooks"].append(name)
+            result["findings"].append(
+                f"Gate loosening: frozen visual_diff hook {name!r} was removed or unfrozen while Doctor/hooks ran "
+                f"(baseline glob(s) {', '.join(f'`{g}`' for g in dropped)} no longer frozen)"
+            )
+    result["visual_baseline_changes"] = _frozen_baseline_changes(root, frozen, sha)
+    for change in result["visual_baseline_changes"]:
+        files = ", ".join(change["changed_files"][:5])
+        result["findings"].append(
+            f"Gate loosening: frozen baseline of visual_diff hook {change['name']!r} was modified since "
+            f"{sha[:12]}: {files}"
         )
     result["loosened"] = bool(result["findings"])
     return result
