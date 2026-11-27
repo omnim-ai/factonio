@@ -11,6 +11,7 @@ drift (`doc_drift` / `harness_gap` / `product_regression`), and audits drift rea
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import os
@@ -22,6 +23,7 @@ import signal
 import subprocess
 import tempfile
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -1850,7 +1852,7 @@ def _env_split_script(opt: str, tokens: list[str], j: int) -> tuple[Optional[str
             return (tokens[j], j + 1) if j < len(tokens) else (None, j)
         if opt.startswith("--split-string="):
             return opt.partition("=")[2], j
-        if opt in ("--unset", "--chdir"):
+        if len(opt) >= 3 and ("--unset".startswith(opt) or "--chdir".startswith(opt)):
             return None, j + 1
         return None, j
     for k, ch in enumerate(opt[1:], start=1):
@@ -1864,11 +1866,38 @@ def _env_split_script(opt: str, tokens: list[str], j: int) -> tuple[Optional[str
     return None, j
 
 
-def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
+def _env_option_effects(opt: str, tokens: list[str], j: int) -> tuple[bool, Optional[str]]:
+    """``(clears the inherited environment, unset variable name)`` of `env` option ``opt`` (`-`, `-i`,
+    `--ignore-environment`, `-u NAME`, `-iuNAME`, `--unset[=]NAME`), whose separate value word is ``tokens[j]``.
+    getopt rules: a short cluster ends at its first value-taking option, and long options may be abbreviated."""
+    if opt == "-":
+        return True, None
+    if opt.startswith("--"):
+        key, eq, val = opt.partition("=")
+        if len(key) >= 3 and "--ignore-environment".startswith(key):
+            return True, None
+        if len(key) >= 3 and "--unset".startswith(key):
+            return False, val if eq else (tokens[j] if j < len(tokens) else None)
+        return False, None
+    clears = False
+    for k, ch in enumerate(opt[1:], start=1):
+        if ch in "SC":
+            break
+        if ch == "u":
+            rest = opt[k + 1:]
+            return clears, rest or (tokens[j] if j < len(tokens) else None)
+        clears = clears or ch == "i"
+    return clears, None
+
+
+def _unwrap_shell_scripts(tokens: list[str], depth: int,
+                          env_calls: Optional[list[dict[str, Any]]] = None) -> list[str]:
     """Expand command-head `sh|bash ... -c <script>` and `env -S <script>` into their tokens and drop command-head
     `env [opts]` and execution wrappers (`timeout 30`, `uv run`, `nice -n 5`, ...), so wrapper options such as
     bash's or env's `-u` are never read as a regeneration flag. Only the command-head position (start, after a
-    shell operator, `VAR=val` or a wrapper) is unwrapped: a positional argument such as `tests/env` is data."""
+    shell operator, `VAR=val` or a wrapper) is unwrapped: a positional argument such as `tests/env` is data.
+    Command-head `eval ARGS` runs its arguments joined by spaces as a script, so they are expanded like `sh -c`.
+    Each dropped `env` that clears the environment or unsets variables is appended to ``env_calls``."""
     tokens = _strip_redirections(tokens)
     out: list[str] = []
     at_head = True
@@ -1895,6 +1924,7 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
             j = i + 1
             script: Optional[str] = None
             gate = False
+            clears, unset = False, []
             # A lone `-` is POSIX `env -` (same as `env -i`), an env option rather than the command.
             while j < len(tokens) and tokens[j].startswith("-") and script is None:
                 opt = tokens[j]
@@ -1904,19 +1934,33 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
                 j += 1
                 if opt == "--":
                     break
+                wipe, name = _env_option_effects(opt, tokens, j)
+                clears = clears or wipe
+                unset.extend([name] if name else [])
                 # `env -u NAME` unsets a variable; it is not jest's `-u`
                 script, j = _env_split_script(opt, tokens, j)
             if gate:
                 out.append(tok)
                 at_head, i = False, i + 1
                 continue
+            end = next((k for k in range(j, len(tokens)) if _is_shell_op(tokens[k])), len(tokens))
+            rest = (_split_shell(script) if script is not None else []) + tokens[j:end]
+            if env_calls is not None and (clears or unset):
+                assigns = list(itertools.takewhile(lambda t: bool(_ENV_ASSIGN_RE.match(t)), rest))
+                env_calls.append({"clears": clears, "unset": unset, "assigns": assigns})
             if script is not None:
                 # GNU env splits the script into argv and appends the arguments up to the next shell operator.
-                end = next((k for k in range(j, len(tokens)) if _is_shell_op(tokens[k])), len(tokens))
-                out.extend(_unwrap_shell_scripts(_split_shell(script) + tokens[j:end], depth + 1))
+                out.extend(_unwrap_shell_scripts(rest, depth + 1, env_calls))
                 at_head, i = False, end
                 continue
             i = j
+            continue
+        if tok == "eval" and depth < _MAX_SHELL_DEPTH:  # a builtin: never a path
+            j = i + 2 if i + 1 < len(tokens) and tokens[i + 1] == "--" else i + 1
+            end = next((k for k in range(j, len(tokens)) if _is_shell_op(tokens[k])), len(tokens))
+            script = " ".join(tokens[j:end])
+            out.extend([";", *_unwrap_shell_scripts(_split_shell(script), depth + 1, env_calls), ";"])
+            at_head, i = False, end
             continue
         wrapped = _skip_exec_wrapper(tokens, i)
         if wrapped is not None:
@@ -1942,7 +1986,7 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
             if j < len(tokens) and tokens[j] in ("--", "-"):  # POSIX: a lone `-` also ends the options
                 j += 1
             if has_c and j < len(tokens):
-                out.extend([";", *_unwrap_shell_scripts(_split_shell(tokens[j]), depth + 1), ";"])
+                out.extend([";", *_unwrap_shell_scripts(_split_shell(tokens[j]), depth + 1, env_calls), ";"])
                 # `sh -c SCRIPT $0 $1...`: the script reads them as "$0"/"$@", so they are scanned as arguments
                 # of a non-exempt placeholder command rather than letting `$0` pose as an exempt command head.
                 end = next((k for k in range(j + 1, len(tokens)) if _is_shell_op(tokens[k])), len(tokens))
@@ -1951,7 +1995,7 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
                     for arg in tokens[j + 1:end]:
                         # an unquoted `$0`/`$@` is field-split, so `'python3 check.py -u'` delivers its words
                         words = _split_shell(arg)
-                        out.extend([arg] if words == [arg] else _unwrap_shell_scripts(words, depth + 1))
+                        out.extend([arg] if words == [arg] else _unwrap_shell_scripts(words, depth + 1, env_calls))
                 at_head, i = False, end
                 continue
         out.append(tok)
@@ -1960,14 +2004,14 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
     return out
 
 
-def _command_tokens(command: Any) -> list[str]:
+def _command_tokens(command: Any, env_calls: Optional[list[dict[str, Any]]] = None) -> list[str]:
     """Shell-aware tokens of a hook command: operators split out, redirections dropped and `sh -c` style
-    scripts expanded inline."""
+    scripts expanded inline (environment-clearing `env` calls collected into ``env_calls``)."""
     if isinstance(command, list):
         tokens = [str(c) for c in command]
     else:
         tokens = _split_shell(str(command or ""))
-    return _unwrap_shell_scripts(tokens, 0)
+    return _unwrap_shell_scripts(tokens, 0, env_calls)
 
 
 _REGEN_DISABLED = frozenset({"0", "false", "no", "off", "none"})
@@ -2239,12 +2283,20 @@ def _threshold_loosening(base_tokens: list[str], live_tokens: list[str]) -> list
                 out.setdefault(key, []).extend(finite(segs[idx][1], key))
         return out
 
+    def env_capped(bi: int, key: str, l_vals: list[_Threshold]) -> bool:
+        """Every live value of ``key`` is within the strictest committed environment assignment of ``key`` that
+        already fed base command ``bi`` (`export T=0.01; check` -> `export T=0.01; env -i T=0.01 check`)."""
+        env_vals = pooled(base_segs, [k for k in base_env if k < bi]).get(key) or []
+        bar = min(env_vals, key=lambda t: t[0]) if env_vals else None
+        return bar is not None and not any(_looser(v, bar) for v in l_vals)
+
     def compare_pair(bi: int, li: int) -> None:
         (sig, b_occ), (_, l_occ) = base_segs[bi], live_segs[li]
         where = f" in `{' '.join(sig)[:80]}`"
         for key in sorted({*b_occ, *l_occ}):
             b_vals, l_vals = finite(b_occ, key), finite(l_occ, key)
-            if not b_vals and any(v[0] > 0 for v in l_vals) and not any(v is None for _, v in b_occ.get(key, [])):
+            if (not b_vals and any(v[0] > 0 for v in l_vals) and not any(v is None for _, v in b_occ.get(key, []))
+                    and not env_capped(bi, key, l_vals)):
                 reasons.append(f"adds loosening threshold `{key}={_fmt_threshold(max(l_vals))}`{where}")
             reasons.extend(_compare_thresholds(key, b_vals, l_vals, where))
 
@@ -2312,14 +2364,106 @@ def _or_fallbacks(tokens: list[str]) -> int:
     return sum(tok.count("||") for tok in tokens if _is_shell_op(tok))
 
 
+def _threshold_key(name: str) -> str:
+    return name.lower().replace("_", "-")
+
+
+def _threshold_env_vars(tokens: list[str]) -> dict[str, list[_Threshold]]:
+    """Normalized key -> finite values of every threshold-like `VAR=val` assignment (prefix or builtin)."""
+    out: dict[str, list[_Threshold]] = {}
+    for tok in tokens:
+        m = _ENV_ASSIGN_RE.match(tok)
+        if m and _THRESHOLD_KEY_RE.search(m.group(1)):
+            value = _parse_threshold(m.group(2).strip())
+            out.setdefault(_threshold_key(m.group(1)), []).extend([value] if value else [])
+    return out
+
+
+def _threshold_env_clears(tokens: list[str], env_calls: list[dict[str, Any]],
+                          tracked: dict[str, list[_Threshold]]) -> list[str]:
+    """Each way ``tokens`` clears a ``tracked`` threshold variable before a command runs: `unset [-v] VAR`,
+    `export -n VAR` or `declare|typeset +x VAR` not followed by `export VAR=<safe>` (or a `VAR=<safe>` prefix on
+    that command), and `env -u VAR` / `env -i` / `env -` not re-assigning it inside the same `env` call. A safe
+    value is at or below the strictest tracked value."""
+    events: list[str] = []
+    if not tracked:
+        return events
+
+    def safe(assigns: Iterable[str], key: str) -> bool:
+        bar = min(tracked[key], key=lambda t: t[0]) if tracked[key] else None
+        for tok in assigns:
+            m = _ENV_ASSIGN_RE.match(tok)
+            if m and _threshold_key(m.group(1)) == key:
+                value = _parse_threshold(m.group(2).strip())
+                if value is not None and (bar is None or not _looser(value, bar)):
+                    return True
+        return False
+
+    pending: dict[str, list[str]] = {}
+    for seg in _command_segments(tokens):
+        k = 0
+        while k < len(seg) and _ENV_ASSIGN_RE.match(seg[k]):
+            k += 1
+        verb = _system_name(seg[k]) if k < len(seg) else None
+        if verb is None:
+            continue  # bare `VAR=val`: unexported after `unset`/`export -n`
+        if verb not in ("unset", "export", "declare", "typeset"):
+            for key in list(pending):
+                if not safe(seg[:k], key):  # this command runs without the threshold
+                    events.extend(pending.pop(key))
+            continue
+        opts: list[str] = []
+        names: list[str] = []
+        for arg in seg[k + 1:]:
+            if not names and arg == "--":
+                continue
+            if not names and arg[:1] in ("-", "+") and len(arg) > 1:
+                opts.append(arg)
+            else:
+                names.append(arg)
+        if verb == "unset":
+            clears = not (any("f" in o for o in opts) and not any("v" in o for o in opts))  # `-f`: functions
+            form = "unset"
+        elif verb == "export":
+            clears, form = any(o.startswith("-") and "n" in o for o in opts), "export -n"
+        else:
+            clears, form = any(o.startswith("+") and "x" in o for o in opts), f"{verb} +x"
+        exports = verb == "export" or any(o.startswith("-") and "x" in o for o in opts)
+        for name in names:
+            key = _threshold_key(name.partition("=")[0])
+            if key not in tracked:
+                continue
+            if clears:
+                pending.setdefault(key, []).append(
+                    f"clears threshold environment variable `{name.partition('=')[0]}` via `{form}`")
+            elif exports and safe([name], key):
+                pending.pop(key, None)
+
+    for call in env_calls:
+        events.extend(f"unsets threshold environment variable `{n}` via `env -u`" for n in call["unset"]
+                      if _threshold_key(n) in tracked and not safe(call["assigns"], _threshold_key(n)))
+        if call["clears"]:
+            events.extend(f"clears threshold environment variable `{key}` via `env -i`/`env -`"
+                          for key in sorted(tracked) if not safe(call["assigns"], key))
+    return events
+
+
 def _visual_hook_loosening(base_hook: dict[str, Any], live_hook: dict[str, Any]) -> list[str]:
     """Ways ``live_hook`` weakens the committed `visual_diff` ``base_hook`` (empty when it does not)."""
     reasons: list[str] = []
-    base_tokens, live_tokens = _command_tokens(base_hook.get("command")), _command_tokens(live_hook.get("command"))
+    base_env_calls: list[dict[str, Any]] = []
+    live_env_calls: list[dict[str, Any]] = []
+    base_tokens = _command_tokens(base_hook.get("command"), base_env_calls)
+    live_tokens = _command_tokens(live_hook.get("command"), live_env_calls)
     added_regen = sorted(_regen_flags(live_tokens) - _regen_flags(base_tokens))
     if added_regen:
         reasons.append("adds snapshot-regeneration flag(s) " + ", ".join(f"`{f}`" for f in added_regen))
     reasons.extend(_threshold_loosening(base_tokens, live_tokens))
+    tracked = _threshold_env_vars(base_tokens)
+    # Clearing the committed threshold variable before the check makes it fall back to the tool default.
+    added_clears = Counter(_threshold_env_clears(live_tokens, live_env_calls, tracked))
+    added_clears.subtract(Counter(_threshold_env_clears(base_tokens, base_env_calls, tracked)))
+    reasons.extend(why for why, n in added_clears.items() if n > 0)
     if _or_fallbacks(live_tokens) > _or_fallbacks(base_tokens):
         reasons.append("adds shell `||` fallback to visual_diff hook (a failing check can still pass)")
     base_frozen = _frozen_baseline_globs(base_hook)
@@ -2398,14 +2542,19 @@ def detect_harness_gate_loosening(repo_path: str | Path, base_ref: Optional[str]
         return result
     result["base_commit"] = sha
     baseline = _baseline_gates(root, sha)
+    live = discover_harness(root)
+    live_hooks, live_doctor = live["hooks"], list(live["phases"].get("doctor") or [])
     if baseline is None:
         result["reason"] = f"no {HARNESS_DIR_NAME}/ harness committed at {sha[:12]}"
-        return result
+        # A first, not-yet-committed harness has no committed gates to compare, but its frozen baselines that
+        # already exist at ``sha`` are still protected (`baseline_source: live`).
+        if not any(_frozen_baseline_globs(h) for h in live_hooks
+                   if isinstance(h, dict) and str(h.get("name") or "").strip()):
+            return result
+        baseline = {"source": "live", "hooks": [], "doctor": []}
     result["checked"] = True
     result["baseline_source"] = baseline["source"]
 
-    live = discover_harness(root)
-    live_hooks, live_doctor = live["hooks"], list(live["phases"].get("doctor") or [])
     live_by_name = {str(h.get("name") or "").strip(): h for h in live_hooks}
     short = sha[:12]
     seen: set[str] = set()
@@ -2674,16 +2823,27 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
         )
     gate = detect_harness_gate_loosening(root, base_sha) if base_sha else _unchecked_gate(base_ref)
     tried = {base_sha}
-    if not gate["checked"] and is_git:
-        # A generated `base_commit` usually predates `.factonio/` itself: gate against the last committed harness,
-        # but only then, so a pinned approved harness stays the bar for later commits that loosen it.
-        fallback = _frozen_baseline_base(root, base_ref, base_sha)
-        if fallback and fallback not in tried:
-            tried.add(fallback)
-            gate = detect_harness_gate_loosening(root, fallback)
-    head = result["head_commit"]
-    if not gate["checked"] and head and head not in tried:
-        gate = detect_harness_gate_loosening(root, head)
+    live_gate: Optional[dict[str, Any]] = None  # a `baseline_source: live` result compares no committed gates
+
+    def committed(g: dict[str, Any]) -> bool:
+        return bool(g["checked"]) and g.get("baseline_source") != "live"
+
+    # A generated `base_commit` usually predates `.factonio/` itself: gate against the last committed harness,
+    # but only then, so a pinned approved harness stays the bar for later commits that loosen it.
+    for step in ("fallback", "head"):
+        if committed(gate):
+            break
+        if gate["checked"] and live_gate is None:
+            live_gate = gate
+        if step == "fallback":
+            nxt = _frozen_baseline_base(root, base_ref, base_sha) if is_git else None
+        else:
+            nxt = result["head_commit"]
+        if nxt and nxt not in tried:
+            tried.add(nxt)
+            gate = detect_harness_gate_loosening(root, nxt)
+    if live_gate is not None and live_gate is not gate:
+        gate = _merge_gate(gate, live_gate) if gate["checked"] else live_gate
     result["gate_loosening"] = gate
     if gate["loosened"]:
         result["warnings"].extend(gate["findings"])

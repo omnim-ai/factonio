@@ -3160,5 +3160,200 @@ class TestFixRound9LiveFrozenShellArgsWordFlagsCommentsAndOverrides(unittest.Tes
         self._assert_end_to_end(self._CHECK, base, loosening, clean)
 
 
+
+class TestFixRound10FirstHarnessFrozenBaselinesEvalAndEnvThresholdClears(unittest.TestCase):
+    """Frozen baselines of a first, not-yet-committed harness, command-head POSIX `eval`, and committed threshold
+    environment variables cleared by `unset`, `export -n`, `env -u`, `env -i` or `env -` before the check."""
+
+    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_cases = TestFixRound4CompoundThresholdsAndShortFlags._assert_cases
+    _assert_end_to_end = TestFixRound7TargetAwareThresholdsUnitsEnvAndShellArgs._assert_end_to_end
+    _CHECK = TestFixRound9LiveFrozenShellArgsWordFlagsCommentsAndOverrides._CHECK
+    # an unset THRESHOLD falls back to a lenient tool default, so clearing it turns the failing diff green
+    _ENV = ("import os, sys\n"
+            "t = os.environ.get('THRESHOLD')\n"
+            "sys.exit(1 if 0.25 > float(t if t is not None else '1.0') else 0)\n")
+
+    @staticmethod
+    def _uncommitted_harness(home: Path, command: str, **meta: Any) -> tuple[Path, str]:
+        """A repo whose committed `snapshots/home.png` predates a freshly initialised, uncommitted harness."""
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        main_sha = _commit_all(repo, "committed baseline image, no harness yet")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"], **meta},
+        ])
+        return repo, main_sha
+
+    def test_uncommitted_first_harness_protects_existing_committed_baselines(self):
+        from factonio.harness import audit_harness, check_harness, detect_harness_gate_loosening
+
+        expected = [{"name": "pixels", "baseline_paths": ["snapshots/**"], "changed_files": ["snapshots/home.png"]}]
+        with isolated_hermes_home() as home:
+            repo, _ = self._uncommitted_harness(home, "true")
+            self.assertTrue(check_harness(str(repo), run_hooks=True)["valid"])
+            _write(repo, "snapshots/home.png", "png-tampered\n")
+            gate = detect_harness_gate_loosening(repo)
+            self.assertEqual((gate["checked"], gate["loosened"], gate["baseline_source"]), (True, True, "live"))
+            self.assertEqual(gate["visual_baseline_changes"], expected)
+            chk = check_harness(str(repo))
+            self.assertFalse(chk["valid"])
+            self.assertEqual(chk["visual_baseline_changes"], expected)
+            self.assertEqual(audit_harness(str(repo))["visual_baseline_changes"], expected)
+        with isolated_hermes_home() as home:
+            repo, _ = self._uncommitted_harness(home, "printf regen > snapshots/home.png")
+            self.assertFalse(detect_harness_gate_loosening(repo)["loosened"])
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertEqual((repo / "snapshots" / "home.png").read_text(encoding="utf-8"), "regen")
+            self.assertEqual(chk["hook_results"]["failed_required"], [])
+            self.assertFalse(chk["valid"])
+            self.assertTrue(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+            self.assertEqual(chk["visual_baseline_changes"], expected)
+
+    def test_pr_introducing_the_first_harness_cannot_modify_existing_baselines(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo, main_sha = self._uncommitted_harness(home, "true")
+            _git(repo, "checkout", "-q", "-b", "feature")
+            _write(repo, "snapshots/home.png", "png-regenerated\n")
+            _commit_all(repo, "add harness and regenerate the committed baseline")
+            chk = check_harness(str(repo), base_ref=main_sha)
+            self.assertFalse(chk["valid"])
+            self.assertEqual(chk["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+            self.assertTrue(any("frozen baseline" in e for e in chk["errors"]), chk["errors"])
+            audit = audit_harness(str(repo), base_ref=main_sha)
+            self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("stale", True))
+            self.assertTrue(check_harness(str(repo))["valid"])  # vs HEAD the committed image is the baseline
+
+    def test_first_harness_controls_stay_clean(self):
+        from factonio.harness import check_harness, detect_harness_gate_loosening
+
+        with isolated_hermes_home() as home:  # brand-new baseline files are new surfaces, not tampering
+            repo, main_sha = self._uncommitted_harness(home, "printf new > snapshots/new-screen.png")
+            _write(repo, "snapshots/other.png", "png-new\n")
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertTrue((repo / "snapshots" / "new-screen.png").exists())
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual(chk["visual_baseline_changes"], [])
+            _commit_all(repo, "harness + new baselines")
+            self.assertTrue(check_harness(str(repo), base_ref=main_sha)["valid"])
+        for meta in ({"frozen_baseline": False}, {"baseline_paths": None}):
+            with self.subTest(meta=meta), isolated_hermes_home() as home:  # no frozen hook: Wave 4 contract
+                repo, _ = self._uncommitted_harness(home, "printf regen > snapshots/home.png")
+                hj = repo / ".factonio" / "harness.json"
+                manifest = json.loads(hj.read_text(encoding="utf-8"))
+                manifest["hooks"][0].update(meta)
+                manifest["hooks"][0] = {k: v for k, v in manifest["hooks"][0].items() if v is not None}
+                hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+                gate = detect_harness_gate_loosening(repo)
+                self.assertEqual((gate["checked"], gate["loosened"], gate["baseline_source"]), (False, False, None))
+                self.assertIn("no .factonio/ harness committed", gate["reason"])
+                self.assertTrue(check_harness(str(repo), run_hooks=True)["valid"])
+
+    def test_audit_still_falls_back_to_the_committed_harness(self):
+        from factonio.harness import audit_harness
+
+        with isolated_hermes_home() as home:
+            repo, main_sha = self._uncommitted_harness(home, "true")
+            hj = repo / ".factonio" / "harness.json"
+            manifest = json.loads(hj.read_text(encoding="utf-8"))
+            manifest["hooks"].append({"name": "lint", "kind": "invariant", "command": "true"})
+            hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            _commit_all(repo, "commit harness")
+            manifest["hooks"] = [h for h in manifest["hooks"] if h["name"] != "lint"]
+            hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            _write(repo, "snapshots/home.png", "png-tampered\n")
+            audit = audit_harness(str(repo), base_ref=main_sha)
+            gate = audit["gate_loosening"]
+            self.assertEqual(gate["removed_required_hooks"], ["lint"], gate)
+            self.assertEqual(gate["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+            self.assertEqual(audit["severity"], "stale")
+
+    def test_command_head_eval_is_unwrapped(self):
+        from factonio.harness import _command_tokens, _regen_flags
+
+        self.assertEqual(_regen_flags(_command_tokens("npx jest eval -u")), {"-u"})
+        self.assertEqual(_regen_flags(_command_tokens("npx jest eval")), set())
+        self.assertEqual(_regen_flags(_command_tokens("eval 'python3 check.py -u'")), {"-u"})
+        loosening = ["eval 'python3 check.py -u'", "eval 'python3 check.py --threshold 0.5'",
+                     "eval 'python3 check.py || true'", "eval -- 'python3 check.py -u'",
+                     "eval python3 check.py -u", "sh -c \"eval 'python3 check.py -u'\""]
+        cases = {live: ("python3 check.py", live, True) for live in loosening}
+        cases.update({
+            "eval at the matching threshold": ("python3 check.py --threshold 0.01",
+                                               "eval 'python3 check.py --threshold 0.01'", False),
+            "eval plain": ("python3 check.py", "eval 'python3 check.py'", False),
+        })
+        self._assert_cases(cases)
+        # dash's `eval` runs `--` as a command, so `eval --` only executes as written under bash-like /bin/sh.
+        executed = [live for live in loosening if not live.startswith("eval --")]
+        self._assert_end_to_end(self._CHECK, "python3 check.py", executed, ["eval 'python3 check.py'"])
+        self._assert_end_to_end(self._CHECK, "python3 check.py --threshold 0.01", [],
+                                ["eval 'python3 check.py --threshold 0.01'"])
+
+    _CLEARS = ("unset THRESHOLD; {c}", "unset -v THRESHOLD; {c}", "unset -- THRESHOLD; {c}",
+               "bash -c 'export -n THRESHOLD; {c}'", "env -u THRESHOLD {c}", "env --unset=THRESHOLD {c}",
+               "env --unset THRESHOLD {c}", "env -iu THRESHOLD PATH=\"$PATH\" {c}", "env -i PATH=\"$PATH\" {c}",
+               "env --ignore-environment PATH=\"$PATH\" {c}", "env - PATH=\"$PATH\" {c}")
+
+    def test_clearing_an_exported_threshold_variable_is_loosening(self):
+        check = "python3 check.py"
+        base = f"export THRESHOLD=0.01; {check}"
+        loosening = [f"export THRESHOLD=0.01; {form.format(c=check)}" for form in self._CLEARS]
+        loosening += [f"export THRESHOLD=0.01; sh -c 'unset THRESHOLD; {check}'",
+                      f"export THRESHOLD=0.01; eval 'unset THRESHOLD'; {check}",
+                      f"export THRESHOLD=0.01; unset THRESHOLD; THRESHOLD=0.01; {check}",
+                      f"export THRESHOLD=0.01; unset THRESHOLD; export THRESHOLD=0.5; {check}",
+                      f"export THRESHOLD=0.01; env -i PATH=\"$PATH\" THRESHOLD=0.5 {check}"]
+        clean = [f"export THRESHOLD=0.01; unset FOO; {check}", f"export THRESHOLD=0.01; env -u FOO {check}",
+                 f"export -n FOO; export THRESHOLD=0.01; {check}",
+                 f"export THRESHOLD=0.01; env -i PATH=\"$PATH\" THRESHOLD=0.01 {check}",
+                 f"export THRESHOLD=0.01; unset THRESHOLD; export THRESHOLD=0.01; {check}",
+                 f"export THRESHOLD=0.01; unset -f THRESHOLD; {check}", f"{base}; unset THRESHOLD", base]
+        cases = {live: (base, live, True) for live in loosening}
+        cases.update({live: (base, live, False) for live in clean})
+        cases.update({
+            "declare +x": (base, f"export THRESHOLD=0.01; declare +x THRESHOLD; {check}", True),
+            "no committed env threshold: env -": (check, "env - python3 -u check.py", False),
+            "no committed env threshold: unset": (check, f"unset THRESHOLD; {check}", False),
+            "committed env -i kept": (f"export THRESHOLD=0.01; env -i PATH=\"$PATH\" {check}",
+                                      f"export THRESHOLD=0.01; env -i PATH=\"$PATH\" {check}", False),
+        })
+        self._assert_cases(cases)
+        self._assert_end_to_end(self._ENV, base, loosening[:len(self._CLEARS)], clean)
+        self._assert_reset_still_enforced(base, f"export THRESHOLD=0.01; env -i PATH=\"$PATH\" THRESHOLD=0.01 {check}")
+
+    def test_clearing_a_prefix_threshold_assignment_is_loosening(self):
+        check = "python3 check.py"
+        base = f"THRESHOLD=0.01 {check}"
+        loosening = [f"THRESHOLD=0.01 sh -c 'unset THRESHOLD; {check}'",
+                     f"THRESHOLD=0.01 sh -c 'unset -v THRESHOLD; {check}'",
+                     f"THRESHOLD=0.01 bash -c 'export -n THRESHOLD; {check}'",
+                     *(f"THRESHOLD=0.01 {form.format(c=check)}" for form in self._CLEARS if form.startswith("env"))]
+        clean = [f"THRESHOLD=0.01 env -u FOO {check}", f"unset FOO; {base}", f"export -n FOO; {base}",
+                 f"THRESHOLD=0.01 env -i PATH=\"$PATH\" THRESHOLD=0.01 {check}",
+                 f"unset THRESHOLD; {base}", base]
+        cases = {live: (base, live, True) for live in loosening}
+        cases.update({live: (base, live, False) for live in clean})
+        self._assert_cases(cases)
+        self._assert_end_to_end(self._ENV, base, loosening, clean)
+        self._assert_reset_still_enforced(base, f"THRESHOLD=0.01 env -i PATH=\"$PATH\" THRESHOLD=0.01 {check}")
+
+    def _assert_reset_still_enforced(self, base: str, live: str) -> None:
+        from factonio.harness import check_harness
+
+        with isolated_hermes_home() as home:
+            repo = self._visual_repo(home, base)
+            _write(repo, "check.py", self._ENV)
+            _commit_all(repo, "visual check script")
+            self._set_command(repo, live)
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertEqual(chk["hook_results"]["failed_required"], ["pixels"], chk["hook_results"])
+            self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+
 if __name__ == "__main__":
     unittest.main()
