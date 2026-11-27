@@ -1732,12 +1732,11 @@ _INERT_EQ_OPTIONS = {
 _INERT_TRAILING_FLAGS = frozenset({"--verbose", "--quiet", "--silent", "--no-color", "--color"})
 # Short verbosity flags per runner; jest and vitest are absent because their `-v` is `--version` (exits 0).
 _RUNNER_SHORT_FLAGS = {"pytest": frozenset({"-q", "-v"}), "go": frozenset({"-v"}), "cargo": frozenset({"-q", "-v"})}
-_LAUNCHERS = frozenset({"npx", "pnpx", "bunx", "uvx", "uv", "pnpm", "yarn", "bun"})
-_LAUNCHER_VERBS = frozenset({"run", "exec", "dlx", "x"})
+# Where trailing options stop reaching the runner and go to the program under test instead.
+_RUNNER_ARGS_END = {"pytest": frozenset({"--"}), "go": frozenset({"--", "-args", "--args"}), "cargo": frozenset({"--"})}
 # A shell word whose meaning is identical as an argv item and as unquoted shell text.
 _PLAIN_WORD_RE = re.compile(r"[A-Za-z0-9_./:=+%,@-]+", re.ASCII)
 _ASCII_THRESHOLD_RE = re.compile(r"^(?:(?:0|[1-9][0-9]*)(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$", re.ASCII)
-# Command-launching wrappers that may sit between a segment head and a Python interpreter given `-u`.
 _MAX_SCRIPT_DEPTH = 4
 _OPERATORS = ("<<<", "&>>", "&&", "||", "|&", ";;", ">>", "<<", "<>", ">&", "<&", "&>", ">|",
               "|", ";", "&", "(", ")", ">", "<")
@@ -1900,7 +1899,19 @@ def _slot_ok(base: _Slot, live: _Slot) -> bool:
         return False
     if base.percent != live.percent:
         return False  # checkers read `1%` and `0.01` differently (`Number("1%")` is NaN): keep the committed unit
+    if _integer_syntax_lost(base, live):
+        return False
     return live.value <= base.value
+
+
+def _integer_syntax_lost(base: _Slot, live: _Slot) -> bool:
+    """A committed integer threshold rewritten as a decimal or scientific number: integer parsers read
+    `parseInt("999e-3", 10)` as 999, `parseInt(".0", 10)` as NaN, and Go/Rust integer parsing errors out."""
+    def number(slot: _Slot) -> str:
+        return slot.raw[:-1] if slot.percent else slot.raw
+
+    return number(base).isascii() and number(base).isdigit() and not (
+        number(live).isascii() and number(live).isdigit())
 
 
 def _item_ok(base: Any, live: Any) -> bool:
@@ -1930,13 +1941,19 @@ def _is_regen(tok: str, prev: Optional[str]) -> bool:
 
 
 def _runner(live: list[Any], head: int) -> Optional[str]:
-    """The command a segment runs: its head, or the tool after `npx`/`uvx`/`uv run`/`pnpm exec`/`yarn`/..."""
-    k = head
-    while k < len(live) and isinstance(live[k], str) and (
-            os.path.basename(live[k]) in _LAUNCHERS or (k > head and live[k] in _LAUNCHER_VERBS)):
-        k += 1
-    word = live[k] if k < len(live) else None
-    return os.path.basename(word) if isinstance(word, str) and not word.startswith("-") else None
+    """The test runner a segment heads: a bare or absolute `pytest`, `uv run pytest`, `go test` or `cargo test`
+    (never a repo-relative script, a package.json script name, or `go run` / `cargo run`)."""
+    def word(k: int) -> Any:
+        return live[k] if k < len(live) else None
+
+    if not _is_bare_or_absolute(word(head)):
+        return None
+    name = os.path.basename(word(head))
+    if name == "uv" and word(head + 1) == "run" and _is_bare_or_absolute(word(head + 2)):
+        return "pytest" if os.path.basename(word(head + 2)) == "pytest" else None
+    if name == "pytest" or (name in ("go", "cargo") and word(head + 1) == "test"):
+        return name
+    return None
 
 
 def _insert_ok(live: list[Any], j: int, head: int, trailing_from: int, matched: set[int]) -> bool:
@@ -1966,7 +1983,11 @@ def _insert_ok(live: list[Any], j: int, head: int, trailing_from: int, matched: 
         return True  # behind a wrapper `python3` may be a module/tool name or an option value (`uv run -m python3`)
     if j < trailing_from:
         return False
-    return item in _INERT_TRAILING_FLAGS or item in _RUNNER_SHORT_FLAGS.get(_runner(live, head) or "", ())
+    if item in _INERT_TRAILING_FLAGS:
+        return True
+    runner = _runner(live, head)
+    return (item in _RUNNER_SHORT_FLAGS.get(runner or "", ())
+            and not any(w in _RUNNER_ARGS_END[runner] for w in live[head + 1:j] if isinstance(w, str)))
 
 
 def _is_bare_or_absolute(word: Any) -> bool:
@@ -2101,7 +2122,11 @@ def _threshold_reasons(base_segs: list[list[str]], live_segs: list[list[str]]) -
         if any(s.value is not None and s.percent != b.percent for b, s in bad):
             reasons.append(f"changes threshold unit {label} (`%` vs plain number) from "
                            f"{', '.join(s.raw for s in b_vals)} to {', '.join(s.raw for s in l_vals)}")
-        if any(s.value is not None and s.percent == b.percent for b, s in bad):
+        if any(s.value is not None and s.percent == b.percent and _integer_syntax_lost(b, s) for b, s in bad):
+            reasons.append(f"rewrites integer threshold {label} as a non-integer "
+                           f"({', '.join(s.raw for b, s in bad if s.value is not None and _integer_syntax_lost(b, s))}"
+                           "; integer parsers read `999e-3` as 999 and `.0` as NaN)")
+        if any(s.value is not None and s.percent == b.percent and not _integer_syntax_lost(b, s) for b, s in bad):
             reasons.append(f"loosens threshold {label} from {', '.join(s.raw for s in b_vals)} to "
                            f"{', '.join(s.raw for s in l_vals)}")
     for (kind, key), l_vals in live.items():

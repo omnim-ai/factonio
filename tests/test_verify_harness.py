@@ -3478,5 +3478,136 @@ class TestFixRound15BlobHashBaselinesAndNoNewInsertions(unittest.TestCase):
                 ])
 
 
+class TestFixRound16IntegerThresholdsAndStrictRunners(unittest.TestCase):
+    """Round 16: committed integer thresholds stay integers, and trailing `-q`/`-v` only reach a bare/absolute
+    `pytest`, `uv run pytest`, `go test` or `cargo test` before `--` / `-args`."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    # 100 differing pixels against an integer `--max-diff-pixels`, parsed with `parseInt` and a NaN guard.
+    _PIXELS_JS = (
+        "const arg = process.argv.slice(2).find((a) => a.startsWith('--max-diff-pixels='));\n"
+        "const limit = parseInt(arg ? arg.slice(18) : '0', 10);\n"
+        "if (Number.isNaN(limit)) process.exit(2);\n"
+        "process.exit(100 > limit ? 1 : 0);\n"
+    )
+    # A runner stand-in that "passes" (skips the visual check) whenever `-v` reaches its argv.
+    _VERBOSE_EXE = '#!/bin/sh\nfor a in "$@"; do [ "$a" = -v ] && exit 0; done\nexit 1\n'
+    _UV_SHIM = '#!/bin/sh\n[ "$1" = run ] || exit 2\nshift\nexec "$@"\n'
+
+    def _repo(self, home: Path, name: str, command: Any) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "pixels.js", self._PIXELS_JS)
+        _write(repo, "tests/pytest", self._VERBOSE_EXE)
+        (repo / "tests" / "pytest").chmod(0o755)
+        _commit_all(repo, "visual checks + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def test_committed_integer_threshold_stays_integer(self):
+        from factonio.harness import _visual_hook_loosening
+
+        base = "node pixels.js --max-diff-pixels=5"
+        rewritten = {
+            "scientific": "node pixels.js --max-diff-pixels=999e-3",
+            "leading dot": "node pixels.js --max-diff-pixels=.0",
+            "decimal": "node pixels.js --max-diff-pixels=0.5",
+            "decimal zero": "node pixels.js --max-diff-pixels=0.0",
+        }
+        self._assert_rejected({k: (base, live) for k, live in rewritten.items()})
+        self._assert_rejected({"spaced scientific": ("node pixels.js --max-diff-pixels 5",
+                                                     "node pixels.js --max-diff-pixels 1e0"),
+                               "percent": ("node pixels.js --max-diff-pixels=5%", "node pixels.js --max-diff-pixels=1e0%"),
+                               "env": ("MAX_DIFF_PIXELS=5 node pixels.js", "MAX_DIFF_PIXELS=.0 node pixels.js")})
+        reasons = _visual_hook_loosening({"command": base}, {"command": rewritten["scientific"]})
+        self.assertTrue(any(r.startswith("rewrites integer threshold `--max-diff-pixels` as a non-integer (999e-3")
+                            for r in reasons), reasons)
+        self.assertFalse(any(r.startswith("loosens threshold") for r in reasons), reasons)
+        self._assert_clean({
+            "5 -> 2": (base, "node pixels.js --max-diff-pixels=2"),
+            "5 -> 0": (base, "node pixels.js --max-diff-pixels=0"),
+            "5% -> 1%": ("node pixels.js --max-diff-pixels=5%", "node pixels.js --max-diff-pixels=1%"),
+            "float 0.05 -> 0.01": ("node check.js --threshold 0.05", "node check.js --threshold 0.01"),
+            "float 0.05 -> 0": ("node check.js --threshold 0.05", "node check.js --threshold 0"),
+            "float 0.05 -> 1e-2": ("node check.js --threshold 0.05", "node check.js --threshold 1e-2"),
+        })
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
+    def test_integer_threshold_rewrite_is_rejected_end_to_end(self):
+        """`parseInt("999e-3", 10)` is 999: the NaN guard does not help, and 100 differing pixels pass."""
+        from factonio.harness import check_harness
+
+        self._assert_executed_bypasses_rejected([
+            ("node pixels.js --max-diff-pixels=5", "node pixels.js --max-diff-pixels=999e-3"),
+        ])
+        with isolated_hermes_home() as home:
+            for n, live in enumerate(("node pixels.js --max-diff-pixels=.0", "node pixels.js --max-diff-pixels=0.5")):
+                with self.subTest(live=live):
+                    repo = self._repo(home, f"frac{n}", "node pixels.js --max-diff-pixels=5")
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertFalse(chk["valid"])
+                    self.assertEqual(chk["gate_loosening"]["loosened_visual_hooks"], ["pixels"])
+
+    def test_short_verbosity_flags_only_for_strict_runners(self):
+        rejected = {
+            "repo-relative pytest": ("tests/pytest snapshots/home.png", "tests/pytest snapshots/home.png -v"),
+            "dot-relative pytest": ("./pytest tests/visual", "./pytest tests/visual -q"),
+            "uv run relative pytest": ("uv run ./tests/pytest tests/visual", "uv run ./tests/pytest tests/visual -v"),
+            "uv run --with pytest": ("uv run --with x pytest tests/visual", "uv run --with x pytest tests/visual -v"),
+            "npx pytest": ("npx pytest tests/visual", "npx pytest tests/visual -v"),
+            "go run": ("go run ./cmd/visual", "go run ./cmd/visual -v"),
+            "cargo run": ("cargo run -- ./visual", "cargo run -- ./visual -v"),
+            "cargo run no --": ("cargo run ./visual", "cargo run ./visual -q"),
+            "pnpm run go": ("pnpm run go", "pnpm run go -v"),
+            "yarn run pytest": ("yarn run pytest", "yarn run pytest -q"),
+            "bun run cargo": ("bun run cargo test", "bun run cargo test -v"),
+            "pytest after --": ("pytest tests/visual -- arg", "pytest tests/visual -- arg -v"),
+            "cargo test after --": ("cargo test -- visual", "cargo test -- visual -q"),
+            "go test after -args": ("go test ./... -args", "go test ./... -args -v"),
+            "go test after --args": ("go test ./... --args x", "go test ./... --args x -v"),
+            "jest -v": ("npx jest", "npx jest -v"),
+        }
+        self._assert_rejected(rejected)
+        self._assert_clean({
+            "pytest -q": ("pytest tests/visual", "pytest tests/visual -q"),
+            "pytest -v": ("pytest tests/visual", "pytest tests/visual -v"),
+            "absolute pytest -v": ("/usr/bin/pytest tests/visual", "/usr/bin/pytest tests/visual -v"),
+            "uv run pytest -q": ("uv run pytest tests/visual", "uv run pytest tests/visual -q"),
+            "go test -v": ("go test ./...", "go test ./... -v"),
+            "cargo test -q": ("cargo test", "cargo test -q"),
+            "cargo test -v": ("cargo test", "cargo test -v"),
+            "pytest --verbose after --": ("pytest tests/visual -- arg", "pytest tests/visual -- arg --verbose"),
+            **{f"unchanged {k}": (live, live) for k, (_, live) in rejected.items()},
+        })
+
+    def test_runner_verbosity_bypasses_are_rejected_end_to_end(self):
+        with isolated_hermes_home() as home:
+            bin_dir = home / "bin"
+            bin_dir.mkdir()
+            for tool in ("go", "cargo", "pnpm"):
+                (bin_dir / tool).write_text(self._VERBOSE_EXE, encoding="utf-8")
+                (bin_dir / tool).chmod(0o755)
+            (bin_dir / "uv").write_text(self._UV_SHIM, encoding="utf-8")
+            (bin_dir / "uv").chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"}):
+                self._assert_executed_bypasses_rejected([
+                    ("tests/pytest snapshots/home.png", "tests/pytest snapshots/home.png -v"),
+                    ("uv run ./tests/pytest tests/visual", "uv run ./tests/pytest tests/visual -v"),
+                    ("go run ./cmd/visual", "go run ./cmd/visual -v"),
+                    ("cargo run -- ./visual", "cargo run -- ./visual -v"),
+                    ("pnpm run go", "pnpm run go -v"),
+                    ("go test ./... -args", "go test ./... -args -v"),
+                ])
+
+
 if __name__ == "__main__":
     unittest.main()
