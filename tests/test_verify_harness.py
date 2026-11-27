@@ -3430,8 +3430,7 @@ class TestFixRound15BlobHashBaselinesAndNoNewInsertions(unittest.TestCase):
         self.assertEqual(_git_blob_oid(b"", 40), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
         with isolated_hermes_home() as home:
             repo = self._repo(home, "svc", "true")
-            os.symlink("home.png", repo / "snapshots" / "link.png")
-            head = _commit_all(repo, "symlinked baseline")
+            head = _git(repo, "rev-parse", "HEAD")
             frozen = {"pixels": ["snapshots/**"]}
             self.assertEqual(_frozen_baseline_changes(repo, frozen, head), [])
 
@@ -3439,19 +3438,22 @@ class TestFixRound15BlobHashBaselinesAndNoNewInsertions(unittest.TestCase):
                 out = _frozen_baseline_changes(repo, frozen, head)
                 return out[0]["changed_files"] if out else []
 
-            _git(repo, "update-index", "--assume-unchanged", "snapshots/link.png", "snapshots/home.png")
-            (repo / "snapshots" / "link.png").unlink()
-            _write(repo, "snapshots/link.png", "home.png")  # same bytes as the link target text, but a file
-            self.assertEqual(changed(), ["snapshots/link.png"])
-            (repo / "snapshots" / "link.png").unlink()
-            os.symlink("other.png", repo / "snapshots" / "link.png")
-            self.assertEqual(changed(), ["snapshots/link.png"])
-            (repo / "snapshots" / "link.png").unlink()
+            _git(repo, "update-index", "--assume-unchanged", "snapshots/home.png")
+            live = repo / "snapshots" / "home.png"
+            _write(repo, "copy.png", "png-v1\n")
+            live.unlink()
+            self.assertEqual(changed(), ["snapshots/home.png"])
+            os.symlink("../copy.png", live)  # identical bytes, but a symlink: not the committed regular file
+            self.assertEqual(changed(), ["snapshots/home.png"])
+            live.unlink()
+            live.mkdir()
+            self.assertEqual(changed(), ["snapshots/home.png"])
+            live.rmdir()
+            _write(repo, "snapshots/home.png", "png-v1\n")
+            self.assertEqual(changed(), [])
             os.symlink("home.png", repo / "snapshots" / "link.png")
-            (repo / "snapshots" / "home.png").unlink()  # Round 22: the link through it no longer reads the bytes
-            self.assertEqual(changed(), ["snapshots/home.png", "snapshots/link.png"])
-            (repo / "snapshots" / "home.png").mkdir()
-            self.assertEqual(changed(), ["snapshots/home.png", "snapshots/link.png"])
+            head = _commit_all(repo, "symlinked baseline")
+            self.assertEqual(changed(), ["snapshots/link.png"])  # a committed symlink baseline fails closed
 
     def test_no_threshold_may_be_newly_inserted(self):
         from factonio.harness import _visual_hook_loosening
@@ -4369,9 +4371,8 @@ class TestFixRound21SingleSimpleCommandTightening(unittest.TestCase):
 
 
 class TestFixRound22SymlinkReferentsAndPositiveCommandGrammar(unittest.TestCase):
-    """Round 22: a frozen symlink baseline pins its whole in-repo referent chain (bytes hashed directly, so index
-    flags cannot hide a referent outside `baseline_paths`), and a symlinked ancestor, absolute, escaping, broken
-    or cyclic link fails closed. An edited command follows a positive grammar: at most one top-level exact
+    """Round 22: a symlinked ancestor of a frozen baseline fails closed (frozen baselines must be regular files;
+    see `TestFrozenBaselinesAreRegularFiles`). An edited command follows a positive grammar: at most one top-level exact
     `sh|bash -c SCRIPT`, leading assignments or a bare flagless `env`, then only threshold flags with plain
     numbers and plain positionals; any other option word fails closed."""
 
@@ -4379,10 +4380,6 @@ class TestFixRound22SymlinkReferentsAndPositiveCommandGrammar(unittest.TestCase)
     _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
     _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
     _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
-    # Fails while the rendered output differs from the frozen baseline it reads through `snapshots/baseline.png`.
-    _CMP = ("import pathlib, sys\n"
-            "sys.exit(0 if pathlib.Path('snapshots/baseline.png').read_bytes() == pathlib.Path('out.png').read_bytes()"
-            " else 1)\n")
     # A test runner whose `--grep` takes the next word as a test-name filter; the one test fails.
     _GREP = ("import sys\n"
              "a = sys.argv[1:]\n"
@@ -4474,100 +4471,6 @@ class TestFixRound22SymlinkReferentsAndPositiveCommandGrammar(unittest.TestCase)
         _commit_all(repo, "harness")
         return repo
 
-    def _symlink_repo(self, home: Path, name: str, target: str = "../golden.png") -> Path:
-        from factonio.harness import bootstrap_verify_harness
-
-        repo = _make_repo(home, name)
-        _write(repo, "golden.png", "png-v1\n")
-        _write(repo, "out.png", "png-v2\n")  # the regressed render
-        _write(repo, "cmp.py", self._CMP)
-        (repo / "snapshots").mkdir()
-        os.symlink(target, repo / "snapshots" / "baseline.png")
-        _commit_all(repo, "symlinked baseline")
-        bootstrap_verify_harness(str(repo), hooks=[
-            {"name": "pixels", "kind": "visual_diff", "command": "python3 cmp.py", "baseline_paths": ["snapshots/**"]},
-        ])
-        _commit_all(repo, "harness")
-        return repo
-
-    @staticmethod
-    def _changed(result: dict) -> list[str]:
-        return sorted({f for c in result["visual_baseline_changes"] for f in c["changed_files"]})
-
-    def test_overwritten_symlink_referent_outside_baseline_paths_fails_check_and_audit(self):
-        from factonio.harness import audit_harness, check_harness
-
-        for flag in ("--assume-unchanged", "--skip-worktree"):
-            with self.subTest(flag=flag), isolated_hermes_home() as home:
-                repo = self._symlink_repo(home, "svc")
-                committed = check_harness(str(repo), run_hooks=True)
-                self.assertEqual(committed["hook_results"]["failed_required"], ["pixels"])
-                self.assertEqual(committed["visual_baseline_changes"], [])
-                _write(repo, "golden.png", "png-v2\n")  # the referent now matches the regressed render
-                _git(repo, "update-index", flag, "golden.png")
-                self.assertEqual(_git(repo, "status", "--porcelain"), "")  # invisible to `git status`
-                chk = check_harness(str(repo), run_hooks=True)
-                self.assertEqual(chk["hook_results"]["failed_required"], [], chk["hook_results"])  # real bypass
-                self.assertFalse(chk["valid"])
-                self.assertTrue(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
-                self.assertEqual(self._changed(chk), ["snapshots/baseline.png"])
-                audit = audit_harness(str(repo))
-                self.assertTrue(audit["drifted"])
-                self.assertEqual((audit["severity"], self._changed(audit)), ("stale", ["snapshots/baseline.png"]))
-
-    def test_unchanged_in_repo_symlink_baseline_stays_clean(self):
-        from factonio.harness import audit_harness, check_harness
-
-        with isolated_hermes_home() as home:
-            repo = self._symlink_repo(home, "svc")
-            _write(repo, "out.png", "png-v1\n")
-            _commit_all(repo, "render matches")
-            chk = check_harness(str(repo), run_hooks=True)
-            self.assertTrue(chk["valid"], chk["errors"])
-            self.assertEqual(chk["hook_results"]["failed_required"], [])
-            self.assertEqual(chk["visual_baseline_changes"], [])
-            self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
-            self.assertEqual(audit_harness(str(repo))["severity"], "clean")
-
-    def test_unverifiable_symlink_baselines_fail_closed(self):
-        from factonio.harness import _frozen_baseline_changes
-
-        frozen = {"pixels": ["snapshots/**"]}
-        with isolated_hermes_home() as home:
-            outside = home / "outside.png"
-            outside.write_text("png-v1\n", encoding="utf-8")
-            cases = {"external": str(outside), "escaping": "../../outside.png", "broken": "../missing.png",
-                     "self cycle": "baseline.png"}
-            for n, (label, target) in enumerate(cases.items()):
-                with self.subTest(label):
-                    repo = self._symlink_repo(home, f"svc{n}", target)
-                    head = _git(repo, "rev-parse", "HEAD")
-                    out = _frozen_baseline_changes(repo, frozen, head)
-                    self.assertEqual(out[0]["changed_files"] if out else [], ["snapshots/baseline.png"])
-            with self.subTest("directory link: its committed contents are pinned through the link"):
-                repo = self._symlink_repo(home, "dirlink", "../api")
-                head = _git(repo, "rev-parse", "HEAD")
-                self.assertEqual(_frozen_baseline_changes(repo, frozen, head), [])
-                _write(repo, "api/server.py", "tampered\n")
-                out = _frozen_baseline_changes(repo, frozen, head)
-                self.assertEqual(out[0]["changed_files"], ["snapshots/baseline.png/server.py"])
-            with self.subTest("a -> b -> a"):
-                repo = self._symlink_repo(home, "cycle", "b.png")
-                os.symlink("baseline.png", repo / "snapshots" / "b.png")
-                head = _commit_all(repo, "cycle")
-                out = _frozen_baseline_changes(repo, frozen, head)
-                self.assertEqual(out[0]["changed_files"], ["snapshots/b.png", "snapshots/baseline.png"])
-            with self.subTest("symlinked intermediate directory"):
-                repo = self._symlink_repo(home, "middir", "../real/x/../../golden.png")
-                (repo / "real" / "x").mkdir(parents=True)
-                _write(repo, "real/x/keep", "")
-                head = _commit_all(repo, "dirs")
-                self.assertEqual(_frozen_baseline_changes(repo, frozen, head), [])  # real directories: intact
-                shutil.rmtree(repo / "real" / "x")
-                os.symlink("../api", repo / "real" / "x")
-                out = _frozen_baseline_changes(repo, frozen, head)
-                self.assertEqual(out[0]["changed_files"], ["snapshots/baseline.png"])
-
     def test_symlinked_parent_directory_fails_closed_even_with_identical_bytes(self):
         from factonio.harness import _frozen_baseline_changes
 
@@ -4614,12 +4517,12 @@ class TestFixRound22SymlinkReferentsAndPositiveCommandGrammar(unittest.TestCase)
         self._assert_executed_bypasses_rejected(available)
 
 
-class TestFixRound23CommittedDirectorySymlinks(unittest.TestCase):
-    """Round 23: frozen baselines resolve component by component like the kernel, so a committed directory
-    symlink in the middle of a baseline chain (`alias -> assets`) stays clean while every hop is pinned, and a
-    committed directory symlink at or above a `baseline_paths` prefix (`snapshots -> real_snapshots`) expands to
-    the virtual paths a checker opens: mutating, committing, regenerating or retargeting through it is caught,
-    and an escaping directory link fails closed."""
+class TestFrozenBaselinesAreRegularFiles(unittest.TestCase):
+    """Frozen `visual_diff` baselines must be regular tracked files, never symlinks or reached through one.
+    Every committed regular baseline is pinned in the index, the `HEAD` tree and the live disk (`lstat` walk +
+    blob hash); a committed or live symlink matching `baseline_paths`, at a concrete glob directory prefix,
+    escaping the repository or exposing matching files fails closed; unrelated symlinks stay clean; and
+    `baseline_paths` must be normalized repo-relative globs."""
 
     @staticmethod
     def _changed(result: dict) -> list[str]:
@@ -4669,428 +4572,6 @@ class TestFixRound23CommittedDirectorySymlinks(unittest.TestCase):
         self.assertTrue(audit["drifted"])
         self.assertEqual(self._changed(audit), expected)
 
-    def _alias_repo(self, home: Path, name: str) -> Path:
-        return self._repo(home, name, {"assets/ref.png": "original\n"},
-                          {"alias": "assets", "snapshots/home.png": "../alias/ref.png"}, self._visual(["snapshots/**"]))
-
-    def test_unchanged_chain_through_committed_intermediate_directory_symlink_is_clean(self):
-        with isolated_hermes_home() as home:
-            repo = self._alias_repo(home, "svc")
-            self.assertEqual(_git(repo, "status", "--porcelain"), "")
-            self._assert_clean(repo)
-
-    def test_mutating_any_hop_of_the_intermediate_directory_chain_fails_closed(self):
-        with isolated_hermes_home() as home:
-            with self.subTest("referent behind assume-unchanged"):
-                repo = self._alias_repo(home, "ref")
-                _write(repo, "assets/ref.png", "tampered\n")
-                _git(repo, "update-index", "--assume-unchanged", "assets/ref.png")
-                self.assertEqual(_git(repo, "status", "--porcelain"), "")
-                self._assert_tampered(repo, ["snapshots/home.png"])
-            with self.subTest("directory hop retargeted to identical bytes"):
-                repo = self._alias_repo(home, "alias")
-                _write(repo, "other_assets/ref.png", "original\n")
-                (repo / "alias").unlink()
-                os.symlink("other_assets", repo / "alias")
-                self._assert_tampered(repo, ["snapshots/home.png"])
-            with self.subTest("baseline link retargeted to the same bytes"):
-                repo = self._alias_repo(home, "link")
-                (repo / "snapshots" / "home.png").unlink()
-                os.symlink("../assets/ref.png", repo / "snapshots" / "home.png")
-                self._assert_tampered(repo, ["snapshots/home.png"])
-
-    def _dirlink_repo(self, home: Path, name: str, globs: list[str], command: str = "true") -> Path:
-        return self._repo(home, name, {"real_snapshots/home.png": "png-v1\n"}, {"snapshots": "real_snapshots"},
-                          self._visual(globs, command))
-
-    _GLOBS = (["snapshots/**"], ["snapshots/*.png"], ["snapshots/home.png"])
-
-    def test_directory_symlink_above_baseline_prefix_is_clean_until_mutated(self):
-        from factonio.harness import audit_harness
-
-        for n, globs in enumerate(self._GLOBS):
-            with self.subTest(globs=globs), isolated_hermes_home() as home:
-                repo = self._dirlink_repo(home, f"svc{n}", globs)
-                self._assert_clean(repo)
-                _write(repo, "snapshots/home.png", "png-tampered\n")  # writes real_snapshots/home.png
-                self._assert_tampered(repo, ["snapshots/home.png"])
-                base = _git(repo, "rev-parse", "HEAD")
-                _commit_all(repo, "commit the tampered baseline")
-                for audit in (audit_harness(str(repo)), audit_harness(str(repo), base_ref=base)):
-                    self.assertTrue(audit["drifted"])
-                    self.assertEqual(self._changed(audit), ["snapshots/home.png"])
-
-    def test_hook_regenerating_through_directory_symlink_is_caught_post_execution(self):
-        for n, globs in enumerate(self._GLOBS):
-            with self.subTest(globs=globs), isolated_hermes_home() as home:
-                repo = self._dirlink_repo(home, f"svc{n}", globs, "printf regen > snapshots/home.png")
-                self._assert_tampered(repo, ["snapshots/home.png"], run_hooks=True)
-                self.assertEqual((repo / "real_snapshots" / "home.png").read_text(encoding="utf-8"), "regen")
-
-    def test_retargeted_or_escaping_directory_symlink_fails_closed(self):
-        from factonio.harness import _frozen_baseline_changes
-
-        for n, globs in enumerate(self._GLOBS):
-            with self.subTest("retargeted", globs=globs), isolated_hermes_home() as home:
-                repo = self._dirlink_repo(home, f"svc{n}", globs)
-                _write(repo, "alt_snapshots/home.png", "png-other\n")
-                (repo / "snapshots").unlink()
-                os.symlink("alt_snapshots", repo / "snapshots")
-                self._assert_tampered(repo, ["snapshots"])
-        with self.subTest("escaping"), isolated_hermes_home() as home:
-            (home / "outside_snaps").mkdir()
-            (home / "outside_snaps" / "home.png").write_text("png-v1\n", encoding="utf-8")
-            repo = self._repo(home, "esc", {}, {"snapshots": "../outside_snaps"}, None)
-            head = _git(repo, "rev-parse", "HEAD")
-            frozen = {"pixels": ["snapshots/**"]}
-            self.assertEqual(_frozen_baseline_changes(repo, frozen, head)[0]["changed_files"], ["snapshots"])
-            (home / "outside_snaps" / "home.png").write_text("png-tampered\n", encoding="utf-8")
-            self.assertEqual(_frozen_baseline_changes(repo, frozen, head)[0]["changed_files"], ["snapshots"])
-
-    def test_live_added_frozen_hook_pins_baselines_behind_directory_symlink(self):
-        from factonio.harness import check_harness
-
-        with isolated_hermes_home() as home:
-            repo = self._repo(home, "svc", {"real_snapshots/home.png": "png-v1\n"}, {"snapshots": "real_snapshots"},
-                              [{"name": "lint", "kind": "invariant", "command": "true"}])
-            TestFixRound9LiveFrozenBaselines._add_live_visual_hook(repo, "true")
-            clean = check_harness(str(repo), run_hooks=True)
-            self.assertTrue(clean["valid"], clean["errors"])
-            self.assertEqual(clean["visual_baseline_changes"], [])
-            _write(repo, "real_snapshots/home.png", "png-tampered\n")
-            chk = check_harness(str(repo), run_hooks=True)
-            self.assertFalse(chk["valid"])
-            self.assertEqual(self._changed(chk), ["snapshots/home.png"])
-
-    def test_nested_directory_symlink_below_a_real_directory(self):
-        with isolated_hermes_home() as home:
-            repo = self._repo(home, "svc", {"real_sub/home.png": "png-v1\n", "snapshots/keep.txt": ""},
-                              {"snapshots/sub": "../real_sub"}, self._visual(["snapshots/sub/**"]))
-            self._assert_clean(repo)
-            _write(repo, "real_sub/home.png", "png-tampered\n")
-            self._assert_tampered(repo, ["snapshots/sub/home.png"])
-
-    def test_cyclic_directory_symlink_terminates_and_still_pins_its_files(self):
-        """Round 24: a finite loop (`real/loop -> .`) is clean until a hop or referent changes (it used to fail
-        closed, which also rejected a valid `alias -> .` under `alias/**`). Round 25: the loop link is its own
-        edge, so the virtual path a checker opens through it (`snapshots/loop/home.png`) is pinned too."""
-        from factonio.harness import _frozen_baseline_changes
-
-        frozen = {"pixels": ["snapshots/**"]}
-        with isolated_hermes_home() as home:
-            repo = self._repo(home, "svc", {"real/home.png": "png-v1\n"}, {"snapshots": "real", "real/loop": "."}, None)
-            head = _git(repo, "rev-parse", "HEAD")
-            self.assertEqual(_frozen_baseline_changes(repo, frozen, head), [])
-            _write(repo, "real/home.png", "png-tampered\n")
-            self.assertEqual(_frozen_baseline_changes(repo, frozen, head)[0]["changed_files"],
-                             ["snapshots/home.png", "snapshots/loop/home.png"])
-            _write(repo, "real/home.png", "png-v1\n")
-            _write(repo, "alt/new.png", "png-other\n")
-            (repo / "real" / "loop").unlink()
-            os.symlink("../alt", repo / "real" / "loop")
-            self.assertEqual(_frozen_baseline_changes(repo, frozen, head)[0]["changed_files"], ["snapshots/loop"])
-
-    def test_could_prefix_match(self):
-        from factonio.harness import _could_prefix_match
-
-        for link, globs in (("snapshots", ["snapshots/**"]), ("snapshots", ["snapshots/*.png"]),
-                            ("snapshots", ["snapshots/home.png"]), ("snapshots", ["**/home.png"]),
-                            ("snapshots", ["*/home.png"]), ("snapshots", ["./snapshots/"]),
-                            ("snapshots/sub", ["snapshots/sub/**"]), ("snapshots/sub", ["snapshots/**/*.png"]),
-                            ("snapshots/sub", ["snapshots/sub/a.png"])):
-            with self.subTest(link=link, globs=globs):
-                self.assertTrue(_could_prefix_match(globs, link))
-        for link, globs in (("snapshots", ["snapshots"]), ("snapshots", ["other/**"]),
-                            ("snapshots/sub", ["snapshots/other/*.png"]), ("snapshots/sub", ["snapshots/*.png"])):
-            with self.subTest(link=link, globs=globs):
-                self.assertFalse(_could_prefix_match(globs, link))
-
-
-class TestFixRound24RootAndUnrelatedSymlinks(unittest.TestCase):
-    """Round 24: a committed directory link to the repository root (`alias -> .`, `sub/up -> ..`) is a valid
-    finite path, and committed symlinks are resolved in the committed tree before any live-disk check, so under
-    `**` globs an unrelated file link, an unrelated directory link without matching baselines, or an external
-    file link never counts as a tampered frozen baseline, while real tampering and escaping links still fail."""
-
-    _repo = staticmethod(TestFixRound23CommittedDirectorySymlinks._repo)
-    _visual = staticmethod(TestFixRound23CommittedDirectorySymlinks._visual)
-    _changed = staticmethod(TestFixRound23CommittedDirectorySymlinks._changed)
-    _assert_clean = TestFixRound23CommittedDirectorySymlinks._assert_clean
-    _assert_tampered = TestFixRound23CommittedDirectorySymlinks._assert_tampered
-
-    _CMP = "cmp -s {link} approved.png"
-
-    def _root_repo(self, home: Path, name: str, link: str, target: str, globs: list[str], baseline: str) -> Path:
-        files = {"golden.png": "pixels-v1\n", "approved.png": "pixels-v1\n"}
-        if "/" in link:
-            files[f"{link.rsplit('/', 1)[0]}/keep.txt"] = ""
-        return self._repo(home, name, files, {link: target}, self._visual(globs, self._CMP.format(link=baseline)))
-
-    _ROOT_CASES = (("alias", ".", ["alias/golden.png"], "alias/golden.png"),
-                   ("alias", ".", ["alias/**"], "alias/golden.png"),
-                   ("sub/up", "..", ["sub/up/golden.png"], "sub/up/golden.png"))
-
-    def test_unchanged_link_to_repository_root_is_clean(self):
-        for n, (link, target, globs, baseline) in enumerate(self._ROOT_CASES):
-            with self.subTest(link=link, globs=globs), isolated_hermes_home() as home:
-                repo = self._root_repo(home, f"svc{n}", link, target, globs, baseline)
-                self.assertEqual(_git(repo, "status", "--porcelain"), "")
-                self._assert_clean(repo)
-
-    def test_mutating_the_root_referent_or_retargeting_the_root_link_is_caught(self):
-        for n, (link, target, globs, baseline) in enumerate(self._ROOT_CASES):
-            with self.subTest("referent behind assume-unchanged", link=link, globs=globs), isolated_hermes_home() as home:
-                repo = self._root_repo(home, f"ref{n}", link, target, globs, baseline)
-                _write(repo, "golden.png", "pixels-v2\n")
-                _write(repo, "approved.png", "pixels-v2\n")
-                _git(repo, "update-index", "--assume-unchanged", "golden.png", "approved.png")
-                self.assertEqual(_git(repo, "status", "--porcelain"), "")
-                expected = ["alias/approved.png", baseline] if globs == ["alias/**"] else [baseline]
-                self._assert_tampered(repo, expected, run_hooks=True)
-            with self.subTest("root link retargeted", link=link, globs=globs), isolated_hermes_home() as home:
-                repo = self._root_repo(home, f"tgt{n}", link, target, globs, baseline)
-                _write(repo, "alt/golden.png", "pixels-v1\n")
-                (repo / link).unlink()
-                os.symlink("alt" if link == "alias" else "../alt", repo / link)
-                self._assert_tampered(repo, [link])
-
-    def _star_repo(self, home: Path, name: str, globs: list[str], files: dict[str, str],
-                   links: dict[str, str]) -> Path:
-        return self._repo(home, name, {"snapshots/home.png": "png-v1\n", "README.md": "readme\n", **files},
-                          links, self._visual(globs))
-
-    def test_unrelated_file_link_under_double_star_glob_is_ignored(self):
-        for n, (globs, link) in enumerate(((["**/*.png"], "docs/readme_link"), (["snapshots/**/*.png"], "snapshots/notes.md"))):
-            with self.subTest(globs=globs), isolated_hermes_home() as home:
-                repo = self._star_repo(home, f"svc{n}", globs, {}, {link: "../README.md"})
-                self._assert_clean(repo)
-                _write(repo, "README.md", "edited readme\n")
-                self._assert_clean(repo)
-
-    def test_unrelated_directory_link_without_matching_baselines_is_ignored(self):
-        globs = ["**/*.png"]
-        for label in ("retargeted", "removed"):
-            with self.subTest(label), isolated_hermes_home() as home:
-                repo = self._star_repo(home, label, globs, {"real_docs/guide.md": "v1\n"}, {"docs": "real_docs"})
-                self._assert_clean(repo)
-                (repo / "docs").unlink()
-                if label == "retargeted":
-                    _write(repo, "real_docs_v2/guide.md", "v2\n")
-                    os.symlink("real_docs_v2", repo / "docs")
-                self._assert_clean(repo)
-
-    def test_unrelated_external_file_link_on_clean_repo_is_ignored(self):
-        with isolated_hermes_home() as home:
-            outside = home / "tool"
-            outside.write_text("#!/bin/sh\n", encoding="utf-8")
-            repo = self._star_repo(home, "svc", ["**/*.png"], {}, {"docs/tool_link": str(outside)})
-            self._assert_clean(repo)
-
-    def test_escaping_directory_link_under_double_star_glob_still_fails_closed(self):
-        from factonio.harness import _frozen_baseline_changes
-
-        with isolated_hermes_home() as home:
-            (home / "outside_snaps").mkdir()
-            (home / "outside_snaps" / "home.png").write_text("png-v1\n", encoding="utf-8")
-            repo = self._repo(home, "esc", {"assets/keep.txt": ""}, {"snapshots": "../outside_snaps"}, None)
-            head = _git(repo, "rev-parse", "HEAD")
-            out = _frozen_baseline_changes(repo, {"pixels": ["**/*.png"]}, head)
-            self.assertEqual(out[0]["changed_files"], ["snapshots"])
-
-    def test_retargeting_an_empty_directory_link_to_matching_files_is_caught(self):
-        from factonio.harness import _frozen_baseline_changes
-
-        with isolated_hermes_home() as home:
-            repo = self._repo(home, "svc", {"empty_dir/keep.txt": ""}, {"snapshots": "empty_dir"}, None)
-            head = _git(repo, "rev-parse", "HEAD")
-            frozen = {"pixels": ["snapshots/**/*.png"]}
-            self.assertEqual(_frozen_baseline_changes(repo, frozen, head), [])
-            _write(repo, "alt_snapshots/home.png", "png-other\n")
-            (repo / "snapshots").unlink()
-            os.symlink("alt_snapshots", repo / "snapshots")
-            self.assertEqual(_frozen_baseline_changes(repo, frozen, head)[0]["changed_files"], ["snapshots"])
-
-    def test_resolve_committed_symlink(self):
-        from factonio.harness import _committed_dirs, _resolve_committed_symlink
-
-        tree = {"golden.png": ("100644", "g"), "alias": ("120000", "a"), "sub/up": ("120000", "u"),
-                "docs/readme_link": ("120000", "r"), "abs": ("120000", "x"), "esc": ("120000", "e"),
-                "gone": ("120000", "m"), "loop1": ("120000", "l1"), "loop2": ("120000", "l2")}
-        targets = {"a": ".", "u": "..", "r": "../golden.png", "x": "/usr/bin/env", "e": "../outside",
-                   "m": "missing", "l1": "loop2", "l2": "loop1"}
-        dirs = _committed_dirs(tree)
-        for link, expected in (("alias", ("dir", "")), ("sub/up", ("dir", "")), ("docs/readme_link", ("file", "golden.png")),
-                               ("alias/golden.png", ("file", "golden.png"))):
-            with self.subTest(link=link):
-                self.assertEqual(_resolve_committed_symlink(tree, dirs, link, targets), expected)
-        for link in ("abs", "esc", "loop1"):
-            with self.subTest(link=link):
-                self.assertEqual(_resolve_committed_symlink(tree, dirs, link, targets)[0], "invalid")
-        # Round 25: a relative in-repo target absent from the tree (an empty directory) is not invalid.
-        self.assertEqual(_resolve_committed_symlink(tree, dirs, "gone", targets), ("missing_in_tree", "missing"))
-
-    def test_concrete_prefix_match(self):
-        from factonio.harness import _concrete_prefix_match
-
-        for rel, globs in (("snapshots", ["snapshots/**"]), ("snapshots", ["snapshots/*.png"]),
-                           ("snapshots", ["snapshots/home.png"]), ("snapshots/sub", ["snapshots/sub/**"])):
-            with self.subTest(rel=rel, globs=globs):
-                self.assertTrue(_concrete_prefix_match(globs, rel))
-        for rel, globs in (("docs/tool_link", ["**/*.png"]), ("snapshots/sub", ["snapshots/**/*.png"]),
-                           ("docs", ["snapshots/**"]), ("snapshots", ["snapshots"])):
-            with self.subTest(rel=rel, globs=globs):
-                self.assertFalse(_concrete_prefix_match(globs, rel))
-
-
-
-class TestFixRound25GlobGuidedSymlinkExpansion(unittest.TestCase):
-    """Round 25: directory-link expansion is a product automaton over (link edge, glob NFA state), so a finite
-    repeated traversal (`alias -> .` under `alias/alias/golden.png`) pins its baseline and sibling links to one
-    directory are each pinned, and an unchanged link to an in-repo directory with no committed blob (Git keeps
-    no empty directory) stays clean until it exposes a matching file or is retargeted."""
-
-    _repo = staticmethod(TestFixRound23CommittedDirectorySymlinks._repo)
-    _visual = staticmethod(TestFixRound23CommittedDirectorySymlinks._visual)
-    _changed = staticmethod(TestFixRound23CommittedDirectorySymlinks._changed)
-    _assert_clean = TestFixRound23CommittedDirectorySymlinks._assert_clean
-    _assert_tampered = TestFixRound23CommittedDirectorySymlinks._assert_tampered
-
-    _REPEATED = ((["alias/alias/golden.png"], "alias/alias/golden.png", ["alias/alias/golden.png"]),
-                 (["alias/alias/*.png"], "alias/alias/golden.png", ["alias/alias/approved.png", "alias/alias/golden.png"]),
-                 (["alias/alias/alias/golden.png"], "alias/alias/alias/golden.png", ["alias/alias/alias/golden.png"]))
-
-    def _alias_repo(self, home: Path, name: str, globs: list[str], command: str) -> Path:
-        return self._repo(home, name, {"golden.png": "pixels-v1\n", "approved.png": "pixels-v1\n"},
-                          {"alias": "."}, self._visual(globs, command))
-
-    def test_repeated_root_link_is_clean_until_tampered(self):
-        for n, (globs, baseline, expected) in enumerate(self._REPEATED):
-            cmp_cmd = f"cmp -s {baseline} approved.png"
-            with self.subTest("unchanged", globs=globs), isolated_hermes_home() as home:
-                repo = self._alias_repo(home, f"svc{n}", globs, cmp_cmd)
-                self.assertEqual(_git(repo, "status", "--porcelain"), "")
-                self._assert_clean(repo)
-            with self.subTest("referent behind assume-unchanged", globs=globs), isolated_hermes_home() as home:
-                repo = self._alias_repo(home, f"ref{n}", globs, cmp_cmd)
-                _write(repo, "golden.png", "pixels-v2\n")
-                _write(repo, "approved.png", "pixels-v2\n")
-                _git(repo, "update-index", "--assume-unchanged", "golden.png", "approved.png")
-                self.assertEqual(_git(repo, "status", "--porcelain"), "")
-                self._assert_tampered(repo, expected, run_hooks=True)
-            with self.subTest("hook regenerates the baseline", globs=globs), isolated_hermes_home() as home:
-                repo = self._alias_repo(home, f"regen{n}", globs, f"printf regen > {baseline}")
-                self._assert_tampered(repo, [baseline], run_hooks=True)
-                self.assertEqual((repo / "golden.png").read_text(encoding="utf-8"), "regen")
-            with self.subTest("root link retargeted", globs=globs), isolated_hermes_home() as home:
-                repo = self._alias_repo(home, f"tgt{n}", globs, "true")
-                _write(repo, "alt/golden.png", "pixels-v1\n")
-                (repo / "alias").unlink()
-                os.symlink("alt", repo / "alias")
-                self._assert_tampered(repo, ["alias"])
-
-    def test_repetition_beyond_the_hop_bound_fails_closed(self):
-        from factonio.harness import _frozen_baseline_changes
-
-        with isolated_hermes_home() as home:
-            repo = self._alias_repo(home, "deep", ["alias/" * 42 + "golden.png"], "true")
-            head = _git(repo, "rev-parse", "HEAD")
-            out = _frozen_baseline_changes(repo, {"pixels": ["alias/" * 42 + "golden.png"]}, head)
-            self.assertTrue(out and out[0]["changed_files"], out)
-
-    def test_sibling_links_to_one_directory_are_each_pinned(self):
-        for n, globs in enumerate((["*/home.png"], ["**/*.png"])):
-            def sibling_repo(home: Path, name: str) -> Path:
-                return self._repo(home, name, {"real_snaps/home.png": "png-v1\n"},
-                                  {"a": "real_snaps", "b": "real_snaps"}, self._visual(globs))
-
-            with self.subTest("unchanged", globs=globs), isolated_hermes_home() as home:
-                self._assert_clean(sibling_repo(home, f"svc{n}"))
-            with self.subTest("only b retargeted", globs=globs), isolated_hermes_home() as home:
-                repo = sibling_repo(home, f"tgt{n}")
-                _write(repo, "alt_snaps/home.png", "png-other\n")
-                (repo / "b").unlink()
-                os.symlink("alt_snaps", repo / "b")
-                self._assert_tampered(repo, ["b"])
-            with self.subTest("shared referent behind assume-unchanged", globs=globs), isolated_hermes_home() as home:
-                repo = sibling_repo(home, f"ref{n}")
-                _write(repo, "real_snaps/home.png", "png-tampered\n")
-                _git(repo, "update-index", "--assume-unchanged", "real_snaps/home.png")
-                self._assert_tampered(repo, ["a/home.png", "b/home.png", "real_snaps/home.png"])
-
-    def _empty_link_repo(self, home: Path, name: str) -> Path:
-        repo = self._repo(home, name, {"snapshots/home.png": "png-v1\n"}, {"not-image": "empty"},
-                          self._visual(["**/*.png"]))
-        (repo / "empty").mkdir()
-        return repo
-
-    def test_unchanged_link_to_empty_in_repo_directory_is_clean(self):
-        with isolated_hermes_home() as home:
-            repo = self._empty_link_repo(home, "svc")
-            self.assertEqual(_git(repo, "status", "--porcelain"), "")
-            self._assert_clean(repo)
-            _write(repo, "empty/notes.txt", "notes\n")  # a live non-matching file exposes no baseline
-            self._assert_clean(repo)
-
-    def test_link_to_empty_directory_exposing_matching_files_or_retargeted_fails_closed(self):
-        with isolated_hermes_home() as home:
-            with self.subTest("matching file added below"):
-                repo = self._empty_link_repo(home, "png")
-                _write(repo, "empty/sneaky.png", "png-other\n")
-                self._assert_tampered(repo, ["not-image"])
-            with self.subTest("live symlink below that can lead to matches"):
-                repo = self._empty_link_repo(home, "nested")
-                os.symlink("../snapshots", repo / "empty" / "sneaky")
-                self._assert_tampered(repo, ["not-image"])
-            with self.subTest("retargeted outside the repository"):
-                (home / "outside_dir").mkdir()
-                repo = self._empty_link_repo(home, "out")
-                (repo / "not-image").unlink()
-                os.symlink("../outside_dir", repo / "not-image")
-                self._assert_tampered(repo, ["not-image"])
-
-    def test_escaping_directory_link_still_fails_closed(self):
-        from factonio.harness import _frozen_baseline_changes
-
-        with isolated_hermes_home() as home:
-            (home / "outside_snaps").mkdir()
-            (home / "outside_snaps" / "home.png").write_text("png-v1\n", encoding="utf-8")
-            repo = self._repo(home, "esc", {"assets/keep.txt": ""}, {"snapshots": "../outside_snaps"}, None)
-            head = _git(repo, "rev-parse", "HEAD")
-            for globs in (["**/*.png"], ["snapshots/**"]):
-                with self.subTest(globs=globs):
-                    out = _frozen_baseline_changes(repo, {"pixels": globs}, head)
-                    self.assertEqual(out[0]["changed_files"], ["snapshots"])
-
-    def test_glob_states_agree_with_glob_matches(self):
-        from factonio.harness import _glob_states, _glob_tokens, glob_matches
-
-        patterns = ("alias/alias/golden.png", "alias/alias/*.png", "**/*.png", "alias/**", "snapshots/",
-                    "./snapshots/**/a?.png", "a/**/b/**", "snap**.png", "*/home.png")
-        paths = ("alias/alias/golden.png", "alias/golden.png", "x/y/z.png", "z.png", "alias", "alias/a/b",
-                 "snapshots", "snapshots/a1.png", "snapshots/x/y/ab.png", "a/b", "a/x/b/c", "snapshots/q.png",
-                 "snapx/y.png", "a/home.png", "a/b/home.png")
-        for pat in patterns:
-            for path in paths:
-                with self.subTest(pat=pat, path=path):
-                    accept = len(_glob_tokens(pat)) in _glob_states([pat], path)[0]
-                    self.assertEqual(accept, glob_matches(pat, path))
-        self.assertEqual(_glob_states(["alias/**"], "alias/"), _glob_states(["alias/**"], "alias/alias/"))
-        self.assertNotEqual(_glob_states(["alias/alias/*.png"], "alias/"),
-                            _glob_states(["alias/alias/*.png"], "alias/alias/"))
-
-
-class TestFixRound26LinkGraphIndexAndNormalizedBaselines(unittest.TestCase):
-    """Round 26: directory-link ownership is a reverse-reachability fixed point (mutually recursive links are
-    each pinned), live walks see nested symlinks but never match ordinary directory names, `baseline_paths`
-    must be normalized repo-relative globs, and every committed path a symlink-backed baseline relies on must
-    still be in the index and the `HEAD` tree (`git rm --cached` / `git mv` leaving an untracked copy)."""
-
-    _repo = staticmethod(TestFixRound23CommittedDirectorySymlinks._repo)
-    _visual = staticmethod(TestFixRound23CommittedDirectorySymlinks._visual)
-    _changed = staticmethod(TestFixRound23CommittedDirectorySymlinks._changed)
-    _assert_clean = TestFixRound23CommittedDirectorySymlinks._assert_clean
-    _assert_tampered = TestFixRound23CommittedDirectorySymlinks._assert_tampered
-
     def _assert_tampered_since(self, repo: Path, base: str, expected: list[str]) -> None:
         from factonio.harness import audit_harness, check_harness
 
@@ -5104,84 +4585,197 @@ class TestFixRound26LinkGraphIndexAndNormalizedBaselines(unittest.TestCase):
         self.assertEqual(audit["severity"], "stale", audit)
         self.assertEqual(self._changed(audit), expected)
 
-    # -- ordinary directory names behind an unchanged link to an empty directory -------------------------
+    # -- committed symlinks that are, or lead to, frozen baselines fail closed even when unchanged ---------
 
-    def _empty_link_repo(self, home: Path, name: str) -> Path:
-        repo = self._repo(home, name, {"snapshots/home.png": "png-v1\n"}, {"not-image": "empty"},
-                          [{"name": "pixels", "kind": "visual_diff", "command": "cmp -s snapshots/home.png snapshots/home.png",
-                            "baseline_paths": ["**/*.png"]}])
-        (repo / "empty").mkdir()
-        return repo
+    _GOLDEN = {"golden.png": "pixels-v1\n", "approved.png": "pixels-v1\n"}
+    _SYMLINK_CASES = (
+        ("file link, literal glob", {"snapshots/home.png": "png-v1\n"}, {"home_link.png": "snapshots/home.png"},
+         ["home_link.png"], ["home_link.png"]),
+        ("file link, ** glob", {"snapshots/home.png": "png-v1\n"}, {"home_link.png": "snapshots/home.png"},
+         ["**/*.png"], ["home_link.png"]),
+        ("file link below a baseline dir", {"golden.png": "png-v1\n", "snapshots/keep.txt": ""},
+         {"snapshots/baseline.png": "../golden.png"}, ["snapshots/**"], ["snapshots/baseline.png"]),
+        ("dir link at concrete prefix", {"snapshots/home.png": "png-v1\n"}, {"current": "snapshots"},
+         ["current/*.png"], ["current"]),
+        ("dir link at concrete prefix, current/**", {"snapshots/home.png": "png-v1\n"}, {"current": "snapshots"},
+         ["current/**"], ["current"]),
+        ("dir link, ** prefix exposing a match", {"real/home.png": "png-v1\n"}, {"snapshots": "real"},
+         ["**/*.png"], ["snapshots"]),
+        ("root link", _GOLDEN, {"alias": "."}, ["alias/golden.png"], ["alias"]),
+        ("root link under alias/**", _GOLDEN, {"alias": "."}, ["alias/**"], ["alias"]),
+        ("repeated root link", _GOLDEN, {"alias": "."}, ["alias/alias/golden.png"], ["alias"]),
+        ("parent link", {**_GOLDEN, "sub/keep.txt": ""}, {"sub/up": ".."}, ["sub/up/golden.png"], ["sub/up"]),
+        ("mutually recursive links, **", {"dir2/golden.png": "png-v1\n", "dir1/keep.txt": ""},
+         {"dir1/a": "../dir2", "dir2/b": "../dir1"}, ["**/*.png"], ["dir1/a", "dir2/b"]),
+        ("mutually recursive links, dir1/**", {"dir2/golden.png": "png-v1\n", "dir1/keep.txt": ""},
+         {"dir1/a": "../dir2", "dir2/b": "../dir1"}, ["dir1/**/*.png"], ["dir1/a"]),
+    )
 
-    def test_ordinary_directory_named_like_a_baseline_is_not_a_baseline(self):
+    def test_committed_symlink_baselines_fail_closed_even_unchanged(self):
+        for n, (label, files, links, globs, expected) in enumerate(self._SYMLINK_CASES):
+            with self.subTest(label, globs=globs), isolated_hermes_home() as home:
+                repo = self._repo(home, f"svc{n}", files, links, self._visual(globs))
+                self.assertEqual(_git(repo, "status", "--porcelain"), "")
+                self._assert_tampered(repo, expected)
+
+    def test_unverifiable_and_escaping_symlinks_fail_closed(self):
+        from factonio.harness import _frozen_baseline_changes
+
         with isolated_hermes_home() as home:
-            repo = self._empty_link_repo(home, "svc")
-            (repo / "empty" / "cache.png").mkdir()
-            self.assertEqual(_git(repo, "status", "--porcelain"), "")
-            self._assert_clean(repo)
-            _write(repo, "empty/cache.png/real.png", "png-other\n")
-            self._assert_tampered(repo, ["not-image"])
+            outside = home / "outside.png"
+            outside.write_text("png-v1\n", encoding="utf-8")
+            (home / "outside_snaps").mkdir()
+            (home / "outside_snaps" / "home.png").write_text("png-v1\n", encoding="utf-8")
+            cases = {
+                "external file": ({"snapshots/baseline.png": str(outside)}, ["snapshots/**"], ["snapshots/baseline.png"]),
+                "broken": ({"snapshots/baseline.png": "../missing.png"}, ["snapshots/**"], ["snapshots/baseline.png"]),
+                "self cycle": ({"snapshots/baseline.png": "baseline.png"}, ["snapshots/**"], ["snapshots/baseline.png"]),
+                "escaping dir, concrete prefix": ({"snapshots": "../outside_snaps"}, ["snapshots/**"], ["snapshots"]),
+                "escaping dir, ** prefix": ({"snapshots": "../outside_snaps"}, ["**/*.png"], ["snapshots"]),
+            }
+            for n, (label, (links, globs, expected)) in enumerate(cases.items()):
+                with self.subTest(label):
+                    repo = self._repo(home, f"svc{n}", {"assets/keep.txt": ""}, links, None)
+                    head = _git(repo, "rev-parse", "HEAD")
+                    out = _frozen_baseline_changes(repo, {"pixels": globs}, head)
+                    self.assertEqual(out[0]["changed_files"] if out else [], expected)
 
-    # -- nested live symlinks -------------------------------------------------------------------------
-
-    def test_live_matches_below_follows_nested_live_symlinks_but_not_directory_names(self):
-        from factonio.harness import _live_matches_below
+    def test_live_symlink_at_a_concrete_glob_prefix_fails_closed(self):
+        from factonio.harness import _frozen_baseline_changes
 
         with isolated_hermes_home() as home:
-            root = home / "live"
-            _write(root, "evil/home.png", "png\n")
-            (root / "fake").mkdir()
-            os.symlink("../evil", root / "fake" / "sub")
-            os.symlink("fake", root / "docs")
-            self.assertTrue(_live_matches_below(root, "docs", ["**/*.png"]))
-            (root / "fake2" / "cache.png").mkdir(parents=True)
-            os.symlink("fake2", root / "docs2")
-            self.assertFalse(_live_matches_below(root, "docs2", ["**/*.png"]))
-            (root / "fake3").mkdir()
-            os.symlink("../evil/home.png", root / "fake3" / "a")
-            os.symlink("fake3", root / "docs3")
-            self.assertTrue(_live_matches_below(root, "docs3", ["docs3/**"]))
-            self.assertFalse(_live_matches_below(root, "docs3", ["docs3/*.png"]))
+            with self.subTest("committed directory replaced by a symlink to identical bytes"):
+                repo = self._repo(home, "svc", {"snapshots/home.png": "png-v1\n"}, {}, None)
+                head = _git(repo, "rev-parse", "HEAD")
+                (repo / "snapshots").rename(repo / "alt_snapshots")
+                os.symlink("alt_snapshots", repo / "snapshots")
+                self.assertEqual((repo / "snapshots" / "home.png").read_text(encoding="utf-8"), "png-v1\n")
+                out = _frozen_baseline_changes(repo, {"pixels": ["snapshots/**"]}, head)
+                self.assertEqual(out[0]["changed_files"], ["snapshots", "snapshots/home.png"])
+            with self.subTest("untracked symlink where no baseline exists yet"):
+                repo = self._repo(home, "fresh", {"README.md": "x\n"}, {}, None)
+                head = _git(repo, "rev-parse", "HEAD")
+                _write(repo, "evil/home.png", "png-other\n")
+                os.symlink("evil", repo / "golden")
+                for globs in (["golden/*.png"], ["golden/sub/**"]):
+                    out = _frozen_baseline_changes(repo, {"pixels": globs}, head)
+                    self.assertEqual(out[0]["changed_files"] if out else [], ["golden"])
 
-    # -- mutually recursive directory links -----------------------------------------------------------
-
-    _CYCLE_GLOBS = (["**/*.png"], ["dir1/**/*.png"])
-
-    def _cycle_repo(self, home: Path, name: str, globs: list[str], command: str = "true") -> Path:
-        return self._repo(home, name, {"dir2/golden.png": "pixels-v1\n", "dir1/keep.txt": "", "approved.png": "pixels-v1\n"},
-                          {"dir1/a": "../dir2", "dir2/b": "../dir1"}, self._visual(globs, command))
-
-    def test_mutually_recursive_directory_links_are_each_pinned(self):
+    def test_live_added_frozen_hook_fails_closed_on_committed_symlink(self):
         from factonio.harness import check_harness
 
-        for n, globs in enumerate(self._CYCLE_GLOBS):
-            with self.subTest("unchanged", globs=globs), isolated_hermes_home() as home:
-                repo = self._cycle_repo(home, f"svc{n}", globs, "cmp -s dir1/a/golden.png approved.png")
-                self.assertEqual(_git(repo, "status", "--porcelain"), "")
+        with isolated_hermes_home() as home:
+            repo = self._repo(home, "svc", {"real_snapshots/home.png": "png-v1\n"}, {"snapshots": "real_snapshots"},
+                              [{"name": "lint", "kind": "invariant", "command": "true"}])
+            TestFixRound9LiveFrozenBaselines._add_live_visual_hook(repo, "true")
+            for run_hooks in (False, True):
+                chk = check_harness(str(repo), run_hooks=run_hooks)
+                self.assertFalse(chk["valid"])
+                self.assertEqual(self._changed(chk), ["snapshots"])
+
+    # -- unrelated symlinks stay clean ------------------------------------------------------------------
+
+    def _star_repo(self, home: Path, name: str, globs: list[str], files: dict[str, str],
+                   links: dict[str, str]) -> Path:
+        return self._repo(home, name, {"snapshots/home.png": "png-v1\n", "README.md": "readme\n", **files},
+                          links, self._visual(globs))
+
+    def test_unrelated_file_links_stay_clean(self):
+        for n, (globs, link) in enumerate(((["**/*.png"], "docs/readme_link"), (["snapshots/**/*.png"], "snapshots/notes.md"))):
+            with self.subTest(globs=globs), isolated_hermes_home() as home:
+                repo = self._star_repo(home, f"svc{n}", globs, {}, {link: "../README.md"})
                 self._assert_clean(repo)
-            with self.subTest("b deleted", globs=globs), isolated_hermes_home() as home:
-                repo = self._cycle_repo(home, f"del{n}", globs)
-                (repo / "dir2" / "b").unlink()
-                chk = check_harness(str(repo))
-                self.assertTrue(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
-                self.assertIn("dir1/a/b", self._changed(chk))
-            with self.subTest("b retargeted to a forged golden", globs=globs), isolated_hermes_home() as home:
-                repo = self._cycle_repo(home, f"tgt{n}", globs, "cmp -s dir1/a/b/a approved.png")
-                _write(repo, "evil/golden.png", "pixels-v1\n")
-                (repo / "fake").mkdir()
-                os.symlink("../evil/golden.png", repo / "fake" / "a")
-                (repo / "dir2" / "b").unlink()
-                os.symlink("../fake", repo / "dir2" / "b")
-                chk = check_harness(str(repo), run_hooks=True)
-                self.assertFalse(chk["valid"])
-                self.assertTrue(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
-                self.assertIn("dir1/a/b", self._changed(chk))
-            with self.subTest("hook retargets b itself", globs=globs), isolated_hermes_home() as home:
-                repo = self._cycle_repo(home, f"hook{n}", globs,
-                                        "mkdir -p fake && rm dir2/b && ln -s ../fake dir2/b")
-                chk = check_harness(str(repo), run_hooks=True)
-                self.assertFalse(chk["valid"])
-                self.assertIn("dir1/a/b", self._changed(chk))
+                _write(repo, "README.md", "edited readme\n")
+                self._assert_clean(repo)
+        with self.subTest("external file link"), isolated_hermes_home() as home:
+            outside = home / "tool"
+            outside.write_text("#!/bin/sh\n", encoding="utf-8")
+            self._assert_clean(self._star_repo(home, "ext", ["**/*.png"], {}, {"docs/tool_link": str(outside)}))
+
+    def test_unrelated_directory_links_stay_clean(self):
+        for label in ("unchanged", "retargeted", "removed"):
+            with self.subTest(label), isolated_hermes_home() as home:
+                repo = self._star_repo(home, label, ["**/*.png"], {"real_docs/guide.md": "v1\n"}, {"docs": "real_docs"})
+                if label != "unchanged":
+                    (repo / "docs").unlink()
+                if label == "retargeted":
+                    _write(repo, "real_docs_v2/guide.md", "v2\n")
+                    os.symlink("real_docs_v2", repo / "docs")
+                self._assert_clean(repo)
+        with self.subTest("link to an empty directory holding a directory named like a baseline"), \
+                isolated_hermes_home() as home:
+            repo = self._star_repo(home, "empty", ["**/*.png"], {}, {"not-image": "empty"})
+            (repo / "empty" / "cache.png").mkdir(parents=True)
+            _write(repo, "empty/notes.txt", "notes\n")
+            self._assert_clean(repo)
+
+    def test_directory_link_that_starts_exposing_matches_fails_closed(self):
+        with isolated_hermes_home() as home:
+            for n, (label, mutate) in enumerate((
+                ("matching file added below", lambda r: _write(r, "empty/sneaky.png", "png-other\n")),
+                ("matching file inside an ordinary directory", lambda r: _write(r, "empty/cache.png/real.png", "x\n")),
+                ("nested live symlink that can lead to matches", lambda r: os.symlink("../snapshots", r / "empty" / "sub")),
+                ("retargeted outside the repository", lambda r: ((r / "not-image").unlink(),
+                                                                 os.symlink("../outside_dir", r / "not-image"))),
+                ("retargeted to matching files", lambda r: (_write(r, "evil/home.png", "png-other\n"), (r / "not-image").unlink(),
+                                                            os.symlink("evil", r / "not-image"))),
+            )):
+                with self.subTest(label):
+                    (home / "outside_dir").mkdir(exist_ok=True)
+                    repo = self._star_repo(home, f"svc{n}", ["**/*.png"], {}, {"not-image": "empty"})
+                    (repo / "empty").mkdir()
+                    mutate(repo)
+                    self._assert_tampered(repo, ["not-image"])
+
+    # -- committed regular baselines are pinned in the index, HEAD and the live disk --------------------
+
+    def _regular_repo(self, home: Path, name: str, hooks: bool = True) -> Path:
+        return self._repo(home, name, {"snapshots/home.png": "png-v1\n"}, {},
+                          self._visual(["snapshots/*.png"]) if hooks else None)
+
+    @staticmethod
+    def _untrack(repo: Path, how: str) -> None:
+        if how == "rm --cached":
+            _git(repo, "rm", "-q", "--cached", "snapshots/home.png")
+        else:
+            _git(repo, "mv", "snapshots/home.png", "archive_home.png")
+            shutil.copyfile(repo / "archive_home.png", repo / "snapshots" / "home.png")
+
+    def test_untracked_regular_baseline_fails_closed_staged_and_committed(self):
+        for n, how in enumerate(("rm --cached", "mv")):
+            with self.subTest("staged", how=how), isolated_hermes_home() as home:
+                repo = self._regular_repo(home, f"st{n}")
+                self._untrack(repo, how)
+                self._assert_tampered(repo, ["snapshots/home.png"])
+            with self.subTest("committed", how=how), isolated_hermes_home() as home:
+                repo = self._regular_repo(home, f"co{n}")
+                base = _git(repo, "rev-parse", "HEAD")
+                self._untrack(repo, how)
+                _git(repo, "commit", "-q", "-m", "untrack baseline")
+                self.assertTrue((repo / "snapshots" / "home.png").is_file())
+                self._assert_tampered_since(repo, base, ["snapshots/home.png"])
+
+    def test_live_added_frozen_hook_with_staged_untracking_fails_closed(self):
+        from factonio.harness import bootstrap_verify_harness
+
+        with isolated_hermes_home() as home:
+            repo = self._regular_repo(home, "live", hooks=False)
+            bootstrap_verify_harness(str(repo), hooks=self._visual(["snapshots/*.png"]))
+            self._untrack(repo, "rm --cached")
+            self._assert_tampered(repo, ["snapshots/home.png"])
+
+    def test_unchanged_regular_baseline_stays_clean_under_assume_unchanged(self):
+        from factonio.harness import audit_harness
+
+        with isolated_hermes_home() as home:
+            repo = self._regular_repo(home, "ok")
+            _git(repo, "update-index", "--assume-unchanged", "snapshots/home.png")
+            self.assertEqual(_git(repo, "status", "--porcelain"), "")
+            self._assert_clean(repo)
+            base = _git(repo, "rev-parse", "HEAD")
+            _write(repo, "unrelated.txt", "x\n")
+            _commit_all(repo, "unrelated")
+            self.assertEqual(audit_harness(str(repo), base_ref=base)["severity"], "clean")
 
     # -- normalized baseline_paths ----------------------------------------------------------------------
 
@@ -5205,8 +4799,7 @@ class TestFixRound26LinkGraphIndexAndNormalizedBaselines(unittest.TestCase):
         from factonio.harness import _committed_blob_mismatches, _frozen_baseline_changes
 
         with isolated_hermes_home() as home:
-            repo = self._repo(home, "svc", {"snapshots/home.png": "png-v1\n"}, {"alias": "util"}, None)
-            (repo / "util").mkdir()
+            repo = self._repo(home, "svc", {"snapshots/home.png": "png-v1\n"}, {}, None)
             head = _git(repo, "rev-parse", "HEAD")
             for bad in self._UNNORMALIZED:
                 with self.subTest(bad=bad):
@@ -5214,77 +4807,50 @@ class TestFixRound26LinkGraphIndexAndNormalizedBaselines(unittest.TestCase):
                     out = _frozen_baseline_changes(repo, {"pixels": [bad]}, head)
                     self.assertEqual(out[0]["changed_files"], [bad])
 
-    # -- committed paths behind symlink-backed baselines are pinned in the index and HEAD --------------
+    # -- glob helpers -----------------------------------------------------------------------------------
 
-    _CASES = {
-        "dir link": ({"current": "snapshots"}, ["current/*.png"]),
-        "file link": ({"home_link.png": "snapshots/home.png"}, ["home_link.png"]),
-        "root link": ({"alias": "."}, ["alias/alias/snapshots/home.png"]),
-    }
+    def test_prefix_match_helpers(self):
+        from factonio.harness import _concrete_prefix_match, _could_prefix_match, _literal_dir_prefixes
 
-    def _pinned_repo(self, home: Path, name: str, case: str, hooks: bool = True) -> Path:
-        links, globs = self._CASES[case]
-        return self._repo(home, name, {"snapshots/home.png": "png-v1\n"}, links,
-                          self._visual(globs) if hooks else None)
+        for link, globs in (("snapshots", ["snapshots/**"]), ("snapshots", ["snapshots/*.png"]),
+                            ("snapshots", ["snapshots/home.png"]), ("snapshots", ["**/home.png"]),
+                            ("snapshots", ["*/home.png"]), ("snapshots", ["snapshots/"]),
+                            ("snapshots/sub", ["snapshots/sub/**"]), ("snapshots/sub", ["snapshots/**/*.png"]),
+                            ("snapshots/sub", ["snapshots/sub/a.png"])):
+            with self.subTest("could", link=link, globs=globs):
+                self.assertTrue(_could_prefix_match(globs, link))
+        for link, globs in (("snapshots", ["snapshots"]), ("snapshots", ["other/**"]),
+                            ("snapshots/sub", ["snapshots/other/*.png"]), ("snapshots/sub", ["snapshots/*.png"])):
+            with self.subTest("could not", link=link, globs=globs):
+                self.assertFalse(_could_prefix_match(globs, link))
+        for rel, globs in (("snapshots", ["snapshots/**"]), ("snapshots", ["snapshots/*.png"]),
+                           ("snapshots", ["snapshots/home.png"]), ("snapshots/sub", ["snapshots/sub/**"])):
+            with self.subTest("concrete", rel=rel, globs=globs):
+                self.assertTrue(_concrete_prefix_match(globs, rel))
+        for rel, globs in (("docs/tool_link", ["**/*.png"]), ("snapshots/sub", ["snapshots/**/*.png"]),
+                           ("docs", ["snapshots/**"]), ("snapshots", ["snapshots"])):
+            with self.subTest("not concrete", rel=rel, globs=globs):
+                self.assertFalse(_concrete_prefix_match(globs, rel))
+        for glob, expected in (("a/b/*.png", ["a", "a/b"]), ("snapshots/", ["snapshots"]), ("**/*.png", []),
+                               ("home.png", []), ("a/*/b/c.png", ["a"]), ("a/[bc]/d.png", ["a"])):
+            with self.subTest("literal", glob=glob):
+                self.assertEqual(_literal_dir_prefixes(glob), expected)
 
-    def _expected(self, case: str, untracked: str) -> list[str]:
-        if case == "dir link":
-            return ["current", "current/home.png"] if untracked == "current" else ["current/home.png"]
-        return ["home_link.png"] if case == "file link" else ["alias/alias/snapshots/home.png"]
+    def test_live_walk_follows_nested_symlinks_but_not_directory_names(self):
+        from factonio.harness import _live_walk_exposes
 
-    def _untrack(self, repo: Path, path: str, how: str) -> None:
-        if how == "rm --cached":
-            _git(repo, "rm", "-q", "--cached", path)
-        else:
-            _git(repo, "mv", path, f"archive_{path.replace('/', '_')}")
-            if (repo / f"archive_{path.replace('/', '_')}").is_symlink():
-                os.symlink(os.readlink(repo / f"archive_{path.replace('/', '_')}"), repo / path)
-            else:
-                shutil.copyfile(repo / f"archive_{path.replace('/', '_')}", repo / path)
-
-    def test_untracked_referent_or_link_fails_closed_staged_and_committed(self):
-        n = 0
-        for case in self._CASES:
-            untracked_paths = ["snapshots/home.png", "current"] if case == "dir link" else ["snapshots/home.png"]
-            for path in untracked_paths:
-                for how in ("rm --cached", "mv"):
-                    n += 1
-                    with self.subTest("staged", case=case, path=path, how=how), isolated_hermes_home() as home:
-                        repo = self._pinned_repo(home, f"st{n}", case)
-                        self._untrack(repo, path, how)
-                        self._assert_tampered(repo, self._expected(case, path))
-                    with self.subTest("committed", case=case, path=path, how=how), isolated_hermes_home() as home:
-                        repo = self._pinned_repo(home, f"co{n}", case)
-                        base = _git(repo, "rev-parse", "HEAD")
-                        self._untrack(repo, path, how)
-                        _git(repo, "commit", "-q", "-m", "untrack baseline")
-                        self.assertTrue((repo / path).exists() or (repo / path).is_symlink())
-                        self._assert_tampered_since(repo, base, self._expected(case, path))
-
-    def test_live_added_frozen_hook_with_staged_untracking_fails_closed(self):
-        from factonio.harness import bootstrap_verify_harness
-
-        for n, (case, path) in enumerate((("dir link", "snapshots/home.png"), ("dir link", "current"),
-                                          ("file link", "snapshots/home.png"))):
-            with self.subTest(case=case, path=path), isolated_hermes_home() as home:
-                repo = self._pinned_repo(home, f"live{n}", case, hooks=False)
-                bootstrap_verify_harness(str(repo), hooks=self._visual(self._CASES[case][1]))
-                self._untrack(repo, path, "rm --cached")
-                self._assert_tampered(repo, self._expected(case, path))
-
-    def test_unchanged_symlink_backed_baselines_stay_clean_under_assume_unchanged(self):
-        for n, case in enumerate(self._CASES):
-            with self.subTest(case=case), isolated_hermes_home() as home:
-                repo = self._pinned_repo(home, f"ok{n}", case)
-                _git(repo, "update-index", "--assume-unchanged", "snapshots/home.png")
-                self.assertEqual(_git(repo, "status", "--porcelain"), "")
-                self._assert_clean(repo)
-                base = _git(repo, "rev-parse", "HEAD")
-                _write(repo, "unrelated.txt", "x\n")
-                _commit_all(repo, "unrelated")
-                from factonio.harness import audit_harness
-
-                self.assertEqual(audit_harness(str(repo), base_ref=base)["severity"], "clean")
+        with isolated_hermes_home() as home:
+            root = home / "live"
+            _write(root, "evil/home.png", "png\n")
+            (root / "fake").mkdir()
+            os.symlink("../evil", root / "fake" / "sub")
+            self.assertTrue(_live_walk_exposes(root / "fake", "docs", ["**/*.png"]))
+            (root / "fake2" / "cache.png").mkdir(parents=True)
+            self.assertFalse(_live_walk_exposes(root / "fake2", "docs2", ["**/*.png"]))
+            (root / "fake3").mkdir()
+            os.symlink("../evil/home.png", root / "fake3" / "a")
+            self.assertTrue(_live_walk_exposes(root / "fake3", "docs3", ["docs3/**"]))
+            self.assertFalse(_live_walk_exposes(root / "fake3", "docs3", ["docs3/*.png"]))
 
 
 if __name__ == "__main__":
