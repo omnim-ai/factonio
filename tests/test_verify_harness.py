@@ -1889,6 +1889,7 @@ class TestFrozenVisualBaselines(unittest.TestCase):
                 "UPDATE_SNAPSHOTS=1": {"command": "UPDATE_SNAPSHOTS=1 " + self.COMMAND},
                 "max-diff-pixels": {"command": "npx playwright test --max-diff-pixels=500"},
                 "threshold": {"command": self.COMMAND + " --threshold 0.3"},
+                "zero threshold added": {"command": self.COMMAND + " --threshold 0"},
                 "unfrozen": {"frozen_baseline": False},
                 "unpinned": {"baseline_paths": None, "frozen_baseline": None},
             }
@@ -1909,7 +1910,7 @@ class TestFrozenVisualBaselines(unittest.TestCase):
                     self.assertEqual(audit["drift_classification"]["classification"], "doc_drift")
 
             for label, change in {
-                "tightened": {"command": "npx playwright test --max-diff-pixels=0 --threshold 0"},
+                "respelled in place": {"command": "npx playwright test --max-diff-pixels 0"},
                 "reworded": {"command": "npx playwright test --reporter=line --max-diff-pixels=0"},
                 "zero-env": {"command": "UPDATE_SNAPSHOTS=0 " + self.COMMAND},
             }.items():
@@ -2762,10 +2763,9 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
         "trailing --verbose": ("npx playwright test", "npx playwright test --verbose"),
         "trailing -q": ("pytest tests/visual", "pytest tests/visual -q"),
         "python3 -u": ("python3 check.py", "python3 -u check.py"),
-        "timeout python3 -u": ("timeout 30 python3 check.py", "timeout 30 python3 -u check.py"),
         "--update-snapshots=false": ("npx playwright test", "npx playwright test --update-snapshots=false"),
         "UPDATE_SNAPSHOTS=0": ("npx playwright test", "UPDATE_SNAPSHOTS=0 npx playwright test"),
-        "zero threshold added": ("npx playwright test", "npx playwright test --threshold 0"),
+        "threshold tightened to zero": ("npx playwright test --threshold 0.05", "npx playwright test --threshold 0"),
         "comment + whitespace": (_EXPORTED, "export THRESHOLD=0.01;   python3 check.py  # visual check"),
         "newlines": (_EXPORTED, "export THRESHOLD=0.01\npython3 check.py\n"),
         "line continuation": ("python3 check.py --threshold 0.01", "python3 check.py \\\n  --threshold 0.01"),
@@ -3278,15 +3278,204 @@ class TestFixRound14ShellWordsQuotingUnitsAndWrappers(unittest.TestCase):
         self._assert_rejected({
             "relative wrapper": ("tests/timeout 30 python3 check.py", "tests/timeout 30 python3 -u check.py"),
             "uv without run": ("uv tool python3 check.py", "uv tool python3 -u check.py"),
-        })
-        self._assert_clean({
-            "python3 -u": ("python3 check.py", "python3 -u check.py"),
-            "/usr/bin/python3 -u": ("/usr/bin/python3 check.py", "/usr/bin/python3 -u check.py"),
+            # Round 15: behind any wrapper `python3` may be a module, tool or option value, so `-u` is rejected
             "timeout python3 -u": ("timeout 30 python3 check.py", "timeout 30 python3 -u check.py"),
             "uv run python3 -u": ("uv run python3 check.py", "uv run python3 -u check.py"),
             "nice -n 5 python3 -u": ("nice -n 5 python3 check.py", "nice -n 5 python3 -u check.py"),
         })
+        self._assert_clean({
+            "python3 -u": ("python3 check.py", "python3 -u check.py"),
+            "/usr/bin/python3 -u": ("/usr/bin/python3 check.py", "/usr/bin/python3 -u check.py"),
+            "unchanged timeout python3 -u": ("timeout 30 python3 -u check.py", "timeout 30 python3 -u check.py"),
+            "unchanged uv run python3 -u": ("uv run python3 -u check.py", "uv run python3 -u check.py"),
+        })
         self._assert_executed_bypasses_rejected(bypasses)
+
+
+class TestFixRound15BlobHashBaselinesAndNoNewInsertions(unittest.TestCase):
+    """Round 15: frozen baselines are hashed against their committed blobs (immune to `assume-unchanged` /
+    `skip-worktree`), no threshold may be newly inserted, and Python `-u` only follows a segment-head interpreter."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    # `uv run -m X` / `uv run -s X` stand-in: `python3 -m X ...` / `python3 X ...`, as real `uv run` executes them.
+    _UV_SHIM = ('#!/bin/sh\n[ "$1" = run ] || exit 2\nshift\n'
+                'case "$1" in -m) shift; exec python3 -m "$@";; -s) shift; exec python3 "$@";; esac\nexec "$@"\n')
+    # A module/script named `python3` that "regenerates" (exits 0) when `-u` reaches its argv.
+    _REGEN_PY = "import sys\nsys.exit(0 if '-u' in sys.argv[1:] else 1)\n"
+
+    def _repo(self, home: Path, name: str, command: Any, extra_hooks: list[dict[str, Any]] | None = None) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "plain.js", TestFixRound14ShellWordsQuotingUnitsAndWrappers._PLAIN_JS_CHECK)
+        _write(repo, "python3.py", self._REGEN_PY)
+        _write(repo, "python3", self._REGEN_PY)
+        _commit_all(repo, "visual checks + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+            *(extra_hooks or []),
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def _assert_baseline_tampered(self, repo: Path, chk: dict) -> None:
+        from factonio.harness import audit_harness, detect_harness_gate_loosening
+
+        self.assertFalse(chk["valid"], chk["errors"])
+        self.assertEqual(chk["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+        before_index = _index_fingerprint(repo)
+        gate = detect_harness_gate_loosening(repo)
+        audit = audit_harness(str(repo))
+        self.assertEqual(_index_fingerprint(repo), before_index)  # strictly read-only
+        self.assertEqual(gate["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+        self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("stale", True))
+        self.assertEqual(audit["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+
+    def test_index_flags_cannot_hide_an_overwritten_frozen_baseline(self):
+        from factonio.harness import audit_harness, check_harness
+
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag=flag), isolated_hermes_home() as home:
+                repo = self._repo(home, "svc", "true")
+                _git(repo, "update-index", flag, "snapshots/home.png")
+                before_index = _index_fingerprint(repo)
+                clean = check_harness(str(repo))
+                self.assertEqual(_index_fingerprint(repo), before_index)
+                self.assertTrue(clean["valid"], clean["errors"])  # the flag alone, with approved bytes, is clean
+                self.assertEqual(audit_harness(str(repo))["severity"], "clean")
+
+                _write(repo, "snapshots/home.png", "png-tampered\n")
+                self.assertEqual(_git(repo, "status", "--porcelain"), "")  # invisible to `git status`
+                before_index = _index_fingerprint(repo)
+                chk = check_harness(str(repo))
+                self.assertEqual(_index_fingerprint(repo), before_index)
+                self._assert_baseline_tampered(repo, chk)
+
+    def test_hook_that_flags_then_overwrites_a_baseline_fails_check(self):
+        from factonio.harness import check_harness
+
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag=flag), isolated_hermes_home() as home:
+                tamper = {"name": "tamper", "kind": "invariant",
+                          "command": f"git update-index {flag} snapshots/home.png && printf regen > snapshots/home.png"}
+                repo = self._repo(home, "svc", "true", [tamper])
+                pre = check_harness(str(repo))
+                self.assertTrue(pre["valid"], pre["errors"])
+                chk = check_harness(str(repo), run_hooks=True)
+                self.assertEqual(chk["hook_results"]["failed_required"], [], chk["hook_results"])
+                self.assertEqual((repo / "snapshots" / "home.png").read_text(encoding="utf-8"), "regen")
+                self.assertEqual(_git(repo, "status", "--porcelain"), "")
+                self._assert_baseline_tampered(repo, chk)
+
+    def test_blob_hash_covers_deletion_type_change_and_symlinks(self):
+        from factonio.harness import _frozen_baseline_changes, _git_blob_oid
+
+        self.assertEqual(_git_blob_oid(b"", 40), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+        with isolated_hermes_home() as home:
+            repo = self._repo(home, "svc", "true")
+            os.symlink("home.png", repo / "snapshots" / "link.png")
+            head = _commit_all(repo, "symlinked baseline")
+            frozen = {"pixels": ["snapshots/**"]}
+            self.assertEqual(_frozen_baseline_changes(repo, frozen, head), [])
+
+            def changed() -> list[str]:
+                out = _frozen_baseline_changes(repo, frozen, head)
+                return out[0]["changed_files"] if out else []
+
+            _git(repo, "update-index", "--assume-unchanged", "snapshots/link.png", "snapshots/home.png")
+            (repo / "snapshots" / "link.png").unlink()
+            _write(repo, "snapshots/link.png", "home.png")  # same bytes as the link target text, but a file
+            self.assertEqual(changed(), ["snapshots/link.png"])
+            (repo / "snapshots" / "link.png").unlink()
+            os.symlink("other.png", repo / "snapshots" / "link.png")
+            self.assertEqual(changed(), ["snapshots/link.png"])
+            (repo / "snapshots" / "link.png").unlink()
+            os.symlink("home.png", repo / "snapshots" / "link.png")
+            (repo / "snapshots" / "home.png").unlink()
+            self.assertEqual(changed(), ["snapshots/home.png"])
+            (repo / "snapshots" / "home.png").mkdir()
+            self.assertEqual(changed(), ["snapshots/home.png"])
+
+    def test_no_threshold_may_be_newly_inserted(self):
+        from factonio.harness import _visual_hook_loosening
+
+        added = {
+            "duplicate =0%": ("node plain.js --threshold 0.05", "node plain.js --threshold 0.05 --threshold=0%"),
+            "duplicate 0%": ("node plain.js --threshold 0.05", "node plain.js --threshold 0.05 --threshold 0%"),
+            "duplicate =0": ("node plain.js --threshold 0.05", "node plain.js --threshold 0.05 --threshold=0"),
+            "new =0%": ("node plain.js", "node plain.js --threshold=0%"),
+            "new =0": ("node plain.js", "node plain.js --threshold=0"),
+            "new 0": ("node plain.js", "node plain.js --threshold 0"),
+            "new env 0": ("node plain.js", "THRESHOLD=0 node plain.js"),
+        }
+        self._assert_rejected(added)
+        for label, (base, live) in added.items():
+            with self.subTest(label):
+                self.assertTrue(any(r.startswith("adds threshold `") and "tightened in place" in r
+                                    for r in _visual_hook_loosening({"command": base}, {"command": live})))
+        self._assert_clean({
+            "tightened to 0": ("node plain.js --threshold 0.05", "node plain.js --threshold 0"),
+            "tightened to =0": ("node plain.js --threshold=0.05", "node plain.js --threshold=0"),
+            "% tightened to 0%": ("node plain.js --threshold 5%", "node plain.js --threshold 0%"),
+        })
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
+    def test_duplicate_zero_percent_threshold_is_rejected_end_to_end(self):
+        """`plain.js` keeps the last `--threshold`: `Number("0%")` is NaN and `0.80 > NaN` is false."""
+        from factonio.harness import audit_harness, check_harness
+
+        self._assert_executed_bypasses_rejected([
+            ("node plain.js --threshold 0.05", "node plain.js --threshold 0.05 --threshold=0%"),
+            ("node plain.js --threshold 0.05", "node plain.js --threshold 0.05 --threshold 0%"),
+        ])
+        with isolated_hermes_home() as home:
+            for n, live in enumerate(("node plain.js --threshold=0%", "node plain.js --threshold=0")):
+                with self.subTest(live=live):
+                    repo = self._repo(home, f"new{n}", "node plain.js")
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertFalse(chk["valid"])
+                    self.assertEqual(chk["gate_loosening"]["loosened_visual_hooks"], ["pixels"])
+                    self.assertEqual(audit_harness(str(repo))["severity"], "stale")
+
+    def test_python_u_only_after_a_segment_head_interpreter(self):
+        wrapped = {
+            "uv run -m": ("uv run -m python3 snapshots/a.png", "uv run -m python3 -u snapshots/a.png"),
+            "uv run -s": ("uv run -s python3 snapshots/a.png", "uv run -s python3 -u snapshots/a.png"),
+            "uv run --module": ("uv run --module python3 a.png", "uv run --module python3 -u a.png"),
+            "FOO=1 uv run -m": ("FOO=1 uv run -m python3 a.png", "FOO=1 uv run -m python3 -u a.png"),
+            "uvx": ("uvx python3 snapshots/a.png", "uvx python3 -u snapshots/a.png"),
+            "uv run --with": ("uv run --with python3 vitest", "uv run --with python3 -u vitest"),
+            "timeout -s": ("timeout -s python3 30 vitest", "timeout -s python3 -u 30 vitest"),
+            "xvfb-run -e": ("xvfb-run -e python3 vitest", "xvfb-run -e python3 -u vitest"),
+            "stdbuf -o": ("stdbuf -o python3 vitest", "stdbuf -o python3 -u vitest"),
+            "ionice -c": ("ionice -c python3 vitest", "ionice -c python3 -u vitest"),
+            "time -o": ("time -o python3 vitest", "time -o python3 -u vitest"),
+            "timeout 30": ("timeout 30 python3 check.py", "timeout 30 python3 -u check.py"),
+        }
+        self._assert_rejected(wrapped)
+        self._assert_clean({
+            "python3 -u": ("python3 check.py", "python3 -u check.py"),
+            "/usr/bin/python3 -u": ("/usr/bin/python3 check.py", "/usr/bin/python3 -u check.py"),
+            "env prefix + python3 -u": ("FOO=1 python3 check.py", "FOO=1 python3 -u check.py"),
+            **{f"unchanged {k}": (live, live) for k, (_, live) in wrapped.items()},
+        })
+
+    def test_wrapper_python_u_reaching_module_argv_is_rejected_end_to_end(self):
+        with isolated_hermes_home() as home:
+            bin_dir = home / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "uv").write_text(self._UV_SHIM, encoding="utf-8")
+            (bin_dir / "uv").chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"}):
+                self._assert_executed_bypasses_rejected([
+                    ("uv run -m python3 snapshots/home.png", "uv run -m python3 -u snapshots/home.png"),
+                    ("uv run -s python3 snapshots/home.png", "uv run -s python3 -u snapshots/home.png"),
+                ])
 
 
 if __name__ == "__main__":

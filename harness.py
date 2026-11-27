@@ -11,6 +11,7 @@ drift (`doc_drift` / `harness_gap` / `product_regression`), and audits drift rea
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -18,6 +19,7 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import time
@@ -1634,6 +1636,39 @@ def _existed_at(root: Path, ref: str, path: str) -> bool:
     return _git_ro(root, ["cat-file", "-e", f"{ref}:{path}"]).returncode == 0
 
 
+def _git_blob_oid(data: bytes, oid_len: int) -> str:
+    algo = hashlib.sha256 if oid_len == 64 else hashlib.sha1
+    return algo(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _committed_blob_mismatches(root: Path, ref: str, globs: list[str]) -> set[str]:
+    """Committed blobs at ``ref`` matching ``globs`` whose live file is missing, of another type or has other
+    bytes. The file itself is hashed, so Git index flags (`assume-unchanged`, `skip-worktree`) and stat-cache
+    tricks that hide a mutation from `git status` cannot. Filtered content (LFS, `autocrlf`) fails closed."""
+    proc = _git_ro(root, ["ls-tree", "-r", "-z", "--full-tree", ref], timeout=60)
+    if proc.returncode != 0:
+        return set()
+    out: set[str] = set()
+    for rec in proc.stdout.split("\0"):
+        meta, sep, rel = rec.partition("\t")
+        fields = meta.split(" ")
+        if not sep or len(fields) != 3 or fields[1] != "blob" or not _any_match(globs, rel):
+            continue
+        mode, _, oid = fields
+        live = root / rel
+        try:
+            st = os.lstat(live)
+            if mode == "120000":
+                data = os.fsencode(os.readlink(live)) if stat.S_ISLNK(st.st_mode) else None
+            else:
+                data = live.read_bytes() if stat.S_ISREG(st.st_mode) else None
+        except OSError:
+            data = None
+        if data is None or _git_blob_oid(data, len(oid)) != oid:
+            out.add(rel)
+    return out
+
+
 def _frozen_baseline_changes(root: Path, frozen: dict[str, list[str]], base_sha: Optional[str]) -> list[dict[str, Any]]:
     """Existing frozen baseline files modified or deleted since ``base_sha`` (committed or in the working tree).
     Baseline files absent from ``base_sha`` (``HEAD`` when no base) are new surfaces, not tampering."""
@@ -1643,10 +1678,11 @@ def _frozen_baseline_changes(root: Path, frozen: dict[str, list[str]], base_sha:
     ref = base_sha or "HEAD"
     out: list[dict[str, Any]] = []
     for name, globs in frozen.items():
-        hits = sorted(
-            p for p, st in status.items()
-            if _any_match(globs, p) and (st != "A" or _existed_at(root, ref, p))
-        )
+        hits = sorted({
+            *(p for p, st in status.items()
+              if _any_match(globs, p) and (st != "A" or _existed_at(root, ref, p))),
+            *_committed_blob_mismatches(root, ref, globs),
+        })
         if hits:
             out.append({"name": name, "baseline_paths": globs, "changed_files": hits})
     return out
@@ -1702,8 +1738,6 @@ _LAUNCHER_VERBS = frozenset({"run", "exec", "dlx", "x"})
 _PLAIN_WORD_RE = re.compile(r"[A-Za-z0-9_./:=+%,@-]+", re.ASCII)
 _ASCII_THRESHOLD_RE = re.compile(r"^(?:(?:0|[1-9][0-9]*)(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$", re.ASCII)
 # Command-launching wrappers that may sit between a segment head and a Python interpreter given `-u`.
-_PY_WRAPPERS = frozenset({"timeout", "nice", "nohup", "time", "uv", "uvx", "stdbuf", "ionice", "xvfb-run"})
-_WRAPPER_ARG_RE = re.compile(r"^(?:run|-.*|\d+(?:\.\d+)?[smhd]?)$")  # `timeout 30`, `uv run`, `nice -n 5`
 _MAX_SCRIPT_DEPTH = 4
 _OPERATORS = ("<<<", "&>>", "&&", "||", "|&", ";;", ">>", "<<", "<>", ">&", "<&", "&>", ">|",
               "|", ";", "&", "(", ")", ">", "<")
@@ -1908,16 +1942,16 @@ def _runner(live: list[Any], head: int) -> Optional[str]:
 def _insert_ok(live: list[Any], j: int, head: int, trailing_from: int, matched: set[int]) -> bool:
     """Whether item ``live[j]``, absent from the committed segment, is on the positive allowlist of inert
     insertions: a disabled regeneration assignment before the head; after it a disabled regeneration option
-    (`--update-snapshots=false`), `--color=`/`--reporter=` with a fixed built-in value, or a zero threshold; after
-    every committed word (``trailing_from``) a verbosity/color flag (`-q`/`-v` only for runners where they are);
-    or Python's unbuffered `-u` right after a committed interpreter head and before its committed script.
+    (`--update-snapshots=false`) or `--color=`/`--reporter=` with a fixed built-in value; after every committed
+    word (``trailing_from``) a verbosity/color flag (`-q`/`-v` only for runners where they are); or Python's
+    unbuffered `-u` right after a committed interpreter that heads the segment and before its committed script.
     Nothing may follow a bare option, which could swallow it as its value (`-run --color=never`)."""
     item = live[j]
     prev = live[j - 1] if j > 0 else None
-    if j > head and isinstance(prev, str) and prev.startswith("-") and "=" not in prev and item != "-u":
+    if j > head and isinstance(prev, str) and prev.startswith("-") and "=" not in prev:
         return False
     if isinstance(item, _Slot):
-        return item.kind == "flag" and item.value == 0 and j > head and (item.eq or j >= trailing_from)
+        return False  # committed thresholds are only tightened in place; a new one (even `0`/`0%`) fails closed
     if _is_assignment(item):
         name, _, value = item.partition("=")
         return j < head and bool(_REGEN_ENV_RE.search(name)) and value.lower() in _DISABLED
@@ -1928,13 +1962,8 @@ def _insert_ok(live: list[Any], j: int, head: int, trailing_from: int, matched: 
         if _REGEN_FLAG_RE.match(name):
             return value.lower() in _DISABLED
         return value in _INERT_EQ_OPTIONS.get(name, ())
-    if item == "-u" and {j - 1, j + 1} <= matched and _is_python_exe(live[j - 1]):
-        if j - 1 == head:
-            return True
-        wrapper = live[head]
-        return (_is_bare_or_absolute(wrapper) and os.path.basename(wrapper) in _PY_WRAPPERS
-                and (os.path.basename(wrapper) != "uv" or live[head + 1] == "run")
-                and all(isinstance(w, str) and _WRAPPER_ARG_RE.match(w) for w in live[head + 1:j - 1]))
+    if item == "-u" and j - 1 == head and j + 1 in matched and _is_python_exe(live[head]):
+        return True  # behind a wrapper `python3` may be a module/tool name or an option value (`uv run -m python3`)
     if j < trailing_from:
         return False
     return item in _INERT_TRAILING_FLAGS or item in _RUNNER_SHORT_FLAGS.get(_runner(live, head) or "", ())
@@ -2076,8 +2105,10 @@ def _threshold_reasons(base_segs: list[list[str]], live_segs: list[list[str]]) -
             reasons.append(f"loosens threshold {label} from {', '.join(s.raw for s in b_vals)} to "
                            f"{', '.join(s.raw for s in l_vals)}")
     for (kind, key), l_vals in live.items():
-        if (kind, key) not in base and any(s.value is None or s.value > 0 or kind == "env" for s in l_vals):
-            reasons.append(f"adds threshold `{key}={l_vals[0].raw}` (replaces the tool's built-in default)")
+        extra = l_vals[len(base.get((kind, key), [])):]
+        if extra:
+            reasons.append(f"adds threshold `{key}={extra[0].raw}` "
+                           "(committed thresholds may only be tightened in place)")
     return reasons
 
 
