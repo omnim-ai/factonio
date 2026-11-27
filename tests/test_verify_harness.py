@@ -2029,7 +2029,7 @@ class TestFrozenVisualBaselines(unittest.TestCase):
             "=false -> =all": ("--update-snapshots=false", "--update-snapshots=all", True),
             "plain -> =none": ("", "--update-snapshots=none", False),
             "plain -> =false": ("", "--update-snapshots=false", False),
-            "plain -> none (separate)": ("", "--update-snapshots none", False),
+            "plain -> none (separate)": ("", "--update-snapshots none", True),  # fail closed: only `=none` is inert
         }
         for label, (base_flag, live_flag, loosened) in hj_cases.items():
             with self.subTest(label), isolated_hermes_home() as home:
@@ -2092,7 +2092,7 @@ class TestFrozenVisualBaselines(unittest.TestCase):
 
 
 class TestFixRound2VisualGuardAndHarnessGaps(unittest.TestCase):
-    """Shell-aware visual_diff guard, post-hook baseline re-check, verify.md hook validation, audit gate base."""
+    """Post-hook frozen-baseline re-check, verify.md hook validation and the audit gate base."""
 
     @staticmethod
     def _visual_repo(home: Path, command: Any, *, name: str = "svc") -> Path:
@@ -2112,56 +2112,6 @@ class TestFixRound2VisualGuardAndHarnessGaps(unittest.TestCase):
         manifest = json.loads(hj.read_text(encoding="utf-8"))
         manifest["hooks"][0]["command"] = command
         hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-
-    def test_shell_wrapped_and_punctuation_adjacent_commands(self):
-        from factonio.harness import check_harness, detect_harness_gate_loosening
-
-        pw, jest, thr = "npx playwright test", "npx jest", "true --threshold 0.01"
-        cases = {
-            "sh -c string": (f"sh -c '{pw}'", f'sh -c "{pw} --update-snapshots"', True),
-            "bash -lc jest -u": (jest, "bash -lc 'npx jest -u'", True),
-            "bash -euo pipefail -c": (pw, f"bash -euo pipefail -c '{pw} --update-snapshots'", True),
-            "argv sh -c": (["sh", "-c", pw], ["sh", "-c", f"{pw} --update-snapshots"], True),
-            "argv /bin/bash -ec": (pw, ["/bin/bash", "-ec", f"{pw} -u"], True),
-            "nested sh in bash": (pw, f"""bash -c "sh -c '{pw} --update-snapshots'" """, True),
-            "; after flag": (pw, f"{pw} --update-snapshots; echo ok", True),
-            "&& glued": (pw, f"{pw} --update-snapshots&&true", True),
-            "subshell": (pw, f"({pw} --update-snapshots)", True),
-            "jest -u;": (jest, "npx jest -u; echo ok", True),
-            "env -S": (pw, f"env -S '{pw} -u'", True),
-            "threshold sh -c": (thr, 'sh -c "true --threshold 0.5"', True),
-            "threshold ;": (thr, "true --threshold 0.5; echo ok", True),
-            "threshold removed": (thr, "true", True),
-            "threshold removed in sh -c": (thr, "sh -c 'true --update-snapshots=none'", True),
-            "=none ;": (pw, f"{pw} --update-snapshots=none; echo ok", False),
-            "none separate ;": (pw, f"{pw} --update-snapshots none; echo ok", False),
-            "env none ;": (pw, f"UPDATE_SNAPSHOTS=none; {pw}", False),
-            "env 0 ;": (pw, f"UPDATE_SNAPSHOTS=0; {pw}", False),
-            "sh -c env 0": (pw, f"sh -c 'UPDATE_SNAPSHOTS=0 {pw}'", False),
-            "sh -c env none": (pw, f"sh -c 'UPDATE_SNAPSHOTS=none {pw}'", False),
-            "bash -u is nounset": (pw, f"bash -u -c '{pw}'", False),
-            "env -u unsets": (pw, f"env -u CI {pw}", False),
-            "same threshold wrapped": (thr, "sh -c 'true --threshold 0.01'", False),
-            "tightened threshold ;": (thr, "true --threshold 0.001; echo ok", False),
-        }
-        with isolated_hermes_home() as home:
-            repos: dict[str, Path] = {}
-            for label, (base, live, loosened) in cases.items():
-                with self.subTest(label):
-                    key = json.dumps(base)
-                    if key not in repos:
-                        repos[key] = self._visual_repo(home, base, name=f"svc{len(repos)}")
-                    repo = repos[key]
-                    self._set_command(repo, live)
-                    gate = detect_harness_gate_loosening(repo)
-                    self.assertEqual(gate["loosened"], loosened, gate["findings"])
-                    self.assertEqual(gate["loosened_visual_hooks"], ["pixels"] if loosened else [])
-                    if label in ("sh -c string", "threshold removed", "sh -c env none"):
-                        chk = check_harness(str(repo))
-                        self.assertEqual(chk["valid"], not loosened, chk["errors"])
-            self._set_command(repos[json.dumps(thr)], "true")
-            removed = detect_harness_gate_loosening(repos[json.dumps(thr)])
-            self.assertTrue(any("removes threshold `threshold=0.01`" in f for f in removed["findings"]), removed)
 
     def test_check_run_hooks_rechecks_frozen_baselines_after_hooks(self):
         from factonio.harness import check_harness, classify_harness_drift
@@ -2375,225 +2325,8 @@ class TestFixRound3PinnedAuditBase(unittest.TestCase):
             self.assertIn("snapshots/home.png", audit["visual_baseline_changes"][0]["changed_files"])
 
 
-class TestFixRound4CompoundThresholdsAndShortFlags(unittest.TestCase):
-    """Every threshold occurrence in compound commands counts; short `-u` is executable-aware and case-sensitive."""
-
-    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
-    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
-
-    def _assert_cases(self, cases: dict[str, tuple[Any, Any, bool]]) -> None:
-        from factonio.harness import detect_harness_gate_loosening
-
-        with isolated_hermes_home() as home:
-            repos: dict[str, Path] = {}
-            for label, (base, live, loosened) in cases.items():
-                with self.subTest(label):
-                    key = json.dumps(base)
-                    if key not in repos:
-                        repos[key] = self._visual_repo(home, base, name=f"svc{len(repos)}")
-                    self._set_command(repos[key], live)
-                    gate = detect_harness_gate_loosening(repos[key])
-                    self.assertEqual(gate["loosened"], loosened, gate["findings"])
-                    self.assertEqual(gate["loosened_visual_hooks"], ["pixels"] if loosened else [])
-
-    def test_compound_threshold_occurrences_are_all_compared(self):
-        a, b = "python3 check_snap.py a", "python3 check_snap.py b"
-        same = f"{a} --threshold 0.01 && {b} --threshold 0.01"
-        mixed = f"{a} --threshold 0.01 && {b} --threshold 0.05"
-        single = "python3 check_ui.py --threshold 0.01"
-        self._assert_cases({
-            "earlier raised &&": (same, f"{a} --threshold 0.50 && {b} --threshold 0.01", True),
-            "earlier raised ;": (same, f"{a} --threshold 0.50; {b} --threshold 0.01", True),
-            "earlier raised newline": (same, f"{a} --threshold 0.50\n{b} --threshold 0.01", True),
-            "earlier raised sh -c": (same, f"sh -c '{a} --threshold 0.50 && {b} --threshold 0.01'", True),
-            "earlier raised below later": (mixed, f"{a} --threshold 0.04 && {b} --threshold 0.05", True),
-            "swapped": (mixed, f"{a} --threshold 0.05 && {b} --threshold 0.01", True),
-            "dummy trailing threshold": (single, "python3 check_ui.py --threshold 0.50 && true --threshold 0.01", True),
-            "extra dummy hides raise": (mixed, f"{a} --threshold 0.04 && {b} --threshold 0.05 && true --threshold 0.01",
-                                        True),
-            "earlier removed": (same, f"{a} && {b} --threshold 0.01", True),
-            "earlier nan": (same, f"{a} --threshold nan && {b} --threshold 0.01", True),
-            "earlier inf": (same, f"{a} --threshold inf && {b} --threshold 0.01", True),
-            "earlier -inf sh -c": (same, f"sh -c '{a} --threshold -inf; {b} --threshold 0.01'", True),
-            "nan beside unchanged": (same, f"{same} && true --threshold nan", True),
-            "unchanged": (same, same, False),
-            "tightened earlier": (f"{a} --threshold 0.05 && {b} --threshold 0.05",
-                                  f"{a} --threshold 0.01 && {b} --threshold 0.05", False),
-            "added stricter check": (mixed, f"{mixed} && python3 check_snap.py c --threshold 0.001", False),
-        })
-
-    def test_short_u_is_executable_aware_and_case_sensitive(self):
-        base, pw = "true", "npx playwright test"
-        self._assert_cases({
-            "python3 -u": (base, "python3 -u scripts/check_ui.py", False),
-            "argv python3 -u": (base, ["python3", "-u", "scripts/check_ui.py"], False),
-            "python -u": (base, "python -u scripts/check_ui.py", False),
-            "python3.14 -u": (base, "python3.14 -u scripts/check_ui.py", False),
-            "argv /usr/bin/python3.14 -u": (base, ["/usr/bin/python3.14", "-u", "scripts/check_ui.py"], False),
-            "python3 -u -m pytest": (base, "python3 -u -m pytest tests/test_ui.py", False),
-            "python3 -X dev -u": (base, "env CI=1 python3 -X dev -u scripts/check_ui.py", False),
-            "sh -c python3 -u": (base, "sh -c 'python3 -u check.py'", False),
-            "bash -u script": (base, "bash -u scripts/check_ui.sh", False),
-            "set -e -u": (base, f"sh -c 'set -e -u; {pw}'", False),
-            "set -euo pipefail newline": (base, f"set -euo pipefail\n{pw}", False),
-            "diff -u": (base, "diff -u a.txt b.txt", False),
-            "-U is not -u": (base, "npx jest -U", False),
-            "jest -u": (base, "jest -u", True),
-            "vitest -u": (base, "vitest -u", True),
-            "npx jest -u": (base, "npx jest -u", True),
-            "npx vitest -u": (base, "npx vitest -u", True),
-            "npm test -- -u": (base, "npm test -- -u", True),
-            "--update-snapshots": (base, f"{pw} --update-snapshots", True),
-            "--UPDATE-SNAPSHOTS": (base, f"{pw} --UPDATE-SNAPSHOTS", True),
-            "python script --update-snapshots": (base, "python3 -u scripts/check_ui.py --update-snapshots", True),
-            "python -m pytest --snapshot-update": (base, "python3 -u -m pytest --snapshot-update", True),
-            "python script -u": (base, "python3 scripts/check_ui.py -u", True),
-            "bash script -u": (base, "bash scripts/check_ui.sh -u", True),
-            "set -u then jest -u": (base, "sh -c 'set -u; npx jest -u'", True),
-            "diff -u then jest -u": (base, "diff -u a b && npx jest -u", True),
-        })
-
-    def test_compound_threshold_loosening_fails_check_and_audit(self):
-        from factonio.harness import audit_harness, check_harness
-
-        script = ("import sys\n"
-                  "diff = {'a': 0.25, 'b': 0.0}[sys.argv[1]]\n"
-                  "sys.exit(1 if diff > float(sys.argv[sys.argv.index('--threshold') + 1]) else 0)\n")
-        a, b = "python3 check_snap.py a", "python3 check_snap.py b"
-        with isolated_hermes_home() as home:
-            repo = self._visual_repo(home, f"{a} --threshold 0.01 && {b} --threshold 0.01", name="svc")
-            _write(repo, "check_snap.py", script)
-            _commit_all(repo, "visual check script")
-            failing = check_harness(str(repo), run_hooks=True)
-            self.assertEqual(failing["hook_results"]["failed_required"], ["pixels"], failing["hook_results"])
-            self._set_command(repo, f"{a} --threshold 0.50 && {b} --threshold 0.01")
-            chk = check_harness(str(repo), run_hooks=True)
-            self.assertEqual(chk["hook_results"]["failed_required"], [])
-            self.assertFalse(chk["valid"])
-            self.assertTrue(chk["gate_loosening"]["loosened"])
-            self.assertTrue(any("loosens threshold `threshold` from 0.01 to 0.5" in e for e in chk["errors"]),
-                            chk["errors"])
-            audit = audit_harness(str(repo))
-            self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("stale", True), audit)
-            self.assertEqual(audit["gate_loosening"]["loosened_visual_hooks"], ["pixels"])
-
-
-class TestFixRound5WrappersBooleanFlagsSegmentsAndHarnessCovers(unittest.TestCase):
-    """Command-head-only unwrapping, execution wrappers, boolean regeneration flags, per-command threshold
-    alignment, and formal invariants covering `.factonio/` files."""
-
-    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
-    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
-    _assert_cases = TestFixRound4CompoundThresholdsAndShortFlags._assert_cases
-
-    def test_env_and_shells_unwrap_only_at_command_head(self):
-        pw, base = "npx playwright test", "true"
-        self._assert_cases({
-            "path ending in env": (base, f"{pw} tests/env --update-snapshots --threshold 0.99", True),
-            "jest path ending in env -u": (base, "npx jest tests/env -u", True),
-            "grep env -u": (base, "npx jest --grep env -u", True),
-            "positional bash -u": (base, "npx jest bash -u", True),
-            "positional sh -c": (base, "npx jest sh -c x -u", True),
-            "attached env -S": (base, "env -S'npx jest -u'", True),
-            "env -S spaced": (base, "env -S 'npx jest -u'", True),
-            "env --split-string=": (base, "env --split-string='npx jest -u'", True),
-            "env -S appends trailing args": (base, "env -S'npx jest' -u", True),
-            "env -u NAME": (base, "env -u CI npx jest", False),
-            "env after &&": (base, "true && env -u CI npx jest", False),
-            "VAR=val env -u": (base, "CI=1 env -u HOME python3 -u check.py", False),
-        })
-
-    def test_execution_wrappers_resolve_interpreter_flags(self):
-        self._assert_cases({
-            "timeout 30 python3 -u": ("true", "timeout 30 python3 -u visual_check.py", False),
-            "timeout -k 5 30 python3 -u": ("true", "timeout -k 5 30 python3 -u visual_check.py", False),
-            "timeout --signal=TERM": ("true", "timeout --signal=TERM 30 python3 -u visual_check.py", False),
-            "timeout -s KILL": ("true", "timeout -s KILL 30 python3 -u visual_check.py", False),
-            "uv run python3 -u": ("true", "uv run python3 -u script.py", False),
-            "uv run --with pillow": ("true", "uv run --with pillow python3 -u script.py", False),
-            "uv run --python 3.12 --": ("true", "uv run --python 3.12 -- python3 -u script.py", False),
-            "nice -n 5": ("true", "nice -n 5 python3 -u script.py", False),
-            "nohup": ("true", "nohup python3 -u script.py", False),
-            "time -p": ("true", "time -p python3 -u script.py", False),
-            "stdbuf -oL": ("true", "stdbuf -oL python3 -u script.py", False),
-            "stdbuf -o L": ("true", "stdbuf -o L python3 -u script.py", False),
-            "command -p": ("true", "command -p python3 -u script.py", False),
-            "exec -a": ("true", "exec -a ui python3 -u script.py", False),
-            "argv timeout": ("true", ["timeout", "30", "python3", "-u", "visual_check.py"], False),
-            "timeout sh -c": ("true", "timeout 30 sh -c 'python3 -u visual_check.py'", False),
-            "timeout bash -u script": ("true", "timeout 30 bash -u check.sh", False),
-            "timeout 30 npx jest -u": ("true", "timeout 30 npx jest -u", True),
-            "uv run pytest --snapshot-update": ("true", "uv run pytest --snapshot-update", True),
-            "uv run python3 -m pytest": ("true", "uv run python3 -m pytest --snapshot-update", True),
-            "uv run -m pytest": ("true", "uv run -m pytest --snapshot-update", True),
-            "nice timeout jest -u": ("true", "nice -n 5 timeout 30 npx jest -u", True),
-            "timeout python script -u": ("true", "timeout 30 python3 check.py -u", True),
-        })
-
-    def test_boolean_regeneration_flags_ignore_trailing_words(self):
-        pw = "npx playwright test"
-        self._assert_cases({
-            'jest -u ""': ("true", 'npx jest -u ""', True),
-            'vitest -u ""': ("true", 'npx vitest -u ""', True),
-            "jest -u none": ("true", "npx jest -u none", True),
-            "jest -u false": ("true", "npx jest -u false", True),
-            "--updateSnapshot false": ("true", "npx jest --updateSnapshot false", True),
-            'pytest --snapshot-update ""': ("true", 'python3 -m pytest --snapshot-update ""', True),
-            "--accept no": ("true", "cargo insta test --accept no", True),
-            '--update-snapshots ""': ("true", f'{pw} --update-snapshots ""', True),
-            "--update-snapshots=": ("true", f"{pw} --update-snapshots=", True),
-            "--update-snapshots none": ("true", f"{pw} --update-snapshots none", False),
-            "--update-snapshots=none": ("true", f"{pw} --update-snapshots=none", False),
-            "--updateSnapshot=false": ("true", "npx jest --updateSnapshot=false", False),
-            "UPDATE_SNAPSHOTS= empty": ("true", f"UPDATE_SNAPSHOTS= {pw}", False),
-        })
-
-    def test_thresholds_align_per_command_signature(self):
-        a, b, c = "python3 check_snap.py a", "python3 check_snap.py b", "python3 check_snap.py c"
-        mixed = f"{a} --threshold 0.01 && {b} --threshold 0.05"
-        single = f"{a} --threshold 0.01"
-        self._assert_cases({
-            "swap + dummy trailing": (mixed, f"{a} --threshold 0.05 && {b} --threshold 0.01 && true --threshold 0.01",
-                                      True),
-            "raise below later + dummy": (mixed, f"{a} --threshold 0.04 && {b} --threshold 0.05 && "
-                                          "true --threshold 0.01", True),
-            "new check appended": (mixed, f"{mixed} && {c} --threshold 0.02", False),
-            "new check prepended": (mixed, f"{c} --threshold 0.02 && {mixed}", False),
-            "new check between": (mixed, f"{a} --threshold 0.01 && {c} --threshold 0.02 && {b} --threshold 0.05",
-                                  False),
-            "single raised + dummy": (single, f"{a} --threshold 0.50 && true --threshold 0.01", True),
-            "renamed raised + dummy": (single, "other --threshold 0.50 && true --threshold 0.01", True),
-            "renamed same": (single, "other --threshold 0.01", False),
-            "tightened later": (mixed, f"{a} --threshold 0.01 && {b} --threshold 0.02", False),
-            "command removed": (mixed, single, True),
-            "extra same-flag occurrence raised": (single, f"{single} --threshold 0.5", True),
-            "threshold added to existing command": (f"{a}", f"{a} --threshold 0.5", True),
-            "new check nan": (mixed, f"{mixed} && {c} --threshold nan", True),
-        })
-
-    def test_wrapped_interpreter_flags_pass_check_harness_end_to_end(self):
-        from factonio.harness import audit_harness, check_harness
-
-        with isolated_hermes_home() as home:
-            repo = self._visual_repo(home, "python3 visual_check.py", name="svc")
-            _write(repo, "visual_check.py", "print('ok')\n")
-            _commit_all(repo, "visual check script")
-            for command in ("timeout 30 python3 -u visual_check.py", "timeout -k 5 30 python3 -u visual_check.py",
-                            "uv run --no-project python3 -u visual_check.py"):
-                if command.startswith("uv ") and not shutil.which("uv"):
-                    continue  # the parser cases above cover `uv run` without the binary
-                with self.subTest(command):
-                    self._set_command(repo, command)
-                    chk = check_harness(str(repo), run_hooks=True)
-                    self.assertEqual(chk["hook_results"]["failed_required"], [], chk["hook_results"])
-                    self.assertTrue(chk["valid"], chk["errors"])
-                    self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
-                    audit = audit_harness(str(repo))
-                    self.assertFalse(audit["gate_loosening"]["loosened"], audit["gate_loosening"])
-            self._set_command(repo, "timeout 30 npx jest -u")
-            chk = check_harness(str(repo))
-            self.assertFalse(chk["valid"])
-            self.assertEqual(chk["gate_loosening"]["loosened_visual_hooks"], ["pixels"])
+class TestHarnessDirFormalInvariants(unittest.TestCase):
+    """Formal invariants covering `.factonio/` files are inventoried without leaking into the general inventory."""
 
     def test_invariant_covering_harness_dir_file_is_inventoried_and_drifts(self):
         from factonio.harness import audit_harness, bootstrap_verify_harness, check_harness
@@ -2644,352 +2377,10 @@ class TestFixRound5WrappersBooleanFlagsSegmentsAndHarnessCovers(unittest.TestCas
             self.assertIn(".factonio/model.cfg", _changed_files(repo, base, include_harness_dir=True))
 
 
-class TestFixRound6ChangedCommandThresholdsFallbacksPathsAndRedirects(unittest.TestCase):
-    """New thresholds on edited commands, `||` fallbacks, repo-local wrapper-named paths, redirections and
-    bundled `env -iS`."""
+class TestFixRound9LiveFrozenBaselines(unittest.TestCase):
+    """Live-declared frozen `visual_diff` baselines protect existing committed images."""
 
     _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
-    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
-    _assert_cases = TestFixRound4CompoundThresholdsAndShortFlags._assert_cases
-
-    def _reasons(self, base: Any, live: Any) -> str:
-        from factonio.harness import detect_harness_gate_loosening
-
-        with isolated_hermes_home() as home:
-            repo = self._visual_repo(home, base, name="svc")
-            self._set_command(repo, live)
-            return json.dumps(detect_harness_gate_loosening(repo)["findings"])
-
-    def test_new_threshold_on_edited_command_is_loosening(self):
-        a, b, c = "python3 check_snap.py a", "python3 check_snap.py b", "python3 check_snap.py c"
-        mixed = f"{a} --threshold 0.01 && {b} --threshold 0.05"
-        pw = "npx playwright test"
-        self._assert_cases({
-            "--verbose --threshold": ("python3 check.py", "python3 check.py --verbose --threshold 0.5", True),
-            "--reporter --max-diff-pixels": (pw, f"{pw} --reporter=line --max-diff-pixels=99999", True),
-            "CI=1 --max-diff-pixels": (pw, f"CI=1 {pw} --max-diff-pixels=99999", True),
-            "python3 -u --threshold": ("python3 check_ui.py", "python3 -u check_ui.py --threshold 0.99", True),
-            "redirect + threshold": ("python3 check.py", "python3 check.py --threshold 0.5 2>&1", True),
-            "verbose only": ("python3 check.py", "python3 check.py --verbose", False),
-            "zero threshold on edited": ("python3 check.py", "python3 check.py --verbose --threshold 0", False),
-            "new check appended": (mixed, f"{mixed} && {c} --threshold 0.02", False),
-        })
-
-    def test_or_fallback_is_loosening(self):
-        self._assert_cases({
-            "|| second run": ("npx jest --threshold 0.01", "npx jest --threshold 0.01 || npx jest --threshold 0.05",
-                              True),
-            "|| true": ("a --threshold 0.01", "a --threshold 0.01 || true", True),
-            "sh -c || true": ("a --threshold 0.01", "sh -c 'a --threshold 0.01 || true'", True),
-            "|| unchanged": ("a --threshold 0.01 || b", "a --threshold 0.01 || b", False),
-            "&& added": ("a --threshold 0.01", "a --threshold 0.01 && c --threshold 0.02", False),
-        })
-        self.assertIn("adds shell `||` fallback", self._reasons("a --threshold 0.01", "a --threshold 0.01 || true"))
-
-    def test_relative_paths_named_like_wrappers_are_not_unwrapped(self):
-        cases: dict[str, tuple[Any, Any, bool]] = {}
-        for path in ("tests/env", "./bin/env", "scripts/timeout", "scripts/nice", "scripts/time",
-                     "scripts/python3"):
-            cases[path] = (f"{path} --threshold 0.01", f"{path} --update-snapshots --threshold 0.99", True)
-        for path in ("scripts/sh", "scripts/bash"):
-            cases[path] = (f"{path} --threshold 0.01", f"{path} --update-snapshots --threshold 0.01", True)
-        cases["scripts/sh -u"] = ("scripts/sh --threshold 0.01", "scripts/sh -u --threshold 0.01", True)
-        cases["tests/env bare"] = ("tests/env", "tests/env --update-snapshots", True)
-        cases["true -> tests/env"] = ("true --threshold 0.01", "tests/env --update-snapshots --threshold 0.99", True)
-        cases["absolute /usr/bin/env -u NAME"] = ("true", "/usr/bin/env -u CI python3 -u check.py", False)
-        cases["absolute /bin/sh -c"] = ("true", "/bin/sh -c 'python3 -u check.py'", False)
-        self._assert_cases(cases)
-        for path in ("tests/env", "./bin/env", "scripts/timeout", "scripts/python3"):
-            with self.subTest(f"{path} reasons"):
-                reasons = self._reasons(f"{path} --threshold 0.01", f"{path} --update-snapshots --threshold 0.99")
-                self.assertIn("`--update-snapshots`", reasons)
-                self.assertIn("loosens threshold `threshold`", reasons)
-
-    def test_system_wrappers_never_swallow_gate_flags(self):
-        self._assert_cases({
-            "env --update-snapshots": ("true", "env --update-snapshots npx playwright test", True),
-            "timeout --update-snapshots": ("true", "timeout --update-snapshots 30 npx playwright test", True),
-            "nice --threshold": ("nice npx jest --threshold 0.01", "nice --threshold 0.99 npx jest", True),
-            "uv run --update-snapshots": ("true", "uv run --update-snapshots pytest", True),
-            "python3 --update-snapshots": ("true", "python3 --update-snapshots check.py", True),
-            "sh --update-snapshots -c": ("true", "sh --update-snapshots -c 'python3 check.py'", True),
-            "bash --update-snapshots script": ("true", "bash --update-snapshots check.sh", True),
-        })
-
-    def test_redirections_stay_in_the_same_simple_command(self):
-        self._assert_cases({
-            "leading > file": ("true", "> output.txt python3 -u check.py", False),
-            "leading 2>/dev/null": ("true", "2>/dev/null python3 -u check.py", False),
-            "trailing > file 2>&1": ("true", "python3 -u check.py > output.txt 2>&1", False),
-            "&>> log": ("true", "python3 -u check.py &>> log.txt", False),
-            "< input": ("true", "< in.txt python3 -u check.py", False),
-            "leading > file jest -u": ("true", "> output.txt npx jest -u", True),
-            "trailing redirect jest -u": ("true", "npx jest -u 2>/dev/null", True),
-        })
-
-    def test_env_bundled_split_string_and_scoped_recursion(self):
-        five = " && ".join(["env -S 'true'"] * 4 + ["env -S 'npx jest -u'"])
-        self._assert_cases({
-            "env -iS": ("true", 'env -iS "npx jest -u"', True),
-            "env -iS attached": ("true", "env -iS'npx jest -u'", True),
-            "env -iu NAME": ("true", "env -iu CI python3 -u check.py", False),
-            "five sequential env -S": ("true", five, True),
-            "env -S scoped to its command": ("true", "env -S 'python3' -u check.py && npx playwright test", False),
-        })
-
-    def test_redirected_python_and_edited_threshold_end_to_end(self):
-        from factonio.harness import audit_harness, check_harness
-
-        script = ("import sys\n"
-                  "t = float(sys.argv[sys.argv.index('--threshold') + 1]) if '--threshold' in sys.argv else 0.01\n"
-                  "sys.exit(1 if 0.25 > t else 0)\n")
-        with isolated_hermes_home() as home:
-            repo = self._visual_repo(home, "python3 check.py", name="svc")
-            _write(repo, "check.py", script)
-            _commit_all(repo, "visual check script")
-            self.assertEqual(check_harness(str(repo), run_hooks=True)["hook_results"]["failed_required"], ["pixels"])
-            self._set_command(repo, "python3 check.py --verbose --threshold 0.5")
-            chk = check_harness(str(repo), run_hooks=True)
-            self.assertEqual(chk["hook_results"]["failed_required"], [])
-            self.assertFalse(chk["valid"])
-            self.assertTrue(chk["gate_loosening"]["loosened"])
-            audit = audit_harness(str(repo))
-            self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("stale", True))
-
-            self._set_command(repo, "> output.txt python3 -u check.py 2>&1")
-            chk = check_harness(str(repo))
-            self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
-
-
-
-class TestFixRound7TargetAwareThresholdsUnitsEnvAndShellArgs(unittest.TestCase):
-    """Thresholds never transfer between edited/reordered targets, `%` keeps its unit, environment assignments are
-    never exempt as new checks, and `sh -c SCRIPT $0 ARGS` / `bash --rcfile FILE -c` are parsed POSIX-correctly."""
-
-    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
-    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
-    _assert_cases = TestFixRound4CompoundThresholdsAndShortFlags._assert_cases
-
-    _PIXELS = ("import sys\n"
-               "diff = {'a': 0.25, 'b': 0.0}[sys.argv[1]]\n"
-               "sys.exit(1 if diff > float(sys.argv[sys.argv.index('--threshold') + 1]) else 0)\n")
-    _PERCENT = ("import sys\n"
-                "raw = sys.argv[sys.argv.index('--threshold') + 1]\n"
-                "t = float(raw[:-1]) / 100 if raw.endswith('%') else float(raw)\n"
-                "sys.exit(1 if 0.25 > t else 0)\n")
-    _ENV = "import os, sys\nsys.exit(1 if 0.25 > float(os.environ.get('THRESHOLD', '0.01')) else 0)\n"
-    _REGEN = "import sys\nsys.exit(0 if '-u' in sys.argv else 1)\n"
-
-    def _assert_end_to_end(self, script: str, base: Any, loosening: list[Any], clean: list[Any], *,
-                           base_fails: bool = True) -> None:
-        from factonio.harness import audit_harness, check_harness
-
-        with isolated_hermes_home() as home:
-            repo = self._visual_repo(home, base, name="svc")
-            for name in ("pixels.py", "check.py"):
-                _write(repo, name, script)
-            _commit_all(repo, "visual check script")
-            committed = check_harness(str(repo), run_hooks=True)
-            self.assertEqual(committed["hook_results"]["failed_required"], ["pixels"] if base_fails else [])
-            for live in loosening:
-                with self.subTest(live=live):
-                    self._set_command(repo, live)
-                    chk = check_harness(str(repo), run_hooks=True)
-                    self.assertEqual(chk["hook_results"]["failed_required"], [], chk["hook_results"])
-                    self.assertFalse(chk["valid"])
-                    self.assertTrue(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
-                    audit = audit_harness(str(repo))
-                    self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("stale", True))
-            for live in clean:
-                with self.subTest(clean=live):
-                    self._set_command(repo, live)
-                    chk = check_harness(str(repo))
-                    self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
-
-    def test_thresholds_keep_target_identity_across_edited_reordered_commands(self):
-        a, b = "python3 pixels.py a", "python3 pixels.py b"
-        base = f"{a} --threshold 0.01 && {b} --threshold 0.9"
-        self._assert_cases({
-            "edited + reordered budget swap": (base, f"{b} --verbose --threshold 0.01 && {a} --verbose --threshold 0.5",
-                                               True),
-            "exact reorder": (base, f"{b} --threshold 0.9 && {a} --threshold 0.01", False),
-            "edited + reordered tightening": (base, f"{b} --verbose --threshold 0.5 && {a} --verbose "
-                                                    "--threshold 0.005", False),
-            "single edited command tightened": ("python3 check.py --threshold 0.05",
-                                                "python3 check.py --verbose --threshold 0.01", False),
-            "ambiguous renamed targets": (base, "x --threshold 0.01 && y --threshold 0.5", True),
-            "ambiguous renamed targets same strictest": (base, "x --threshold 0.01 && y --threshold 0.01", False),
-            "target removed among edits": (base, f"{b} --verbose --threshold 0.9", True),
-        })
-        self._assert_end_to_end(self._PIXELS, base,
-                                [f"{b} --verbose --threshold 0.01 && {a} --verbose --threshold 0.5"],
-                                [f"{b} --threshold 0.9 && {a} --threshold 0.01"])
-
-    def test_percentage_thresholds_keep_their_unit(self):
-        cmd = "python3 check.py --threshold"
-        cases = {
-            "1% -> 0.5": ("1%", "0.5", True),
-            "0.5 -> 10%": ("0.5", "10%", False),
-            "1% -> 5%": ("1%", "5%", True),
-            "10% -> 5%": ("10%", "5%", False),
-            "0.01 -> 2%": ("0.01", "2%", True),
-            "1% -> 0.005": ("1%", "0.005", False),
-            "1% -> 5 ambiguous unit": ("1%", "5", True),
-            "5 -> 1% ambiguous unit": ("5", "1%", True),
-            "5% unchanged": ("5%", "5%", False),
-        }
-        self._assert_cases({k: (f"{cmd} {b}", f"{cmd} {l}", x) for k, (b, l, x) in cases.items()})
-        from factonio.harness import _visual_hook_loosening
-
-        unit = _visual_hook_loosening({"command": f"{cmd} 1%"}, {"command": f"{cmd} 5"})
-        self.assertTrue(any("changes threshold `threshold` unit from 1% to 5" in r for r in unit), unit)
-        self._assert_end_to_end(self._PERCENT, f"{cmd} 1%", [f"{cmd} 0.5", f"{cmd} 5"], [f"{cmd} 0.005"])
-        self._assert_end_to_end(self._PERCENT, f"{cmd} 0.5", [f"{cmd} 60%"], [f"{cmd} 30%", f"{cmd} 0.5"],
-                                base_fails=False)
-
-    def test_environment_assignments_are_never_exempt_as_new_checks(self):
-        check = "python3 check.py"
-        loosening = [f"export THRESHOLD=0.5; {check}", f"export THRESHOLD=0.5 && {check}",
-                     f"THRESHOLD=0.5; export THRESHOLD; {check}", f"declare -x THRESHOLD=0.5; {check}"]
-        cases = {live: (check, live, True) for live in loosening}
-        cases.update({
-            "typeset MAX_DIFF": (check, f"typeset -x MAX_DIFF=3; {check}", True),
-            "export beside command threshold": (f"{check} --threshold 0.01",
-                                                f"export THRESHOLD=0.5; {check} --threshold 0.01", True),
-            "env assignment raised": (f"THRESHOLD=0.01; {check}", f"export THRESHOLD=0.5; {check}", True),
-            "env assignment kept": (f"THRESHOLD=0.01; {check}", f"export THRESHOLD=0.01; {check}", False),
-            "export zero": (check, f"export THRESHOLD=0; {check}", False),
-            "export unrelated": (check, f"export CI=1; {check}", False),
-            "unchanged": (check, check, False),
-        })
-        self._assert_cases(cases)
-        # `declare` is a bash builtin; hooks run under /bin/sh (dash on Debian/Ubuntu), so only POSIX forms execute.
-        self._assert_end_to_end(self._ENV, check, loosening[:3], [f"export THRESHOLD=0; {check}", check])
-
-    def test_sh_c_positional_args_and_shell_value_options(self):
-        script = 'python3 check.py "$@"'
-        loosening: list[Any] = [
-            f"sh -c '{script}' sh -u", f"bash -c '{script}' bash -u", ["sh", "-c", script, "sh", "-u"],
-            f"sh -c '{script}' python3 -u", f"sh -c '{script}' diff -u", f"sh -c '{script}' env -u -u",
-            "bash --rcfile /dev/null -c 'python3 check.py -u'", "bash --init-file /dev/null -c 'python3 check.py -u'",
-        ]
-        cases: dict[str, tuple[Any, Any, bool]] = {json.dumps(live): ("python3 check.py", live, True)
-                                                   for live in loosening}
-        cases.update({
-            "sh -c $0 only": ("python3 check.py", f"sh -c '{script}' sh", False),
-            "rcfile python3 -u": ("python3 check.py", "bash --rcfile /dev/null -c 'python3 -u check.py'", False),
-            "sh -c then &&": ("python3 check.py", "sh -c 'python3 check.py' && true", False),
-        })
-        self._assert_cases(cases)
-        self._assert_end_to_end(self._REGEN, "python3 check.py",
-                                [f"sh -c '{script}' sh -u", "bash --rcfile /dev/null -c 'python3 check.py -u'"],
-                                [f"sh -c '{script}' sh"])
-
-
-class TestFixRound8GroupedFlagsEnvDashShellClustersAndEnvOrder(unittest.TestCase):
-    """Bundled `-vu`/`-uv` update options, POSIX `env -`, `-oc`/`-oo`/`-Oc` shell clusters, and environment
-    thresholds that never borrow another command's budget or lose their assignment order."""
-
-    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
-    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
-    _assert_cases = TestFixRound4CompoundThresholdsAndShortFlags._assert_cases
-    _assert_end_to_end = TestFixRound7TargetAwareThresholdsUnitsEnvAndShellArgs._assert_end_to_end
-
-    _ARGPARSE = ("import argparse, sys\n"
-                 "p = argparse.ArgumentParser()\n"
-                 "p.add_argument('-u', action='store_true')\n"
-                 "p.add_argument('-v', action='store_true')\n"
-                 "p.add_argument('--threshold', type=float, default=0.01)\n"
-                 "a = p.parse_args()\n"
-                 "sys.exit(0 if a.u or a.threshold >= 0.25 else 1)\n")
-    _TARGETS = ("import os, sys\n"
-                "args = sys.argv[1:]\n"
-                "t = float(args[args.index('--threshold') + 1]) if '--threshold' in args "
-                "else float(os.environ.get('THRESHOLD', '0.01'))\n"
-                "sys.exit(1 if 0.25 > t else 0)\n")
-
-    def test_grouped_short_update_options_are_regeneration(self):
-        from factonio.harness import _command_tokens, _regen_flags
-
-        for cmd in ("python3 check.py -vu", "python3 check.py -uv", "npx jest -qu", "npm test -- -vu"):
-            with self.subTest(cmd):
-                self.assertTrue(_regen_flags(_command_tokens(cmd)), cmd)
-        for cmd in ("python3 -u check.py", "python3 -Bu check.py", "diff -ru a b", "sh -eu check.sh",
-                    "set -eu; python3 check.py", "python3 check.py -v", "env -u HOME python3 check.py"):
-            with self.subTest(clean=cmd):
-                self.assertEqual(_regen_flags(_command_tokens(cmd)), set(), cmd)
-        clean = ["python3 -u check.py", "python3 -Bu check.py", "diff -ru a b", "sh -eu check.sh",
-                 "set -eu; python3 check.py"]
-        cases = {live: ("python3 check.py", live, True) for live in ("python3 check.py -vu", "python3 check.py -uv")}
-        cases.update({c: ("python3 check.py", c, False) for c in clean})
-        self._assert_cases(cases)
-        self._assert_end_to_end(self._ARGPARSE, "python3 check.py",
-                                ["python3 check.py -vu", "python3 check.py -uv"], clean)
-
-    def test_posix_env_dash_is_an_env_option(self):
-        loosening = ["env - sh -c 'python3 check.py -u'", "env - sh -c 'python3 check.py --threshold 0.5'"]
-        cases = {live: ("python3 check.py", live, True) for live in loosening}
-        cases["env - python3 -u"] = ("python3 check.py", "env - python3 -u check.py", False)
-        self._assert_cases(cases)
-        self._assert_end_to_end(self._ARGPARSE, "python3 check.py", loosening, ["env - python3 -u check.py"])
-        from factonio.harness import check_harness
-
-        with isolated_hermes_home() as home:
-            repo = self._visual_repo(home, "python3 check.py")
-            _write(repo, "check.py", "import sys\nsys.exit(0)\n")
-            _commit_all(repo, "passing visual check")
-            self._set_command(repo, "env - python3 -u check.py")
-            chk = check_harness(str(repo), run_hooks=True)
-            self.assertEqual(chk["hook_results"]["failed_required"], [], chk["hook_results"])
-            self.assertTrue(chk["valid"], chk)
-            self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
-
-    def test_shell_option_clusters_consume_one_word_per_o(self):
-        loosening = ["bash -oc pipefail 'python3 check.py -u'", "sh -oc errexit 'python3 check.py --threshold 0.5'",
-                     "bash -oo pipefail errexit -c 'python3 check.py -u'", "bash -Oc extglob 'python3 check.py -u'"]
-        cases = {live: ("python3 check.py", live, True) for live in loosening}
-        cases["bash -ou errexit -u script.sh"] = ("python3 check.py", "bash -ou errexit -u script.sh", False)
-        self._assert_cases(cases)
-        self._assert_end_to_end(self._ARGPARSE, "python3 check.py", loosening, ["bash -ou errexit -u script.sh"])
-
-    def test_environment_thresholds_respect_default_commands_and_assignment_order(self):
-        a, b = "python3 check.py a", "python3 check.py b"
-        base = f"{a} --threshold 0.9 && {b}"
-        borrow = [f"export THRESHOLD=0.9; {base}", f"sh -c '{a} --threshold 0.9 && {b} \"$@\"' sh --threshold 0.9"]
-        cases = {live: (base, live, True) for live in borrow}
-        cases.update({
-            "assignment order swapped": ("THRESHOLD=0.9; THRESHOLD=0.01; python3 check.py",
-                                         "THRESHOLD=0.01; THRESHOLD=0.9; python3 check.py", True),
-            "assignment order kept": ("THRESHOLD=0.9; THRESHOLD=0.01; python3 check.py",
-                                      "THRESHOLD=0.9; THRESHOLD=0.01; python3 check.py", False),
-            "every command already at the bar": (f"{a} --threshold 0.9 && {b} --threshold 0.9",
-                                                 f"export THRESHOLD=0.9; {a} --threshold 0.9 && {b} --threshold 0.9",
-                                                 False),
-        })
-        self._assert_cases(cases)
-        self._assert_end_to_end(self._TARGETS, base, borrow, [base])
-        exported = "export THRESHOLD=0.9; export THRESHOLD=0.01; python3 check.py a"
-        self._assert_end_to_end(self._TARGETS, exported,
-                                ["export THRESHOLD=0.01; export THRESHOLD=0.9; python3 check.py a"], [exported])
-
-
-class TestFixRound9LiveFrozenShellArgsWordFlagsCommentsAndOverrides(unittest.TestCase):
-    """Live-declared frozen baselines, field-split `sh -c` positional args, `sh -c -`, single-dash word options,
-    leading `VAR=val` before `export`, trailing threshold overrides and POSIX `#` comments."""
-
-    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
-    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
-    _assert_cases = TestFixRound4CompoundThresholdsAndShortFlags._assert_cases
-    _assert_end_to_end = TestFixRound7TargetAwareThresholdsUnitsEnvAndShellArgs._assert_end_to_end
-
-    # last `--threshold` wins (argparse), `$THRESHOLD` is the default, unknown words such as `||` are ignored
-    _CHECK = ("import argparse, os, sys\n"
-              "p = argparse.ArgumentParser()\n"
-              "p.add_argument('-u', action='store_true')\n"
-              "p.add_argument('-v', action='store_true')\n"
-              "p.add_argument('--threshold', type=float, default=float(os.environ.get('THRESHOLD', '0.01')))\n"
-              "a, _ = p.parse_known_args()\n"
-              "sys.exit(0 if a.u or a.threshold >= 0.25 else 1)\n")
 
     @staticmethod
     def _repo_without_visual_hook(home: Path) -> Path:
@@ -3077,103 +2468,9 @@ class TestFixRound9LiveFrozenShellArgsWordFlagsCommentsAndOverrides(unittest.Tes
                     self.assertFalse(chk["valid"])
                     self.assertEqual(chk["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
 
-    def test_sh_c_positional_args_are_field_split(self):
-        loosening = ["sh -c '$0' 'python3 check.py -u'", "sh -c '$1' sh 'python3 check.py -u'",
-                     "sh -c '$0' 'python3 check.py --threshold 0.99'", "bash -c '$0' 'python3 check.py -u'",
-                     "sh -c 'python3 check.py \"$@\"' sh -u"]
-        cases = {live: ("python3 check.py", live, True) for live in loosening}
-        cases.update({
-            "$0 || fallback": ("python3 check.py", "sh -c '$0' 'python3 check.py || true'", True),
-            "nested sh -c in $0": ("python3 check.py", "sh -c '$0' 'sh -c \"python3 check.py -u\"'", True),
-            "$0 plain": ("python3 check.py", "sh -c '$0' 'python3 check.py'", False),
-            "$0 = sh": ("python3 check.py", "sh -c 'python3 check.py \"$@\"' sh", False),
-        })
-        self._assert_cases(cases)
-        self._assert_end_to_end(self._CHECK, "python3 check.py", loosening, ["sh -c '$0' 'python3 check.py'"])
 
-    def test_lone_dash_ends_shell_options(self):
-        loosening = ["sh -c - 'python3 check.py -u'", "sh -c - 'python3 check.py --threshold 0.99'",
-                     "sh -c - 'python3 check.py || true'", "bash -c - 'python3 check.py -u'"]
-        cases = {live: ("python3 check.py", live, True) for live in loosening}
-        cases["sh -c - plain"] = ("python3 check.py", "sh -c - 'python3 check.py'", False)
-        cases["sh - script args"] = ("python3 check.py", "sh - check.sh -v", False)
-        self._assert_cases(cases)
-        self._assert_end_to_end(self._CHECK, "python3 check.py", loosening, ["sh -c - 'python3 check.py'"])
-
-    def test_single_dash_word_options_are_not_bundled_update_flags(self):
-        from factonio.harness import _command_tokens, _regen_flags
-
-        for cmd in ("compare -metric AE -fuzz 0% a.png b.png d.png", "magick compare -fuzz 5% a.png b.png d.png",
-                    "go test -run TestVisual -count 1 -timeout 60s -cpu 2 ./...", "find . -user root",
-                    "pytest -quiet -suite visual -junit out.xml -summary -debug -full -auto",
-                    "node check.js -out o -output o -url u -num 3 -sub s -module m -include i -exclude e"):
-            with self.subTest(clean=cmd):
-                self.assertEqual(_regen_flags(_command_tokens(cmd)), set(), cmd)
-        for cmd in ("python3 check.py -vu", "python3 check.py -uv", "npx jest -qu", "npx jest -su", "npx jest -xu",
-                    "npx jest -vsu", "npx jest -u", "go test -update ./...", "node check.js -update"):
-            with self.subTest(cmd):
-                self.assertTrue(_regen_flags(_command_tokens(cmd)), cmd)
-        self._assert_cases({
-            "compare -fuzz 0%": ("compare -metric AE a.png b.png d.png",
-                                 "compare -metric AE -fuzz 0% a.png b.png d.png", False),
-            "go test word flags": ("go test ./...", "go test -run TestVisual -count 1 -timeout 60s -cpu 2 ./...",
-                                   False),
-            "go test -update": ("go test ./...", "go test -update ./...", True),
-            "-vu": ("python3 check.py", "python3 check.py -vu", True),
-            "-uv": ("python3 check.py", "python3 check.py -uv", True),
-        })
-
-    def test_leading_assignments_before_export_still_feed_every_command(self):
-        check = "python3 check.py"
-        loosening = [f"CI=1 export THRESHOLD=0.5; {check}", f"CI=1 THRESHOLD=0.5; export THRESHOLD; {check}"]
-        cases = {live: (check, live, True) for live in loosening}
-        cases["CI=1 export CI"] = (check, f"CI=1 export CI; {check}", False)
-        self._assert_cases(cases)
-        self._assert_end_to_end(self._CHECK, check, loosening, [f"CI=1 export CI; {check}"])
-
-    def test_trailing_threshold_override_is_capped_by_the_strictest_base_value(self):
-        exported = "export THRESHOLD=0.9; export THRESHOLD=0.01; python3 check.py"
-        cli = "python3 check.py --threshold 0.9 --threshold 0.01"
-        env_live = "export THRESHOLD=0.9; export THRESHOLD=0.01; export THRESHOLD=0.9; python3 check.py"
-        self._assert_cases({
-            "env override": (exported, env_live, True),
-            "cli override": (cli, cli + " --threshold 0.9", True),
-            "cli strict extra": (cli, cli + " --threshold 0.005", False),
-        })
-        self._assert_end_to_end(self._CHECK, exported, [env_live], [exported])
-        self._assert_end_to_end(self._CHECK, cli, [cli + " --threshold 0.9"], [cli, cli + " --threshold 0.005"])
-
-    def test_posix_comments_are_not_live_tokens(self):
-        from factonio.harness import _split_shell
-
-        self.assertEqual(_split_shell("true # --threshold 0.01\npython3 check.py"),
-                         ["true", "\n", "python3", "check.py"])
-        self.assertEqual(_split_shell("a --color=#fff foo#bar '#q' \"#d\" \\#e"),
-                         ["a", "--color=#fff", "foo#bar", "#q", "#d", "#e"])
-        base = "python3 check.py --threshold 0.01"
-        loosening = [f"# {base}", "true # --threshold 0.01"]
-        clean = ["python3 check.py --label foo#bar --threshold 0.01",
-                 'python3 check.py --label "#notacomment" --threshold 0.01']
-        cases = {live: (base, live, True) for live in loosening}
-        cases.update({live: (base, live, False) for live in clean})
-        self._assert_cases(cases)
-        self._assert_end_to_end(self._CHECK, base, loosening, clean)
-
-
-
-class TestFixRound10FirstHarnessFrozenBaselinesEvalAndEnvThresholdClears(unittest.TestCase):
-    """Frozen baselines of a first, not-yet-committed harness, command-head POSIX `eval`, and committed threshold
-    environment variables cleared by `unset`, `export -n`, `env -u`, `env -i` or `env -` before the check."""
-
-    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
-    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
-    _assert_cases = TestFixRound4CompoundThresholdsAndShortFlags._assert_cases
-    _assert_end_to_end = TestFixRound7TargetAwareThresholdsUnitsEnvAndShellArgs._assert_end_to_end
-    _CHECK = TestFixRound9LiveFrozenShellArgsWordFlagsCommentsAndOverrides._CHECK
-    # an unset THRESHOLD falls back to a lenient tool default, so clearing it turns the failing diff green
-    _ENV = ("import os, sys\n"
-            "t = os.environ.get('THRESHOLD')\n"
-            "sys.exit(1 if 0.25 > float(t if t is not None else '1.0') else 0)\n")
+class TestFixRound10FirstHarnessFrozenBaselines(unittest.TestCase):
+    """Frozen baselines of a first, not-yet-committed harness (`baseline_source: live`)."""
 
     @staticmethod
     def _uncommitted_harness(home: Path, command: str, **meta: Any) -> tuple[Path, str]:
@@ -3273,102 +2570,12 @@ class TestFixRound10FirstHarnessFrozenBaselinesEvalAndEnvThresholdClears(unittes
             self.assertEqual(gate["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
             self.assertEqual(audit["severity"], "stale")
 
-    def test_command_head_eval_is_unwrapped(self):
-        from factonio.harness import _command_tokens, _regen_flags
 
-        self.assertEqual(_regen_flags(_command_tokens("npx jest eval -u")), {"-u"})
-        self.assertEqual(_regen_flags(_command_tokens("npx jest eval")), set())
-        self.assertEqual(_regen_flags(_command_tokens("eval 'python3 check.py -u'")), {"-u"})
-        loosening = ["eval 'python3 check.py -u'", "eval 'python3 check.py --threshold 0.5'",
-                     "eval 'python3 check.py || true'", "eval -- 'python3 check.py -u'",
-                     "eval python3 check.py -u", "sh -c \"eval 'python3 check.py -u'\""]
-        cases = {live: ("python3 check.py", live, True) for live in loosening}
-        cases.update({
-            "eval at the matching threshold": ("python3 check.py --threshold 0.01",
-                                               "eval 'python3 check.py --threshold 0.01'", False),
-            "eval plain": ("python3 check.py", "eval 'python3 check.py'", False),
-        })
-        self._assert_cases(cases)
-        # dash's `eval` runs `--` as a command, so `eval --` only executes as written under bash-like /bin/sh.
-        executed = [live for live in loosening if not live.startswith("eval --")]
-        self._assert_end_to_end(self._CHECK, "python3 check.py", executed, ["eval 'python3 check.py'"])
-        self._assert_end_to_end(self._CHECK, "python3 check.py --threshold 0.01", [],
-                                ["eval 'python3 check.py --threshold 0.01'"])
+class TestFixRound11ImmutablePreExecutionFrozenContract(unittest.TestCase):
+    """The frozen-baseline contract fixed before Doctor/hooks run, even when they unfreeze or remove the hook."""
 
-    _CLEARS = ("unset THRESHOLD; {c}", "unset -v THRESHOLD; {c}", "unset -- THRESHOLD; {c}",
-               "bash -c 'export -n THRESHOLD; {c}'", "env -u THRESHOLD {c}", "env --unset=THRESHOLD {c}",
-               "env --unset THRESHOLD {c}", "env -iu THRESHOLD PATH=\"$PATH\" {c}", "env -i PATH=\"$PATH\" {c}",
-               "env --ignore-environment PATH=\"$PATH\" {c}", "env - PATH=\"$PATH\" {c}")
+    _uncommitted_harness = staticmethod(TestFixRound10FirstHarnessFrozenBaselines._uncommitted_harness)
 
-    def test_clearing_an_exported_threshold_variable_is_loosening(self):
-        check = "python3 check.py"
-        base = f"export THRESHOLD=0.01; {check}"
-        loosening = [f"export THRESHOLD=0.01; {form.format(c=check)}" for form in self._CLEARS]
-        loosening += [f"export THRESHOLD=0.01; sh -c 'unset THRESHOLD; {check}'",
-                      f"export THRESHOLD=0.01; eval 'unset THRESHOLD'; {check}",
-                      f"export THRESHOLD=0.01; unset THRESHOLD; THRESHOLD=0.01; {check}",
-                      f"export THRESHOLD=0.01; unset THRESHOLD; export THRESHOLD=0.5; {check}",
-                      f"export THRESHOLD=0.01; env -i PATH=\"$PATH\" THRESHOLD=0.5 {check}"]
-        clean = [f"export THRESHOLD=0.01; unset FOO; {check}", f"export THRESHOLD=0.01; env -u FOO {check}",
-                 f"export -n FOO; export THRESHOLD=0.01; {check}",
-                 f"export THRESHOLD=0.01; env -i PATH=\"$PATH\" THRESHOLD=0.01 {check}",
-                 f"export THRESHOLD=0.01; unset THRESHOLD; export THRESHOLD=0.01; {check}",
-                 f"export THRESHOLD=0.01; unset -f THRESHOLD; {check}", f"{base}; unset THRESHOLD", base]
-        cases = {live: (base, live, True) for live in loosening}
-        cases.update({live: (base, live, False) for live in clean})
-        cases.update({
-            "declare +x": (base, f"export THRESHOLD=0.01; declare +x THRESHOLD; {check}", True),
-            "no committed env threshold: env -": (check, "env - python3 -u check.py", False),
-            "no committed env threshold: unset": (check, f"unset THRESHOLD; {check}", False),
-            "committed env -i kept": (f"export THRESHOLD=0.01; env -i PATH=\"$PATH\" {check}",
-                                      f"export THRESHOLD=0.01; env -i PATH=\"$PATH\" {check}", False),
-        })
-        self._assert_cases(cases)
-        self._assert_end_to_end(self._ENV, base, loosening[:len(self._CLEARS)], clean)
-        self._assert_reset_still_enforced(base, f"export THRESHOLD=0.01; env -i PATH=\"$PATH\" THRESHOLD=0.01 {check}")
-
-    def test_clearing_a_prefix_threshold_assignment_is_loosening(self):
-        check = "python3 check.py"
-        base = f"THRESHOLD=0.01 {check}"
-        loosening = [f"THRESHOLD=0.01 sh -c 'unset THRESHOLD; {check}'",
-                     f"THRESHOLD=0.01 sh -c 'unset -v THRESHOLD; {check}'",
-                     f"THRESHOLD=0.01 bash -c 'export -n THRESHOLD; {check}'",
-                     *(f"THRESHOLD=0.01 {form.format(c=check)}" for form in self._CLEARS if form.startswith("env"))]
-        clean = [f"THRESHOLD=0.01 env -u FOO {check}", f"unset FOO; {base}", f"export -n FOO; {base}",
-                 f"THRESHOLD=0.01 env -i PATH=\"$PATH\" THRESHOLD=0.01 {check}",
-                 f"unset THRESHOLD; {base}", base]
-        cases = {live: (base, live, True) for live in loosening}
-        cases.update({live: (base, live, False) for live in clean})
-        self._assert_cases(cases)
-        self._assert_end_to_end(self._ENV, base, loosening, clean)
-        self._assert_reset_still_enforced(base, f"THRESHOLD=0.01 env -i PATH=\"$PATH\" THRESHOLD=0.01 {check}")
-
-    def _assert_reset_still_enforced(self, base: str, live: str) -> None:
-        from factonio.harness import check_harness
-
-        with isolated_hermes_home() as home:
-            repo = self._visual_repo(home, base)
-            _write(repo, "check.py", self._ENV)
-            _commit_all(repo, "visual check script")
-            self._set_command(repo, live)
-            chk = check_harness(str(repo), run_hooks=True)
-            self.assertEqual(chk["hook_results"]["failed_required"], ["pixels"], chk["hook_results"])
-            self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
-
-
-class TestFixRound11FrozenContractExportScopeEnvSplitUnsetAndBuiltin(unittest.TestCase):
-    """The frozen-baseline contract fixed before Doctor/hooks run, thresholds that actually reach the check's
-    environment (exported, in scope, before it), `env -S` words re-parsed as env options, `unset --` and bash's
-    command-head `builtin`."""
-
-    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
-    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
-    _assert_cases = TestFixRound4CompoundThresholdsAndShortFlags._assert_cases
-    _assert_end_to_end = TestFixRound7TargetAwareThresholdsUnitsEnvAndShellArgs._assert_end_to_end
-    _assert_reset_still_enforced = TestFixRound10FirstHarnessFrozenBaselinesEvalAndEnvThresholdClears._assert_reset_still_enforced
-    _uncommitted_harness = staticmethod(TestFixRound10FirstHarnessFrozenBaselinesEvalAndEnvThresholdClears._uncommitted_harness)
-    _CHECK = TestFixRound9LiveFrozenShellArgsWordFlagsCommentsAndOverrides._CHECK
-    _ENV = TestFixRound10FirstHarnessFrozenBaselinesEvalAndEnvThresholdClears._ENV
     # run by a hook or Doctor command: drop the `pixels` hook's frozen contract, then regenerate its baseline
     _MUTATE = ("import json, pathlib, sys\n"
                "hj = pathlib.Path('.factonio/harness.json')\n"
@@ -3447,133 +2654,266 @@ class TestFixRound11FrozenContractExportScopeEnvSplitUnsetAndBuiltin(unittest.Te
             self.assertTrue(chk["valid"], chk["errors"])
             self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
 
-    _EXPORTED = "export THRESHOLD=0.01; python3 check.py"
-    _UNEXPORTED = ("THRESHOLD=0.01; python3 check.py", "python3 check.py; export THRESHOLD=0.01",
-                   "(export THRESHOLD=0.01); python3 check.py", "sh -c 'export THRESHOLD=0.01'; python3 check.py",
-                   "export THRESHOLD=0.01 | true; python3 check.py", "declare THRESHOLD=0.01; python3 check.py",
-                   "readonly THRESHOLD=0.01; python3 check.py", "THRESHOLD=0.01; set -a; python3 check.py")
 
-    def test_threshold_must_still_be_exported_before_the_check(self):
+class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
+    """The fail-closed structural `visual_diff` command guard: an unchanged committed command is always clean;
+    an edited one passes only when it keeps the committed shell structure token for token and adds nothing but
+    in-place threshold tightening or provably inert checker options. Shell rewrites fail closed."""
+
+    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    # The visual diff is 0.25: the committed THRESHOLD=0.01 fails it, the lenient default (THRESHOLD unset) or a
+    # regenerating `-u` passes it, so every bypass below turns the failing committed check green.
+    _CHECK = ("import os, sys\n"
+              "t = os.environ.get('THRESHOLD')\n"
+              "sys.exit(0 if '-u' in sys.argv[1:] or 0.25 <= float(t if t is not None else '1.0') else 1)\n")
+    _EXPORTED = "export THRESHOLD=0.01; python3 check.py"
+    _UNVERIFIABLE = "unverifiable shell/structural rewrite"
+
+    # Round 12 attack classes against the committed `_EXPORTED` hook, each executed by `/bin/sh` (dash or bash).
+    _EXECUTED_BYPASSES = (
+        "export threshold=0.01; python3 check.py",                                  # case-renamed variable
+        "false && export THRESHOLD=0.01; python3 check.py",                         # short-circuited export
+        "export THRESHOLD=0.01; bash -c 'exec -c python3 check.py'",               # bash `exec -c`
+        "export THRESHOLD=0.01; bash -c 'exec -ca visual python3 check.py'",
+        "export THRESHOLD=0.01; bash -c 'unset \"$0\"; python3 check.py' THRESHOLD",  # positional expansion
+        "unset THRESHOLD; (export THRESHOLD=0.01); python3 check.py",               # subshell re-export
+        "sh -c 'export THRESHOLD=0.01'; python3 check.py",                          # child-shell re-export
+        "export THRESHOLD=0.01 | true; python3 check.py",                           # pipeline re-export
+        "eval 'export THRESHOLD=0.01' | true; python3 check.py",                    # `eval` in a pipeline
+        "{ export THRESHOLD=0.01; } | true; python3 check.py",                      # brace group in a pipeline
+        "export THRESHOLD=0.01; env -u THRESHOLD python3 check.py",                 # env mutators
+        "export THRESHOLD=0.01; env -i PATH=\"$PATH\" python3 check.py",
+        "bash -c 'export -f THRESHOLD=0.01; python3 check.py'",                      # function-mode export
+        "f() { export THRESHOLD=0.01; }; python3 check.py",                         # uncalled function body
+        "export THRESHOLD=0.01; python3 check.py || true",                          # `||` fallback
+        "export THRESHOLD=0.01; python3 check.py -u",                               # regeneration flag
+        "export THRESHOLD=0.01; eval 'python3 check.py -u'",
+        "export THRESHOLD=0.01\nunset THRESHOLD\npython3 check.py",                 # newline injection
+    )
+    # Parser-level attacks (bash/GNU-only forms or non-executing fixtures) that must be rejected as well.
+    _REJECTED = {
+        "env --split-str": (_EXPORTED, "export THRESHOLD=0.01; env --split-str='-u THRESHOLD python3 check.py'"),
+        "env -S": (_EXPORTED, "export THRESHOLD=0.01; env -S '-u THRESHOLD python3 check.py'"),
+        "env -": (_EXPORTED, "export THRESHOLD=0.01; env - python3 check.py"),
+        "env -u $0": (_EXPORTED, "export THRESHOLD=0.01; bash -c 'env -u \"$0\" python3 check.py' THRESHOLD"),
+        "export -f": (_EXPORTED, "export -f THRESHOLD=0.01; python3 check.py"),
+        "assign + export -f": (_EXPORTED, "THRESHOLD=0.01; export -f THRESHOLD; python3 check.py"),
+        "declare -xf": (_EXPORTED, "declare -xf THRESHOLD=0.01; python3 check.py"),
+        "typeset -xf": (_EXPORTED, "typeset -xf THRESHOLD=0.01; python3 check.py"),
+        "builtin eval": ("python3 check.py", "builtin eval 'python3 check.py -u'"),
+        "python3 -c": ("python3 check.py", "python3 -c 'import sys; sys.exit(0)' check.py"),
+        "option swallowing": ("npx playwright test --threshold 0.01", "npx playwright test --output --threshold 0.01"),
+        "-- bypass": ("npx playwright test --threshold 0.01", "npx playwright test -- --threshold 0.01"),
+        "new positive threshold": ("python3 check.py", "python3 check.py --threshold 0.5"),
+        "threshold removed": ("python3 check.py --threshold 0.01", "python3 check.py"),
+        "NaN": ("python3 check.py --threshold 0.01", "python3 check.py --threshold NaN"),
+        "inf": ("python3 check.py --threshold 0.01", "python3 check.py --threshold=inf"),
+        "% loosened": ("python3 check.py --threshold 1%", "python3 check.py --threshold 0.05"),
+        "ratio to %": ("python3 check.py --threshold 0.05", "python3 check.py --threshold 10%"),
+        "% vs pixels": ("python3 check.py --threshold 1%", "python3 check.py --threshold 5"),
+        "swapped thresholds": ("a --threshold 0.01 && b --threshold 0.05", "a --threshold 0.05 && b --threshold 0.01"),
+        "prefix loosened": ("THRESHOLD=0.05 python3 check.py", "THRESHOLD=0.5 python3 check.py"),
+        "new env threshold": ("python3 check.py", "THRESHOLD=0 python3 check.py"),
+        "jest -u": ("npx jest", "npx jest -u"),
+        "bundled -vu": ("npx jest", "npx jest -vu"),
+        "UPDATE_SNAPSHOTS=1": ("npx jest", "UPDATE_SNAPSHOTS=1 npx jest"),
+        "--update-snapshots=all": ("npx playwright test --update-snapshots=none",
+                                   "npx playwright test --update-snapshots=all"),
+        "go -update": ("go test ./...", "go test ./... -update"),
+        "argv -u": ("python3 check.py", ["python3", "check.py", "-u"]),
+        "test filter": ("pytest tests/visual", "pytest tests/visual -k home"),
+        "--grep=": ("npx playwright test", "npx playwright test --grep=home"),
+        "--help exits 0": ("python3 check.py", "python3 check.py --help"),
+        "positional added": ("npx playwright test", "npx playwright test home.spec.ts"),
+        "sudo": ("python3 check.py", "sudo python3 check.py"),
+        "--env-file=": ("uv run python3 check.py", "uv run --env-file=.env python3 check.py"),
+        "--snapshot-dir=": ("npx playwright test", "npx playwright test --snapshot-dir=tmp"),
+        "-u not after the interpreter": ("npx jest python3 tests", "npx jest python3 -u tests"),
+        "fd becomes positional": ("npx playwright test 2>err.log", "npx playwright test 2 >err.log"),
+        "quoted expansion": ("python3 check.py '$HOME'", "python3 check.py $HOME"),
+        "redirect target": ("npx playwright test > log.txt", "npx playwright test > UPDATE_SNAPSHOTS=0 log.txt"),
+        "heredoc body": ("python3 - <<'EOF'\nt = 0.01\nEOF", "python3 - <<'EOF'\nt = 0.01 --True\nEOF"),
+        "unclosed quote": ("python3 check.py", "python3 check.py 'unclosed"),
+        "trailing backslash": ("python3 check.py", "python3 check.py \\"),
+    }
+    _UNCHANGED = (
+        _EXPORTED, "env - python3 -u check.py", "env -S '-u FOO python3 -u check.py'",
+        "bash -c 'export THRESHOLD=0.01; python3 check.py'", "go test -run TestVisual -fuzz=FuzzUI ./...",
+        "timeout 30 python3 -u check.py", "UPDATE_SNAPSHOTS=0 npx playwright test",
+        "npx playwright test --update-snapshots=false", "npx jest -u", "python3 check.py || true",
+        ["sh", "-c", "python3 check.py -u"],
+    )
+    _CLEAN = {
+        "--threshold tightened": ("python3 check.py --threshold 0.05", "python3 check.py --threshold 0.01"),
+        "% tightened to ratio": ("python3 check.py --threshold 5%", "python3 check.py --threshold 0.01"),
+        "--flag val -> --flag=val": ("python3 check.py --threshold 0.05", "python3 check.py --threshold=0.01"),
+        "prefix tightened": ("THRESHOLD=0.05 python3 check.py", "THRESHOLD=0.01 python3 check.py"),
+        "export tightened": ("export THRESHOLD=0.05; python3 check.py", _EXPORTED),
+        "sh -c tightened": ("bash -c 'export THRESHOLD=0.05; python3 check.py'", "bash -c '" + _EXPORTED + "'"),
+        "compound tightened": ("a --threshold 0.05 && b --threshold 0.02", "a --threshold 0.01 && b --threshold 0.01"),
+        "--reporter=list before": ("npx playwright test --threshold 0.01",
+                                   "npx playwright test --reporter=list --threshold 0.01"),
+        "--project= after": ("npx playwright test", "npx playwright test --project=chromium"),
+        "trailing --verbose": ("npx playwright test", "npx playwright test --verbose"),
+        "trailing -q": ("pytest tests/visual", "pytest tests/visual -q"),
+        "python3 -u": ("python3 check.py", "python3 -u check.py"),
+        "timeout python3 -u": ("timeout 30 python3 check.py", "timeout 30 python3 -u check.py"),
+        "--update-snapshots=false": ("npx playwright test", "npx playwright test --update-snapshots=false"),
+        "UPDATE_SNAPSHOTS=0": ("npx playwright test", "UPDATE_SNAPSHOTS=0 npx playwright test"),
+        "zero threshold added": ("npx playwright test", "npx playwright test --threshold 0"),
+        "comment + whitespace": (_EXPORTED, "export THRESHOLD=0.01;   python3 check.py  # visual check"),
+        "newlines": (_EXPORTED, "export THRESHOLD=0.01\npython3 check.py\n"),
+        "line continuation": ("python3 check.py --threshold 0.01", "python3 check.py \\\n  --threshold 0.01"),
+        "harmless quoting": (_EXPORTED, "export 'THRESHOLD=0.01'; python3 \"check.py\""),
+        "argv form": ("python3 check.py", ["python3", "check.py"]),
+    }
+
+    def _checked_repo(self, home: Path, command: str) -> Path:
+        """A repo whose committed `check.py` predates the committed frozen `visual_diff` harness."""
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "check.py", self._CHECK)
+        _commit_all(repo, "visual check script + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def _assert_rejected(self, cases: dict[str, tuple[Any, Any]]) -> None:
         from factonio.harness import _visual_hook_loosening
 
-        base = self._EXPORTED
-        cases = {live: (base, live, True) for live in self._UNEXPORTED}
-        cases.update({
-            "export kept": (base, base, False),
-            "export tightened": (base, "export THRESHOLD=0.005; python3 check.py", False),
-            "assign then export": (base, "THRESHOLD=0.01; export THRESHOLD; python3 check.py", False),
-            "export name first": (base, "export THRESHOLD; THRESHOLD=0.01; python3 check.py", False),
-            "declare -x": (base, "declare -x THRESHOLD=0.01; python3 check.py", False),
-            "set -a": (base, "set -a; THRESHOLD=0.01; python3 check.py", False),
-            "same subshell": (base, "(export THRESHOLD=0.01; python3 check.py)", False),
-            "same sh -c": (base, "sh -c 'export THRESHOLD=0.01; python3 check.py'", False),
-            "exported into sh -c": (base, "export THRESHOLD=0.01; sh -c 'python3 check.py'", False),
-            "loosened in subshell": (base, "(export THRESHOLD=0.9; python3 check.py)", True),
-            "prefix unchanged": ("THRESHOLD=0.01 python3 check.py", "THRESHOLD=0.01 python3 check.py", False),
-            "bare assign + export loosens": ("python3 check.py", "THRESHOLD=0.5; export THRESHOLD; python3 check.py",
-                                             True),
-            "unexported base kept": ("THRESHOLD=0.01; python3 check.py", "THRESHOLD=0.01; python3 check.py", False),
-        })
-        self._assert_cases(cases)
-        reasons = _visual_hook_loosening({"command": base}, {"command": "python3 check.py; export THRESHOLD=0.01"})
-        self.assertTrue(any("no longer exports threshold `threshold=0.01`" in r for r in reasons), reasons)
-        # `declare`/`readonly` and `set -a` are exercised by the parser cases; dash runs these POSIX forms
-        executed = [live for live in self._UNEXPORTED if not live.startswith(("declare", "readonly"))]
-        self._assert_end_to_end(self._ENV, base, executed, [
-            base, "export THRESHOLD=0.005; python3 check.py", "THRESHOLD=0.01; export THRESHOLD; python3 check.py",
-            "(export THRESHOLD=0.01; python3 check.py)", "set -a; THRESHOLD=0.01; python3 check.py",
-        ])
-        for live in ("THRESHOLD=0.01; export THRESHOLD; python3 check.py", "set -a; THRESHOLD=0.01; python3 check.py",
-                     "export THRESHOLD=0.01; sh -c 'python3 check.py'"):
-            with self.subTest(still_enforced=live):
-                self._assert_reset_still_enforced(base, live)
+        for label, (base, live) in cases.items():
+            with self.subTest(label):
+                self.assertTrue(_visual_hook_loosening({"command": base}, {"command": live}), (base, live))
 
-    _ENV_SPLIT_CLEARS = ("env -S '-u THRESHOLD python3 check.py'", "env -S '-i python3 check.py'",
-                         "env -S'-i python3 check.py'", "env -S '- python3 check.py'",
-                         "env -S '--unset=THRESHOLD python3 check.py'", "env --split-string='-i python3 check.py'",
-                         "env --split-string '-u THRESHOLD python3 check.py'")
+    def _assert_clean(self, cases: dict[str, tuple[Any, Any]]) -> None:
+        from factonio.harness import _visual_hook_loosening
 
-    def test_env_split_string_words_are_parsed_as_env_options(self):
-        from factonio.harness import _command_tokens, _regen_flags
+        for label, (base, live) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(_visual_hook_loosening({"command": base}, {"command": live}), [])
 
-        base = self._EXPORTED
-        cases = {live: (base, f"export THRESHOLD=0.01; {live}", True) for live in self._ENV_SPLIT_CLEARS}
-        cases.update({
-            "-i before -S": (base, "export THRESHOLD=0.01; env -i -S 'PATH=/usr/bin:/bin python3 check.py'", True),
-            "-u before -S": (base, "export THRESHOLD=0.01; env -u THRESHOLD -S 'python3 check.py'", True),
-            "-iS bundle": (base, "export THRESHOLD=0.01; env -iS 'python3 check.py'", True),
-            "nested -S": (base, "export THRESHOLD=0.01; env -S \"-S '-u THRESHOLD python3 check.py'\"", True),
-            "-i re-assigns": (base, "export THRESHOLD=0.01; env -S '-i THRESHOLD=0.01 python3 check.py'", False),
-            "-i before -S re-assigns": (base, "export THRESHOLD=0.01; env -i -S 'THRESHOLD=0.01 python3 check.py'",
-                                        False),
-            "-u FOO": (base, "export THRESHOLD=0.01; env -S '-u FOO python3 check.py'", False),
-            "unbuffered -u FOO": ("python3 check.py", "env -S '-u FOO python3 -u check.py'", False),
-            "unbuffered -i PATH": ("python3 check.py", "env -S '-i PATH=/usr/bin:/bin python3 -u check.py'", False),
-            "regen still caught": ("python3 check.py", "env -S '-u FOO python3 check.py -u'", True),
-        })
-        self._assert_cases(cases)
-        self.assertEqual(_regen_flags(_command_tokens("env -S '-u FOO python3 -u check.py'")), set())
-        self.assertEqual(_regen_flags(_command_tokens("env -S '-i PATH=/usr/bin:/bin npx jest -u'")), {"-u"})
-        # `-i`/`-` keep PATH for the executed hooks so `python3` resolves on any runner
-        executed = [live.replace("-i ", '-i PATH=$PATH ').replace("'- ", "'- PATH=$PATH ").replace("'", '"')
-                    for live in self._ENV_SPLIT_CLEARS]
-        self._assert_end_to_end(self._ENV, base, [f"export THRESHOLD=0.01; {live}" for live in executed], [])
-        self._assert_reset_still_enforced(base, 'export THRESHOLD=0.01; env -S "-i PATH=$PATH THRESHOLD=0.01 '
-                                                'python3 check.py"')
-        from factonio.harness import check_harness
+    def test_round12_attack_classes_fail_check_and_audit_end_to_end(self):
+        from factonio.harness import audit_harness, check_harness
 
-        for live in ("env -S '-u FOO python3 -u check.py'", 'env -S "-i PATH=$PATH python3 -u check.py"'):
-            with self.subTest(valid=live), isolated_hermes_home() as home:
-                repo = self._visual_repo(home, "python3 check.py")
-                _write(repo, "check.py", self._ENV)  # THRESHOLD unset: the committed check passes
-                _commit_all(repo, "visual check script")
-                self._set_command(repo, live)
-                chk = check_harness(str(repo), run_hooks=True)
-                self.assertTrue(chk["valid"], chk["errors"])
-                self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+        self._assert_rejected({live: (self._EXPORTED, live) for live in self._EXECUTED_BYPASSES})
+        with isolated_hermes_home() as home:
+            repo = self._checked_repo(home, self._EXPORTED)
+            committed = check_harness(str(repo), run_hooks=True)
+            self.assertEqual(committed["hook_results"]["failed_required"], ["pixels"], committed["hook_results"])
+            self.assertEqual(audit_harness(str(repo))["severity"], "clean")
+            for live in self._EXECUTED_BYPASSES:
+                with self.subTest(live=live):
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(chk["hook_results"]["failed_required"], [], chk["hook_results"])  # real bypass
+                    self.assertFalse(chk["ok"])
+                    self.assertFalse(chk["valid"])
+                    self.assertEqual(chk["gate_loosening"]["loosened_visual_hooks"], ["pixels"], chk["gate_loosening"])
+                    audit = audit_harness(str(repo))
+                    self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("stale", True))
 
-    def test_unset_double_dash_makes_every_word_an_operand(self):
-        base = self._EXPORTED
-        self._assert_cases({
-            "unset -- -f": (base, "export THRESHOLD=0.01; unset -- -f THRESHOLD; python3 check.py", True),
-            "bash unset -- -f": (base, "export THRESHOLD=0.01; bash -c 'unset -- -f THRESHOLD; python3 check.py'",
-                                 True),
-            "unset -f": (base, "export THRESHOLD=0.01; unset -f THRESHOLD; python3 check.py", False),
-            "unset -f --": (base, "export THRESHOLD=0.01; unset -f -- THRESHOLD; python3 check.py", False),
-        })
-        # dash aborts on `unset -- -f` (bad variable name); bash unsets THRESHOLD and runs the check
-        self._assert_end_to_end(self._ENV, base,
-                                ["export THRESHOLD=0.01; bash -c 'unset -- -f THRESHOLD; python3 check.py'"],
-                                ["export THRESHOLD=0.01; bash -c 'unset -f THRESHOLD; python3 check.py'"])
+    def test_parser_level_attacks_are_rejected(self):
+        self._assert_rejected(self._REJECTED)
 
-    _BUILTIN_REGEN = ("bash -c 'builtin eval \"python3 check.py -u\"'", "builtin eval 'python3 check.py -u'")
-    _BUILTIN_CLEARS = ("export THRESHOLD=0.01; bash -c 'builtin unset THRESHOLD; python3 check.py'",
-                       "export THRESHOLD=0.01; builtin export -n THRESHOLD; python3 check.py",
-                       "export THRESHOLD=0.01; bash -c 'builtin declare +x THRESHOLD; python3 check.py'")
+    def test_specific_diagnostics_name_the_loosening(self):
+        from factonio.harness import _visual_hook_loosening
 
-    def test_command_head_builtin_is_unwrapped_like_command(self):
-        from factonio.harness import _command_tokens, _regen_flags
+        def reasons(base: Any, live: Any) -> list[str]:
+            return _visual_hook_loosening({"command": base}, {"command": live})
 
-        self.assertEqual(_regen_flags(_command_tokens("builtin eval 'python3 check.py -u'")), {"-u"})
-        self.assertEqual(_regen_flags(_command_tokens("npx jest builtin -u")), {"-u"})
-        self.assertEqual(_regen_flags(_command_tokens("python3 check.py builtin")), set())
-        cases = {live: ("python3 check.py", live, True) for live in self._BUILTIN_REGEN}
-        cases.update({live: (self._EXPORTED, live, True) for live in self._BUILTIN_CLEARS})
-        cases.update({
-            "builtin -- eval": ("python3 check.py", "builtin -- eval 'python3 check.py -u'", True),
-            "builtin unset FOO": (self._EXPORTED, "export THRESHOLD=0.01; bash -c 'builtin unset FOO; "
-                                                  "python3 check.py'", False),
-            "builtin export kept": (self._EXPORTED, "builtin export THRESHOLD=0.01; python3 check.py", False),
-            "builtin eval plain": ("python3 check.py", "bash -c 'builtin eval \"python3 check.py\"'", False),
-        })
-        self._assert_cases(cases)
-        # `builtin` is a bash builtin (dash has none): execute through `bash -c`
-        self._assert_end_to_end(self._CHECK, "python3 check.py", [self._BUILTIN_REGEN[0]],
-                                ["bash -c 'builtin eval \"python3 check.py\"'"])
-        self._assert_end_to_end(self._ENV, self._EXPORTED, [
-            self._BUILTIN_CLEARS[0], self._BUILTIN_CLEARS[2],
-            "export THRESHOLD=0.01; bash -c 'builtin export -n THRESHOLD; python3 check.py'",
-        ], ["export THRESHOLD=0.01; bash -c 'builtin unset FOO; python3 check.py'"])
+        renamed = reasons(self._EXPORTED, "export threshold=0.01; python3 check.py")
+        self.assertIn("removes threshold `THRESHOLD=0.01` (falls back to the tool default)", renamed)
+        self.assertTrue(any("adds threshold `threshold=0.01`" in r for r in renamed), renamed)
+        self.assertIn("loosens threshold `threshold` from 0.01 to 0.5",
+                      reasons("python3 check.py --threshold 0.01", "python3 check.py --threshold 0.5"))
+        self.assertIn("loosens threshold `threshold` from 1% to 0.05",
+                      reasons("python3 check.py --threshold 1%", "python3 check.py --threshold 0.05"))
+        self.assertTrue(any(r.startswith("sets non-finite or unparseable threshold `threshold`")
+                            for r in reasons("x --threshold 0.01", "x --threshold nan")))
+        self.assertTrue(any(r.startswith("adds threshold `threshold=0.5`")
+                            for r in reasons("python3 check.py", "python3 check.py --threshold 0.5")))
+        self.assertIn("adds snapshot-regeneration flag(s) `-u`", reasons("npx jest", "npx jest -u"))
+        self.assertIn("adds snapshot-regeneration flag(s) `UPDATE_SNAPSHOTS=1`",
+                      reasons("npx jest", "UPDATE_SNAPSHOTS=1 npx jest"))
+        self.assertIn("adds shell `||` fallback to visual_diff hook (a failing check can still pass)",
+                      reasons("python3 check.py", "python3 check.py || true"))
+        self.assertEqual(reasons("python3 check.py", "python3 check.py 'x"),
+                         ["mutates visual_diff command with unparseable shell syntax"])
+        self.assertEqual(reasons(self._EXPORTED, "export THRESHOLD=0.01; (unset THRESHOLD); python3 check.py"),
+                         ["mutates committed visual_diff command with an unverifiable shell/structural rewrite"])
+
+    def test_unchanged_commands_of_any_shell_complexity_stay_clean(self):
+        from factonio.harness import audit_harness, check_harness
+
+        self._assert_clean({json.dumps(cmd): (cmd, cmd) for cmd in self._UNCHANGED})
+        self._assert_clean({"malformed but unchanged": ("python3 check.py 'x", "python3 check.py 'x")})
+        with isolated_hermes_home() as home:
+            for n, cmd in enumerate(self._UNCHANGED[:4]):
+                with self.subTest(cmd=cmd):
+                    repo = self._visual_repo(home, cmd, name=f"svc{n}")
+                    self._set_command(repo, cmd)
+                    chk = check_harness(str(repo))
+                    self.assertTrue(chk["valid"], chk["errors"])
+                    self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+                    self.assertEqual(audit_harness(str(repo))["severity"], "clean")
+
+    def test_in_place_tightening_and_inert_additions_stay_clean(self):
+        from factonio.harness import audit_harness, check_harness
+
+        self._assert_clean(self._CLEAN)
+        with isolated_hermes_home() as home:
+            for n, label in enumerate(("export tightened", "sh -c tightened", "--reporter=list before",
+                                       "python3 -u", "UPDATE_SNAPSHOTS=0", "comment + whitespace")):
+                base, live = self._CLEAN[label]
+                with self.subTest(label):
+                    repo = self._visual_repo(home, base, name=f"svc{n}")
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo))
+                    self.assertTrue(chk["valid"], chk["errors"])
+                    self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+                    audit = audit_harness(str(repo))
+                    self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("clean", False))
+
+    def test_scope_preserving_shell_rewrites_fail_closed(self):
+        """Injecting subshells, unsets or env mutators into a committed command is rejected even when it would keep
+        the effective threshold: the guard does not emulate the shell. Committing the same command is clean."""
+        from factonio.harness import _visual_hook_loosening, check_harness
+
+        rewrites = ("(unset THRESHOLD); python3 check.py", "(export THRESHOLD=0.9); python3 check.py",
+                    "export -n THRESHOLD; export THRESHOLD; python3 check.py", "unset -fv FOO; python3 check.py")
+        with isolated_hermes_home() as home:
+            repo = self._checked_repo(home, self._EXPORTED)
+            for live in (f"export THRESHOLD=0.01; {r}" for r in rewrites):
+                with self.subTest(live=live):
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(chk["hook_results"]["failed_required"], ["pixels"])  # the bar still holds...
+                    self.assertTrue(chk["gate_loosening"]["loosened"])  # ...but the rewrite is unverifiable
+                    self.assertTrue(any(self._UNVERIFIABLE in f for f in chk["gate_loosening"]["findings"]))
+                    self.assertEqual(_visual_hook_loosening({"command": live}, {"command": live}), [])
+
+    def test_tokenizer_normalizes_only_inert_syntax(self):
+        from factonio.harness import _tokenize_visual_cmd
+
+        def sig(cmd: Any) -> list[tuple[str, bool]]:
+            return [(t.text, t.is_op) for t in _tokenize_visual_cmd(cmd)]
+
+        self.assertEqual(sig("a 'b c' \"d\" # e --threshold 9\n\nf;;"), sig("a \"b c\" d; f;;"))
+        self.assertEqual(sig("x --color=#fff y#z"), [("x", False), ("--color=#fff", False), ("y#z", False)])
+        self.assertEqual(sig("cmd 2>&1 | tee log"), [("cmd", False), ("2>&", True), ("1", False), ("|", True),
+                                                      ("tee", False), ("log", False)])
+        self.assertEqual(sig("{ a; } && (b)"), [("{", True), ("a", False), (";", True), ("}", True),
+                                                 ("&&", True), ("(", True), ("b", False), (")", True)])
+        self.assertEqual(sig("${X} a{b,c}"), [("${X}", False), ("a{b,c}", False)])
+        for bad in ("a 'b", 'a "b', "a \\"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                _tokenize_visual_cmd(bad)
+        self.assertEqual(sig(["sh", "-c", "a; b"]), [("sh", False), ("-c", False), ("a; b", False)])
 
 
 if __name__ == "__main__":

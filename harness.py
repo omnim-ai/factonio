@@ -11,13 +11,11 @@ drift (`doc_drift` / `harness_gap` / `product_regression`), and audits drift rea
 
 from __future__ import annotations
 
-import itertools
 import json
 import math
 import os
 import re
 import secrets
-import shlex
 import shutil
 import signal
 import subprocess
@@ -26,7 +24,7 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, NamedTuple, Optional
 
 try:
     import tomllib
@@ -1663,944 +1661,376 @@ def _merge_baseline_changes(*groups: list[dict[str, Any]]) -> list[dict[str, Any
     return list(merged.values())
 
 
-_REGEN_FLAGS = frozenset({
-    "-u", "-update", "--update", "--update-snapshots", "--update-snapshot", "--updatesnapshot", "--snapshot-update",
-    "--update-baseline", "--update-baselines", "--regenerate", "--regen", "--update-goldens", "--update-golden",
-    "--overwrite-baselines", "--force-update-snapshots", "--accept", "--accept-snapshots",
-})
-_REGEN_ENV_RE = re.compile(
-    r"^(?:[A-Z0-9_]*_)?(?:UPDATE_?SNAPSHOTS?|SNAPSHOTS?_?UPDATE|UPDATE_?BASELINES?|UPDATE_?GOLDENS?|"
-    r"REGENERATE(?:_[A-Z0-9_]+)?)=(.*)$",
-    re.IGNORECASE,
-)
+# ---------------------------------------------------------------------------
+# Fail-closed structural `visual_diff` command guard
+# ---------------------------------------------------------------------------
+# Proving that an arbitrary rewritten shell script keeps a committed threshold is undecidable, so the guard does
+# not emulate the shell. An unchanged command (modulo whitespace, comments and harmless quoting) is always clean;
+# an edited one passes only when it keeps the committed shell structure token for token and adds nothing but
+# in-place threshold tightening or provably inert checker options. Everything else fails closed.
+
 _THRESHOLD_KEY_RE = re.compile(
     r"threshold|toleran|max[-_]?diff|fuzz|max[-_]?pixel|diff[-_]?ratio|mismatch", re.IGNORECASE
 )
-_ENV_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_REGEN_FLAG_RE = re.compile(r"^--?(?:update|regen(?:erate)?|accept(?:-snapshots)?|snapshot[-_]?update|"
+                            r"(?:force[-_]?)?update[-_]?(?:snapshots?|baselines?|goldens?)|"
+                            r"overwrite[-_]?baselines?)$", re.IGNORECASE)
+_REGEN_ENV_RE = re.compile(r"(?:^|_)(?:UPDATE_?SNAPSHOTS?|SNAPSHOTS?_?UPDATE|UPDATE_?BASELINES?|UPDATE_?GOLDENS?|"
+                           r"REGENERATE)(?:_|$)", re.IGNORECASE)
+_DISABLED = frozenset({"", "0", "false", "no", "off", "none"})
+_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
+_PYTHON_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|pypy3?)$")
+_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "busybox"})
+# Segment heads that change the environment or control flow: only in-place threshold tightening is allowed.
+_SEALED_HEADS = _SHELLS | frozenset({
+    "export", "declare", "typeset", "local", "readonly", "unset", "env", "exec", "eval", "command", "builtin",
+    "set", "shopt", "alias", "unalias", "trap", "source", ".", "if", "then", "elif", "else", "fi", "for",
+    "while", "until", "do", "done", "case", "esac", "function", "!",
+})
+_OPTION_RE = re.compile(r"^--?[A-Za-z][A-Za-z0-9_-]*(?:=.*)?$", re.DOTALL)
+# Inserted options that select, skip or retry tests, exit early, load code/config or move baselines.
+_UNSAFE_OPTION_RE = re.compile(
+    r"grep|skip|ignore|only|filter|exclude|deselect|pattern|select|fail|exit|pass|retr(?:y|ies)|shard|env|"
+    r"require|import|loader|eval|exec|preload|inject|rc|init|conf|help|version|list|collect|dry|snapshot|"
+    r"baseline|golden|update|regen|accept|root|dir|path|cwd|output|resolver|^[cekmptvh]$",
+    re.IGNORECASE,
+)
+_WRAPPER_ARG_RE = re.compile(r"^(?:run|-.*|\d+(?:\.\d+)?[smhd]?)$")  # `timeout 30`, `uv run`, `nice -n 5`
+_MAX_SCRIPT_DEPTH = 4
+_OPERATORS = ("<<<", "&>>", "&&", "||", "|&", ";;", ">>", "<<", "<>", ">&", "<&", "&>", ">|",
+              "|", ";", "&", "(", ")", ">", "<")
+_UNVERIFIABLE = "mutates committed visual_diff command with an unverifiable shell/structural rewrite"
 
 
-_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "busybox"})
-_SHELL_LONG_VALUE_OPTS = frozenset({"--rcfile", "--init-file"})
-_SH_ARGS_HEAD = "_"  # placeholder command carrying `sh -c SCRIPT` positional arguments ($0, $1, ...)
-# Builtins whose assignments set the environment of every later command, like a bare `VAR=val` command.
-_ENV_BUILTINS = frozenset({"export", "declare", "typeset", "local", "readonly"})
-_SHELL_PUNCT = frozenset("();<>|&\n")
-_MAX_SHELL_DEPTH = 4
+class _Tok(NamedTuple):
+    text: str     # the word after quote removal, or the operator
+    raw: str      # the source slice
+    is_op: bool
+    quoted: bool
+
+    @property
+    def key(self) -> str:
+        """Comparison identity: quoting is harmless unless the word expands (`'$HOME'` vs `$HOME`, `'*'`)."""
+        return self.raw if re.search(r"[$*?\[~`{]", self.raw) else self.text
 
 
-def _is_shell_op(tok: str) -> bool:
-    return bool(tok) and all(ch in _SHELL_PUNCT for ch in tok)
+class _Slot(NamedTuple):
+    """A threshold: `--flag val` / `--flag=val` (kind `flag`, normalized key) or `VAR=val` (kind `env`, exact
+    case-sensitive name); ``value`` is the ratio (`1%` -> 0.01) or None when non-finite or unparseable."""
+    kind: str
+    key: str
+    raw: str
+    value: Optional[float]
+    percent: bool
+    eq: bool
 
 
-def _strip_shell_comments(text: str) -> str:
-    """Drop POSIX comments: an unquoted `#` starting a word, up to (not including) the next newline. A mid-word
-    `#` (`foo#bar`, `--color=#fff`) and a quoted or escaped one are literal."""
-    out: list[str] = []
-    quote: Optional[str] = None
-    word_start = True
-    i, n = 0, len(text)
+def _tokenize_visual_cmd(command: Any) -> list[_Tok]:
+    """Shell words and operators of ``command`` (argv lists are literal words). Unquoted newlines are `;`,
+    `#` at a word start comments to the end of the line, runs of `;` collapse and edge `;` are dropped, and a
+    redirection keeps its fd (`2>`). Raises ValueError on an unclosed quote or a trailing lone backslash."""
+    if isinstance(command, list):
+        return [_Tok(str(c), str(c), False, True) for c in command]
+    text = str(command or "")
+    toks: list[_Tok] = []
+    word: Optional[list[str]] = None
+    i, n, start, quoted = 0, len(text), 0, False
+
+    def flush(end: int) -> None:
+        nonlocal word, quoted
+        if word is not None:
+            toks.append(_Tok("".join(word), text[start:end], False, quoted))
+        word, quoted = None, False
+
     while i < n:
         ch = text[i]
-        if quote == "'":
-            quote = None if ch == "'" else quote
-        elif ch == "\\" and i + 1 < n:
-            out.append(text[i:i + 2])
-            i, word_start = i + 2, False
-            continue
-        elif quote == '"':
-            quote = None if ch == '"' else quote
-        elif ch == "#" and word_start:
+        if ch in " \t\r\n":
+            flush(i)
+            if ch == "\n":
+                toks.append(_Tok(";", "\n", True, False))
+            i += 1
+        elif word is None and ch == "#":
             end = text.find("\n", i)
             i = n if end < 0 else end
-            continue
-        elif ch in "'\"":
-            quote = ch
-        out.append(ch)
-        word_start = quote is None and (ch in " \t\r" or ch in _SHELL_PUNCT)
-        i += 1
-    return "".join(out)
-
-
-def _split_shell(text: str) -> list[str]:
-    """POSIX words with shell operators (`;`, `&&`, `|`, `(`, `)`, ...) split into their own tokens; comments
-    are dropped."""
-    text = _strip_shell_comments(text)
-    lexer = shlex.shlex(text, posix=True, punctuation_chars="();<>|&\n")
-    lexer.whitespace_split = True
-    lexer.whitespace = " \t\r"  # an unquoted newline separates commands like `;`
-    lexer.commenters = ""
-    try:
-        tokens = list(lexer)
-    except ValueError:
-        tokens = re.findall(r"[();<>|&\n]+|[^\s();<>|&]+", text)
-    # shlex groups adjacent punctuation (`);`, `((`): keep each subshell paren a token of its own
-    return [part for tok in tokens
-            for part in (re.findall(r"[()]|[^()]+", tok) if _is_shell_op(tok) and len(tok) > 1 else [tok])]
-
-
-_REDIRECT_OPS = frozenset({">", ">>", "<", "<>", ">|", ">&", "<&", "&>", "&>>", "<<", "<<<"})
-
-
-def _strip_redirections(tokens: list[str]) -> list[str]:
-    """Drop shell redirections (`> out`, `2>&1`, `<in`, `&>> log`) with their target and fd number, so they stay
-    part of the same simple command instead of splitting it or making the target look like its executable."""
-    out: list[str] = []
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if tok not in _REDIRECT_OPS:
+        elif word is None and ch in "{}" and (i + 1 == n or text[i + 1] in " \t\r\n;&|()"):
+            toks.append(_Tok(ch, ch, True, False))
+            i += 1
+        elif ch == "\\" and text.startswith("\n", i + 1):
+            i += 2  # line continuation
+        elif op := next((o for o in _OPERATORS if text.startswith(o, i)), None):
+            i += len(op)
+            fd = "".join(word) if word is not None and not quoted else ""
+            if re.fullmatch(r"\d+|\{[A-Za-z_]\w*\}", fd) and ("<" in op or ">" in op):
+                word, op = None, fd + op  # `2>`: the fd belongs to the redirection
+            flush(i)
+            toks.append(_Tok(op, op, True, False))
+        else:
+            if word is None:
+                word, start = [], i
+            if ch == "\\":
+                if i + 1 >= n:
+                    raise ValueError("trailing backslash")
+                word.append(text[i + 1])
+                quoted, i = True, i + 2
+            elif ch == "'":
+                end = text.find("'", i + 1)
+                if end < 0:
+                    raise ValueError("unclosed single quote")
+                word.append(text[i + 1:end])
+                quoted, i = True, end + 1
+            elif ch == '"':
+                i += 1
+                while i < n and text[i] != '"':
+                    esc = text[i] == "\\" and i + 1 < n and text[i + 1] in '$`"\\\n'
+                    word.append(text[i + 1] if esc and text[i + 1] != "\n" else "" if esc else text[i])
+                    i += 2 if esc else 1
+                if i >= n:
+                    raise ValueError("unclosed double quote")
+                quoted, i = True, i + 1
+            else:
+                word.append(ch)
+                i += 1
+    flush(n)
+    out: list[_Tok] = []
+    for tok in toks:
+        if not (tok.is_op and tok.text == ";" and (not out or (out[-1].is_op and out[-1].text == ";"))):
             out.append(tok)
-            i += 1
-            continue
-        # `2>`: shlex splits the fd off; keep a digit that is the value of a preceding `--opt` (`--retries 2 > x`).
-        if out and out[-1].isdigit() and not (len(out) > 1 and out[-2].startswith("-") and "=" not in out[-2]):
-            out.pop()
-        i += 1
-        if i < len(tokens) and not _is_shell_op(tokens[i]):
-            i += 1
+    while out and out[-1].is_op and out[-1].text == ";":
+        out.pop()
     return out
 
 
-def _system_name(tok: str) -> Optional[str]:
-    """Basename of a bare (`env`) or absolute (`/usr/bin/env`) executable; None for a relative path such as
-    `scripts/env`, which is a repo-local program rather than the system wrapper, shell or interpreter."""
-    if "/" not in tok and "\\" not in tok:
-        return tok
-    return os.path.basename(tok) if tok.startswith("/") else None
-
-
-def _is_gate_flag(tok: str) -> bool:
-    """A long snapshot-regeneration option or any threshold-like option, which no wrapper may swallow."""
-    if not tok.startswith("-") or len(tok) < 2:
-        return False
-    key = tok.partition("=")[0]
-    if key.startswith("--") and key.lower() in _REGEN_FLAGS:
-        return True
-    return bool(_THRESHOLD_KEY_RE.search(key.lstrip("-")))
-
-
-# Execution wrappers that run their trailing argv as the real command: name -> (short options taking a
-# value, long options taking a value, required positional args before the command). `uv` only wraps `uv run`.
-_EXEC_WRAPPERS: dict[str, tuple[frozenset[str], frozenset[str], int]] = {
-    "timeout": (frozenset("sk"), frozenset({"--signal", "--kill-after"}), 1),
-    "nice": (frozenset("n"), frozenset({"--adjustment"}), 0),
-    "nohup": (frozenset(), frozenset(), 0),
-    "time": (frozenset("fo"), frozenset({"--format", "--output"}), 0),
-    "stdbuf": (frozenset("ioe"), frozenset({"--input", "--output", "--error"}), 0),
-    "command": (frozenset(), frozenset(), 0),
-    "builtin": (frozenset(), frozenset(), 0),  # bash `builtin eval|unset|export ...`; a builtin, never a path
-    "exec": (frozenset("a"), frozenset(), 0),
-    "xvfb-run": (frozenset("efnpsw"), frozenset({
-        "--error-file", "--auth-file", "--server-num", "--xauth-protocol", "--server-args", "--wait",
-    }), 0),
-}
-_UV_RUN_VALUE_OPTS = frozenset({
-    "--with", "--with-editable", "--with-requirements", "--python", "--directory", "--project", "--group",
-    "--no-group", "--extra", "--no-extra", "--env-file", "--from", "--index", "--default-index", "--index-url",
-    "--extra-index-url", "--find-links", "--package", "--cache-dir", "--config-file", "--python-platform",
-    "--only-group", "--prerelease", "--resolution", "--index-strategy", "--keyring-provider", "--exclude-newer",
-    "--link-mode", "--refresh-package", "--reinstall-package", "--upgrade-package", "--no-binary-package",
-    "--no-build-package", "--allow-insecure-host", "--color", "-p", "-C", "-w", "-f", "-i",
-})
-# Shell reserved words that precede a command without being its executable.
-_SHELL_PREFIX_WORDS = frozenset({"!", "{", "}", "if", "then", "elif", "else", "do", "while", "until"})
-
-
-def _skip_options(tokens: list[str], i: int, short_vals: frozenset[str],
-                  long_vals: frozenset[str]) -> Optional[int]:
-    """Index after a wrapper's options starting at ``i`` (``--`` consumed; value-taking options skip their value),
-    or None when an option is a regeneration/threshold flag, which then belongs to the wrapper as the command."""
-    while i < len(tokens) and tokens[i].startswith("-") and len(tokens[i]) > 1:
-        tok = tokens[i]
-        if _is_gate_flag(tok):
-            return None
-        i += 1
-        if tok == "--":
-            break
-        if tok.startswith("--"):
-            if "=" not in tok and tok in long_vals:
-                i += 1
-        elif tok[1] in short_vals and len(tok) == 2:
-            i += 1
-    return i
-
-
-def _skip_exec_wrapper(tokens: list[str], i: int) -> Optional[int]:
-    """Index of the wrapped command when ``tokens[i]`` is a supported execution wrapper, else None."""
-    name = _system_name(tokens[i])
-    if name == "uv":
-        j = _skip_options(tokens, i + 1, frozenset("pCw"), frozenset({"--directory", "--project", "--cache-dir",
-                                                                         "--config-file", "--color"}))
-        if j is None or j >= len(tokens) or tokens[j] != "run":
-            return None
-        j += 1
-        while j < len(tokens) and tokens[j].startswith("-") and len(tokens[j]) > 1:
-            tok = tokens[j]
-            if _is_gate_flag(tok):
-                return None
-            j += 1
-            if tok == "--":
-                break
-            if tok in ("-m", "--module"):
-                break  # `uv run -m pytest ...`: the module name is the command head
-            if "=" not in tok and tok in _UV_RUN_VALUE_OPTS:
-                j += 1
-        return j
-    spec = _EXEC_WRAPPERS.get(name or "")
-    if spec is None or (name == "builtin" and tokens[i] != "builtin"):
-        return None
-    short_vals, long_vals, positional = spec
-    j = _skip_options(tokens, i + 1, short_vals, long_vals)
-    return None if j is None else j + positional
-
-
-def _env_split_script(opt: str, tokens: list[str], j: int) -> tuple[Optional[str], int]:
-    """The `env -S` script carried by option ``opt`` (`-S <s>`, attached `-S'...'`, bundled `-iS <s>`, or
-    `--split-string[=]<s>`) and the index after any consumed value word (`-u NAME`, `-iC DIR`)."""
-    if opt.startswith("--"):
-        if opt == "--split-string":
-            return (tokens[j], j + 1) if j < len(tokens) else (None, j)
-        if opt.startswith("--split-string="):
-            return opt.partition("=")[2], j
-        if len(opt) >= 3 and ("--unset".startswith(opt) or "--chdir".startswith(opt)):
-            return None, j + 1
-        return None, j
-    for k, ch in enumerate(opt[1:], start=1):
-        if ch in "SuC":
-            rest = opt[k + 1:]
-            if rest:
-                return (rest if ch == "S" else None), j
-            if j >= len(tokens):
-                return None, j
-            return (tokens[j] if ch == "S" else None), j + 1
-    return None, j
-
-
-def _env_option_effects(opt: str, tokens: list[str], j: int) -> tuple[bool, Optional[str]]:
-    """``(clears the inherited environment, unset variable name)`` of `env` option ``opt`` (`-`, `-i`,
-    `--ignore-environment`, `-u NAME`, `-iuNAME`, `--unset[=]NAME`), whose separate value word is ``tokens[j]``.
-    getopt rules: a short cluster ends at its first value-taking option, and long options may be abbreviated."""
-    if opt == "-":
-        return True, None
-    if opt.startswith("--"):
-        key, eq, val = opt.partition("=")
-        if len(key) >= 3 and "--ignore-environment".startswith(key):
-            return True, None
-        if len(key) >= 3 and "--unset".startswith(key):
-            return False, val if eq else (tokens[j] if j < len(tokens) else None)
-        return False, None
-    clears = False
-    for k, ch in enumerate(opt[1:], start=1):
-        if ch in "SC":
-            break
-        if ch == "u":
-            rest = opt[k + 1:]
-            return clears, rest or (tokens[j] if j < len(tokens) else None)
-        clears = clears or ch == "i"
-    return clears, None
-
-
-def _unwrap_shell_scripts(tokens: list[str], depth: int,
-                          env_calls: Optional[list[dict[str, Any]]] = None) -> list[str]:
-    """Expand command-head `sh|bash ... -c <script>` and `env -S <script>` into their tokens and drop command-head
-    `env [opts]` and execution wrappers (`timeout 30`, `uv run`, `nice -n 5`, ...), so wrapper options such as
-    bash's or env's `-u` are never read as a regeneration flag. Only the command-head position (start, after a
-    shell operator, `VAR=val` or a wrapper) is unwrapped: a positional argument such as `tests/env` is data.
-    Command-head `eval ARGS` runs its arguments joined by spaces as a script, so they are expanded like `sh -c`.
-    Each dropped `env` that clears the environment or unsets variables is appended to ``env_calls``."""
-    tokens = _strip_redirections(tokens)
-    out: list[str] = []
-    at_head = True
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if _is_shell_op(tok):
-            out.append(tok)
-            at_head, i = True, i + 1
-            continue
-        if not at_head:
-            out.append(tok)
-            i += 1
-            continue
-        base = _system_name(tok)
-        if _ENV_ASSIGN_RE.match(tok):
-            out.append(tok)
-            i += 1
-            continue
-        if tok in _SHELL_PREFIX_WORDS:
-            i += 1
-            continue
-        if base == "env" and depth < _MAX_SHELL_DEPTH:
-            j = i + 1
-            script: Optional[str] = None
-            gate = False
-            clears, unset = False, []
-            # A lone `-` is POSIX `env -` (same as `env -i`), an env option rather than the command.
-            while j < len(tokens) and tokens[j].startswith("-") and script is None:
-                opt = tokens[j]
-                if _is_gate_flag(opt):
-                    gate = True
-                    break
-                j += 1
-                if opt == "--":
-                    break
-                wipe, name = _env_option_effects(opt, tokens, j)
-                clears = clears or wipe
-                unset.extend([name] if name else [])
-                # `env -u NAME` unsets a variable; it is not jest's `-u`
-                script, j = _env_split_script(opt, tokens, j)
-            if gate:
-                out.append(tok)
-                at_head, i = False, i + 1
-                continue
-            end = next((k for k in range(j, len(tokens)) if _is_shell_op(tokens[k])), len(tokens))
-            if script is not None:
-                # GNU env splits the script into argv, appends the arguments up to the next shell operator and
-                # parses the result as env's own arguments again (`env -S '-u T cmd'`): re-run it through `env`,
-                # carrying the effects of the options before `-S` so one call records them all.
-                carried = (["-i"] if clears else []) + [f"--unset={n}" for n in unset]
-                inner = ["env", *carried, *_split_shell(script), *tokens[j:end]]
-                out.extend(_unwrap_shell_scripts(inner, depth + 1, env_calls))
-                at_head, i = False, end
-                continue
-            if env_calls is not None and (clears or unset):
-                rest = tokens[j:end]
-                assigns = list(itertools.takewhile(lambda t: bool(_ENV_ASSIGN_RE.match(t)), rest))
-                env_calls.append({"clears": clears, "unset": unset, "assigns": assigns})
-            i = j
-            continue
-        if tok == "eval" and depth < _MAX_SHELL_DEPTH:  # a builtin: never a path
-            j = i + 2 if i + 1 < len(tokens) and tokens[i + 1] == "--" else i + 1
-            end = next((k for k in range(j, len(tokens)) if _is_shell_op(tokens[k])), len(tokens))
-            script = " ".join(tokens[j:end])
-            out.extend([";", *_unwrap_shell_scripts(_split_shell(script), depth + 1, env_calls), ";"])
-            at_head, i = False, end
-            continue
-        wrapped = _skip_exec_wrapper(tokens, i)
-        if wrapped is not None:
-            i = wrapped
-            continue
-        if depth < _MAX_SHELL_DEPTH and base in _SHELLS:
-            j, has_c = i + 1, False
-            if base == "busybox" and j < len(tokens) and tokens[j] in _SHELLS:
-                j += 1
-            while j < len(tokens) and tokens[j][:1] in ("-", "+") and len(tokens[j]) > 1 and tokens[j] != "--":
-                opt = tokens[j]
-                if _is_gate_flag(opt):
-                    has_c = False
-                    break
-                j += 1
-                if opt.startswith("--"):
-                    if opt in _SHELL_LONG_VALUE_OPTS and j < len(tokens):
-                        j += 1  # `bash --rcfile FILE -c ...`: the option takes the next word
-                    continue
-                has_c = has_c or "c" in opt[1:]
-                # every `o`/`O` in a cluster takes the next word: `-euo pipefail`, `-oc pipefail SCRIPT`
-                j = min(len(tokens), j + sum(ch in "oO" for ch in opt[1:]))
-            if j < len(tokens) and tokens[j] in ("--", "-"):  # POSIX: a lone `-` also ends the options
-                j += 1
-            if has_c and j < len(tokens):
-                # a child shell: its own `export`s never reach the commands after it (`(` ... `)` scope)
-                out.extend(["(", *_unwrap_shell_scripts(_split_shell(tokens[j]), depth + 1, env_calls), ")"])
-                # `sh -c SCRIPT $0 $1...`: the script reads them as "$0"/"$@", so they are scanned as arguments
-                # of a non-exempt placeholder command rather than letting `$0` pose as an exempt command head.
-                end = next((k for k in range(j + 1, len(tokens)) if _is_shell_op(tokens[k])), len(tokens))
-                if end > j + 1:
-                    out.append(_SH_ARGS_HEAD)
-                    for arg in tokens[j + 1:end]:
-                        # an unquoted `$0`/`$@` is field-split, so `'python3 check.py -u'` delivers its words
-                        words = _split_shell(arg)
-                        out.extend([arg] if words == [arg] else _unwrap_shell_scripts(words, depth + 1, env_calls))
-                at_head, i = False, end
-                continue
-        out.append(tok)
-        at_head = False
-        i += 1
-    return out
-
-
-def _command_tokens(command: Any, env_calls: Optional[list[dict[str, Any]]] = None) -> list[str]:
-    """Shell-aware tokens of a hook command: operators split out, redirections dropped and `sh -c` style
-    scripts expanded inline (environment-clearing `env` calls collected into ``env_calls``)."""
-    if isinstance(command, list):
-        tokens = [str(c) for c in command]
-    else:
-        tokens = _split_shell(str(command or ""))
-    return _unwrap_shell_scripts(tokens, 0, env_calls)
-
-
-_REGEN_DISABLED = frozenset({"0", "false", "no", "off", "none"})
-# Long regeneration options that take a mode word (`--update-snapshots none`); every other regeneration flag
-# is boolean, so a following word (even `""` or `none`) is a positional argument, never a disable value.
-_REGEN_MODE_FLAGS = frozenset({"--update-snapshots", "--update-snapshot", "--update"})
-
-
-def _value_after(tokens: list[str], i: int) -> Optional[str]:
-    nxt = tokens[i + 1] if i + 1 < len(tokens) else None
-    return None if nxt is None or nxt.startswith("-") or _is_shell_op(nxt) else nxt
-
-
-_PYTHON_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|pypy3?)$")
-_PYTHON_VALUE_OPTS = frozenset("WXQ")
-_SHORT_FLAG_EXEMPT = frozenset({"set", "diff"})  # `set -u` (nounset), `diff -u` (unified output)
-
-
-def _command_segments(tokens: list[str]) -> list[list[str]]:
-    """Simple commands of a token stream, split on shell operators (`&&`, `||`, `;`, `|`, `&`, `(`, `)`, newline)."""
-    segments: list[list[str]] = [[]]
-    for tok in tokens:
-        if _is_shell_op(tok):
-            segments.append([])
+def _segments(toks: list[_Tok]) -> tuple[list[str], list[list[_Tok]]]:
+    """Operator sequence and the word segments around them (always ``len(ops) + 1`` segments)."""
+    ops: list[str] = []
+    segs: list[list[_Tok]] = [[]]
+    for tok in toks:
+        if tok.is_op:
+            ops.append(tok.text)
+            segs.append([])
         else:
-            segments[-1].append(tok)
-    return [seg for seg in segments if seg]
+            segs[-1].append(tok)
+    return ops, segs
 
 
-def _command_head(seg: list[str]) -> int:
-    """Index of the executable in ``seg`` after leading `VAR=val` assignments, `env [opts]` and execution
-    wrappers (`timeout 30`, `uv run [opts]`, `nice -n 5`, `stdbuf -oL`, ...)."""
-    i = 0
-    while i < len(seg):
-        if _ENV_ASSIGN_RE.match(seg[i]) or seg[i] in _SHELL_PREFIX_WORDS:
-            i += 1
-        elif _system_name(seg[i]) == "env":
-            j = i + 1
-            while j < len(seg) and seg[j].startswith("-") and not _is_gate_flag(seg[j]):
-                _, j = _env_split_script(seg[j], seg, j + 1)
-            if j < len(seg) and _is_gate_flag(seg[j]):
-                break
-            i = j
-        else:
-            wrapped = _skip_exec_wrapper(seg, i)
-            if wrapped is None:
-                break
-            i = wrapped
-    return i
-
-
-def _python_args_start(seg: list[str], i: int) -> int:
-    """First index after a Python interpreter's own options and its script, `-m <module>` or `-c <code>`."""
-    while i < len(seg):
-        tok = seg[i]
-        if tok == "--":
-            return i + 2
-        if not tok.startswith("-") or tok == "-":
-            return i + 1
-        if _is_gate_flag(tok):
-            return i
-        i += 1
-        if tok.startswith("--"):
-            if tok == "--check-hash-based-pycs":
-                i += 1
-            continue
-        for k, ch in enumerate(tok[1:], start=1):
-            if ch in "cm":
-                return i if k < len(tok) - 1 else i + 1
-            if ch in _PYTHON_VALUE_OPTS:
-                if k == len(tok) - 1:
-                    i += 1
-                break
-    return i
-
-
-def _shell_args_start(seg: list[str], i: int) -> int:
-    """First index after a non-`-c` shell's own options and its script path (`bash -u script.sh ARGS`)."""
-    while i < len(seg) and seg[i][:1] in ("-", "+") and len(seg[i]) > 1 and seg[i] != "--":
-        if _is_gate_flag(seg[i]):
-            return i
-        if seg[i].startswith("--"):
-            i += 2 if seg[i] in _SHELL_LONG_VALUE_OPTS else 1
-        else:
-            i += 1 + sum(ch in "oO" for ch in seg[i][1:])  # `-ou errexit`: one word per `o`/`O`
-    if i < len(seg) and seg[i] in ("--", "-"):
-        i += 1
-    return i + 1
-
-
-def _regen_flags(tokens: list[str]) -> set[str]:
-    found: set[str] = set()
-    for tok in tokens:
-        m = _REGEN_ENV_RE.match(tok)
-        if m and m.group(1).strip().lower() not in _REGEN_DISABLED | {""}:
-            found.add(tok.split("=", 1)[0].upper() + "=" + m.group(1))
-    for seg in _command_segments(tokens):
-        head = _command_head(seg)
-        if head >= len(seg):
-            continue
-        name = _system_name(seg[head]) or ""
-        if name == "busybox" and head + 1 < len(seg) and seg[head + 1] in _SHELLS:
-            head, name = head + 1, seg[head + 1]
-        start, short_ok = head + 1, name not in _SHORT_FLAG_EXEMPT
-        if _PYTHON_RE.match(name):
-            start = _python_args_start(seg, head + 1)
-        elif name in _SHELLS:
-            start = _shell_args_start(seg, head + 1)
-        for i in range(start, len(seg)):
-            tok = seg[i]
-            if not tok.startswith("-"):
-                continue
-            flag, eq, value = tok.partition("=")
-            if flag.startswith("--"):
-                flag = flag.lower()
-            elif not short_ok:
-                continue
-            if flag not in _REGEN_FLAGS and not _grouped_update(flag, eq, name):
-                continue
-            if not eq and flag in _REGEN_MODE_FLAGS and _value_after(seg, i) is not None:
-                if seg[i + 1].strip().lower() in _REGEN_DISABLED:
-                    continue  # e.g. Playwright `--update-snapshots none`
-            elif eq and value.strip().lower() in _REGEN_DISABLED:
-                continue
-            found.add(flag if eq else tok)
-    return found
-
-
-# CLIs whose single-dash options are long words (`go test -run`, `compare -fuzz`), never bundled short flags.
-_SINGLE_DASH_LONG_CLIS = frozenset({"go", "compare", "magick", "convert", "ffmpeg", "find", "java"})
-_SINGLE_DASH_WORDS = frozenset({
-    "run", "count", "timeout", "cpu", "quiet", "out", "output", "url", "user", "num", "full", "debug", "auto",
-    "suite", "summary", "junit", "sub", "module", "include", "exclude",
-})
-
-
-def _grouped_update(flag: str, eq: str, name: str = "") -> bool:
-    """A bundled short-option cluster carrying `-u` (`-vu`, `-uv`), which argparse-style CLIs expand."""
-    word = flag[1:]
-    return (not eq and not flag.startswith("--") and len(flag) > 2 and word.isalpha() and "u" in word
-            and not _THRESHOLD_KEY_RE.search(word) and name not in _SINGLE_DASH_LONG_CLIS
-            and word.lower() not in _SINGLE_DASH_WORDS)
-
-
-# A finite threshold as (value, given in `%`); a percentage is stored as its ratio (`5%` -> 0.05).
-_Threshold = tuple[float, bool]
-_Occurrences = dict[str, list[tuple[str, Optional[_Threshold]]]]
-
-
-def _parse_threshold(raw: str) -> Optional[_Threshold]:
+def _parse_value(raw: str) -> tuple[Optional[float], bool]:
     pct = raw.endswith("%")
     try:
         value = float(raw[:-1] if pct else raw)
     except ValueError:
-        return None
-    if not math.isfinite(value):
-        return None
-    return (value / 100.0, True) if pct else (value, False)
+        return None, pct
+    if not math.isfinite(value) or value < 0:
+        return None, pct
+    return (value / 100.0 if pct else value), pct
 
 
-def _fmt_threshold(t: _Threshold) -> str:
-    return f"{t[0] * 100:g}%" if t[1] else f"{t[0]:g}"
-
-
-def _unit_ambiguous(a: _Threshold, b: _Threshold) -> bool:
-    """`%` against a plain number above 1 (pixels, or a 0-100 scale?) has no safe ordering; a plain number in
-    [0, 1] is a ratio comparable with a percentage."""
-    return a[1] != b[1] and (b if a[1] else a)[0] > 1.0
-
-
-def _looser(live: _Threshold, base: _Threshold) -> bool:
-    return _unit_ambiguous(live, base) or live[0] > base[0]
-
-
-def _threshold_occurrences(tokens: list[str]) -> tuple[_Occurrences, set[int]]:
-    """Every threshold-like option/assignment in command order as ``(raw, finite threshold or None)`` plus the
-    token indexes they occupy; nothing is overwritten, so a loosened, removed or non-finite earlier occurrence
-    cannot hide behind a later one."""
-    found: _Occurrences = {}
-    used: set[int] = set()
-    for i, tok in enumerate(tokens):
-        span = {i}
-        if tok.startswith("-"):
-            key, eq, val = tok.lstrip("-").partition("=")
-            if not eq:
-                val = _value_after(tokens, i) or ""
-                if val:
-                    span.add(i + 1)
-        else:
-            m = _ENV_ASSIGN_RE.match(tok)
-            if not m:
-                continue
-            key, val = m.group(1), m.group(2)
-        if not key or not _THRESHOLD_KEY_RE.search(key):
-            continue
-        raw = val.strip()
-        found.setdefault(key.lower().replace("_", "-"), []).append((raw, _parse_threshold(raw)))
-        used |= span
-    return found, used
-
-
-def _threshold_segments(tokens: list[str]) -> list[tuple[tuple[str, ...], _Occurrences]]:
-    """Per simple command: its normalized signature (tokens minus every threshold option and value) and its
-    threshold occurrences, so base and live checks are compared command by command."""
-    out: list[tuple[tuple[str, ...], _Occurrences]] = []
-    for seg in _command_segments(tokens):
-        occ, used = _threshold_occurrences(seg)
-        out.append((tuple(t.strip() for k, t in enumerate(seg) if k not in used), occ))
-    return out
-
-
-def _compare_thresholds(key: str, base_vals: list[_Threshold], live_vals: list[_Threshold],
-                        where: str) -> list[str]:
-    """Reasons ``live_vals`` loosen ``base_vals`` (positional, with any extra occurrence capped by the strictest
-    base value, which is the effective bar under both last-wins and strictest-wins semantics)."""
-    if not base_vals:
-        return []
-    base_s, live_s = ", ".join(map(_fmt_threshold, base_vals)), ", ".join(map(_fmt_threshold, live_vals))
-    if not live_vals:
-        return [f"removes threshold `{key}={base_s}`{where} (falls back to the tool default)"]
-    reasons: list[str] = []
-    if len(live_vals) < len(base_vals):
-        reasons.append(f"removes {len(base_vals) - len(live_vals)} of {len(base_vals)} `{key}` threshold(s) "
-                       f"({base_s} -> {live_s}){where}")
-    bar = min(base_vals, key=lambda t: t[0])
-    pairs = [*zip(base_vals, live_vals), *((bar, c) for c in live_vals[len(base_vals):])]
-    if any(_unit_ambiguous(c, b) for b, c in pairs):
-        reasons.append(f"changes threshold `{key}` unit from {base_s} to {live_s}{where} (`%` against a plain "
-                       "value above 1 cannot be ordered)")
-    elif any(c[0] > b[0] for b, c in pairs):
-        reasons.append(f"loosens threshold `{key}` from {base_s} to {live_s}{where}")
-    return reasons
-
-
-def _is_env_modifier(sig: tuple[str, ...]) -> bool:
-    """A bare `VAR=val`, `export`/`declare`/... or `sh -c` argument segment: it feeds every check rather than
-    being an independent check with its own bar."""
-    k = 0
-    while k < len(sig) and _ENV_ASSIGN_RE.match(sig[k]):
-        k += 1  # `CI=1 export THRESHOLD=0.5`, `CI=1 THRESHOLD=0.5`
-    return k == len(sig) or sig[k] == _SH_ARGS_HEAD or _system_name(sig[k]) in _ENV_BUILTINS
-
-
-_PIPE_OPS = frozenset({"|", "|&"})
-_ExportedEnv = dict[str, Optional[_Threshold]]
-
-
-def _exported_thresholds(tokens: list[str]) -> list[_ExportedEnv]:
-    """Per simple command (in `_command_segments` order): the threshold variables actually in its process
-    environment, i.e. exported in an enclosing scope before it (`export V=x`, `declare|typeset -x V=x`, `V=x`
-    then `export V`, `set -a`) or given as its own `V=x` prefix. An unexported `V=x;`, a later `export`, and an
-    `export` inside a `( ... )` subshell, `sh -c` script, pipeline element or `&` job never reach it."""
-    items: list[tuple[str, Any]] = []
-    for tok in tokens:
-        if _is_shell_op(tok):
-            items.append(("op", tok))
-        elif items and items[-1][0] == "seg":
-            items[-1][1].append(tok)
-        else:
-            items.append(("seg", [tok]))
-    # scope: (shell variable values, exported names, allexport)
-    scopes: list[tuple[dict[str, Optional[_Threshold]], set[str], list[bool]]] = [({}, set(), [False])]
-    out: list[_ExportedEnv] = []
-    prefix_into_subshell: dict[str, Optional[_Threshold]] = {}
-
-    def assign(tok: str) -> Optional[tuple[str, Optional[_Threshold]]]:
-        m = _ENV_ASSIGN_RE.match(tok)
-        if not m or not _THRESHOLD_KEY_RE.search(m.group(1)):
-            return None
-        return _threshold_key(m.group(1)), _parse_threshold(m.group(2).strip())
-
-    for n, (kind, val) in enumerate(items):
-        if kind == "op":
-            if val == "(":
-                vals, exported, allexport = scopes[-1]
-                scopes.append(({**vals, **prefix_into_subshell}, exported | set(prefix_into_subshell),
-                               [allexport[0]]))
-            elif val == ")" and len(scopes) > 1:
-                scopes.pop()
-            prefix_into_subshell = {}
-            continue
-        prev_op = items[n - 1][1] if n and items[n - 1][0] == "op" else None
-        next_op = items[n + 1][1] if n + 1 < len(items) and items[n + 1][0] == "op" else None
-        vals, exported, allexport = scopes[-1]
-        if prev_op in _PIPE_OPS or next_op in _PIPE_OPS or next_op == "&":
-            vals, exported, allexport = dict(vals), set(exported), [allexport[0]]  # runs in a subshell
-        k = 0
-        while k < len(val) and val[k] in _SHELL_PREFIX_WORDS:
-            k += 1
-        prefix = []
-        while k < len(val) and _ENV_ASSIGN_RE.match(val[k]):
-            prefix.append(val[k])
-            k += 1
-        verb = val[k] if k < len(val) else None
-        args = val[k + 1:]
-        if verb is None or verb in _ENV_BUILTINS or verb == "set":
-            out.append({})
-            if verb is None and next_op == "(":
-                # `V=x sh -c '...'` (expanded to `V=x ( ... )`): the prefix reaches only that child shell
-                prefix_into_subshell = dict(a for a in map(assign, prefix) if a)
-                continue
-            for a in filter(None, map(assign, prefix)):
-                vals[a[0]] = a[1]
-                if allexport[0]:
-                    exported.add(a[0])
-            if verb == "set":
-                for i, arg in enumerate(args):
-                    if arg[:1] in ("-", "+") and "a" in arg[1:] and not arg.startswith("--"):
-                        allexport[0] = arg[0] == "-"
-                    elif arg in ("-o", "+o") and i + 1 < len(args) and args[i + 1] == "allexport":
-                        allexport[0] = arg == "-o"
-                continue
-            if verb is None:
-                continue
-            opts = [a for a in args if a[:1] in ("-", "+") and len(a) > 1 and "=" not in a]
-            if verb == "export":
-                exports = not any(o.startswith("-") and "n" in o for o in opts)
-            elif verb in ("declare", "typeset", "local"):
-                exports = any(o.startswith("-") and "x" in o for o in opts)
-            else:
-                exports = False
-            exports = exports or allexport[0]
-            for arg in args:
-                if arg in opts or arg == "--":
-                    continue
-                name, eq, raw = arg.partition("=")
-                key = _threshold_key(name)
-                if not _THRESHOLD_KEY_RE.search(name) or not _ENV_ASSIGN_RE.match(f"{name}=x"):
-                    continue
-                if eq:
-                    vals[key] = _parse_threshold(raw.strip())
-                if exports:
-                    exported.add(key)
-            continue
-        env: _ExportedEnv = {key: vals[key] for key in exported if key in vals}
-        env.update(a for a in map(assign, prefix) if a)
-        out.append(env)
-    return out
-
-
-def _threshold_loosening(base_tokens: list[str], live_tokens: list[str]) -> list[str]:
-    """Threshold loosening, aligning base and live simple commands: first by identical signature (in any order),
-    then a single edited command or a unique target (executable + positional words) on each side. Each aligned
-    pair keeps every threshold at or below its base value; a still-ambiguous mapping fails closed when any live
-    threshold exceeds the strictest unaligned base one, so budgets never transfer between targets. Environment
-    assignments are compared globally; a brand-new command (every base command aligned) may carry its own bar."""
-    reasons: list[str] = []
-    base_segs, live_segs = _threshold_segments(base_tokens), _threshold_segments(live_tokens)
-
-    base_bad = [raw for _, occ in base_segs for vals in occ.values() for raw, v in vals if v is None]
-    for _, occ in live_segs:
-        for key, vals in sorted(occ.items()):
-            for raw in (raw for raw, v in vals if v is None):
-                if raw in base_bad:
-                    base_bad.remove(raw)
-                else:
-                    reasons.append(f"sets non-finite or unparseable threshold `{key}={raw}`")
-
-    def finite(occ: _Occurrences, key: str) -> list[_Threshold]:
-        return [v for _, v in occ.get(key, []) if v is not None]
-
-    def pooled(segs: list[tuple[tuple[str, ...], _Occurrences]], idxs: list[int]) -> dict[str, list[_Threshold]]:
-        out: dict[str, list[_Threshold]] = {}
-        for idx in idxs:
-            for key in segs[idx][1]:
-                out.setdefault(key, []).extend(finite(segs[idx][1], key))
-        return out
-
-    def env_capped(bi: int, key: str, l_vals: list[_Threshold]) -> bool:
-        """Every live value of ``key`` is within the strictest committed environment assignment of ``key`` that
-        already fed base command ``bi`` (`export T=0.01; check` -> `export T=0.01; env -i T=0.01 check`)."""
-        env_vals = pooled(base_segs, [k for k in base_env if k < bi]).get(key) or []
-        bar = min(env_vals, key=lambda t: t[0]) if env_vals else None
-        return bar is not None and not any(_looser(v, bar) for v in l_vals)
-
-    base_exp, live_exp = _exported_thresholds(base_tokens), _exported_thresholds(live_tokens)
-
-    def exported_reasons(bi: int, live_envs: list[_ExportedEnv], where: str) -> list[str]:
-        """Thresholds exported to base command ``bi`` that no live candidate still receives at or below the
-        committed value (an unexported, later or subshell-scoped `export` leaves it on the tool default)."""
-        out: list[str] = []
-        for key, b_val in sorted(base_exp[bi].items()):
-            if b_val is None:
-                continue  # unparseable: reported above
-            got = [env[key] for env in live_envs if key in env]
-            if not any(v is None or not _looser(v, b_val) for v in got):
-                out.append(f"no longer exports threshold `{key}={_fmt_threshold(b_val)}` to the check{where} "
-                           "(an unexported, later or subshell-scoped assignment leaves it on the tool default)")
-        return out
-
-    def compare_pair(bi: int, li: int) -> None:
-        (sig, b_occ), (_, l_occ) = base_segs[bi], live_segs[li]
-        where = f" in `{' '.join(sig)[:80]}`"
-        for key in sorted({*b_occ, *l_occ}):
-            b_vals, l_vals = finite(b_occ, key), finite(l_occ, key)
-            if (not b_vals and any(v[0] > 0 for v in l_vals) and not any(v is None for _, v in b_occ.get(key, []))
-                    and not env_capped(bi, key, l_vals)):
-                reasons.append(f"adds loosening threshold `{key}={_fmt_threshold(max(l_vals))}`{where}")
-            reasons.extend(_compare_thresholds(key, b_vals, l_vals, where))
-        reasons.extend(exported_reasons(bi, [live_exp[li]], where))
-
-    def ident(sig: tuple[str, ...]) -> tuple[str, ...]:
-        return tuple(t for t in sig if not t.startswith("-"))
-
-    base_env = [k for k, (sig, _) in enumerate(base_segs) if _is_env_modifier(sig)]
-    live_env = [k for k, (sig, _) in enumerate(live_segs) if _is_env_modifier(sig)]
-    unmatched_base: list[int] = []
-    unmatched_live = [k for k in range(len(live_segs)) if k not in live_env]
-    for bi in (k for k in range(len(base_segs)) if k not in base_env):
-        li = next((li for li in unmatched_live if live_segs[li][0] == base_segs[bi][0]), None)
-        if li is None:
-            unmatched_base.append(bi)
-        else:
-            unmatched_live.remove(li)
-            compare_pair(bi, li)
-    for bi in list(unmatched_base):
-        target = ident(base_segs[bi][0])
-        cands = [li for li in unmatched_live if ident(live_segs[li][0]) == target]
-        rivals = [b for b in unmatched_base if ident(base_segs[b][0]) == target]
-        if len(cands) == 1 and len(rivals) == 1:
-            unmatched_base.remove(bi)
-            unmatched_live.remove(cands[0])
-            compare_pair(bi, cands[0])
-    if len(unmatched_base) == 1 and len(unmatched_live) == 1:
-        compare_pair(unmatched_base[0], unmatched_live[0])
-    elif unmatched_base:
-        pool_base, pool_live = pooled(base_segs, unmatched_base), pooled(live_segs, unmatched_live)
-        where = " in a changed command"
-        for key in sorted({*pool_base, *pool_live}):
-            b_vals, l_vals = pool_base.get(key, []), pool_live.get(key, [])
-            if not l_vals or len(l_vals) < len(b_vals):
-                reasons.extend(_compare_thresholds(key, b_vals, l_vals, where))
-            elif b_vals:
-                strictest = min(b_vals, key=lambda t: t[0])
-                if any(_looser(c, strictest) for c in l_vals):
-                    reasons.append(f"ambiguous threshold/command mutation: `{key}` "
-                                   f"{', '.join(map(_fmt_threshold, l_vals))} exceeds the strictest base "
-                                   f"{_fmt_threshold(strictest)}{where} (cannot align edited commands by target)")
-            elif any(v[0] > 0 for v in l_vals):
-                reasons.append(f"adds loosening threshold `{key}={_fmt_threshold(max(l_vals))}`{where}")
-        if unmatched_live:
-            reasons.extend(dict.fromkeys(
-                why for bi in unmatched_base for why in exported_reasons(bi, [live_exp[li] for li in unmatched_live],
-                                                                         where)
-            ))
-
-    env_base, env_live = pooled(base_segs, base_env), pooled(live_segs, live_env)
-    base_cmds = [k for k in range(len(base_segs)) if k not in base_env]
-    where = " in a shell environment assignment"
-    for key in sorted({*env_base, *env_live}):
-        # command order, not sorted: a later assignment overrides an earlier one
-        b_vals, l_vals = env_base.get(key, []), env_live.get(key, [])
-        if b_vals:
-            reasons.extend(_compare_thresholds(key, b_vals, l_vals, where))
-            continue
-        # A new assignment feeds every command, so it is only safe when no base command ran on the tool default.
-        per_cmd = [finite(base_segs[k][1], key) for k in base_cmds]
-        strictest = (min((t for vals in per_cmd for t in vals), key=lambda t: t[0])
-                     if per_cmd and all(per_cmd) else None)
-        bad = [c for c in l_vals if (_looser(c, strictest) if strictest else c[0] > 0)]
-        if bad:
-            reasons.append(f"adds loosening threshold `{key}={_fmt_threshold(max(bad))}`{where} "
-                           "(applies to every later command)")
-    return reasons
-
-
-def _or_fallbacks(tokens: list[str]) -> int:
-    return sum(tok.count("||") for tok in tokens if _is_shell_op(tok))
-
-
-def _threshold_key(name: str) -> str:
-    return name.lower().replace("_", "-")
-
-
-def _threshold_env_vars(tokens: list[str]) -> dict[str, list[_Threshold]]:
-    """Normalized key -> finite values of every threshold-like `VAR=val` assignment (prefix or builtin)."""
-    out: dict[str, list[_Threshold]] = {}
-    for tok in tokens:
-        m = _ENV_ASSIGN_RE.match(tok)
+def _slot_items(words: list[str]) -> list[Any]:
+    """``words`` with each threshold (`--flag val`, `--flag=val`, `VAR=val`) collapsed into one `_Slot`."""
+    items: list[Any] = []
+    i = 0
+    while i < len(words):
+        tok = words[i]
+        m = _ASSIGN_RE.match(tok)
         if m and _THRESHOLD_KEY_RE.search(m.group(1)):
-            value = _parse_threshold(m.group(2).strip())
-            out.setdefault(_threshold_key(m.group(1)), []).extend([value] if value else [])
-    return out
-
-
-def _threshold_env_clears(tokens: list[str], env_calls: list[dict[str, Any]],
-                          tracked: dict[str, list[_Threshold]]) -> list[str]:
-    """Each way ``tokens`` clears a ``tracked`` threshold variable before a command runs: `unset [-v] VAR`,
-    `export -n VAR` or `declare|typeset +x VAR` not followed by `export VAR=<safe>` (or a `VAR=<safe>` prefix on
-    that command), and `env -u VAR` / `env -i` / `env -` not re-assigning it inside the same `env` call. A safe
-    value is at or below the strictest tracked value."""
-    events: list[str] = []
-    if not tracked:
-        return events
-
-    def safe(assigns: Iterable[str], key: str) -> bool:
-        bar = min(tracked[key], key=lambda t: t[0]) if tracked[key] else None
-        for tok in assigns:
-            m = _ENV_ASSIGN_RE.match(tok)
-            if m and _threshold_key(m.group(1)) == key:
-                value = _parse_threshold(m.group(2).strip())
-                if value is not None and (bar is None or not _looser(value, bar)):
-                    return True
-        return False
-
-    pending: dict[str, list[str]] = {}
-    for seg in _command_segments(tokens):
-        k = 0
-        while k < len(seg) and _ENV_ASSIGN_RE.match(seg[k]):
-            k += 1
-        verb = _system_name(seg[k]) if k < len(seg) else None
-        if verb is None:
-            continue  # bare `VAR=val`: unexported after `unset`/`export -n`
-        if verb not in ("unset", "export", "declare", "typeset"):
-            for key in list(pending):
-                if not safe(seg[:k], key):  # this command runs without the threshold
-                    events.extend(pending.pop(key))
-            continue
-        opts: list[str] = []
-        names: list[str] = []
-        end_opts = False
-        for arg in seg[k + 1:]:
-            if not end_opts and not names and arg == "--":
-                end_opts = True  # every later word is an operand, even `-f`
-                continue
-            if not end_opts and not names and arg[:1] in ("-", "+") and len(arg) > 1:
-                opts.append(arg)
-            else:
-                names.append(arg)
-        if verb == "unset":
-            clears = not (any("f" in o for o in opts) and not any("v" in o for o in opts))  # `-f`: functions
-            form = "unset"
-        elif verb == "export":
-            clears, form = any(o.startswith("-") and "n" in o for o in opts), "export -n"
+            items.append(_Slot("env", m.group(1), m.group(2), *_parse_value(m.group(2).strip()), True))
+        elif tok.startswith("-") and tok not in ("-", "--") and _THRESHOLD_KEY_RE.search(tok.partition("=")[0]):
+            name, eq, raw = tok.partition("=")
+            if not eq and i + 1 < len(words) and not words[i + 1].startswith("--"):
+                i, raw = i + 1, words[i + 1]
+            items.append(_Slot("flag", name.lstrip("-").lower().replace("_", "-"), raw,
+                               *_parse_value(raw.strip()), bool(eq)))
         else:
-            clears, form = any(o.startswith("+") and "x" in o for o in opts), f"{verb} +x"
-        exports = verb == "export" or any(o.startswith("-") and "x" in o for o in opts)
-        for name in names:
-            key = _threshold_key(name.partition("=")[0])
-            if key not in tracked:
-                continue
-            if clears:
-                pending.setdefault(key, []).append(
-                    f"clears threshold environment variable `{name.partition('=')[0]}` via `{form}`")
-            elif exports and safe([name], key):
-                pending.pop(key, None)
+            items.append(tok)
+        i += 1
+    return items
 
-    for call in env_calls:
-        events.extend(f"unsets threshold environment variable `{n}` via `env -u`" for n in call["unset"]
-                      if _threshold_key(n) in tracked and not safe(call["assigns"], _threshold_key(n)))
-        if call["clears"]:
-            events.extend(f"clears threshold environment variable `{key}` via `env -i`/`env -`"
-                          for key in sorted(tracked) if not safe(call["assigns"], key))
-    return events
+
+def _slot_ok(base: _Slot, live: _Slot) -> bool:
+    """``live`` keeps ``base``'s bar: same slot, and the same text or a finite, comparable, no looser value."""
+    if (base.kind, base.key) != (live.kind, live.key):
+        return False
+    if live.raw.strip() == base.raw.strip():
+        return True
+    if base.value is None or live.value is None:
+        return False
+    if base.percent != live.percent and (base.value if live.percent else live.value) > 1.0:
+        return False  # `%` against a plain number above 1 (pixels?) cannot be ordered
+    return live.value <= base.value
+
+
+def _item_ok(base: Any, live: Any) -> bool:
+    if isinstance(base, _Slot) and isinstance(live, _Slot):
+        return _slot_ok(base, live)
+    return not isinstance(base, _Slot) and not isinstance(live, _Slot) and base == live
+
+
+def _is_assignment(item: Any) -> bool:
+    return item.kind == "env" if isinstance(item, _Slot) else bool(_ASSIGN_RE.match(item))
+
+
+def _is_regen(tok: str, prev: Optional[str]) -> bool:
+    """An active snapshot-regeneration option or environment assignment (`=false`/`=0`/... disable it)."""
+    m = _ASSIGN_RE.match(tok)
+    if m:
+        return bool(_REGEN_ENV_RE.search(m.group(1))) and m.group(2).strip().lower() not in _DISABLED
+    name, eq, value = tok.partition("=")
+    if _REGEN_FLAG_RE.match(name):
+        return not (eq and value.strip().lower() in _DISABLED)
+    word = name[1:]
+    if not name.startswith("-") or eq or not word.isalpha() or "u" not in word or len(word) > 3:
+        return False
+    prev_name = os.path.basename(prev or "")
+    exempt = bool(_PYTHON_RE.match(prev_name)) or prev_name in _SHELLS | {"set", "env", "diff"}
+    return not exempt and word.lower() not in {"run", "sub", "cpu", "out", "url", "num"}
+
+
+def _insert_ok(live: list[Any], j: int, head: int, trailing_from: int, matched: set[int]) -> bool:
+    """Whether item ``live[j]``, absent from the committed segment, is provably inert: a disabled regeneration
+    assignment before the head; after it a disabled regeneration option or self-contained `--flag=value`; a zero
+    threshold or plain option after every committed word (``trailing_from``); or Python's unbuffered `-u` right
+    after a committed interpreter head (`python3`, `timeout 30 python3`) and before its committed script."""
+    item = live[j]
+    if isinstance(item, _Slot):
+        return item.kind == "flag" and item.value == 0 and j > head and (item.eq or j >= trailing_from)
+    if any(c in item for c in "$`\n\r") or item == "--" or item.endswith("()"):
+        return False
+    if _is_assignment(item):
+        return j < head and bool(_REGEN_ENV_RE.search(item.partition("=")[0])) and not _is_regen(item, None)
+    if j <= head or not _OPTION_RE.match(item):  # never a word: no command, shell, wrapper or positional
+        return False
+    name, eq, value = item.partition("=")
+    if _REGEN_FLAG_RE.match(name) and eq:
+        return value.strip().lower() in _DISABLED
+    if item == "-u" and {j - 1, j + 1} <= matched and _PYTHON_RE.match(os.path.basename(live[j - 1])):
+        return all(isinstance(w, str) and _WRAPPER_ARG_RE.match(w) for w in live[head + 1:j - 1])
+    if _is_regen(item, None) or _THRESHOLD_KEY_RE.search(item) or _UNSAFE_OPTION_RE.search(name.lstrip("-")):
+        return False
+    return (name.startswith("--") and bool(eq)) or j >= trailing_from
+
+
+def _segment_ok(base_toks: list[_Tok], live_toks: list[_Tok], depth: int, sealed: bool, trailing: bool) -> bool:
+    base, live = [t.key for t in base_toks], [t.key for t in live_toks]
+    if base == live:
+        return True
+    b_items, l_items = _slot_items(base), _slot_items(live)
+    head = next((k for k, t in enumerate(base) if not _ASSIGN_RE.match(t)), None)
+    name = os.path.basename(base[head]) if head is not None else None
+    if name in _SHELLS and len(base) == len(live):
+        # an unchanged `sh|bash ... -c SCRIPT [args]` wrapper: only the script may differ, checked recursively
+        diff = [k for k in range(len(base)) if base[k] != live[k]]
+        if len(diff) == 1 and diff[0] > head + 1 and re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", base[diff[0] - 1]):
+            return _structure_ok(base_toks[diff[0]].text, live_toks[diff[0]].text, depth + 1)
+    if sealed or head is None or name in _SEALED_HEADS:
+        return len(b_items) == len(l_items) and all(map(_item_ok, b_items, l_items))
+    matched: list[int] = []
+    j = 0
+    for item in b_items:  # every committed word and threshold, in order (greedy earliest match)
+        while j < len(l_items) and not _item_ok(item, l_items[j]):
+            j += 1
+        if j >= len(l_items):
+            return False
+        matched.append(j)
+        j += 1
+    live_head = matched[next(k for k, t in enumerate(b_items) if not _is_assignment(t))]
+    trailing_from = matched[-1] + 1 if trailing else len(l_items)
+    return all(_insert_ok(l_items, k, live_head, trailing_from, set(matched))
+               for k in range(len(l_items)) if k not in matched)
+
+
+def _is_redirect(op: str) -> bool:
+    return "<" in op or ">" in op
+
+
+def _structure_ok(base_cmd: Any, live_cmd: Any, depth: int = 0) -> bool:
+    """The fail-closed structural rule: identical operators and segment count, each segment aligned 1-to-1."""
+    if depth > _MAX_SCRIPT_DEPTH:
+        return False
+    try:
+        base, live = _tokenize_visual_cmd(base_cmd), _tokenize_visual_cmd(live_cmd)
+    except ValueError:
+        return False
+    if [(t.key, t.is_op) for t in base] == [(t.key, t.is_op) for t in live]:
+        return True
+    (b_ops, b_segs), (l_ops, l_segs) = _segments(base), _segments(live)
+    if b_ops != l_ops or any(op.lstrip("0123456789").startswith("<<") and "<<<" not in op for op in b_ops):
+        return False  # a changed heredoc body is code, not argv
+    # a redirection target is sealed, and nothing may trail a word that precedes a redirection (`cmd 2>f`)
+    return all(_segment_ok(b, s, depth, k > 0 and _is_redirect(b_ops[k - 1]),
+                           k == len(b_ops) or not _is_redirect(b_ops[k]))
+               for k, (b, s) in enumerate(zip(b_segs, l_segs)))
+
+
+def _flat_segments(command: Any, depth: int = 0) -> tuple[list[list[str]], int]:
+    """Word segments of ``command`` and of every nested `sh -c` script, plus its `||` count (diagnostics)."""
+    try:
+        ops, segs = _segments(_tokenize_visual_cmd(command))
+    except ValueError:
+        return [], 0
+    out, ors = [[t.text for t in s] for s in segs if s], ops.count("||")
+    for seg in out[:]:
+        if depth < _MAX_SCRIPT_DEPTH and os.path.basename(seg[0]) in _SHELLS:
+            k = next((k for k in range(1, len(seg) - 1) if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", seg[k])), None)
+            if k is not None:
+                inner, inner_ors = _flat_segments(seg[k + 1], depth + 1)
+                out, ors = out + inner, ors + inner_ors
+    return out, ors
+
+
+def _threshold_reasons(base_segs: list[list[str]], live_segs: list[list[str]]) -> list[str]:
+    def slots(segs: list[list[str]]) -> dict[tuple[str, str], list[_Slot]]:
+        out: dict[tuple[str, str], list[_Slot]] = {}
+        for item in (i for seg in segs for i in _slot_items(seg) if isinstance(i, _Slot)):
+            out.setdefault((item.kind, item.key), []).append(item)
+        return out
+
+    base, live = slots(base_segs), slots(live_segs)
+    reasons: list[str] = []
+    for (kind, key), b_vals in base.items():
+        l_vals = live.get((kind, key), [])
+        label = f"`{key}`" + (" environment variable" if kind == "env" else "")
+        if not l_vals:
+            reasons.append(f"removes threshold `{key}={b_vals[0].raw}` (falls back to the tool default)")
+            continue
+        if len(l_vals) < len(b_vals):
+            reasons.append(f"removes {len(b_vals) - len(l_vals)} of {len(b_vals)} {label} threshold(s)")
+        strictest = min(b_vals, key=lambda s: math.inf if s.value is None else s.value)
+        bad = [s for b, s in [*zip(b_vals, l_vals), *((strictest, s) for s in l_vals[len(b_vals):])]
+               if not _slot_ok(b, s)]
+        if any(s.value is None for s in bad):
+            reasons.append(f"sets non-finite or unparseable threshold {label} "
+                           f"({', '.join(s.raw for s in bad if s.value is None)})")
+        if any(s.value is not None for s in bad):
+            reasons.append(f"loosens threshold {label} from {', '.join(s.raw for s in b_vals)} to "
+                           f"{', '.join(s.raw for s in l_vals)}")
+    for (kind, key), l_vals in live.items():
+        if (kind, key) not in base and any(s.value is None or s.value > 0 or kind == "env" for s in l_vals):
+            reasons.append(f"adds threshold `{key}={l_vals[0].raw}` (replaces the tool's built-in default)")
+    return reasons
 
 
 def _visual_hook_loosening(base_hook: dict[str, Any], live_hook: dict[str, Any]) -> list[str]:
     """Ways ``live_hook`` weakens the committed `visual_diff` ``base_hook`` (empty when it does not)."""
     reasons: list[str] = []
-    base_env_calls: list[dict[str, Any]] = []
-    live_env_calls: list[dict[str, Any]] = []
-    base_tokens = _command_tokens(base_hook.get("command"), base_env_calls)
-    live_tokens = _command_tokens(live_hook.get("command"), live_env_calls)
-    added_regen = sorted(_regen_flags(live_tokens) - _regen_flags(base_tokens))
-    if added_regen:
-        reasons.append("adds snapshot-regeneration flag(s) " + ", ".join(f"`{f}`" for f in added_regen))
-    reasons.extend(_threshold_loosening(base_tokens, live_tokens))
-    tracked = _threshold_env_vars(base_tokens)
-    # Clearing the committed threshold variable before the check makes it fall back to the tool default.
-    added_clears = Counter(_threshold_env_clears(live_tokens, live_env_calls, tracked))
-    added_clears.subtract(Counter(_threshold_env_clears(base_tokens, base_env_calls, tracked)))
-    reasons.extend(why for why, n in added_clears.items() if n > 0)
-    if _or_fallbacks(live_tokens) > _or_fallbacks(base_tokens):
-        reasons.append("adds shell `||` fallback to visual_diff hook (a failing check can still pass)")
+    base_cmd, live_cmd = base_hook.get("command"), live_hook.get("command")
+    unchanged = isinstance(base_cmd, str) and isinstance(live_cmd, str) and base_cmd.strip() == live_cmd.strip()
+    if not unchanged:
+        try:
+            _tokenize_visual_cmd(live_cmd)
+        except ValueError:
+            reasons.append("mutates visual_diff command with unparseable shell syntax")
+    if not unchanged and not reasons and not _structure_ok(base_cmd, live_cmd):
+        (base_segs, base_ors), (live_segs, live_ors) = _flat_segments(base_cmd), _flat_segments(live_cmd)
+
+        def regen(segs: list[list[str]]) -> Counter[str]:
+            return Counter(t for seg in segs for k, t in enumerate(seg) if _is_regen(t, seg[k - 1] if k else None))
+
+        added = sorted((regen(live_segs) - regen(base_segs)).elements())
+        if added:
+            reasons.append("adds snapshot-regeneration flag(s) " + ", ".join(f"`{f}`" for f in added))
+        reasons.extend(_threshold_reasons(base_segs, live_segs))
+        if live_ors > base_ors:
+            reasons.append("adds shell `||` fallback to visual_diff hook (a failing check can still pass)")
+        reasons.append(_UNVERIFIABLE)
     base_frozen = _frozen_baseline_globs(base_hook)
     if base_frozen:
         live_frozen = _frozen_baseline_globs(live_hook) if live_hook.get("kind") == "visual_diff" else []
