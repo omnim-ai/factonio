@@ -1110,12 +1110,26 @@ def _read_arena_tasks(
 
 
 def _scrub(text: Any) -> Optional[str]:
-    return None if text is None or contains_holdout_reference(text) else str(text)
+    """Public string fields are a real ``str`` without a holdout reference, else ``None``."""
+    return text if isinstance(text, str) and not contains_holdout_reference(text) else None
 
 
-def _scrub_labels(entry: dict[str, Any]) -> dict[str, Any]:
-    """Fail closed on manifest-sourced strings (slot, vendor, model, task_id) that reference holdout."""
-    return {**entry, **{k: _scrub(entry.get(k)) for k in ("slot", "vendor", "model", "task_id") if k in entry}}
+def _public_candidate(entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **{k: _scrub(entry.get(k)) for k in ("slot", "vendor", "model", "task_id", "status")},
+        "artifact_ready": entry.get("artifact_ready") is True,
+    }
+
+
+def _public_judge(judge: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Typed judge projection: manifest data never reaches the payload except as ``str``/``bool``/``None``."""
+    if not judge:
+        return None
+    cross_vendor = judge.get("cross_vendor")
+    return {
+        **{k: _scrub(judge.get(k)) for k in ("task_id", "status", "vendor", "model")},
+        "cross_vendor": cross_vendor if isinstance(cross_vendor, bool) else None,
+    }
 
 
 # Per-manifest failures: corrupt JSON shapes, non-finite numbers, unreadable files.
@@ -1190,16 +1204,16 @@ def list_arena_summaries(
                 "arena_id": aid,
                 "tenant": str(manifest["tenant"]),
                 "repo": _scrub(manifest.get("repo")),
-                "target": manifest.get("target") or "define",
+                "target": str(manifest.get("target") or "define"),
                 "title": _scrub(manifest.get("title")),
-                "status": state["status"],
-                "created_at": _created_ns(manifest) // 1_000_000_000 or None,
-                "candidates": [_scrub_labels(c) for c in state["candidates"]],
-                "judge": _scrub_labels(state["judge"]) if state["judge"] else None,
-                "ready_for_synthesis": state["ready_for_synthesis"],
-                "synthesized": state["synthesized"],
-                "canonical_artifact_exists": state["canonical_artifact_exists"],
-                "advisories": [str(a) for a in state["advisories"] if not contains_holdout_reference(a)],
+                "status": str(state["status"]),
+                "created_at": int(_created_ns(manifest) // 1_000_000_000) or None,
+                "candidates": [_public_candidate(c) for c in state["candidates"]],
+                "judge": _public_judge(state["judge"]),
+                "ready_for_synthesis": state["ready_for_synthesis"] is True,
+                "synthesized": state["synthesized"] is True,
+                "canonical_artifact_exists": state["canonical_artifact_exists"] is True,
+                "advisories": [a for a in state["advisories"] if isinstance(a, str) and not contains_holdout_reference(a)],
             })
         except _MANIFEST_ERRORS:
             continue

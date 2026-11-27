@@ -1175,6 +1175,63 @@ class TestArenaInformationBarrierApi(unittest.TestCase):
             arenas = r.json()["arenas"]
             self.assertEqual([(a["arena_id"], a["title"], a["created_at"]) for a in arenas], [("ar_aaaaaaaaaa", "Good", 5)])
 
+    def test_cards_judge_cross_vendor_is_strict_bool_or_null(self):
+        cases = (
+            ('"/runs/probe-ws/holdout/private-scenario.md"', None),
+            ('{"nested": "holdout/secret.md"}', None),
+            ('["holdout/a.md"]', None),
+            ("1e309", None),
+            ("1", None),
+            ('"true"', None),
+            ("true", True),
+            ("false", False),
+            ("null", None),
+        )
+        for raw_cv, expected in cases:
+            with self.subTest(cross_vendor=raw_cv), isolated_hermes_home() as home:
+                aid = "ar_dddddddddd"
+                _seed_arena_cards(home / "kanban.db", time.time(), {
+                    "t_j1": _arena_stamp(aid, "judge", "define", "google"),
+                }, tenant="ws-cv")
+                _write_arena_manifest(home, "ws-cv", aid, None, raw=(
+                    '{"arena_id": "ar_dddddddddd", "tenant": "ws-cv", "target": "define", "created_at_ns": 7,'
+                    ' "candidates": [], "judge": {"task_id": "t_j1", "vendor": "google", "model": "gemini",'
+                    f' "cross_vendor": {raw_cv}}}}}'))
+                r = _client(_load_plugin_api("factonio_test_plugin_api_arena_cv")).get(
+                    "/api/plugins/factonio/cards?tenant=ws-cv")
+                self.assertEqual(r.status_code, 200, r.text)
+                self.assertNotIn("holdout", r.text.lower())
+                judge = r.json()["arenas"][0]["judge"]
+                self.assertEqual(judge, {"task_id": "t_j1", "status": "running", "vendor": "google",
+                                         "model": "gemini", "cross_vendor": expected})
+                self.assertIs(type(judge["cross_vendor"]), type(expected))
+
+    def test_cards_arena_fields_reject_non_string_manifest_values(self):
+        with isolated_hermes_home() as home:
+            aid = "ar_eeeeeeeeee"
+            _seed_arena_cards(home / "kanban.db", time.time(), {
+                "t_c1": _arena_stamp(aid, "candidate", "define", "openai", slot="c1"),
+                "t_j1": _arena_stamp(aid, "judge", "define", "google"),
+            }, tenant="ws-typed")
+            _write_arena_manifest(home, "ws-typed", aid, None, raw=(
+                '{"arena_id": "ar_eeeeeeeeee", "tenant": "ws-typed", "target": "define", "created_at_ns": 9e9,'
+                ' "repo": {"p": "holdout/r"}, "title": 1e309,'
+                ' "candidates": [{"slot": ["holdout"], "vendor": 1e309, "model": {"x": "holdout/m"}, "task_id": "t_c1"}],'
+                ' "judge": {"task_id": "t_j1", "vendor": ["holdout/v"], "label": 1e309, "cross_vendor": true}}'))
+            r = _client(_load_plugin_api("factonio_test_plugin_api_arena_typed")).get(
+                "/api/plugins/factonio/cards?tenant=ws-typed")
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertNotIn("holdout", r.text.lower())
+            arena = r.json()["arenas"][0]
+            self.assertEqual((arena["repo"], arena["title"], arena["created_at"]), (None, None, 9))
+            self.assertEqual(arena["candidates"], [{"slot": None, "vendor": None, "model": None, "task_id": "t_c1",
+                                                    "status": "running", "artifact_ready": False}])
+            self.assertEqual(arena["judge"], {"task_id": "t_j1", "status": "running", "vendor": None, "model": None,
+                                              "cross_vendor": True})
+            for key in ("ready_for_synthesis", "synthesized", "canonical_artifact_exists"):
+                self.assertIs(type(arena[key]), bool)
+            self.assertTrue(all(isinstance(a, str) for a in arena["advisories"]))
+
 
 class TestTrailInformationBarrierApi(unittest.TestCase):
     def test_trail_list_and_detail_scrub_holdout_keys_paths_counts_and_text(self):
