@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-27T18:45:00Z",
+  "generated_at": "2026-11-27T19:00:00Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -179,7 +179,8 @@
         "`arena status --json` reads kanban.db read-only and reports ready_for_synthesis / synthesized / canonical_artifact_exists; `synthesized` requires every candidate done with an artifact, a done judge and a canonical artifact changed since canonical_baseline; archived candidates read degraded, failed/cancelled candidates or judge read needs_attention, and an unreadable canonical artifact is never synthesized",
         "`--spawn-judge` creates a missing judge exactly once, reusing the saved judge model and persisted strict_cross_vendor and reporting its real Kanban status; a failure on any arena card rolls back every card and the arena directory; a deferred judge whose manifest write fails is rolled back (zero judge card, unchanged manifest, CLI JSON error + exit 1) and a retry succeeds",
         "`list_arena_summaries` (GET /cards `arenas`) shares evaluate_arena's status machine, reads kanban.db with one `?mode=ro` query, skips corrupt or mismatched manifests, sorts newest first, never creates directories, kanban.db or manifests, and never emits paths, manifest_path, holdout_dir, holdout_files or holdout-referencing titles/labels/advisories",
-        "`list_arena_summaries` skips (per manifest, never failing GET /cards) a manifest with a non-finite created_at_ns / created_at (`1e309`), an unknown target, or an arena_id / tenant that does not match its runs/<tenant>/arena/<arena_id>/ directory, keeps valid sibling arenas, and nulls repo, title and every candidate / judge slot, vendor, model and task_id that references holdout"
+        "`list_arena_summaries` skips (per manifest, never failing GET /cards) a manifest with a non-finite created_at_ns / created_at (`1e309`), an unknown target, or an arena_id / tenant that does not match its runs/<tenant>/arena/<arena_id>/ directory, keeps valid sibling arenas, and nulls repo, title and every candidate / judge slot, vendor, model and task_id that references holdout",
+        "`list_arena_summaries` emits a strictly typed projection: string fields (repo, title, candidate / judge slot, vendor, model, task_id, status, advisories) are a real `str` without a holdout reference or null, `judge.cross_vendor` is `true` / `false` / null (a string, number, `1e309`, list or object reads null), and artifact_ready / ready_for_synthesis / synthesized / canonical_artifact_exists are bools, so a malformed manifest can neither leak nor make GET /cards HTTP 500"
       ]
     },
     {

@@ -6,7 +6,7 @@ This file describes how to run and observe the software; it is not implementatio
 
 - Schema: `.factonio/harness.json` (schema_version 1)
 - Detected stack: hermes-plugin, github-actions, python, node
-- Generated at: 2026-11-27T18:45:00Z from `wave5-dashboard-api`
+- Generated at: 2026-11-27T19:00:00Z from `wave5-dashboard-api`
 
 ## Launch
 
