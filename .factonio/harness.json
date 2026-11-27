@@ -329,11 +329,23 @@
         "`GET /repos` under /api/plugins/factonio responds as documented",
         "`GET /status` under /api/plugins/factonio responds as documented",
         "`GET /trail` under /api/plugins/factonio responds as documented",
+        "`GET /trail/audit` under /api/plugins/factonio responds as documented",
         "`GET /trail/{decision_id}` under /api/plugins/factonio responds as documented",
+        "`GET /workstreams/{tenant}/report` under /api/plugins/factonio responds as documented",
         "`PATCH /repos/{slug}` under /api/plugins/factonio responds as documented",
+        "`POST /arenas/evaluate` under /api/plugins/factonio responds as documented",
+        "`POST /panels/evaluate` under /api/plugins/factonio responds as documented",
+        "`POST /publish-pr` under /api/plugins/factonio responds as documented",
+        "`POST /repos/{slug}/harness/audit` under /api/plugins/factonio responds as documented",
+        "`POST /trail/decisions` under /api/plugins/factonio responds as documented",
         "`GET /repos` returns defaults.publish_policy and per-repo publish_policy (legacy records inherit the global default; invalid stored values read as null, never auto); `PATCH /repos/{slug}` persists publish_policy auto/ask and answers 422 for any other value including null and \"\"",
         "`GET /cards` adds `workstreams`, `arenas`, per-card `workstream_kind` and `arena_*` fields without creating kanban.db, trail.db or runs/; `GET /repos` and `PATCH /repos/{slug}` responses add a per-repo read-only `harness` summary (malformed manifests read has_manifest_error, never HTTP 500) and `PATCH /repos/{slug}` with `harness` is 422",
-        "`GET /trail` and `GET /trail/{decision_id}` drop every holdout-named key at any depth (holdout_path, holdout_files) and replace holdout-referencing strings with [redacted], leaving other rows unchanged; `GET /cards` per-card arena_role / arena_target outside their enums and any holdout-referencing arena_* field read null"
+        "`GET /trail` and `GET /trail/{decision_id}` drop every holdout-named key at any depth (holdout_path, holdout_files) and replace holdout-referencing strings with [redacted], leaving other rows unchanged; `GET /cards` per-card arena_role / arena_target outside their enums and any holdout-referencing arena_* field read null",
+        "`POST /publish-pr` answers 422 for unknown keys (`body_file`, `remote`, `actor`), non-string/non-bool coercions, short or non-hex SHAs, blank titles and `confirmed` not `true`, 404 for an unregistered repo, and 409 plus a `refused` `publish_pr` trail row (actor human, no git/gh call) unless `metrics.local_branch_verification_status` proves the exact `(repo, branch, expected_head_sha)` passed local verification; a verified target calls `repos.publish_pr(remote=\"origin\", actor=\"human\")` and maps readback 200 / refusal or drift 409 / push-create-readback failure 502",
+        "`GET /workstreams/{tenant}/report` returns `exists: false` without creating runs/, serves only `<runs>/<safe_tenant>/investigation.md` capped at 256 KiB (`truncated`) with holdout lines redacted (`redacted`) and no filesystem path, answers 422 for invalid tenants or NUL content and 403 for symlinks or non-regular files",
+        "`POST /repos/{slug}/harness/audit` is 404 unregistered / 409 missing checkout / 422 for unknown keys or flag-like `base_ref`, never changes repo files or `.git/index`, logs `harness_audit` (phase harness, actor human) and omits `repo_path`; `GET /repos` stays subprocess-free",
+        "`POST /panels/evaluate` (`pr_number` XOR `branch`, strict types) and `POST /arenas/evaluate` (`spawn_judge` is 422; never writes) return 404 when absent or a scrubbed, path-free summary; `POST /trail/decisions` rejects a client `actor`, requires `confirmed: true`, an allowlisted phase and <= 16 KiB object evidence, 404s an unknown `supersedes_id` and returns 201 with an `actor: human` row",
+        "`GET /trail/audit` (registered before `GET /trail/{decision_id}`) is read-only and 503 when trail.db is unreadable; `GET /trail` keeps its legacy `filters` keys and adds `actor`, `q` (matches public scrubbed text only; holdout probes return nothing), `signal` (all/key/attention) and `include_superseded`, all read with `mode=ro`; non-finite evidence floats serialize as null"
       ]
     },
     {
@@ -490,8 +502,15 @@
       "GET /repos",
       "GET /status",
       "GET /trail",
+      "GET /trail/audit",
       "GET /trail/{decision_id}",
-      "PATCH /repos/{slug}"
+      "GET /workstreams/{tenant}/report",
+      "PATCH /repos/{slug}",
+      "POST /arenas/evaluate",
+      "POST /panels/evaluate",
+      "POST /publish-pr",
+      "POST /repos/{slug}/harness/audit",
+      "POST /trail/decisions"
     ],
     "cli_commands": [
       "add",
