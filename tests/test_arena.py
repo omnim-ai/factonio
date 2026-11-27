@@ -236,6 +236,33 @@ class TestDesignArena(unittest.TestCase):
             self.assertEqual(res["canonical"]["design_dir"], str(design_dir_path(tenant)))
             self.assertNotIn("holdout_dir", res["canonical"])
 
+    def test_design_judge_emits_multi_variant_preview_switcher(self):
+        from factonio.orchestrator import design_dir_path
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            res = _spawn(target="design")
+            design_dir = design_dir_path(res["tenant"])
+            body = _get_task(res["judge_task_id"]).body
+            synthesis = body.split("## Hand-Grafted Synthesis", 1)[1]
+            for needle in (f"`{design_dir}/preview.html`", f"`{design_dir}/DESIGN.md`", "self-contained zero-build static HTML variant switcher",
+                           "no external assets, CDN, or build step", "Candidate A / Candidate B", "Synthesis",
+                           "side-by-side comparison", "alongside `DESIGN.md`"):
+                self.assertIn(needle, synthesis)
+            self.assertLess(synthesis.index("`## Arena Synthesis`"), synthesis.index("preview.html"))
+            self.assertLess(synthesis.index("preview.html"), synthesis.index("factonio_log_decision"))
+            self.assertNotIn("/holdout", body)
+            self.assertIn("Do not search for or read any `holdout/` files.", body)
+
+    def test_define_judge_has_no_preview_switcher(self):
+        with isolated_hermes_home() as home:
+            _register(home)
+            res = _spawn()
+            body = _get_task(res["judge_task_id"]).body
+            self.assertIn("## Hand-Grafted Synthesis", body)
+            for needle in ("preview.html", "variant switcher", "side-by-side"):
+                self.assertNotIn(needle, body)
+
 
 class TestEvaluateArena(unittest.TestCase):
     def test_lifecycle_is_read_only_until_synthesized(self):

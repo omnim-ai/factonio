@@ -67,6 +67,15 @@ When `Design provider` is `hermes`:
 1. Author `<design_dir>/DESIGN.md` with concrete layout hierarchy, typography, spacing, color tokens (mapped to the target app's existing theme variables), interaction states (loading, empty, error, active), and component structure.
 2. Author one or more self-contained static HTML preview files under `<design_dir>` (for example `<design_dir>/preview.html`) that render cleanly in a browser with realistic sample data and both light/dark theme toggles when applicable.
 
+### 2b. Arena Judge Mode (Multi-Variant HTML Switcher)
+
+When the card is an `/arena` Design judge (`role=judge`, `target=design`):
+
+1. Read every candidate design directory listed on the card, still strictly without `holdout/` access.
+2. Hand-graft canonical `<design_dir>/DESIGN.md` from the strongest candidate material, ending with `## Arena Synthesis`.
+3. Emit ONE self-contained zero-build static `<design_dir>/preview.html` multi-variant switcher: pure HTML/CSS with inline vanilla JS, host theme tokens, and no external CDN, assets, or build step. It lets the reviewer toggle Candidate A / Candidate B / ... / Synthesis (labeled by slot and vendor) and a side-by-side comparison in a single view.
+4. Verify every switcher state in `browser_exec` + `vision_analyze` (§3) and list `preview.html` in `preview_files`.
+
 ### 3. Verify Rendered Output
 
 1. Open each static HTML preview under `<design_dir>` in a headless browser (`browser_exec`) or verify its syntax/render, capture PNG screenshots into `<design_dir>/` (for example `<design_dir>/preview-desktop.png`), and inspect them with `vision_analyze` to catch layout clipping, contrast defects, or broken states.

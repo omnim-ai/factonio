@@ -23,3 +23,17 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing this repository. It defi
    - `node --check desktop/plugin.js`
    - `python3 tools/check_repo_integrity.py`
 6. Report exact commands run, outcomes, and any remaining limitations. Do not weaken assertions to make a failing test pass.
+
+## Rule-to-Enforcer Ledger
+
+Each rule sits on the strongest rung of the `/correct` enforcement ladder (`Architecture -> Types -> Lint/CI -> Harness -> Test -> Prose`) that enforces it; retros bump `Occurrences` on repeats and promote repeat offenders up a rung.
+
+| Rule | Enforcer | Rung | Occurrences | Last seen |
+| --- | --- | --- | --- | --- |
+| Zero-build ESM & host CSS theme tokens in `desktop/plugin.js` | `node --check desktop/plugin.js`, `.factonio/harness.json` `desktop-syntax` hook, `tests/test_desktop_plugin.py` (Desktop SDK lint & token tests) | Harness + Test | 0 | - |
+| README media freshness on UI/capture changes | `.github/workflows/ci.yml` `README media freshness` job | Lint/CI | 0 | - |
+| `plugin.yaml` / CLI / prompt / manifest parity & local doc links | `tools/check_repo_integrity.py`, `.factonio/harness.json` `repo-integrity` hook, `tests/test_plugin_registration.py`, `tests/test_cli_and_tools.py` | Lint/CI + Test | 0 | - |
+| `holdout/` information barrier & public-surface scrubbing | `eval_skills.py` `audit_barrier_leaks`, `trail.py` `contains_holdout_reference`, `dashboard/plugin_api.py` / `arena.py` redaction, barrier unit suites | Architecture + Test | 0 | - |
+| Isolated `HERMES_HOME` in tests (never touch real `~/.hermes`) | `tests/_env.py` `isolated_hermes_home()`, `.factonio/harness.json` Drive wrapper | Test | 0 | - |
+| Bundled skill bloat budget (`<= 4,500` tokens per `skills/*/SKILL.md`) | `.factonio/harness.json` required `skill-bloat` invariant hook (`python3 tools/eval_skills.py bloat skills --fail-on-over-budget`) | Harness | 1 | 2026-11-27 |
+| Wave 5 simplicity rule: small, fail-closed contracts over custom mini-parsers/regex dialects (decisions `d_9dc6423042b1` / `d_1b69f416199c`) | `AGENTS.md` §Completing a change #2 (watch item; promote if repeated) | Prose | 1 | 2026-11-26 |
