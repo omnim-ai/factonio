@@ -1892,6 +1892,10 @@ class TestFrozenVisualBaselines(unittest.TestCase):
                 "zero threshold added": {"command": self.COMMAND + " --threshold 0"},
                 "unfrozen": {"frozen_baseline": False},
                 "unpinned": {"baseline_paths": None, "frozen_baseline": None},
+                # Round 19: an edit is clean only as pure in-place tightening; syntax swaps and insertions fail closed
+                "respelled in place": {"command": "npx playwright test --max-diff-pixels 0"},
+                "reworded": {"command": "npx playwright test --reporter=line --max-diff-pixels=0"},
+                "zero-env": {"command": "UPDATE_SNAPSHOTS=0 " + self.COMMAND},
             }
             for label, change in loosening.items():
                 with self.subTest(label):
@@ -1910,9 +1914,8 @@ class TestFrozenVisualBaselines(unittest.TestCase):
                     self.assertEqual(audit["drift_classification"]["classification"], "doc_drift")
 
             for label, change in {
-                "respelled in place": {"command": "npx playwright test --max-diff-pixels 0"},
-                "reworded": {"command": "npx playwright test --reporter=line --max-diff-pixels=0"},
-                "zero-env": {"command": "UPDATE_SNAPSHOTS=0 " + self.COMMAND},
+                "unchanged": {"command": self.COMMAND},
+                "comment added": {"command": self.COMMAND + "  # pixel-exact"},
             }.items():
                 with self.subTest(label):
                     hj.write_text(committed, encoding="utf-8")
@@ -2028,8 +2031,10 @@ class TestFrozenVisualBaselines(unittest.TestCase):
             "=none -> bare": ("--update-snapshots=none", "--update-snapshots", True),
             "none -> all (separate)": ("--update-snapshots none", "--update-snapshots all", True),
             "=false -> =all": ("--update-snapshots=false", "--update-snapshots=all", True),
-            "plain -> =none": ("", "--update-snapshots=none", False),
-            "plain -> =false": ("", "--update-snapshots=false", False),
+            "plain -> =none": ("", "--update-snapshots=none", True),  # Round 19: no insertion is inert
+            "plain -> =false": ("", "--update-snapshots=false", True),
+            "unchanged =none": ("--update-snapshots=none", "--update-snapshots=none", False),
+            "unchanged =false": ("--update-snapshots=false", "--update-snapshots=false", False),
             "plain -> none (separate)": ("", "--update-snapshots none", True),  # fail closed: only `=none` is inert
         }
         for label, (base_flag, live_flag, loosened) in hj_cases.items():
@@ -2657,9 +2662,9 @@ class TestFixRound11ImmutablePreExecutionFrozenContract(unittest.TestCase):
 
 
 class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
-    """The fail-closed structural `visual_diff` command guard: an unchanged committed command is always clean;
-    an edited one passes only when it keeps the committed shell structure token for token and adds nothing but
-    in-place threshold tightening or provably inert checker options. Shell rewrites fail closed."""
+    """The fail-closed structural `visual_diff` command guard: a byte-identical committed command is always
+    clean; an edited one passes only as a pure in-place threshold tightening (the same tokens 1-to-1, nothing
+    inserted or deleted). Shell rewrites fail closed."""
 
     _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
     _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
@@ -2743,6 +2748,19 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
         "quoted export argument": (_EXPORTED, "export 'THRESHOLD=0.01'; python3 check.py"),
         "quoted script argument": (_EXPORTED, "export THRESHOLD=0.01; python3 \"check.py\""),
         "quote mutations": (_EXPORTED, "export 'THRESHOLD=0.01'; python3 \"check.py\""),
+        # Round 19: nothing may be inserted, and operators, flag syntax and line structure keep their spelling
+        "--flag val -> --flag=val": ("python3 check.py --threshold 0.05", "python3 check.py --threshold=0.01"),
+        "--reporter=list inserted": ("npx playwright test --threshold 0.01",
+                                     "npx playwright test --reporter=list --threshold 0.01"),
+        "--color=never inserted": ("npx playwright test", "npx playwright test --color=never"),
+        "--no-color inserted": ("npx playwright test", "npx playwright test --no-color"),
+        "--verbose inserted": ("npx playwright test", "npx playwright test --verbose"),
+        "-q inserted": ("pytest tests/visual", "pytest tests/visual -q"),
+        "python3 -u inserted": ("python3 check.py", "python3 -u check.py"),
+        "--update-snapshots=false inserted": ("npx playwright test", "npx playwright test --update-snapshots=false"),
+        "UPDATE_SNAPSHOTS=0 inserted": ("npx playwright test", "UPDATE_SNAPSHOTS=0 npx playwright test"),
+        "; -> newline": (_EXPORTED, "export THRESHOLD=0.01\npython3 check.py\n"),
+        "line continuation": ("python3 check.py --threshold 0.01", "python3 check.py \\\n  --threshold 0.01"),
     }
     _UNCHANGED = (
         _EXPORTED, "export 'THRESHOLD=0.01'; python3 \"check.py\"", "env - python3 -u check.py", "env -S '-u FOO python3 -u check.py'",
@@ -2751,28 +2769,27 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
         "timeout 30 python3 -u check.py", "UPDATE_SNAPSHOTS=0 npx playwright test",
         "npx playwright test --update-snapshots=false", "npx jest -u", "python3 check.py || true",
         ["sh", "-c", "python3 check.py -u"],
+        "npx playwright test --reporter=list --color=never --verbose", "python3 -u check.py", "pytest -q tests/visual",
+        "cat <<EOF >/dev/null\nunused\nEOF\npython3 check.py", "python3 check.py | tee log.txt",
+        "python3 check.py \\\n  --threshold 0.01", "node check.js --threshold 1e-2",
     )
     _CLEAN = {
         "--threshold tightened": ("python3 check.py --threshold 0.05", "python3 check.py --threshold 0.01"),
+        "--threshold= tightened": ("python3 check.py --threshold=0.05", "python3 check.py --threshold=0.01"),
         "% tightened": ("python3 check.py --threshold 5%", "python3 check.py --threshold 1%"),
-        "--flag val -> --flag=val": ("python3 check.py --threshold 0.05", "python3 check.py --threshold=0.01"),
         "prefix tightened": ("THRESHOLD=0.05 python3 check.py", "THRESHOLD=0.01 python3 check.py"),
+        "quoted prefix tightened": ("THRESHOLD='0.05' python3 check.py", "THRESHOLD='0.01' python3 check.py"),
         "export tightened": ("export THRESHOLD=0.05; python3 check.py", _EXPORTED),
         "sh -c tightened": ("bash -c 'export THRESHOLD=0.05; python3 check.py'", "bash -c '" + _EXPORTED + "'"),
+        "sh -c pixels tightened": ("sh -c 'node check.js --max-diff-pixels=5'",
+                                   "sh -c 'node check.js --max-diff-pixels=1'"),
         "compound tightened": ("a --threshold 0.05 && b --threshold 0.02", "a --threshold 0.01 && b --threshold 0.01"),
-        "--reporter=list before": ("npx playwright test --threshold 0.01",
-                                   "npx playwright test --reporter=list --threshold 0.01"),
-        "--color=never after": ("npx playwright test", "npx playwright test --color=never"),
-        "trailing --no-color": ("npx playwright test", "npx playwright test --no-color"),
-        "trailing --verbose": ("npx playwright test", "npx playwright test --verbose"),
-        "trailing -q": ("pytest tests/visual", "pytest tests/visual -q"),
-        "python3 -u": ("python3 check.py", "python3 -u check.py"),
-        "--update-snapshots=false": ("npx playwright test", "npx playwright test --update-snapshots=false"),
-        "UPDATE_SNAPSHOTS=0": ("npx playwright test", "UPDATE_SNAPSHOTS=0 npx playwright test"),
+        "committed --reporter=list tightened": ("npx playwright test --reporter=list --threshold 0.05",
+                                                "npx playwright test --reporter=list --threshold 0.01"),
+        "committed UPDATE_SNAPSHOTS=0 tightened": ("UPDATE_SNAPSHOTS=0 THRESHOLD=0.05 npx playwright test",
+                                                   "UPDATE_SNAPSHOTS=0 THRESHOLD=0.01 npx playwright test"),
         "threshold tightened to zero": ("npx playwright test --threshold 0.05", "npx playwright test --threshold 0"),
         "comment + whitespace": (_EXPORTED, "export THRESHOLD=0.01;   python3 check.py  # visual check"),
-        "newlines": (_EXPORTED, "export THRESHOLD=0.01\npython3 check.py\n"),
-        "line continuation": ("python3 check.py --threshold 0.01", "python3 check.py \\\n  --threshold 0.01"),
         "argv form": ("python3 check.py", ["python3", "check.py"]),
     }
 
@@ -2871,13 +2888,14 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
                     self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
                     self.assertEqual(audit_harness(str(repo))["severity"], "clean")
 
-    def test_in_place_tightening_and_inert_additions_stay_clean(self):
+    def test_in_place_tightening_stays_clean(self):
         from factonio.harness import audit_harness, check_harness
 
         self._assert_clean(self._CLEAN)
         with isolated_hermes_home() as home:
-            for n, label in enumerate(("export tightened", "sh -c tightened", "--reporter=list before",
-                                       "python3 -u", "UPDATE_SNAPSHOTS=0", "comment + whitespace")):
+            for n, label in enumerate(("export tightened", "sh -c tightened", "committed --reporter=list tightened",
+                                       "quoted prefix tightened", "committed UPDATE_SNAPSHOTS=0 tightened",
+                                       "comment + whitespace")):
                 base, live = self._CLEAN[label]
                 with self.subTest(label):
                     repo = self._visual_repo(home, base, name=f"svc{n}")
@@ -2927,7 +2945,7 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
 
 
 class TestFixRound13StructuralGuardHardening(unittest.TestCase):
-    """Round 13: a positive allowlist of inert insertions, exact flag spelling, strict ASCII threshold syntax,
+    """Round 13 (insertions fully closed in round 19): exact flag spelling, strict ASCII threshold syntax,
     preserved outer quoting of `sh -c` scripts / argv lists, and operator-adjacent whitespace."""
 
     _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
@@ -2993,7 +3011,7 @@ class TestFixRound13StructuralGuardHardening(unittest.TestCase):
                     audit = audit_harness(str(repo))
                     self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("stale", True))
 
-    def test_only_allowlisted_inert_options_may_be_inserted(self):
+    def test_no_option_may_be_inserted(self):
         self._assert_rejected({
             "--override-ini snapshot-update": ("pytest tests/visual",
                                                "pytest tests/visual --override-ini=addopts=--snapshot-update"),
@@ -3029,19 +3047,28 @@ class TestFixRound13StructuralGuardHardening(unittest.TestCase):
             "swallowed by -run": ("go test -run TestVisual ./...", "go test -run --color=never TestVisual ./..."),
             "UPDATE_SNAPSHOTS=$X": ("npx jest", "UPDATE_SNAPSHOTS=$X npx jest"),
         })
-        self._assert_clean({
+        # Round 19: formerly "inert" insertions are rejected too; committed as such, they stay clean
+        inserted = {
             "pytest -q": ("pytest tests/visual", "pytest tests/visual -q"),
             "pytest -v": ("pytest tests/visual", "pytest tests/visual -v"),
             "uv run pytest -q": ("uv run pytest tests/visual", "uv run pytest tests/visual -q"),
             "go -v": ("go test ./...", "go test ./... -v"),
+            "cargo test -q": ("cargo test", "cargo test -q"),
+            "cargo test -v": ("cargo test", "cargo test -v"),
             "--reporter=list": ("npx playwright test", "npx playwright test --reporter=list"),
             "--color=never": ("npx playwright test", "npx playwright test --color=never"),
+            "--color": ("npx playwright test", "npx playwright test --color"),
             "--verbose": ("npx playwright test", "npx playwright test --verbose"),
+            "--quiet": ("npx playwright test", "npx playwright test --quiet"),
             "--no-color": ("npx jest", "npx jest --no-color"),
             "--silent": ("npx jest", "npx jest --silent"),
             "python3 -u": ("python3 check.py", "python3 -u check.py"),
             "UPDATE_SNAPSHOTS=0": ("npx playwright test", "UPDATE_SNAPSHOTS=0 npx playwright test"),
             "--update-snapshots=false": ("npx playwright test", "npx playwright test --update-snapshots=false"),
+        }
+        self._assert_rejected(inserted)
+        self._assert_clean({
+            **{f"unchanged {k}": (live, live) for k, (_, live) in inserted.items()},
             "unchanged --project": ("npx playwright test --project=chromium", "npx playwright test --project=chromium"),
         })
         self._assert_executed_bypasses_rejected([
@@ -3058,9 +3085,13 @@ class TestFixRound13StructuralGuardHardening(unittest.TestCase):
             "-threshold": ("python3 check.py --threshold 0.01", "python3 check.py -threshold 0.01"),
             "--max_diff_pixels": ("python3 check.py --max-diff-pixels=0", "python3 check.py --max_diff_pixels=0"),
         })
-        self._assert_clean({
+        self._assert_rejected({  # Round 19: the `=` / space syntax is part of the flag's spelling
             "--flag val -> --flag=val": ("python3 check.py --threshold 0.05", "python3 check.py --threshold=0.01"),
-            "pixels tightened": ("python3 check.py --max-diff-pixels=5", "python3 check.py --max-diff-pixels 0"),
+            "--flag=val -> --flag val": ("python3 check.py --max-diff-pixels=5", "python3 check.py --max-diff-pixels 0"),
+        })
+        self._assert_clean({
+            "--flag val tightened": ("python3 check.py --threshold 0.05", "python3 check.py --threshold 0.01"),
+            "pixels tightened": ("python3 check.py --max-diff-pixels=5", "python3 check.py --max-diff-pixels=0"),
         })
         self._assert_executed_bypasses_rejected([
             ("python3 check.py --threshold 0.01", "python3 check.py --THRESHOLD 0.01"),
@@ -3115,6 +3146,9 @@ class TestFixRound13StructuralGuardHardening(unittest.TestCase):
             "argv list -> double quotes": (argv, double),
             "argv list -> unquoted glob": (["python3", "check.py", "*.png"], "python3 check.py *.png"),
             "string -> argv with spaces": ("python3 check.py 'a b'", ["python3", "check.py", "a b"]),
+            # Round 19: the script keeps its committed outer quote style even without expansions
+            "single -> double quotes without expansions": ("bash -c 'export THRESHOLD=0.05; python3 check.py'",
+                                                           'bash -c "export THRESHOLD=0.01; python3 check.py"'),
         })
         # `T` is not a threshold name, so `T=0.05` -> `T=0.01` is an unverifiable edit; a threshold-named
         # variable is tightened in place inside the single-quoted script.
@@ -3122,8 +3156,6 @@ class TestFixRound13StructuralGuardHardening(unittest.TestCase):
             "single-quoted tightening": (
                 "bash -c 'T_THRESHOLD=0.05; export THRESHOLD=$T_THRESHOLD; python3 check.py'",
                 "bash -c 'T_THRESHOLD=0.01; export THRESHOLD=$T_THRESHOLD; python3 check.py'"),
-            "double quotes without expansions": ("bash -c 'export THRESHOLD=0.05; python3 check.py'",
-                                                 'bash -c "export THRESHOLD=0.01; python3 check.py"'),
             "argv list -> plain string": (["python3", "check.py", "--threshold", "0.05"],
                                           "python3 check.py --threshold 0.01"),
             "unchanged double-quoted": (double, double),
@@ -3293,9 +3325,12 @@ class TestFixRound14ShellWordsQuotingUnitsAndWrappers(unittest.TestCase):
             "uv run python3 -u": ("uv run python3 check.py", "uv run python3 -u check.py"),
             "nice -n 5 python3 -u": ("nice -n 5 python3 check.py", "nice -n 5 python3 -u check.py"),
         })
-        self._assert_clean({
+        self._assert_rejected({  # Round 19: no insertion at all, even behind a bare interpreter
             "python3 -u": ("python3 check.py", "python3 -u check.py"),
             "/usr/bin/python3 -u": ("/usr/bin/python3 check.py", "/usr/bin/python3 -u check.py"),
+        })
+        self._assert_clean({
+            "unchanged python3 -u": ("python3 -u check.py", "python3 -u check.py"),
             "unchanged timeout python3 -u": ("timeout 30 python3 -u check.py", "timeout 30 python3 -u check.py"),
             "unchanged uv run python3 -u": ("uv run python3 -u check.py", "uv run python3 -u check.py"),
         })
@@ -3467,13 +3502,13 @@ class TestFixRound15BlobHashBaselinesAndNoNewInsertions(unittest.TestCase):
             "time -o": ("time -o python3 vitest", "time -o python3 -u vitest"),
             "timeout 30": ("timeout 30 python3 check.py", "timeout 30 python3 -u check.py"),
         }
-        self._assert_rejected(wrapped)
-        self._assert_clean({
+        self._assert_rejected({
+            **wrapped,  # Round 19: no insertion at all, even behind a bare interpreter
             "python3 -u": ("python3 check.py", "python3 -u check.py"),
             "/usr/bin/python3 -u": ("/usr/bin/python3 check.py", "/usr/bin/python3 -u check.py"),
             "env prefix + python3 -u": ("FOO=1 python3 check.py", "FOO=1 python3 -u check.py"),
-            **{f"unchanged {k}": (live, live) for k, (_, live) in wrapped.items()},
         })
+        self._assert_clean({f"unchanged {k}": (live, live) for k, (_, live) in wrapped.items()})
 
     def test_wrapper_python_u_reaching_module_argv_is_rejected_end_to_end(self):
         with isolated_hermes_home() as home:
@@ -3489,8 +3524,8 @@ class TestFixRound15BlobHashBaselinesAndNoNewInsertions(unittest.TestCase):
 
 
 class TestFixRound16IntegerThresholdsAndStrictRunners(unittest.TestCase):
-    """Round 16: committed integer thresholds stay integers, and trailing `-q`/`-v` only reach a bare/absolute
-    `pytest`, `uv run pytest`, `go test` or `cargo test` before `--` / `-args`."""
+    """Round 16: committed integer thresholds stay integers; trailing `-q`/`-v` may never be inserted (round 19
+    closed the strict-runner allowlist too), and committed as such they stay clean."""
 
     _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
     _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
@@ -3570,7 +3605,7 @@ class TestFixRound16IntegerThresholdsAndStrictRunners(unittest.TestCase):
                     self.assertFalse(chk["valid"])
                     self.assertEqual(chk["gate_loosening"]["loosened_visual_hooks"], ["pixels"])
 
-    def test_short_verbosity_flags_only_for_strict_runners(self):
+    def test_short_verbosity_flags_are_never_inserted(self):
         rejected = {
             "repo-relative pytest": ("tests/pytest snapshots/home.png", "tests/pytest snapshots/home.png -v"),
             "dot-relative pytest": ("./pytest tests/visual", "./pytest tests/visual -q"),
@@ -3589,8 +3624,7 @@ class TestFixRound16IntegerThresholdsAndStrictRunners(unittest.TestCase):
             "go test after --args": ("go test ./... --args x", "go test ./... --args x -v"),
             "jest -v": ("npx jest", "npx jest -v"),
         }
-        self._assert_rejected(rejected)
-        self._assert_clean({
+        strict = {  # Round 19: rejected for strict runners too; committed as such, they stay clean
             "pytest -q": ("pytest tests/visual", "pytest tests/visual -q"),
             "pytest -v": ("pytest tests/visual", "pytest tests/visual -v"),
             "absolute pytest -v": ("/usr/bin/pytest tests/visual", "/usr/bin/pytest tests/visual -v"),
@@ -3599,8 +3633,9 @@ class TestFixRound16IntegerThresholdsAndStrictRunners(unittest.TestCase):
             "cargo test -q": ("cargo test", "cargo test -q"),
             "cargo test -v": ("cargo test", "cargo test -v"),
             "pytest --verbose after --": ("pytest tests/visual -- arg", "pytest tests/visual -- arg --verbose"),
-            **{f"unchanged {k}": (live, live) for k, (_, live) in rejected.items()},
-        })
+        }
+        self._assert_rejected({**rejected, **strict})
+        self._assert_clean({f"unchanged {k}": (live, live) for k, (_, live) in {**rejected, **strict}.items()})
 
     def test_runner_verbosity_bypasses_are_rejected_end_to_end(self):
         with isolated_hermes_home() as home:
@@ -3859,6 +3894,166 @@ class TestFixRound18RawQuotingAndFixedPointThresholds(unittest.TestCase):
                     self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
                     audit = audit_harness(str(repo))
                     self.assertFalse(audit["gate_loosening"]["loosened"], audit["gate_loosening"])
+
+
+class TestFixRound19PureInPlaceTightening(unittest.TestCase):
+    """Round 19: an edited committed command is clean only as a pure in-place threshold tightening. No token
+    may be inserted anywhere (`$(...)`, pipes, `&&`, after `time`, before a positional), heredocs and line
+    continuations fail closed unless byte-identical, and `--flag=val` / `--flag val` keep their syntax."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    _FAIL = "import sys\nsys.exit(1)\n"
+    _PRINT_FAIL = "print('FAIL: 100 pixels differ')\n"
+    _HEREDOC = "cat <<EOF >/dev/null\nunused\nEOF\npython3 check.py"
+    _NESTED_HEREDOC = "bash -c 'cat <<EOF >/dev/null\nunused\nEOF\npython3 check.py'"
+    _SUBST = "bash -c 'out=$(python3 check.py); [[ ! $out =~ ^FAIL ]]'"
+    _PIPE = "python3 check.py | awk '/FAIL/ { exit 1 }'"
+    _GREP = "grep -q FAIL report.txt && exit 1; true"
+    _TIME_ASSIGN = "bash -c 'time -p THRESHOLD=0.05; export THRESHOLD; python3 check.py'"
+    _TIME_NEG = "bash -c 'time ! python3 check.py'"
+    _POSITIONAL = "python3 check.py snapshots/home.png"
+    _EQ_JS = "node eq.js --threshold=0.05"
+    _SPACE_JS = "node space.js --threshold 0.05"
+    # The `check.py` each committed command runs; every committed command fails its hook.
+    _CHECKS = {
+        _SUBST: _PRINT_FAIL,
+        _PIPE: _PRINT_FAIL,
+        _TIME_ASSIGN: "import os, sys\nsys.exit(0 if 0.25 <= float(os.environ.get('THRESHOLD') or '1.0') else 1)\n",
+        _TIME_NEG: "import sys\nsys.exit(0)\n",
+        _POSITIONAL: "import sys\nsys.exit(1 if sys.argv[1:2] == ['snapshots/home.png'] else 0)\n",
+    }
+    # Single-syntax Node checkers: visual diff 0.25, lenient default 1 when their one form is absent.
+    _EQ_CHECK = ("const a = process.argv.slice(2).find((x) => x.startsWith('--threshold='));\n"
+                 "process.exit(0.25 > Number(a ? a.slice(12) : '1') ? 1 : 0);\n")
+    _SPACE_CHECK = ("const args = process.argv.slice(2); const i = args.indexOf('--threshold');\n"
+                    "process.exit(0.25 > Number(i >= 0 ? args[i + 1] : '1') ? 1 : 0);\n")
+    _SWALLOWED = (
+        (_HEREDOC, "cat <<EOF >/dev/null\nunused\n EOF\npython3 check.py"),
+        (_NESTED_HEREDOC, "bash -c 'cat <<EOF >/dev/null\nunused\n EOF\npython3 check.py'"),
+    )
+    _INSERTED = (
+        (_SUBST, "bash -c 'out=$(python3 --color=never check.py); [[ ! $out =~ ^FAIL ]]'"),
+        (_PIPE, "python3 --color=never check.py | awk '/FAIL/ { exit 1 }'"),
+        (_GREP, "grep --reporter=list -q FAIL report.txt && exit 1; true"),
+        (_TIME_ASSIGN, "bash -c 'UPDATE_SNAPSHOTS=0 time -p THRESHOLD=0.05; export THRESHOLD; python3 check.py'"),
+        (_TIME_NEG, "bash -c 'time ! --color=never python3 check.py'"),
+        (_POSITIONAL, "python3 check.py --color=never snapshots/home.png"),
+    )
+    _SYNTAX_SWAPS = (
+        (_EQ_JS, "node eq.js --threshold 0.01"),
+        (_SPACE_JS, "node space.js --threshold=0.01"),
+    )
+
+    def _repo(self, home: Path, name: str, command: Any) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "check.py", self._CHECKS.get(command, self._FAIL))
+        _write(repo, "report.txt", "FAIL: 100 pixels differ\n")
+        _write(repo, "eq.js", self._EQ_CHECK)
+        _write(repo, "space.js", self._SPACE_CHECK)
+        _commit_all(repo, "visual checks + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def test_edited_heredocs_and_line_continuations_fail_closed_before_token_comparison(self):
+        from factonio.harness import _tokenize_visual_cmd, _UnsupportedEdit, _visual_hook_loosening
+
+        for cmd in ("cat <<EOF\nx\nEOF", "cat <<-EOF\n\tx\n\tEOF", "cat <<< x", "a $(cat <<E\nE\n)",
+                    "python3 check.py \\\n --threshold 0.01", 'echo "a\\\nb"'):
+            with self.subTest(cmd=cmd), self.assertRaises(_UnsupportedEdit):
+                _tokenize_visual_cmd(cmd)
+        self.assertEqual([t.text for t in _tokenize_visual_cmd("echo '<<' \"<<<\" '\\\n'")], ["echo", "<<", "<<<", "\\\n"])
+        self._assert_rejected({live: (base, live) for base, live in self._SWALLOWED})
+        self._assert_rejected({
+            "heredoc body": (self._HEREDOC, "cat <<EOF >/dev/null\nused\nEOF\npython3 check.py"),
+            "heredoc added": ("python3 check.py", "cat <<EOF\nEOF\npython3 check.py"),
+            "heredoc removed": (self._HEREDOC, "python3 check.py"),
+            "herestring": ("python3 check.py", "python3 check.py <<< x"),
+            "continuation added": ("python3 check.py --threshold 0.05", "python3 check.py \\\n --threshold 0.01"),
+        })
+        reasons = _visual_hook_loosening({"command": self._HEREDOC}, {"command": self._SWALLOWED[0][1]})
+        self.assertEqual(reasons, ["mutates visual_diff command with a heredoc/herestring (allowed only when "
+                                   "byte-identical to the committed command)"])
+        self._assert_clean({f"unchanged {cmd!r}": (cmd, cmd) for cmd in (
+            self._HEREDOC, self._NESTED_HEREDOC, "python3 check.py \\\n --threshold 0.01", "cat <<< x")})
+
+    def test_operators_and_sh_c_quote_style_keep_their_spelling(self):
+        self._assert_rejected({
+            "; -> newline": ("a --threshold 0.05; b", "a --threshold 0.01\nb"),
+            "newline -> ;": ("a\nb", "a; b"),
+            "trailing ; added": ("python3 check.py", "python3 check.py;"),
+            "( ( -> ((": ("( (python3 check.py) )", "((python3 check.py))"),
+            "$( -> $ (": ("x=$(python3 check.py)", "x=$ (python3 check.py)"),
+            "single -> double": ("sh -c 'node c.js --threshold 0.05'", 'sh -c "node c.js --threshold 0.01"'),
+            "double -> single": ('sh -c "node c.js --threshold 0.05"', "sh -c 'node c.js --threshold 0.01'"),
+        })
+        self._assert_clean({
+            "blank lines": ("a\nb", "a\n\n\nb\n"),
+            "single-quoted tightened": ("sh -c 'node c.js --threshold 0.05'", "sh -c 'node c.js --threshold 0.01'"),
+            "double-quoted tightened": ('sh -c "node c.js --threshold 0.05"', 'sh -c "node c.js --threshold 0.01"'),
+        })
+
+    def test_no_token_may_be_inserted_anywhere(self):
+        self._assert_rejected({live: (base, live) for base, live in self._INSERTED})
+        self._assert_rejected({
+            "trailing inert flag": ("python3 check.py", "python3 check.py --verbose"),
+            "disabled regen env": ("npx jest", "UPDATE_SNAPSHOTS=0 npx jest"),
+            "token deleted": ("python3 check.py --verbose", "python3 check.py"),
+            "token moved": ("python3 check.py a b", "python3 check.py b a"),
+        })
+        self._assert_clean({f"unchanged {live}": (live, live) for _, live in self._INSERTED})
+
+    def test_flag_syntax_swaps_are_rejected_with_a_specific_reason(self):
+        from factonio.harness import _visual_hook_loosening
+
+        self._assert_rejected({live: (base, live) for base, live in self._SYNTAX_SWAPS})
+        for base, live in self._SYNTAX_SWAPS:
+            with self.subTest(live=live):
+                self.assertIn("changes threshold syntax `--threshold` (`--flag=value` vs `--flag value`; checkers "
+                              "often read only one form)",
+                              _visual_hook_loosening({"command": base}, {"command": live}))
+        self._assert_clean({
+            "= tightened": (self._EQ_JS, "node eq.js --threshold=0.01"),
+            "space tightened": (self._SPACE_JS, "node space.js --threshold 0.01"),
+            "quoted value tightened": (self._SPACE_JS, "node space.js --threshold '0.01'"),
+        })
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is required for `[[`, `time` and heredocs in `bash -c`")
+    def test_heredoc_and_insertion_bypasses_are_rejected_end_to_end(self):
+        """Each mutation really turns the failing committed hook green: an indented delimiter makes `cat` swallow
+        the checker, and an inserted option makes `python3`/`grep` exit 2 with no `FAIL` output, `time` lose its
+        reserved-word meaning, `!` negate a missing command, or the checker read the wrong positional."""
+        self._assert_executed_bypasses_rejected([*self._SWALLOWED, *self._INSERTED])
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checkers")
+    def test_flag_syntax_swaps_are_rejected_end_to_end(self):
+        self._assert_executed_bypasses_rejected(list(self._SYNTAX_SWAPS))
+
+    def test_unchanged_and_in_place_tightening_controls_stay_clean_end_to_end(self):
+        from factonio.harness import audit_harness, check_harness
+
+        cases = ((self._HEREDOC, self._HEREDOC), (self._PIPE, self._PIPE),
+                 ("THRESHOLD='0.05' python3 check.py", "THRESHOLD='0.01' python3 check.py"),
+                 ("python3 check.py --threshold=0.05", "python3 check.py --threshold=0.01"),
+                 ("sh -c 'python3 check.py --max-diff-pixels=5'", "sh -c 'python3 check.py --max-diff-pixels=1'"))
+        with isolated_hermes_home() as home:
+            for n, (base, live) in enumerate(cases):
+                with self.subTest(base=base, live=live):
+                    repo = self._repo(home, f"svc{n}", base)
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(chk["hook_results"]["failed_required"], ["pixels"])  # the bar still holds
+                    self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+                    audit = audit_harness(str(repo))
+                    self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("clean", False))
 
 
 if __name__ == "__main__":

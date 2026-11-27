@@ -1701,9 +1701,11 @@ def _merge_baseline_changes(*groups: list[dict[str, Any]]) -> list[dict[str, Any
 # Fail-closed structural `visual_diff` command guard
 # ---------------------------------------------------------------------------
 # Proving that an arbitrary rewritten shell script keeps a committed threshold is undecidable, so the guard does
-# not emulate the shell. An unchanged command (modulo whitespace, comments and harmless quoting) is always clean;
-# an edited one passes only when it keeps the committed shell structure token for token and adds nothing but
-# in-place threshold tightening or provably inert checker options. Everything else fails closed.
+# not emulate the shell. A committed command left byte-identical is always clean. An edited one is clean only as
+# a pure in-place threshold tightening: the same tokens 1-to-1 with the same raw spelling (no insertions,
+# deletions, quote or operator edits, heredocs or line continuations), the same `--flag=val` / `--flag val`
+# syntax, and each changed committed threshold a plain fixed-point decimal no larger than before. Everything
+# else fails closed.
 
 _THRESHOLD_KEY_RE = re.compile(
     r"threshold|toleran|max[-_]?diff|fuzz|max[-_]?pixel|diff[-_]?ratio|mismatch", re.IGNORECASE
@@ -1717,23 +1719,6 @@ _DISABLED = frozenset({"", "0", "false", "no", "off", "none"})
 _ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 _PYTHON_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|pypy3?)$")
 _SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "busybox"})
-# Segment heads that change the environment or control flow: only in-place threshold tightening is allowed.
-_SEALED_HEADS = _SHELLS | frozenset({
-    "export", "declare", "typeset", "local", "readonly", "unset", "env", "exec", "eval", "command", "builtin",
-    "set", "shopt", "alias", "unalias", "trap", "source", ".", "if", "then", "elif", "else", "fi", "for",
-    "while", "until", "do", "done", "case", "esac", "function", "!",
-})
-# The only options an edit may insert: output formatting/verbosity with fixed built-in values. Everything else
-# (runner config, plugins, filters, modes, help/version, unknown flags) can skip or regenerate the visual check.
-_INERT_EQ_OPTIONS = {
-    "--color": frozenset({"always", "never", "auto", "yes", "no"}),
-    "--reporter": frozenset({"list", "line", "dot", "json", "html", "junit", "github", "spec", "tap"}),
-}
-_INERT_TRAILING_FLAGS = frozenset({"--verbose", "--quiet", "--silent", "--no-color", "--color"})
-# Short verbosity flags per runner; jest and vitest are absent because their `-v` is `--version` (exits 0).
-_RUNNER_SHORT_FLAGS = {"pytest": frozenset({"-q", "-v"}), "go": frozenset({"-v"}), "cargo": frozenset({"-q", "-v"})}
-# Where trailing options stop reaching the runner and go to the program under test instead.
-_RUNNER_ARGS_END = {"pytest": frozenset({"--"}), "go": frozenset({"--", "-args", "--args"}), "cargo": frozenset({"--"})}
 # A shell word whose meaning is identical as an argv item and as unquoted shell text.
 _PLAIN_WORD_RE = re.compile(r"[A-Za-z0-9_./:=+%,@-]+", re.ASCII)
 # Plain fixed-point only: no exponent, no bare leading `.`. For two such spellings, a smaller exact value is never
@@ -1745,27 +1730,33 @@ _OPERATORS = ("<<<", "&>>", "&&", "||", "|&", ";;", ">>", "<<", "<>", ">&", "<&"
 _UNVERIFIABLE = "mutates committed visual_diff command with an unverifiable shell/structural rewrite"
 
 
+class _UnsupportedEdit(ValueError):
+    """Syntax whose bytes the token comparison cannot preserve; allowed only in a byte-identical command."""
+
+
 class _Tok(NamedTuple):
     text: str     # the word after quote removal, or the operator
     raw: str      # the source slice
     is_op: bool
     quoted: bool
     from_argv: bool = False  # an argv-list item: never seen by a shell
+    glued: bool = False      # a `(`/`)` with no whitespace before it: `((`/`$(` differ from `( (`/`$ (`
 
     @property
-    def key(self) -> tuple[str, bool, bool]:
+    def key(self) -> tuple[str, bool, bool, bool]:
         """Comparison identity: the exact source spelling. No quoting is harmless in general (`'T=1'` is a
         command, `"^FAIL"` a literal `=~` pattern, `\\!=` invalid arithmetic), so none is normalized away."""
-        return self.raw, self.is_op, self.from_argv
+        return self.raw, self.is_op, self.from_argv, self.glued
 
 
 class _Slot(NamedTuple):
-    """A threshold: `--flag val` / `--flag=val` (kind `flag`) or `VAR=val` (kind `env`), keyed by the exact
-    spelling (dashes, case, `-` vs `_`: `--THRESHOLD` is another, unknown, flag). ``raw`` is the source spelling
-    of the value and ``text`` the word the program receives; ``value`` is its exact number (`1%` -> 1 with
-    ``percent``) or None when not strict ASCII decimal syntax."""
+    """A threshold: `--flag val` / `--flag=val` (kind `flag`, ``eq`` tells which) or `VAR=val` (kind `env`),
+    keyed by the exact unquoted spelling (dashes, case, `-` vs `_`: `--THRESHOLD` is another, unknown, flag).
+    ``raw`` is the source spelling of the value and ``text`` the word the program receives; ``value`` is its
+    exact number (`1%` -> 1 with ``percent``) or None when not strict ASCII decimal syntax."""
     kind: str
     key: str
+    eq: bool
     raw: str
     text: str
     value: Optional[Decimal]
@@ -1773,9 +1764,11 @@ class _Slot(NamedTuple):
 
 
 def _tokenize_visual_cmd(command: Any) -> list[_Tok]:
-    """Shell words and operators of ``command`` (argv lists are literal words). Unquoted newlines are `;`,
-    `#` at a word start comments to the end of the line, runs of `;` collapse and edge `;` are dropped, and a
-    redirection keeps its fd (`2>`). Raises ValueError on an unclosed quote or a trailing lone backslash."""
+    """Shell words and operators of ``command`` (argv lists are literal words). An unquoted newline is a
+    separator (raw `\\n`, never equal to `;`; blank lines collapse and edge newlines are dropped), `#` at a word
+    start comments to the end of the line, and a redirection keeps its fd (`2>`). Raises ValueError on an
+    unclosed quote or a trailing lone backslash, and `_UnsupportedEdit` on a heredoc/herestring or a line
+    continuation, whose meaning depends on bytes (delimiter lines, joined words) the tokens do not keep."""
     if isinstance(command, list):
         return [_Tok(str(c), str(c), False, True, True) for c in command]
     text = str(command or "")
@@ -1803,14 +1796,17 @@ def _tokenize_visual_cmd(command: Any) -> list[_Tok]:
             toks.append(_Tok(ch, ch, True, False))
             i += 1
         elif ch == "\\" and text.startswith("\n", i + 1):
-            i += 2  # line continuation
+            raise _UnsupportedEdit("line continuation")
         elif op := next((o for o in _OPERATORS if text.startswith(o, i)), None):
+            if op.startswith("<<"):
+                raise _UnsupportedEdit("heredoc/herestring")
             op_start, i = i, i + len(op)
             fd = "".join(word) if word is not None and not quoted else ""
             if re.fullmatch(r"\d+|\{[A-Za-z_]\w*\}", fd) and ("<" in op or ">" in op):
                 word, op = None, fd + op  # `2>`: the fd belongs to the redirection
             flush(op_start)
-            toks.append(_Tok(op, op, True, False))
+            glued = op in "()" and op_start > 0 and text[op_start - 1] not in " \t\n"
+            toks.append(_Tok(op, op, True, False, False, glued))
         else:
             if word is None:
                 word, start = [], i
@@ -1828,8 +1824,10 @@ def _tokenize_visual_cmd(command: Any) -> list[_Tok]:
             elif ch == '"':
                 i += 1
                 while i < n and text[i] != '"':
-                    esc = text[i] == "\\" and i + 1 < n and text[i + 1] in '$`"\\\n'
-                    word.append(text[i + 1] if esc and text[i + 1] != "\n" else "" if esc else text[i])
+                    if text.startswith("\\\n", i):
+                        raise _UnsupportedEdit("line continuation")
+                    esc = text[i] == "\\" and i + 1 < n and text[i + 1] in '$`"\\'
+                    word.append(text[i + 1] if esc else text[i])
                     i += 2 if esc else 1
                 if i >= n:
                     raise ValueError("unclosed double quote")
@@ -1840,20 +1838,20 @@ def _tokenize_visual_cmd(command: Any) -> list[_Tok]:
     flush(n)
     out: list[_Tok] = []
     for tok in toks:
-        if not (tok.is_op and tok.text == ";" and (not out or (out[-1].is_op and out[-1].text == ";"))):
+        if not (tok.raw == "\n" and (not out or out[-1].raw == "\n")):
             out.append(tok)
-    while out and out[-1].is_op and out[-1].text == ";":
+    while out and out[-1].raw == "\n":
         out.pop()
     return out
 
 
-def _segments(toks: list[_Tok]) -> tuple[list[str], list[list[_Tok]]]:
-    """Operator sequence and the word segments around them (always ``len(ops) + 1`` segments)."""
-    ops: list[str] = []
+def _segments(toks: list[_Tok]) -> tuple[list[_Tok], list[list[_Tok]]]:
+    """Operator tokens and the word segments around them (always ``len(ops) + 1`` segments)."""
+    ops: list[_Tok] = []
     segs: list[list[_Tok]] = [[]]
     for tok in toks:
         if tok.is_op:
-            ops.append(tok.text)
+            ops.append(tok)
             segs.append([])
         else:
             segs[-1].append(tok)
@@ -1880,8 +1878,9 @@ def _parse_value(raw: str) -> tuple[Optional[Decimal], bool]:
 
 def _slot_items(words: list[str], texts: Optional[list[str]] = None) -> list[Any]:
     """``words`` (source spellings) with each threshold (`--flag val`, `--flag=val`, `VAR=val`) collapsed into one
-    `_Slot`; ``texts`` are the same words after quote removal (default: ``words``). Only an unquoted `NAME=` is
-    an assignment: `'T=0.01'`, `"T"=0.01` and `T\\=0.01` are command words the shell cannot find."""
+    `_Slot`; ``texts`` are the same words after quote removal (default: ``words``). Names are matched on the
+    source spelling, so only an unquoted `NAME=` is an assignment (`'T=0.01'`, `"T"=0.01` and `T\\=0.01` are
+    command words the shell cannot find) and only an unquoted `--flag` / `--flag=` is a threshold flag."""
     texts = words if texts is None else texts
 
     def value_text(k: int, prefix: str) -> str:
@@ -1894,13 +1893,13 @@ def _slot_items(words: list[str], texts: Optional[list[str]] = None) -> list[Any
         m = _ASSIGN_RE.match(tok)
         if m and _THRESHOLD_KEY_RE.search(m.group(1)):
             text = value_text(i, m.group(1) + "=")
-            items.append(_Slot("env", m.group(1), m.group(2), text, *_parse_value(text)))
+            items.append(_Slot("env", m.group(1), True, m.group(2), text, *_parse_value(text)))
         elif tok.startswith("-") and tok not in ("-", "--") and _THRESHOLD_KEY_RE.search(tok.partition("=")[0]):
             name, eq, raw = tok.partition("=")
             text = value_text(i, name + "=") if eq else raw
             if not eq and i + 1 < len(words) and not words[i + 1].startswith("--"):
                 i, raw, text = i + 1, words[i + 1], texts[i + 1]
-            items.append(_Slot("flag", name, raw, text, *_parse_value(text)))
+            items.append(_Slot("flag", name, bool(eq), raw, text, *_parse_value(text)))
         else:
             items.append(tok)
         i += 1
@@ -1908,9 +1907,9 @@ def _slot_items(words: list[str], texts: Optional[list[str]] = None) -> list[Any
 
 
 def _slot_ok(base: _Slot, live: _Slot) -> bool:
-    """``live`` keeps ``base``'s bar: same slot, and the same text or a finite, comparable, no looser value."""
-    if (base.kind, base.key) != (live.kind, live.key):
-        return False
+    """``live`` keeps ``base``'s bar: same slot and syntax, and the same text or a comparable, no looser value."""
+    if (base.kind, base.key, base.eq) != (live.kind, live.key, live.eq):
+        return False  # `--t=v` <-> `--t v` drops the threshold for parsers that read only one form
     if live.raw == base.raw:
         return True
     if base.value is None or live.value is None:
@@ -1938,10 +1937,6 @@ def _item_ok(base: Any, live: Any) -> bool:
     return not isinstance(base, _Slot) and not isinstance(live, _Slot) and base == live
 
 
-def _is_assignment(item: Any) -> bool:
-    return item.kind == "env" if isinstance(item, _Slot) else bool(_ASSIGN_RE.match(item))
-
-
 def _is_regen(tok: str, prev: Optional[str]) -> bool:
     """An active snapshot-regeneration option or environment assignment (`=false`/`=0`/... disable it)."""
     m = _ASSIGN_RE.match(tok)
@@ -1956,65 +1951,6 @@ def _is_regen(tok: str, prev: Optional[str]) -> bool:
     prev_name = os.path.basename(prev or "")
     exempt = bool(_PYTHON_RE.match(prev_name)) or prev_name in _SHELLS | {"set", "env", "diff"}
     return not exempt and word.lower() not in {"run", "sub", "cpu", "out", "url", "num"}
-
-
-def _runner(live: list[Any], head: int) -> Optional[str]:
-    """The test runner a segment heads: a bare or absolute `pytest`, `uv run pytest`, `go test` or `cargo test`
-    (never a repo-relative script, a package.json script name, or `go run` / `cargo run`)."""
-    def word(k: int) -> Any:
-        return live[k] if k < len(live) else None
-
-    if not _is_bare_or_absolute(word(head)):
-        return None
-    name = os.path.basename(word(head))
-    if name == "uv" and word(head + 1) == "run" and _is_bare_or_absolute(word(head + 2)):
-        return "pytest" if os.path.basename(word(head + 2)) == "pytest" else None
-    if name == "pytest" or (name in ("go", "cargo") and word(head + 1) == "test"):
-        return name
-    return None
-
-
-def _insert_ok(live: list[Any], j: int, head: int, trailing_from: int, matched: set[int]) -> bool:
-    """Whether item ``live[j]``, absent from the committed segment, is on the positive allowlist of inert
-    insertions: a disabled regeneration assignment before the head; after it a disabled regeneration option
-    (`--update-snapshots=false`) or `--color=`/`--reporter=` with a fixed built-in value; after every committed
-    word (``trailing_from``) a verbosity/color flag (`-q`/`-v` only for runners where they are); or Python's
-    unbuffered `-u` right after a committed interpreter that heads the segment and before its committed script.
-    Nothing may follow a bare option, which could swallow it as its value (`-run --color=never`)."""
-    item = live[j]
-    prev = live[j - 1] if j > 0 else None
-    if j > head and isinstance(prev, str) and prev.startswith("-") and "=" not in prev:
-        return False
-    if isinstance(item, _Slot):
-        return False  # committed thresholds are only tightened in place; a new one (even `0`/`0%`) fails closed
-    if _is_assignment(item):
-        name, _, value = item.partition("=")
-        return j < head and bool(_REGEN_ENV_RE.search(name)) and value.lower() in _DISABLED
-    if j <= head:
-        return False
-    name, eq, value = item.partition("=")
-    if eq:
-        if _REGEN_FLAG_RE.match(name):
-            return value.lower() in _DISABLED
-        return value in _INERT_EQ_OPTIONS.get(name, ())
-    if item == "-u" and j - 1 == head and j + 1 in matched and _is_python_exe(live[head]):
-        return True  # behind a wrapper `python3` may be a module/tool name or an option value (`uv run -m python3`)
-    if j < trailing_from:
-        return False
-    if item in _INERT_TRAILING_FLAGS:
-        return True
-    runner = _runner(live, head)
-    return (item in _RUNNER_SHORT_FLAGS.get(runner or "", ())
-            and not any(w in _RUNNER_ARGS_END[runner] for w in live[head + 1:j] if isinstance(w, str)))
-
-
-def _is_bare_or_absolute(word: Any) -> bool:
-    """A command resolved via PATH (`python3`) or an absolute path, never a repo-relative script (`tests/python3`)."""
-    return isinstance(word, str) and ("/" not in word or word.startswith("/"))
-
-
-def _is_python_exe(word: Any) -> bool:
-    return _is_bare_or_absolute(word) and bool(_PYTHON_RE.match(os.path.basename(word)))
 
 
 def _outer_expands(tok: _Tok) -> bool:
@@ -2039,46 +1975,40 @@ def _outer_expands(tok: _Tok) -> bool:
     return False
 
 
-def _segment_ok(base_toks: list[_Tok], live_toks: list[_Tok], depth: int, sealed: bool, trailing: bool) -> bool:
-    base, live = [t.raw for t in base_toks], [t.raw for t in live_toks]
-    if base == live:
-        return True
-    b_items = _slot_items(base, [t.text for t in base_toks])
-    l_items = _slot_items(live, [t.text for t in live_toks])
+def _sh_c_script_ok(base_toks: list[_Tok], live_toks: list[_Tok], depth: int) -> Optional[bool]:
+    """For an unchanged `sh|bash [-flags] -c SCRIPT [args]` wrapper whose only difference is SCRIPT, whether the
+    script edit is clean (checked recursively); None when the segment is not such a wrapper."""
+    base = [t.raw for t in base_toks]
     head = next((k for k, t in enumerate(base) if not _ASSIGN_RE.match(t)), None)
-    name = os.path.basename(base[head]) if head is not None else None
-    if name in _SHELLS and len(base) == len(live):
-        # an unchanged `sh|bash ... -c SCRIPT [args]` wrapper: only the script may differ, checked recursively
-        diff = [k for k in range(len(base)) if base[k] != live[k]]
-        if len(diff) == 1 and diff[0] > head + 1 and re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", base[diff[0] - 1]):
-            # the outer shell expands `$T`/globs in a double-quoted or unquoted script before the child sees it, so
-            # neither side may expand: any quoting flip that changes what the child shell receives fails closed
-            return (not _outer_expands(base_toks[diff[0]]) and not _outer_expands(live_toks[diff[0]])
-                    and all(re.fullmatch(r"[-+][A-Za-z]+", t) and "c" not in t for t in base[head + 1:diff[0] - 1])
-                    and _structure_ok(base_toks[diff[0]].text, live_toks[diff[0]].text, depth + 1))
-    if sealed or head is None or name in _SEALED_HEADS:
-        return len(b_items) == len(l_items) and all(map(_item_ok, b_items, l_items))
-    matched: list[int] = []
-    j = 0
-    for item in b_items:  # every committed word and threshold, in order (greedy earliest match)
-        while j < len(l_items) and not _item_ok(item, l_items[j]):
-            j += 1
-        if j >= len(l_items):
-            return False
-        matched.append(j)
-        j += 1
-    live_head = matched[next(k for k, t in enumerate(b_items) if not _is_assignment(t))]
-    trailing_from = matched[-1] + 1 if trailing else len(l_items)
-    return all(_insert_ok(l_items, k, live_head, trailing_from, set(matched))
-               for k in range(len(l_items)) if k not in matched)
+    if head is None or len(base_toks) != len(live_toks) or os.path.basename(base[head]) not in _SHELLS:
+        return None
+    diff = [k for k in range(len(base)) if base_toks[k].key != live_toks[k].key]
+    if len(diff) != 1 or diff[0] <= head + 1 or not re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", base[diff[0] - 1]):
+        return None
+    b, s = base_toks[diff[0]], live_toks[diff[0]]
+    # the outer shell expands `$T`/globs in a double-quoted or unquoted script before the child sees it, so
+    # neither side may expand, and the script keeps its committed outer quote style
+    return (not _outer_expands(b) and not _outer_expands(s)
+            and b.from_argv == s.from_argv and (b.from_argv or b.raw[:1] == s.raw[:1])
+            and all(re.fullmatch(r"[-+][A-Za-z]+", t) and "c" not in t for t in base[head + 1:diff[0] - 1])
+            and _structure_ok(b.text, s.text, depth + 1))
 
 
-def _is_redirect(op: str) -> bool:
-    return "<" in op or ">" in op
+def _segment_ok(base_toks: list[_Tok], live_toks: list[_Tok], depth: int) -> bool:
+    """Pure in-place tightening: the same items 1-to-1, each word with its exact spelling and each committed
+    threshold kept or tightened in place. Nothing may be inserted, deleted or moved."""
+    if [t.key for t in base_toks] == [t.key for t in live_toks]:
+        return True
+    script = _sh_c_script_ok(base_toks, live_toks, depth)
+    if script is not None:
+        return script
+    b_items = _slot_items([t.raw for t in base_toks], [t.text for t in base_toks])
+    l_items = _slot_items([t.raw for t in live_toks], [t.text for t in live_toks])
+    return len(b_items) == len(l_items) and all(map(_item_ok, b_items, l_items))
 
 
 def _structure_ok(base_cmd: Any, live_cmd: Any, depth: int = 0) -> bool:
-    """The fail-closed structural rule: identical operators and segment count, each segment aligned 1-to-1."""
+    """The fail-closed structural rule: identical operators (exact spelling), each segment aligned 1-to-1."""
     if depth > _MAX_SCRIPT_DEPTH:
         return False
     try:
@@ -2088,15 +2018,10 @@ def _structure_ok(base_cmd: Any, live_cmd: Any, depth: int = 0) -> bool:
     if isinstance(base_cmd, list) != isinstance(live_cmd, list) and not all(
             not t.is_op and _PLAIN_WORD_RE.fullmatch(t.text) for t in (*base, *live)):
         return False  # argv list <-> shell string: only plain words mean the same thing in both
-    if [t.key for t in base] == [t.key for t in live]:
-        return True
     (b_ops, b_segs), (l_ops, l_segs) = _segments(base), _segments(live)
-    if b_ops != l_ops or any(op.lstrip("0123456789").startswith("<<") and "<<<" not in op for op in b_ops):
-        return False  # a changed heredoc body is code, not argv
-    # a redirection target is sealed, and nothing may trail a word that precedes a redirection (`cmd 2>f`)
-    return all(_segment_ok(b, s, depth, k > 0 and _is_redirect(b_ops[k - 1]),
-                           k == len(b_ops) or not _is_redirect(b_ops[k]))
-               for k, (b, s) in enumerate(zip(b_segs, l_segs)))
+    if [o.key for o in b_ops] != [o.key for o in l_ops]:
+        return False
+    return all(_segment_ok(b, s, depth) for b, s in zip(b_segs, l_segs))
 
 
 def _flat_segments(command: Any, depth: int = 0) -> tuple[list[list[str]], int]:
@@ -2105,14 +2030,26 @@ def _flat_segments(command: Any, depth: int = 0) -> tuple[list[list[str]], int]:
         ops, segs = _segments(_tokenize_visual_cmd(command))
     except ValueError:
         return [], 0
-    out, ors = [[t.text for t in s] for s in segs if s], ops.count("||")
-    for seg in out[:]:
+    out, ors = [[t.text for t in s] for s in segs if s], sum(o.raw == "||" for o in ops)
+    for n, seg in enumerate(out[:]):
         if depth < _MAX_SCRIPT_DEPTH and os.path.basename(seg[0]) in _SHELLS:
             k = next((k for k in range(1, len(seg) - 1) if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", seg[k])), None)
             if k is not None:
+                out[n] = seg[:k + 1] + seg[k + 2:]  # the script is code, diagnosed below, not one outer word
                 inner, inner_ors = _flat_segments(seg[k + 1], depth + 1)
                 out, ors = out + inner, ors + inner_ors
     return out, ors
+
+
+def _slot_problem(base: _Slot, live: _Slot) -> str:
+    """Why ``live`` fails `_slot_ok` against ``base`` (same kind and key)."""
+    if live.value is None:
+        return "value"
+    if base.percent != live.percent:
+        return "unit"
+    if base.eq != live.eq:
+        return "syntax"
+    return "integer" if _integer_syntax_lost(base, live) else "loosen"
 
 
 def _threshold_reasons(base_segs: list[list[str]], live_segs: list[list[str]]) -> list[str]:
@@ -2134,18 +2071,23 @@ def _threshold_reasons(base_segs: list[list[str]], live_segs: list[list[str]]) -
             reasons.append(f"removes {len(b_vals) - len(l_vals)} of {len(b_vals)} {label} threshold(s)")
         strictest = min(b_vals, key=lambda s: Decimal("Infinity") if s.value is None else s.value)
         pairs = [*zip(b_vals, l_vals), *((strictest, s) for s in l_vals[len(b_vals):])]
-        bad = [(b, s) for b, s in pairs if not _slot_ok(b, s)]
-        if any(s.value is None for _, s in bad):
+        problems: dict[str, list[_Slot]] = {}
+        for b, s in pairs:
+            if not _slot_ok(b, s):
+                problems.setdefault(_slot_problem(b, s), []).append(s)
+        if "value" in problems:
             reasons.append(f"sets non-finite or unparseable threshold {label} "
-                           f"({', '.join(s.raw for _, s in bad if s.value is None)})")
-        if any(s.value is not None and s.percent != b.percent for b, s in bad):
+                           f"({', '.join(s.raw for s in problems['value'])})")
+        if "unit" in problems:
             reasons.append(f"changes threshold unit {label} (`%` vs plain number) from "
                            f"{', '.join(s.raw for s in b_vals)} to {', '.join(s.raw for s in l_vals)}")
-        if any(s.value is not None and s.percent == b.percent and _integer_syntax_lost(b, s) for b, s in bad):
+        if "syntax" in problems:
+            reasons.append(f"changes threshold syntax {label} (`--flag=value` vs `--flag value`; checkers "
+                           "often read only one form)")
+        if "integer" in problems:
             reasons.append(f"rewrites integer threshold {label} as a non-integer "
-                           f"({', '.join(s.raw for b, s in bad if s.value is not None and _integer_syntax_lost(b, s))}"
-                           "; integer parsers reject `0.5`)")
-        if any(s.value is not None and s.percent == b.percent and not _integer_syntax_lost(b, s) for b, s in bad):
+                           f"({', '.join(s.raw for s in problems['integer'])}; integer parsers reject `0.5`)")
+        if "loosen" in problems:
             reasons.append(f"loosens threshold {label} from {', '.join(s.raw for s in b_vals)} to "
                            f"{', '.join(s.raw for s in l_vals)}")
     for (kind, key), l_vals in live.items():
@@ -2160,10 +2102,13 @@ def _visual_hook_loosening(base_hook: dict[str, Any], live_hook: dict[str, Any])
     """Ways ``live_hook`` weakens the committed `visual_diff` ``base_hook`` (empty when it does not)."""
     reasons: list[str] = []
     base_cmd, live_cmd = base_hook.get("command"), live_hook.get("command")
-    unchanged = isinstance(base_cmd, str) and isinstance(live_cmd, str) and base_cmd.strip() == live_cmd.strip()
+    unchanged = base_cmd == live_cmd  # byte-identical: any shell construct is the committed, reviewed one
     if not unchanged:
         try:
             _tokenize_visual_cmd(live_cmd)
+        except _UnsupportedEdit as exc:
+            reasons.append(f"mutates visual_diff command with a {exc} (allowed only when byte-identical to the "
+                           "committed command)")
         except ValueError:
             reasons.append("mutates visual_diff command with unparseable shell syntax")
     if not unchanged and not reasons and not _structure_ok(base_cmd, live_cmd):
