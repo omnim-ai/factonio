@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-27T13:50:00Z",
+  "generated_at": "2026-11-27T15:17:00Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
