@@ -1641,32 +1641,100 @@ def _git_blob_oid(data: bytes, oid_len: int) -> str:
     return algo(b"blob %d\0" % len(data) + data).hexdigest()
 
 
-def _committed_blob_mismatches(root: Path, ref: str, globs: list[str]) -> set[str]:
-    """Committed blobs at ``ref`` matching ``globs`` whose live file is missing, of another type or has other
-    bytes. The file itself is hashed, so Git index flags (`assume-unchanged`, `skip-worktree`) and stat-cache
-    tricks that hide a mutation from `git status` cannot. Filtered content (LFS, `autocrlf`) fails closed."""
+_MAX_SYMLINK_HOPS = 40
+
+
+def _committed_tree(root: Path, ref: str) -> Optional[dict[str, tuple[str, str]]]:
+    """Every committed blob at ``ref`` (path -> ``(mode, oid)``), or None when the tree cannot be read."""
     proc = _git_ro(root, ["ls-tree", "-r", "-z", "--full-tree", ref], timeout=60)
     if proc.returncode != 0:
-        return set()
-    out: set[str] = set()
+        return None
+    tree: dict[str, tuple[str, str]] = {}
     for rec in proc.stdout.split("\0"):
         meta, sep, rel = rec.partition("\t")
         fields = meta.split(" ")
-        if not sep or len(fields) != 3 or fields[1] != "blob" or not _any_match(globs, rel):
-            continue
-        mode, _, oid = fields
-        live = root / rel
-        try:
-            st = os.lstat(live)
-            if mode == "120000":
-                data = os.fsencode(os.readlink(live)) if stat.S_ISLNK(st.st_mode) else None
-            else:
-                data = live.read_bytes() if stat.S_ISREG(st.st_mode) else None
-        except OSError:
+        if sep and len(fields) == 3 and fields[1] == "blob":
+            tree[rel] = (fields[0], fields[2])
+    return tree
+
+
+def _live_blob_matches(root: Path, rel: str, entry: Optional[tuple[str, str]]) -> bool:
+    """Whether the file at ``rel`` (its parents already checked) is the committed ``entry`` itself: a symlink
+    with the same link text for mode `120000`, else a regular file with the same bytes (hashed in Python)."""
+    if entry is None:
+        return False
+    mode, oid = entry
+    live = root / rel
+    try:
+        st = os.lstat(live)
+        if mode == "120000":
+            data = os.fsencode(os.readlink(live)) if stat.S_ISLNK(st.st_mode) else None
+        elif mode in ("100644", "100755"):
+            data = live.read_bytes() if stat.S_ISREG(st.st_mode) else None
+        else:
             data = None
-        if data is None or _git_blob_oid(data, len(oid)) != oid:
-            out.add(rel)
-    return out
+    except OSError:
+        data = None
+    return data is not None and _git_blob_oid(data, len(oid)) == oid
+
+
+def _real_dirs(root: Path, parts: list[str]) -> bool:
+    """Whether every prefix of ``parts`` under ``root`` is a real directory on disk, never a symlink."""
+    try:
+        return all(stat.S_ISDIR(os.lstat(root.joinpath(*parts[:n + 1])).st_mode) for n in range(len(parts)))
+    except OSError:
+        return False
+
+
+def _frozen_path_intact(root: Path, rel: str, tree: dict[str, tuple[str, str]]) -> bool:
+    """Whether the bytes a checker reads through the frozen baseline ``rel`` are the committed ones: every parent
+    directory is real (no symlinked ancestor), and a symlink baseline's whole chain is followed inside the repo,
+    each hop a committed, unchanged link, to a committed regular file with unchanged bytes. An absolute or
+    escaping target, a symlinked intermediate directory, a missing, cyclic, too deep or non-regular end fails."""
+    cur = rel
+    visited = {rel}
+    if not _real_dirs(root, rel.split("/")[:-1]):
+        return False
+    for _ in range(_MAX_SYMLINK_HOPS + 1):
+        entry = tree.get(cur)
+        if not _live_blob_matches(root, cur, entry):
+            return False
+        if entry is None or entry[0] != "120000":
+            return True
+        try:
+            target = os.readlink(root / cur)
+        except OSError:
+            return False
+        if not target or target.startswith("/"):
+            return False
+        parts = cur.split("/")[:-1]
+        comps = [c for c in target.split("/") if c not in ("", ".")]
+        for n, comp in enumerate(comps):
+            if comp == "..":
+                if not parts:
+                    return False  # escapes the repository
+                parts.pop()  # every part is a verified real directory, so `..` is its lexical parent
+            else:
+                parts.append(comp)
+                if n + 1 < len(comps) and not _real_dirs(root, parts):
+                    return False
+        cur = "/".join(parts)
+        if not cur or cur in visited:
+            return False
+        visited.add(cur)
+    return False
+
+
+def _committed_blob_mismatches(root: Path, ref: str, globs: list[str]) -> set[str]:
+    """Committed blobs at ``ref`` matching ``globs`` whose live file is missing, of another type or has other
+    bytes, sits under a symlinked directory, or (a symlink) no longer resolves to the committed bytes of its
+    committed in-repo referent (`_frozen_path_intact`). Files are hashed directly, so Git index flags
+    (`assume-unchanged`, `skip-worktree`) and stat-cache tricks that hide a mutation from `git status` cannot,
+    for the baseline or for a referent outside ``globs``. Filtered content (LFS, `autocrlf`) fails closed."""
+    tree = _committed_tree(root, ref)
+    if tree is None:
+        return set()
+    return {rel for rel in tree if _any_match(globs, rel) and not _frozen_path_intact(root, rel, tree)}
 
 
 def _frozen_baseline_changes(root: Path, frozen: dict[str, list[str]], base_sha: Optional[str]) -> list[dict[str, Any]]:
@@ -1707,8 +1775,10 @@ def _merge_baseline_changes(*groups: list[dict[str, Any]]) -> list[dict[str, Any
 # syntax, and each changed committed threshold a plain fixed-point decimal no larger than before. On top of that,
 # every byte outside the tightened threshold value spans must match the committed command verbatim
 # (`_verbatim_tightening_ok`): whitespace, comments and quoting are never normalized. Edited commands allow this
-# only on a single simple command (or `sh -c`/`bash -c` wrapping one) with `env` slots in leading assignment
-# position and `flag` slots before `--` (`_value_spans`), so comparison data is never a threshold. Everything
+# only under a positive grammar (`_value_spans`): one simple command (optionally wrapped once in exactly
+# `sh -c SCRIPT` / `bash -c SCRIPT`), leading `NAME=val` assignments or a bare flagless `env`, a non-denied head,
+# then only threshold flags with plain numbers and plain positionals. Any other option word fails closed, as no
+# option denylist can know which flag turns the next word into code or a filter. Everything
 # else fails closed, and every validation regex anchors with `\A...\Z` + `fullmatch` (`$` also matches before a final LF).
 
 _THRESHOLD_KEY_RE = re.compile(
@@ -2056,41 +2126,34 @@ def _value_span(raw: str, off: int, from_argv: bool) -> list[tuple[int, int]]:
 
 
 # Command heads an edited command may never have: shell keywords/builtins, shells, test/comparison utilities,
-# text filters and wrappers that run another command (any argument could be comparison data or code).
+# text filters, expression/script interpreters whose positional argument is code, and wrappers that run another
+# command (any argument could be comparison data or code).
 _EDIT_DENIED_HEADS = frozenset({
     "[", "[[", "test", "if", "then", "elif", "else", "fi", "while", "until", "for", "do", "done", "case", "esac",
     "select", "time", "coproc", "!", "{", "}", "function", "echo", "printf", "grep", "egrep", "fgrep", "rg",
     "sed", "awk", "gawk", "mawk", "tr", "cut", "cat", "head", "tail", "true", "false", "exit", "return", "eval",
     "exec", "source", ".", "alias", "set", "unset", "declare", "typeset", "local", "readonly", "export", "let",
-    "command", "builtin", "env", "xargs", "nice", "nohup", "timeout", "sudo", "doas", "stdbuf", "setsid",
-    "chroot", "ionice", "taskset", "strace", "watch", "expr", *_SHELLS,
+    "command", "builtin", "env", "xargs", "find", "nice", "nohup", "timeout", "sudo", "doas", "stdbuf", "setsid",
+    "chroot", "ionice", "taskset", "strace", "watch", "expr", "jq", "yq", "perl", "ruby", "php", "lua", "git",
+    *_SHELLS,
 })
 _SH_C_SHELLS = frozenset({"sh", "bash"})
-
-
-def _inline_code_option(text: str) -> bool:
-    """`-c`/`-e`/`-p` (alone, in a short cluster like `-Bc`, or with attached code) or `--eval`/`--print`/...:
-    the following word is code or printed data, never an argument the checker reads as a threshold."""
-    if text.startswith("--"):
-        return bool(re.fullmatch(r"--(?:eval|print|command|execute)(?:=.*)?", text, re.DOTALL))
-    if not text.startswith("-") or len(text) < 2:
-        return False
-    if text[1] in "cep":
-        return True
-    m = re.match(r"-[A-Za-z]{1,3}(?![A-Za-z])", text)
-    return bool(m) and any(c in m.group(0) for c in "cep")
+# Positional words that make a runner evaluate or filter (`deno eval`, `npm exec`, `git grep`), never a file.
+_EDIT_DENIED_POSITIONALS = frozenset({"eval", "exec", "grep"})
+_FLAG_NAME_RE = re.compile(r"\A--?[A-Za-z0-9][A-Za-z0-9_-]*\Z", re.ASCII)
 
 
 def _value_spans(command: Any, depth: int = 0) -> list[tuple[int, int, int]]:
     """``(item, start, end)`` source offsets of every editable threshold value in ``command`` (item is the argv
-    index, 0 for a string). Only a single simple command has editable values (or `sh -c`/`bash -c` wrapping
-    one, recursively, when the script's offsets map 1:1): `env` slots only as leading `NAME=val` assignments
-    (directly, or after a leading `env` and `-i`) before a real command head, `flag` slots only after that head
-    and before `--`. Raises `_UnsupportedEdit` for anything else: shell operators, newlines, comments, `$`/``
-    ` ``/glob expansion, a missing or denied head (shell keyword, test, text filter, wrapper) or an inline-code
-    option; and ValueError like `_tokenize_visual_cmd`."""
-    if depth > _MAX_SCRIPT_DEPTH:
-        raise _UnsupportedEdit("nesting too deep")
+    index, 0 for a string). A positive grammar, never a denylist of options: only a single simple command has
+    editable values, optionally wrapped once (top level only) in exactly `sh -c SCRIPT` / `bash -c SCRIPT` whose
+    offsets map 1:1. It is `[NAME=val ...] <cmd> ARG...` or `env [NAME=val ...] <cmd> ARG...` (a bare `env`: no
+    flags, no assignment before it), where `<cmd>` is not a denied head (shell keyword, shell, test, text filter,
+    expression interpreter, wrapper) and every ARG is either a threshold flag with a plain number
+    (`--threshold=0.05` / `--threshold 0.05`) or a plain positional (no leading `-`, no `=`, not `eval`/`exec`/
+    `grep`). Any other option (`-c`, `-Bc'...'`, `-E`, `--grep`, `--`, ...) could make the next word code or a
+    filter, so it raises `_UnsupportedEdit`, as do shell operators, newlines, comments and `$`/`` ` ``/glob
+    expansion; ValueError like `_tokenize_visual_cmd`."""
     toks = _tokenize_visual_cmd(command)
     argv = isinstance(command, list)
     if not argv:
@@ -2117,45 +2180,45 @@ def _value_spans(command: Any, depth: int = 0) -> list[tuple[int, int, int]]:
     while not argv and k < len(toks) and env_slot(k):
         k += 1  # an argv item `NAME=val` is a command name for execvp, never an assignment
     if k < len(toks) and os.path.basename(toks[k].text) == "env":
+        if k:
+            raise _UnsupportedEdit("assignment before env")  # `env -i`/`-u` would clear it
         k += 1
-        while k < len(toks) and toks[k].text in ("-", "-i", "--ignore-environment"):
-            k += 1
         while k < len(toks) and env_slot(k):
             k += 1
     if k >= len(toks):
         raise _UnsupportedEdit("no command head")
     head = os.path.basename(toks[k].text)
     rest = toks[k + 1:]
-    if head in _SH_C_SHELLS:
-        j = 0
-        while j < len(rest) and re.fullmatch(r"[-+][A-Za-z]+", rest[j].raw) and "c" not in rest[j].raw:
-            j += 1
-        if (len(rest) != j + 2 or not re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", rest[j].raw)
-                or (off := _payload_offset(rest[j + 1])) is None):
+    if head in _SH_C_SHELLS and depth == 0:
+        if len(rest) != 2 or rest[0].raw != "-c" or (off := _payload_offset(rest[1])) is None:
             raise _UnsupportedEdit("shell wrapper")
-        unit = k + 1 + j + 1 if argv else 0
-        inner = _value_spans(rest[j + 1].text, depth + 1)
+        unit = k + 2 if argv else 0
+        inner = _value_spans(rest[1].text, depth + 1)
         return sorted([*spans, *((unit, off + s, off + e) for _, s, e in inner)])
     if head in _EDIT_DENIED_HEADS or _ASSIGN_RE.fullmatch(toks[k].text) or toks[k].text.startswith("-"):
         raise _UnsupportedEdit("command head")
-    end = next((j for j, t in enumerate(rest) if t.text == "--"), len(rest))
-    if any(_inline_code_option(t.text) for t in rest[:end]):
-        raise _UnsupportedEdit("inline code option")
     i = 0
-    while i < end:
+    while i < len(rest):
         tok = rest[i]
+        unit = k + 1 + i if argv else 0
         i += 1
-        raw = tok.raw
-        if not (raw.startswith("-") and raw not in ("-", "--") and _THRESHOLD_KEY_RE.search(raw.partition("=")[0])):
+        if not tok.text.startswith("-"):
+            if "=" in tok.text or tok.text in _EDIT_DENIED_POSITIONALS:
+                raise _UnsupportedEdit("non-positional argument")
             continue
-        unit = k + i if argv else 0
-        name, eq, val = raw.partition("=")
+        name, eq, val = tok.raw.partition("=")
+        if not (_FLAG_NAME_RE.fullmatch(name) and _THRESHOLD_KEY_RE.search(name)):
+            raise _UnsupportedEdit("non-threshold option")
         if eq:
-            spans += [(unit, s, e) for s, e in _value_span(val, tok.start + len(name) + 1, tok.from_argv)]
-        elif i < end and not rest[i].raw.startswith("--"):
-            nxt = rest[i]
+            found = [(unit, s, e) for s, e in _value_span(val, tok.start + len(name) + 1, tok.from_argv)]
+        else:
+            nxt = rest[i] if i < len(rest) else None
+            found = [] if nxt is None else [
+                (k + 1 + i if argv else 0, s, e) for s, e in _value_span(nxt.raw, nxt.start, nxt.from_argv)]
             i += 1
-            spans += [(k + i if argv else 0, s, e) for s, e in _value_span(nxt.raw, nxt.start, nxt.from_argv)]
+        if not found:
+            raise _UnsupportedEdit("threshold option without a plain number")
+        spans += found
     return sorted(spans)
 
 

@@ -2762,6 +2762,9 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
         "UPDATE_SNAPSHOTS=0 inserted": ("npx playwright test", "UPDATE_SNAPSHOTS=0 npx playwright test"),
         "; -> newline": (_EXPORTED, "export THRESHOLD=0.01\npython3 check.py\n"),
         "line continuation": ("python3 check.py --threshold 0.01", "python3 check.py \\\n  --threshold 0.01"),
+        # Round 22: an edited command carries no non-threshold option (it could consume the threshold word)
+        "committed --reporter=list tightened": ("npx playwright test --reporter=list --threshold 0.05",
+                                                "npx playwright test --reporter=list --threshold 0.01"),
     }
     _UNCHANGED = (
         _EXPORTED, "export 'THRESHOLD=0.01'; python3 \"check.py\"", "env - python3 -u check.py", "env -S '-u FOO python3 -u check.py'",
@@ -2771,6 +2774,7 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
         "npx playwright test --update-snapshots=false", "npx jest -u", "python3 check.py || true",
         ["sh", "-c", "python3 check.py -u"],
         "npx playwright test --reporter=list --color=never --verbose", "python3 -u check.py", "pytest -q tests/visual",
+        "npx playwright test --reporter=list --threshold 0.05",
         "cat <<EOF >/dev/null\nunused\nEOF\npython3 check.py", "python3 check.py | tee log.txt",
         "python3 check.py \\\n  --threshold 0.01", "node check.js --threshold 1e-2",
     )
@@ -2784,8 +2788,6 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
         "sh -c prefix tightened": ("bash -c 'THRESHOLD=0.05 python3 check.py'", "bash -c 'THRESHOLD=0.01 python3 check.py'"),
         "sh -c pixels tightened": ("sh -c 'node check.js --max-diff-pixels=5'",
                                    "sh -c 'node check.js --max-diff-pixels=1'"),
-        "committed --reporter=list tightened": ("npx playwright test --reporter=list --threshold 0.05",
-                                                "npx playwright test --reporter=list --threshold 0.01"),
         "committed UPDATE_SNAPSHOTS=0 tightened": ("UPDATE_SNAPSHOTS=0 THRESHOLD=0.05 npx playwright test",
                                                    "UPDATE_SNAPSHOTS=0 THRESHOLD=0.01 npx playwright test"),
         "threshold tightened to zero": ("npx playwright test --threshold 0.05", "npx playwright test --threshold 0"),
@@ -2891,7 +2893,7 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
 
         self._assert_clean(self._CLEAN)
         with isolated_hermes_home() as home:
-            for n, label in enumerate(("env tightened", "sh -c prefix tightened", "committed --reporter=list tightened",
+            for n, label in enumerate(("env tightened", "sh -c prefix tightened", "sh -c pixels tightened",
                                        "quoted prefix tightened", "committed UPDATE_SNAPSHOTS=0 tightened")):
                 base, live = self._CLEAN[label]
                 with self.subTest(label):
@@ -3268,12 +3270,15 @@ class TestFixRound14ShellWordsQuotingUnitsAndWrappers(unittest.TestCase):
                                                "bash -c 'python3 check.py' -c 'x --threshold 0.01'"),
             "option with a value": ("bash -o pipefail -c 'python3 check.py --threshold 0.05'",
                                     "bash -o pipefail -c 'python3 check.py --threshold 0.01'"),
+            # Round 22: the one wrapper is exactly `sh|bash -c SCRIPT`, with no other shell option
+            "bash -e -c tightening": ("bash -e -c 'python3 check.py --threshold 0.05'",
+                                      "bash -e -c 'python3 check.py --threshold 0.01'"),
         })
         self._assert_clean({
             "single-quoted tightening": ("bash -c 'python3 check.py --threshold 0.05'",
                                          "bash -c 'python3 check.py --threshold 0.01'"),
-            "bash -e -c tightening": ("bash -e -c 'python3 check.py --threshold 0.05'",
-                                      "bash -e -c 'python3 check.py --threshold 0.01'"),
+            "unchanged bash -e -c": ("bash -e -c 'python3 check.py --threshold 0.05'",
+                                     "bash -e -c 'python3 check.py --threshold 0.05'"),
             "unchanged expanding script": (flips["sh -c"][0], flips["sh -c"][0]),
         })
         self._assert_executed_bypasses_rejected(list(flips.values()))
@@ -3443,10 +3448,10 @@ class TestFixRound15BlobHashBaselinesAndNoNewInsertions(unittest.TestCase):
             self.assertEqual(changed(), ["snapshots/link.png"])
             (repo / "snapshots" / "link.png").unlink()
             os.symlink("home.png", repo / "snapshots" / "link.png")
-            (repo / "snapshots" / "home.png").unlink()
-            self.assertEqual(changed(), ["snapshots/home.png"])
+            (repo / "snapshots" / "home.png").unlink()  # Round 22: the link through it no longer reads the bytes
+            self.assertEqual(changed(), ["snapshots/home.png", "snapshots/link.png"])
             (repo / "snapshots" / "home.png").mkdir()
-            self.assertEqual(changed(), ["snapshots/home.png"])
+            self.assertEqual(changed(), ["snapshots/home.png", "snapshots/link.png"])
 
     def test_no_threshold_may_be_newly_inserted(self):
         from factonio.harness import _visual_hook_loosening
@@ -4169,9 +4174,8 @@ class TestFixRound20VerbatimOutsideThresholdValueSpans(unittest.TestCase):
         self.assertEqual(spans("THRESHOLD='0.05' a --threshold=\"1%\" --max-diff-pixels 5"), ["0.05", "1%", "5"])
         self.assertEqual(spans("sh -c 'node c.js --max-diff-pixels=5'"), ["5"])
         self.assertEqual(spans(["bash", "-c", "node c.js --threshold 0.05"]), ["0.05"])
-        self.assertEqual(spans('a --threshold "0.01\n"'), [])
         for compound in ("[[ $x =~ --threshold=0.05 ]] && (( --threshold=5 )) && $((--threshold=5))",
-                         "a --threshold=0.05 # c"):
+                         "a --threshold=0.05 # c", 'a --threshold "0.01\n"'):
             with self.assertRaises(ValueError):
                 spans(compound)
         with self.assertRaises(ValueError):  # escapes: offsets do not map 1:1
@@ -4300,16 +4304,17 @@ class TestFixRound21SingleSimpleCommandTightening(unittest.TestCase):
         "argv test": (["test", "x", "=", "--threshold=0.05"], ["test", "x", "=", "--threshold=0.01"]),
         "-pe cluster": ("perl -pe 1 --threshold=0.05", "perl -pe 1 --threshold=0.01"),
         "--eval=": ("deno --eval=1 --threshold=0.05", "deno --eval=1 --threshold=0.01"),
+        # Round 22: no `env` option and no option word other than a threshold flag (`--` included)
+        "env -i assignment": ("env -i THRESHOLD=0.05 node check.js", "env -i THRESHOLD=0.01 node check.js"),
+        "flag before --": ("npx jest --threshold=0.05 -- x", "npx jest --threshold=0.01 -- x"),
     }
     _CLEAN = {
         "leading assignment": ("THRESHOLD=0.05 node check.js", "THRESHOLD=0.01 node check.js"),
         "env assignment": ("env THRESHOLD=0.05 node check.js", "env THRESHOLD=0.01 node check.js"),
-        "env -i assignment": ("env -i THRESHOLD=0.05 node check.js", "env -i THRESHOLD=0.01 node check.js"),
         "--flag=": ("node check.js --threshold=0.05", "node check.js --threshold=0.01"),
         "--flag value": ("node check.js --threshold 0.05", "node check.js --threshold 0.01"),
         "playwright": ("npx playwright test --max-diff-pixel-ratio=0.05", "npx playwright test --max-diff-pixel-ratio=0.01"),
         "sh -c pixels": ("sh -c 'node check.js --max-diff-pixels=5'", "sh -c 'node check.js --max-diff-pixels=1'"),
-        "flag before --": ("npx jest --threshold=0.05 -- x", "npx jest --threshold=0.01 -- x"),
         "argv env": (["env", "THRESHOLD=0.05", "node", "check.js"], ["env", "THRESHOLD=0.01", "node", "check.js"]),
         "argv flag": (["node", "check.js", "--threshold=0.05"], ["node", "check.js", "--threshold=0.01"]),
     }
@@ -4336,10 +4341,12 @@ class TestFixRound21SingleSimpleCommandTightening(unittest.TestCase):
             items = cmd if isinstance(cmd, list) else [cmd]
             return [items[u][s:e] for u, s, e in _value_spans(cmd)]
 
-        self.assertEqual(spans("A=1 THRESHOLD=0.05 env -i MAX_DIFF=2 node c.js THRESHOLD=3 --threshold 4 -- "
-                               "--threshold=5"), ["0.05", "2", "4"])
-        self.assertEqual(spans(["env", "THRESHOLD=1", "node", "--threshold", "2", "--", "--threshold=3"]), ["1", "2"])
+        self.assertEqual(spans("A=1 THRESHOLD=0.05 MAX_DIFF=2 node c.js --threshold 4"), ["0.05", "2", "4"])
+        self.assertEqual(spans(["env", "THRESHOLD=1", "node", "--threshold", "2"]), ["1", "2"])
         for cmd in ('[ "$out" = THRESHOLD=0.05 ]', "THRESHOLD=0.05", "x=1; node c.js --threshold=1",
+                    "A=1 THRESHOLD=0.05 env -i MAX_DIFF=2 node c.js", "node c.js THRESHOLD=3 --threshold 4",
+                    "node c.js --threshold 4 -- --threshold=5",
+                    ["env", "THRESHOLD=1", "node", "--threshold", "2", "--", "--threshold=3"],
                     "node -e 1 --threshold=1", "bash -c 'a; b --threshold=1'", "test 1 --threshold=1"):
             with self.subTest(cmd=cmd), self.assertRaises(ValueError):
                 spans(cmd)
@@ -4359,6 +4366,245 @@ class TestFixRound21SingleSimpleCommandTightening(unittest.TestCase):
                     self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
                     audit = audit_harness(str(repo))
                     self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("clean", False))
+
+
+class TestFixRound22SymlinkReferentsAndPositiveCommandGrammar(unittest.TestCase):
+    """Round 22: a frozen symlink baseline pins its whole in-repo referent chain (bytes hashed directly, so index
+    flags cannot hide a referent outside `baseline_paths`), and a symlinked ancestor, absolute, escaping, broken
+    or cyclic link fails closed. An edited command follows a positive grammar: at most one top-level exact
+    `sh|bash -c SCRIPT`, leading assignments or a bare flagless `env`, then only threshold flags with plain
+    numbers and plain positionals; any other option word fails closed."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    # Fails while the rendered output differs from the frozen baseline it reads through `snapshots/baseline.png`.
+    _CMP = ("import pathlib, sys\n"
+            "sys.exit(0 if pathlib.Path('snapshots/baseline.png').read_bytes() == pathlib.Path('out.png').read_bytes()"
+            " else 1)\n")
+    # A test runner whose `--grep` takes the next word as a test-name filter; the one test fails.
+    _GREP = ("import sys\n"
+             "a = sys.argv[1:]\n"
+             "pat = a[a.index('--grep') + 1] if '--grep' in a else ''\n"
+             "sys.exit(1 if pat in 'visual --threshold=0.05 home' else 0)\n")
+    # Passes only when its argv carries the edited `0.01` literal.
+    _CHECKER = "#!/usr/bin/env python3\nimport sys\nsys.exit(0 if '0.01' in sys.argv[1:] else 1)\n"
+    _PY_CODE = "import sys; sys.exit(0 if \"--threshold=0.01\" in sys.argv or \"0.01\" in sys.argv else 1)"
+    _EXECUTED = (
+        ("python3 visual.py --grep --threshold=0.05", "python3 visual.py --grep --threshold=0.01"),
+        (f"python3 -Bc'{_PY_CODE}' --threshold=0.05", f"python3 -Bc'{_PY_CODE}' --threshold=0.01"),
+        (f"python3 -Ic'{_PY_CODE}' --threshold 0.05", f"python3 -Ic'{_PY_CODE}' --threshold 0.01"),
+        (f"python3 -EsBc '{_PY_CODE}' --threshold=0.05", f"python3 -EsBc '{_PY_CODE}' --threshold=0.01"),
+        (["python3", f"-Bc{_PY_CODE}", "--threshold", "0.05"], ["python3", f"-Bc{_PY_CODE}", "--threshold", "0.01"]),
+        ("sh -c \"sh -c './checker.py --threshold 0.05'\"", "sh -c \"sh -c './checker.py --threshold 0.01'\""),
+        ("bash -c \"bash -c './checker.py --threshold 0.05'\"", "bash -c \"bash -c './checker.py --threshold 0.01'\""),
+    )
+    _INTERPRETERS = (
+        ("perl", "THRESHOLD=0.05 perl -E 'exit($ENV{THRESHOLD} eq \"0.01\" ? 0 : 1)'"),
+        ("perl", "THRESHOLD=0.05 perl -we'exit($ENV{THRESHOLD} eq \"0.01\" ? 0 : 1)'"),
+        ("ruby", "THRESHOLD=0.05 ruby -we'exit(ENV[\"THRESHOLD\"] == \"0.01\" ? 0 : 1)'"),
+        ("jq", "THRESHOLD=0.05 jq -n --exit-status 'env.THRESHOLD == \"0.01\"'"),
+    )
+    _REJECTED = {
+        "--grep operand": ("python3 visual.py --grep --threshold=0.05", "python3 visual.py --grep --threshold=0.01"),
+        "playwright --grep": ("npx playwright test --grep --threshold=0.05", "npx playwright test --grep --threshold=0.01"),
+        "-k operand": ("pytest -k --threshold=0.05", "pytest -k --threshold=0.01"),
+        "-wlne cluster": ("perl -wlne 1 --threshold=0.05", "perl -wlne 1 --threshold=0.01"),
+        "node -p": ("node -p 1 --threshold=0.05", "node -p 1 --threshold=0.01"),
+        "python3 -m": ("python3 -m pytest --threshold=0.05", "python3 -m pytest --threshold=0.01"),
+        "--project=": ("npx playwright test --project=chromium --threshold=0.05",
+                       "npx playwright test --project=chromium --threshold=0.01"),
+        "php -r": ("THRESHOLD=0.05 php -r 'exit(1);'", "THRESHOLD=0.01 php -r 'exit(1);'"),
+        "php -R": ("THRESHOLD=0.05 php -R 1", "THRESHOLD=0.01 php -R 1"),
+        "jq positional": ("THRESHOLD=0.05 jq . report.json", "THRESHOLD=0.01 jq . report.json"),
+        "yq head": ("THRESHOLD=0.05 yq report.yml", "THRESHOLD=0.01 yq report.yml"),
+        "lua head": ("THRESHOLD=0.05 lua check.lua", "THRESHOLD=0.01 lua check.lua"),
+        "git head": ("THRESHOLD=0.05 git diff", "THRESHOLD=0.01 git diff"),
+        "find head": ("THRESHOLD=0.05 find snapshots", "THRESHOLD=0.01 find snapshots"),
+        "env before env -i": ("THRESHOLD=0.05 env -i ./checker.py", "THRESHOLD=0.01 env -i ./checker.py"),
+        "env before env": ("THRESHOLD=0.05 env ./checker.py", "THRESHOLD=0.01 env ./checker.py"),
+        "env -": ("env - THRESHOLD=0.05 node check.js", "env - THRESHOLD=0.01 node check.js"),
+        "env --ignore-environment": ("env --ignore-environment THRESHOLD=0.05 node check.js",
+                                     "env --ignore-environment THRESHOLD=0.01 node check.js"),
+        "env -u": ("env -u X THRESHOLD=0.05 node check.js", "env -u X THRESHOLD=0.01 node check.js"),
+        "argv env -i": (["env", "-i", "THRESHOLD=0.05", "node", "c.js"], ["env", "-i", "THRESHOLD=0.01", "node", "c.js"]),
+        "bash -x -c": ("bash -x -c 'node c.js --threshold=0.05'", "bash -x -c 'node c.js --threshold=0.01'"),
+        "sh -ec": ("sh -ec 'node c.js --threshold=0.05'", "sh -ec 'node c.js --threshold=0.01'"),
+        "nested argv sh -c": (["sh", "-c", "sh -c 'node c.js --threshold=0.05'"],
+                              ["sh", "-c", "sh -c 'node c.js --threshold=0.01'"]),
+        "sh -c env -i": ("sh -c 'env -i THRESHOLD=0.05 node c.js'", "sh -c 'env -i THRESHOLD=0.01 node c.js'"),
+        "positional assignment": ("node c.js key=1 --threshold=0.05", "node c.js key=1 --threshold=0.01"),
+        "eval positional": ("deno eval 1 --threshold=0.05", "deno eval 1 --threshold=0.01"),
+        "exec positional": ("npm exec x --threshold=0.05", "npm exec x --threshold=0.01"),
+        "grep positional": ("cargo grep x --threshold=0.05", "cargo grep x --threshold=0.01"),
+        "threshold flag with a word": ("node c.js --threshold=low --max-diff=5", "node c.js --threshold=low --max-diff=1"),
+        "quoted flag name": ("node c.js '--threshold'=0.05", "node c.js '--threshold'=0.01"),
+    }
+    _CLEAN = {
+        "--flag=": ("node check.js --threshold=0.05", "node check.js --threshold=0.01"),
+        "--flag value": ("node check.js --threshold 0.05", "node check.js --threshold 0.01"),
+        "playwright": ("npx playwright test --max-diff-pixel-ratio=0.05", "npx playwright test --max-diff-pixel-ratio=0.01"),
+        "leading assignment": ("THRESHOLD=0.05 node check.js", "THRESHOLD=0.01 node check.js"),
+        "bare env": ("env THRESHOLD=0.05 node check.js", "env THRESHOLD=0.01 node check.js"),
+        "sh -c pixels": ("sh -c 'node check.js --max-diff-pixels=5'", "sh -c 'node check.js --max-diff-pixels=1'"),
+        "bash -c": ("bash -c 'node check.js --threshold 0.05'", "bash -c 'node check.js --threshold 0.01'"),
+        "argv sh -c": (["sh", "-c", "node c.js --threshold=0.05"], ["sh", "-c", "node c.js --threshold=0.01"]),
+        "positional paths": ("node check.js tests/visual.spec.ts snapshots/home.png --threshold=0.05",
+                             "node check.js tests/visual.spec.ts snapshots/home.png --threshold=0.01"),
+    }
+    _UNCHANGED = (
+        *(base for base, _ in _EXECUTED), *(cmd for _, cmd in _INTERPRETERS),
+        *(base for base, _ in _REJECTED.values()),
+        "npx playwright test --project=chromium | tee log # c",
+    )
+
+    def _repo(self, home: Path, name: str, command: Any) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "visual.py", self._GREP)
+        _write(repo, "checker.py", self._CHECKER)
+        (repo / "checker.py").chmod(0o755)
+        _commit_all(repo, "visual checks + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def _symlink_repo(self, home: Path, name: str, target: str = "../golden.png") -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "golden.png", "png-v1\n")
+        _write(repo, "out.png", "png-v2\n")  # the regressed render
+        _write(repo, "cmp.py", self._CMP)
+        (repo / "snapshots").mkdir()
+        os.symlink(target, repo / "snapshots" / "baseline.png")
+        _commit_all(repo, "symlinked baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": "python3 cmp.py", "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    @staticmethod
+    def _changed(result: dict) -> list[str]:
+        return sorted({f for c in result["visual_baseline_changes"] for f in c["changed_files"]})
+
+    def test_overwritten_symlink_referent_outside_baseline_paths_fails_check_and_audit(self):
+        from factonio.harness import audit_harness, check_harness
+
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag=flag), isolated_hermes_home() as home:
+                repo = self._symlink_repo(home, "svc")
+                committed = check_harness(str(repo), run_hooks=True)
+                self.assertEqual(committed["hook_results"]["failed_required"], ["pixels"])
+                self.assertEqual(committed["visual_baseline_changes"], [])
+                _write(repo, "golden.png", "png-v2\n")  # the referent now matches the regressed render
+                _git(repo, "update-index", flag, "golden.png")
+                self.assertEqual(_git(repo, "status", "--porcelain"), "")  # invisible to `git status`
+                chk = check_harness(str(repo), run_hooks=True)
+                self.assertEqual(chk["hook_results"]["failed_required"], [], chk["hook_results"])  # real bypass
+                self.assertFalse(chk["valid"])
+                self.assertTrue(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+                self.assertEqual(self._changed(chk), ["snapshots/baseline.png"])
+                audit = audit_harness(str(repo))
+                self.assertTrue(audit["drifted"])
+                self.assertEqual((audit["severity"], self._changed(audit)), ("stale", ["snapshots/baseline.png"]))
+
+    def test_unchanged_in_repo_symlink_baseline_stays_clean(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo = self._symlink_repo(home, "svc")
+            _write(repo, "out.png", "png-v1\n")
+            _commit_all(repo, "render matches")
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual(chk["hook_results"]["failed_required"], [])
+            self.assertEqual(chk["visual_baseline_changes"], [])
+            self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+            self.assertEqual(audit_harness(str(repo))["severity"], "clean")
+
+    def test_unverifiable_symlink_baselines_fail_closed(self):
+        from factonio.harness import _frozen_baseline_changes
+
+        frozen = {"pixels": ["snapshots/**"]}
+        with isolated_hermes_home() as home:
+            outside = home / "outside.png"
+            outside.write_text("png-v1\n", encoding="utf-8")
+            cases = {"external": str(outside), "escaping": "../../outside.png", "broken": "../missing.png",
+                     "directory": "../api", "self cycle": "baseline.png"}
+            for n, (label, target) in enumerate(cases.items()):
+                with self.subTest(label):
+                    repo = self._symlink_repo(home, f"svc{n}", target)
+                    head = _git(repo, "rev-parse", "HEAD")
+                    out = _frozen_baseline_changes(repo, frozen, head)
+                    self.assertEqual(out[0]["changed_files"] if out else [], ["snapshots/baseline.png"])
+            with self.subTest("a -> b -> a"):
+                repo = self._symlink_repo(home, "cycle", "b.png")
+                os.symlink("baseline.png", repo / "snapshots" / "b.png")
+                head = _commit_all(repo, "cycle")
+                out = _frozen_baseline_changes(repo, frozen, head)
+                self.assertEqual(out[0]["changed_files"], ["snapshots/b.png", "snapshots/baseline.png"])
+            with self.subTest("symlinked intermediate directory"):
+                repo = self._symlink_repo(home, "middir", "../real/x/../../golden.png")
+                (repo / "real" / "x").mkdir(parents=True)
+                _write(repo, "real/x/keep", "")
+                head = _commit_all(repo, "dirs")
+                self.assertEqual(_frozen_baseline_changes(repo, frozen, head), [])  # real directories: intact
+                shutil.rmtree(repo / "real" / "x")
+                os.symlink("../api", repo / "real" / "x")
+                out = _frozen_baseline_changes(repo, frozen, head)
+                self.assertEqual(out[0]["changed_files"], ["snapshots/baseline.png"])
+
+    def test_symlinked_parent_directory_fails_closed_even_with_identical_bytes(self):
+        from factonio.harness import _frozen_baseline_changes
+
+        with isolated_hermes_home() as home:
+            repo = TestFixRound2VisualGuardAndHarnessGaps._visual_repo(home, "true")
+            head = _git(repo, "rev-parse", "HEAD")
+            frozen = {"pixels": ["snapshots/**"]}
+            self.assertEqual(_frozen_baseline_changes(repo, frozen, head), [])
+            (repo / "snapshots").rename(repo / "alt_snapshots")
+            os.symlink("alt_snapshots", repo / "snapshots")
+            self.assertEqual((repo / "snapshots" / "home.png").read_text(encoding="utf-8"), "png-v1\n")
+            out = _frozen_baseline_changes(repo, frozen, head)
+            self.assertIn("snapshots/home.png", out[0]["changed_files"])
+
+    def test_non_threshold_options_nested_shells_and_env_flags_are_rejected(self):
+        self._assert_rejected({
+            **{repr(live): (base, live) for base, live in self._EXECUTED},
+            **{cmd: (cmd, cmd.replace("0.05", "0.01")) for _, cmd in self._INTERPRETERS},
+            **self._REJECTED,
+        })
+
+    def test_positive_grammar_tightening_and_unchanged_commands_stay_clean(self):
+        self._assert_clean({**self._CLEAN, **{f"unchanged {cmd!r}": (cmd, cmd) for cmd in self._UNCHANGED}})
+
+    def test_value_spans_raise_on_any_non_threshold_option(self):
+        from factonio.harness import _value_spans
+
+        self.assertEqual(len(_value_spans("env THRESHOLD=1 node c.js a/b.png --threshold 2 --max-diff=3")), 3)
+        for cmd in ("node c.js --grep x --threshold=1", "node c.js --threshold=1 --", "node c.js -x --threshold=1",
+                    "python3 -Bc'1' --threshold=1", "T=1 env node c.js", "env -i T=1 node c.js",
+                    "sh -c \"sh -c 'node c.js --threshold=1'\"", "bash -e -c 'node c.js --threshold=1'",
+                    "perl c.pl --threshold=1", "jq . --threshold=1", "node c.js --threshold"):
+            with self.subTest(cmd=cmd), self.assertRaises(ValueError):
+                _value_spans(cmd)
+
+    def test_option_and_nested_shell_bypasses_are_rejected_end_to_end(self):
+        """Each committed command fails; each edited literal really turns it green, yet check and audit flag it."""
+        self._assert_executed_bypasses_rejected(list(self._EXECUTED))
+
+    def test_interpreter_bypasses_are_rejected_end_to_end(self):
+        available = [(cmd, cmd.replace("0.05", "0.01")) for tool, cmd in self._INTERPRETERS if shutil.which(tool)]
+        if not available:
+            self.skipTest("perl, ruby and jq are all unavailable")
+        self._assert_executed_bypasses_rejected(available)
 
 
 if __name__ == "__main__":
