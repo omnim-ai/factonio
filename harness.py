@@ -87,7 +87,7 @@ _WORKFLOW_RUN_RE = re.compile(r"^[ \t]*-?[ \t]*run:[ \t]*(?![|>\s])(.+?)[ \t]*$"
 # A positive allowlist prevents provisioning, package-manager, privileged, and
 # shell-boilerplate steps from leaking into generated verification plans.
 _CI_VERIFY_RE = re.compile(
-    r"^(?:(?:[A-Z_][A-Z0-9_]*=\S+\s+)|(?:env(?:\s+-u\s+\S+)*\s+))*"
+    r"\A(?:(?:[A-Z_][A-Z0-9_]*=\S+\s+)|(?:env(?:\s+-u\s+\S+)*\s+))*"
     r"(?:pytest\b|"
     r"python3?(?:\s+-W\s+\S+)*(?:\s+-m\s+(?:pytest|unittest|compileall|mypy|flake8|ruff|black|isort|pylint|doctest)\b|\s+(?:tools|scripts|tests)/)|"
     r"uv\s+run\b|uvx\b|ruff\b|mypy\b|pyright\b|flake8\b|pylint\b|black\b|isort\b|"
@@ -101,7 +101,7 @@ _CI_VERIFY_RE = re.compile(
     re.IGNORECASE,
 )
 _CI_SETUP_SUBCMD_RE = re.compile(
-    r"(?:^|\s)(?:pip\s+install|npm\s+(?:ci|install)|uv\s+sync)\b",
+    r"(?:\A|\s)(?:pip\s+install|npm\s+(?:ci|install)|uv\s+sync)\b",
     re.IGNORECASE,
 )
 
@@ -112,7 +112,7 @@ def _is_ci_verification_command(cmd: str) -> bool:
     if not text or not _CI_VERIFY_RE.match(text):
         return False
     return _CI_SETUP_SUBCMD_RE.search(text) is None
-_GITHUB_REMOTE_RE = re.compile(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
+_GITHUB_REMOTE_RE = re.compile(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?\Z")
 _H2_RE = re.compile(r"^##\s+(.+?)\s*#*\s*$", re.MULTILINE)
 _FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
 _HOOK_LINE_RE = re.compile(
@@ -279,12 +279,12 @@ def _glob_to_regex(pattern: str) -> re.Pattern[str]:
             i += 1
     if pat.endswith("/"):
         out.append(".*")
-    return re.compile("^" + "".join(out) + "$")
+    return re.compile(r"\A" + "".join(out) + r"\Z")
 
 
 def glob_matches(pattern: str, rel_path: str) -> bool:
     """True when a POSIX-relative path matches a feature-map glob (`*`, `?`, `**`)."""
-    return bool(_glob_to_regex(pattern).match(rel_path.replace(os.sep, "/")))
+    return bool(_glob_to_regex(pattern).fullmatch(rel_path.replace(os.sep, "/")))
 
 
 def _any_match(patterns: Iterable[str], rel_path: str) -> bool:
@@ -493,7 +493,7 @@ def detect_repo_profile(repo_path: str | Path) -> dict[str, Any]:
         entrypoints.append("plugin.yaml")
         add_stack("hermes-plugin")
 
-    workflows = sorted(f for f in files if re.match(r"^\.github/workflows/[^/]+\.ya?ml$", f))
+    workflows = sorted(f for f in files if re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", f))
     ci_commands: list[str] = []
     for wf in workflows:
         for cmd in _WORKFLOW_RUN_RE.findall(_read_text(root / wf)):
@@ -1704,26 +1704,30 @@ def _merge_baseline_changes(*groups: list[dict[str, Any]]) -> list[dict[str, Any
 # not emulate the shell. A committed command left byte-identical is always clean. An edited one is clean only as
 # a pure in-place threshold tightening: the same tokens 1-to-1 with the same raw spelling (no insertions,
 # deletions, quote or operator edits, heredocs or line continuations), the same `--flag=val` / `--flag val`
-# syntax, and each changed committed threshold a plain fixed-point decimal no larger than before. Everything
-# else fails closed.
+# syntax, and each changed committed threshold a plain fixed-point decimal no larger than before. On top of that,
+# every byte outside the tightened threshold value spans must match the committed command verbatim
+# (`_verbatim_tightening_ok`): whitespace, comments and quoting are never normalized. Everything else fails
+# closed, and every validation regex anchors with `\A...\Z` + `fullmatch` (`$` also matches before a final LF).
 
 _THRESHOLD_KEY_RE = re.compile(
     r"threshold|toleran|max[-_]?diff|fuzz|max[-_]?pixel|diff[-_]?ratio|mismatch", re.IGNORECASE
 )
-_REGEN_FLAG_RE = re.compile(r"^--?(?:update|regen(?:erate)?|accept(?:-snapshots)?|snapshot[-_]?update|"
+_REGEN_FLAG_RE = re.compile(r"\A--?(?:update|regen(?:erate)?|accept(?:-snapshots)?|snapshot[-_]?update|"
                             r"(?:force[-_]?)?update[-_]?(?:snapshots?|baselines?|goldens?)|"
-                            r"overwrite[-_]?baselines?)$", re.IGNORECASE)
-_REGEN_ENV_RE = re.compile(r"(?:^|_)(?:UPDATE_?SNAPSHOTS?|SNAPSHOTS?_?UPDATE|UPDATE_?BASELINES?|UPDATE_?GOLDENS?|"
-                           r"REGENERATE)(?:_|$)", re.IGNORECASE)
+                            r"overwrite[-_]?baselines?)\Z", re.IGNORECASE)
+_REGEN_ENV_RE = re.compile(r"(?:\A|_)(?:UPDATE_?SNAPSHOTS?|SNAPSHOTS?_?UPDATE|UPDATE_?BASELINES?|UPDATE_?GOLDENS?|"
+                           r"REGENERATE)(?:_|\Z)", re.IGNORECASE)
 _DISABLED = frozenset({"", "0", "false", "no", "off", "none"})
-_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
-_PYTHON_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|pypy3?)$")
+_ASSIGN_RE = re.compile(r"\A([A-Za-z_][A-Za-z0-9_]*)=(.*)\Z", re.DOTALL)
+_PYTHON_RE = re.compile(r"\A(?:python(?:\d+(?:\.\d+)*)?|pypy3?)\Z")
 _SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "busybox"})
 # A shell word whose meaning is identical as an argv item and as unquoted shell text.
 _PLAIN_WORD_RE = re.compile(r"[A-Za-z0-9_./:=+%,@-]+", re.ASCII)
 # Plain fixed-point only: no exponent, no bare leading `.`. For two such spellings, a smaller exact value is never
 # larger under `parseInt`/integer-prefix, `parseFloat`/`Number` or `Decimal` (`parseInt("9e-2", 10)` is 9).
-_ASCII_THRESHOLD_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$", re.ASCII)
+_ASCII_THRESHOLD_RE = re.compile(r"\A(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\Z", re.ASCII)
+# A replaceable threshold value span: the same digits plus an optional `%`; no quote, escape or whitespace.
+_ASCII_VALUE_RE = re.compile(r"\A(?:0|[1-9][0-9]*)(?:\.[0-9]+)?%?\Z", re.ASCII)
 _MAX_SCRIPT_DEPTH = 4
 _OPERATORS = ("<<<", "&>>", "&&", "||", "|&", ";;", ">>", "<<", "<>", ">&", "<&", "&>", ">|",
               "|", ";", "&", "(", ")", ">", "<")
@@ -1741,6 +1745,8 @@ class _Tok(NamedTuple):
     quoted: bool
     from_argv: bool = False  # an argv-list item: never seen by a shell
     glued: bool = False      # a `(`/`)` with no whitespace before it: `((`/`$(` differ from `( (`/`$ (`
+    start: int = 0           # source offsets of ``raw`` in the command string (argv items: in the item)
+    end: int = 0
 
     @property
     def key(self) -> tuple[str, bool, bool, bool]:
@@ -1770,7 +1776,7 @@ def _tokenize_visual_cmd(command: Any) -> list[_Tok]:
     unclosed quote or a trailing lone backslash, and `_UnsupportedEdit` on a heredoc/herestring or a line
     continuation, whose meaning depends on bytes (delimiter lines, joined words) the tokens do not keep."""
     if isinstance(command, list):
-        return [_Tok(str(c), str(c), False, True, True) for c in command]
+        return [_Tok(str(c), str(c), False, True, True, start=0, end=len(str(c))) for c in command]
     text = str(command or "")
     toks: list[_Tok] = []
     word: Optional[list[str]] = None
@@ -1779,7 +1785,7 @@ def _tokenize_visual_cmd(command: Any) -> list[_Tok]:
     def flush(end: int) -> None:
         nonlocal word, quoted
         if word is not None:
-            toks.append(_Tok("".join(word), text[start:end], False, quoted))
+            toks.append(_Tok("".join(word), text[start:end], False, quoted, start=start, end=end))
         word, quoted = None, False
 
     while i < n:
@@ -1787,13 +1793,13 @@ def _tokenize_visual_cmd(command: Any) -> list[_Tok]:
         if ch in " \t\n":  # not `\r`: sh/bash keep it inside the word
             flush(i)
             if ch == "\n":
-                toks.append(_Tok(";", "\n", True, False))
+                toks.append(_Tok(";", "\n", True, False, start=i, end=i + 1))
             i += 1
         elif word is None and ch == "#":
             end = text.find("\n", i)
             i = n if end < 0 else end
         elif word is None and ch in "{}" and (i + 1 == n or text[i + 1] in " \t\n;&|()"):
-            toks.append(_Tok(ch, ch, True, False))
+            toks.append(_Tok(ch, ch, True, False, start=i, end=i + 1))
             i += 1
         elif ch == "\\" and text.startswith("\n", i + 1):
             raise _UnsupportedEdit("line continuation")
@@ -1806,7 +1812,7 @@ def _tokenize_visual_cmd(command: Any) -> list[_Tok]:
                 word, op = None, fd + op  # `2>`: the fd belongs to the redirection
             flush(op_start)
             glued = op in "()" and op_start > 0 and text[op_start - 1] not in " \t\n"
-            toks.append(_Tok(op, op, True, False, False, glued))
+            toks.append(_Tok(op, op, True, False, False, glued, start=i - len(op), end=i))
         else:
             if word is None:
                 word, start = [], i
@@ -1865,7 +1871,7 @@ def _parse_value(raw: str) -> tuple[Optional[Decimal], bool]:
     never round to the context precision."""
     pct = raw.endswith("%")
     number = raw[:-1] if pct else raw
-    if not _ASCII_THRESHOLD_RE.match(number):
+    if not _ASCII_THRESHOLD_RE.fullmatch(number):
         return None, pct
     try:
         value = Decimal(number)
@@ -1890,7 +1896,7 @@ def _slot_items(words: list[str], texts: Optional[list[str]] = None) -> list[Any
     i = 0
     while i < len(words):
         tok = words[i]
-        m = _ASSIGN_RE.match(tok)
+        m = _ASSIGN_RE.fullmatch(tok)
         if m and _THRESHOLD_KEY_RE.search(m.group(1)):
             text = value_text(i, m.group(1) + "=")
             items.append(_Slot("env", m.group(1), True, m.group(2), text, *_parse_value(text)))
@@ -1939,17 +1945,17 @@ def _item_ok(base: Any, live: Any) -> bool:
 
 def _is_regen(tok: str, prev: Optional[str]) -> bool:
     """An active snapshot-regeneration option or environment assignment (`=false`/`=0`/... disable it)."""
-    m = _ASSIGN_RE.match(tok)
+    m = _ASSIGN_RE.fullmatch(tok)
     if m:
         return bool(_REGEN_ENV_RE.search(m.group(1))) and m.group(2).strip().lower() not in _DISABLED
     name, eq, value = tok.partition("=")
-    if _REGEN_FLAG_RE.match(name):
+    if _REGEN_FLAG_RE.fullmatch(name):
         return not (eq and value.strip().lower() in _DISABLED)
     word = name[1:]
     if not name.startswith("-") or eq or not word.isalpha() or "u" not in word or len(word) > 3:
         return False
     prev_name = os.path.basename(prev or "")
-    exempt = bool(_PYTHON_RE.match(prev_name)) or prev_name in _SHELLS | {"set", "env", "diff"}
+    exempt = bool(_PYTHON_RE.fullmatch(prev_name)) or prev_name in _SHELLS | {"set", "env", "diff"}
     return not exempt and word.lower() not in {"run", "sub", "cpu", "out", "url", "num"}
 
 
@@ -1979,7 +1985,7 @@ def _sh_c_script_ok(base_toks: list[_Tok], live_toks: list[_Tok], depth: int) ->
     """For an unchanged `sh|bash [-flags] -c SCRIPT [args]` wrapper whose only difference is SCRIPT, whether the
     script edit is clean (checked recursively); None when the segment is not such a wrapper."""
     base = [t.raw for t in base_toks]
-    head = next((k for k, t in enumerate(base) if not _ASSIGN_RE.match(t)), None)
+    head = next((k for k, t in enumerate(base) if not _ASSIGN_RE.fullmatch(t)), None)
     if head is None or len(base_toks) != len(live_toks) or os.path.basename(base[head]) not in _SHELLS:
         return None
     diff = [k for k in range(len(base)) if base_toks[k].key != live_toks[k].key]
@@ -2022,6 +2028,141 @@ def _structure_ok(base_cmd: Any, live_cmd: Any, depth: int = 0) -> bool:
     if [o.key for o in b_ops] != [o.key for o in l_ops]:
         return False
     return all(_segment_ok(b, s, depth) for b, s in zip(b_segs, l_segs))
+
+
+def _payload_offset(tok: _Tok) -> Optional[int]:
+    """Offset of an `sh -c` script's first character in the outer string when its characters map 1:1 to the
+    outer source (an argv item, `'...'`, or `"..."` without `\\`, `$`, `` ` ``); None otherwise."""
+    raw = tok.raw
+    if tok.from_argv:
+        return tok.start
+    if len(raw) >= 2 and raw[0] == raw[-1] == "'" and "'" not in raw[1:-1]:
+        return tok.start + 1
+    if len(raw) >= 2 and raw[0] == raw[-1] == '"' and not any(c in raw[1:-1] for c in '\\$`"'):
+        return tok.start + 1
+    return None
+
+
+def _value_span(raw: str, off: int, from_argv: bool) -> list[tuple[int, int]]:
+    """The offsets of a threshold value's bare number in the source (inside one pair of shell quotes)."""
+    if _ASCII_VALUE_RE.fullmatch(raw):
+        return [(off, off + len(raw))]
+    if (not from_argv and len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\""
+            and _ASCII_VALUE_RE.fullmatch(raw[1:-1])):
+        return [(off + 1, off + len(raw) - 1)]
+    return []
+
+
+def _value_spans(command: Any, depth: int = 0) -> list[tuple[int, int, int]]:
+    """``(item, start, end)`` source offsets of every editable threshold value in ``command`` (item is the argv
+    index, 0 for a string), nested `sh -c` scripts included when their offsets map 1:1. Words inside bash
+    `[[ ... ]]` or `(( ... ))` are never thresholds. Raises ValueError like `_tokenize_visual_cmd`."""
+    toks = _tokenize_visual_cmd(command)
+    argv = isinstance(command, list)
+    segs: list[list[Optional[tuple[int, _Tok]]]] = [[]]
+    parens: list[bool] = []  # one entry per open `(`: True inside arithmetic `((`
+    in_test = False
+    for k, tok in enumerate(toks):
+        unit = k if argv else 0
+        if tok.is_op:
+            if tok.raw == "(":
+                nxt = toks[k + 1] if k + 1 < len(toks) else None
+                parens.append(any(parens) or (nxt is not None and nxt.is_op and nxt.raw == "("
+                                              and nxt.start == tok.end))
+            elif tok.raw == ")" and parens:
+                parens.pop()
+            segs.append([])
+            continue
+        if not argv and tok.raw in ("[[", "]]"):
+            in_test = tok.raw == "[["
+            segs[-1].append(None)
+        elif in_test or any(parens):
+            segs[-1].append(None)
+        else:
+            segs[-1].append((unit, tok))
+    spans: list[tuple[int, int, int]] = []
+    for seg in segs:
+        head = next((k for k, w in enumerate(seg) if w is None or not _ASSIGN_RE.fullmatch(w[1].raw)), None)
+        if (head is not None and seg[head] is not None and depth < _MAX_SCRIPT_DEPTH
+                and os.path.basename(seg[head][1].raw) in _SHELLS):
+            k = head + 1
+            while k < len(seg) and seg[k] is not None and re.fullmatch(r"[-+][A-Za-z]+", seg[k][1].raw) \
+                    and "c" not in seg[k][1].raw:
+                k += 1
+            if (k + 1 < len(seg) and seg[k] is not None and seg[k + 1] is not None
+                    and re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", seg[k][1].raw)):
+                unit, script = seg[k + 1]
+                off = _payload_offset(script)
+                if off is not None:
+                    spans += [(unit, off + s, off + e) for _, s, e in _value_spans(script.text, depth + 1)]
+                seg[k + 1] = None  # the script is code, never one threshold word
+        i = 0
+        while i < len(seg):
+            item = seg[i]
+            i += 1
+            if item is None:
+                continue
+            unit, tok = item
+            raw = tok.raw
+            m = _ASSIGN_RE.fullmatch(raw)
+            if m and _THRESHOLD_KEY_RE.search(m.group(1)):
+                found = _value_span(m.group(2), tok.start + len(m.group(1)) + 1, tok.from_argv)
+            elif raw.startswith("-") and raw not in ("-", "--") and _THRESHOLD_KEY_RE.search(raw.partition("=")[0]):
+                name, eq, val = raw.partition("=")
+                nxt_item = seg[i] if i < len(seg) else None
+                found = []
+                if eq:
+                    found = _value_span(val, tok.start + len(name) + 1, tok.from_argv)
+                elif nxt_item is not None and not nxt_item[1].raw.startswith("--"):
+                    unit, nxt = nxt_item  # the value word: its own argv index
+                    i += 1
+                    found = _value_span(nxt.raw, nxt.start, nxt.from_argv)
+            else:
+                found = []
+            spans += [(unit, s, e) for s, e in found]
+    return sorted(spans)
+
+
+def _verbatim_tightening_ok(base_cmd: Any, live_cmd: Any) -> bool:
+    """The verbatim invariant for an edited command: at least one committed threshold value span, every byte
+    outside those spans identical to the committed command, and each span replaced by a plain fixed-point ASCII
+    number (same `%` unit, integer stays integer) no larger than the committed one."""
+    if isinstance(base_cmd, list) != isinstance(live_cmd, list):
+        return False
+    b_units = [str(c) for c in base_cmd] if isinstance(base_cmd, list) else [str(base_cmd or "")]
+    l_units = [str(c) for c in live_cmd] if isinstance(live_cmd, list) else [str(live_cmd or "")]
+    try:
+        b_spans, l_spans = _value_spans(base_cmd), _value_spans(live_cmd)
+    except ValueError:
+        return False
+    if len(b_units) != len(l_units) or not b_spans or len(b_spans) != len(l_spans):
+        return False
+
+    def outside(units: list[str], spans: list[tuple[int, int, int]]) -> list[list[str]]:
+        parts: list[list[str]] = []
+        for u, unit in enumerate(units):
+            pos, cur = 0, []
+            for su, s, e in spans:
+                if su == u:
+                    cur.append(unit[pos:s])
+                    pos = e
+            parts.append([*cur, unit[pos:]])
+        return parts
+
+    if outside(b_units, b_spans) != outside(l_units, l_spans):
+        return False
+    for (bu, bs, be), (lu, ls, le) in zip(b_spans, l_spans):
+        b_val, l_val = b_units[bu][bs:be], l_units[lu][ls:le]
+        if not (_ASCII_VALUE_RE.fullmatch(b_val) and _ASCII_VALUE_RE.fullmatch(l_val)):
+            return False
+        if b_val.endswith("%") != l_val.endswith("%"):
+            return False
+        b_num, l_num = b_val.rstrip("%"), l_val.rstrip("%")
+        if b_num.isdigit() and not l_num.isdigit():
+            return False
+        if Decimal(l_num) > Decimal(b_num):
+            return False
+    return True
 
 
 def _flat_segments(command: Any, depth: int = 0) -> tuple[list[list[str]], int]:
@@ -2111,7 +2252,8 @@ def _visual_hook_loosening(base_hook: dict[str, Any], live_hook: dict[str, Any])
                            "committed command)")
         except ValueError:
             reasons.append("mutates visual_diff command with unparseable shell syntax")
-    if not unchanged and not reasons and not _structure_ok(base_cmd, live_cmd):
+    if not unchanged and not reasons and not (_structure_ok(base_cmd, live_cmd)
+                                              and _verbatim_tightening_ok(base_cmd, live_cmd)):
         (base_segs, base_ors), (live_segs, live_ors) = _flat_segments(base_cmd), _flat_segments(live_cmd)
 
         def regen(segs: list[list[str]]) -> Counter[str]:

@@ -1896,6 +1896,8 @@ class TestFrozenVisualBaselines(unittest.TestCase):
                 "respelled in place": {"command": "npx playwright test --max-diff-pixels 0"},
                 "reworded": {"command": "npx playwright test --reporter=line --max-diff-pixels=0"},
                 "zero-env": {"command": "UPDATE_SNAPSHOTS=0 " + self.COMMAND},
+                # Round 20: every byte outside a tightened threshold value is compared verbatim
+                "comment added": {"command": self.COMMAND + "  # pixel-exact"},
             }
             for label, change in loosening.items():
                 with self.subTest(label):
@@ -1915,7 +1917,6 @@ class TestFrozenVisualBaselines(unittest.TestCase):
 
             for label, change in {
                 "unchanged": {"command": self.COMMAND},
-                "comment added": {"command": self.COMMAND + "  # pixel-exact"},
             }.items():
                 with self.subTest(label):
                     hj.write_text(committed, encoding="utf-8")
@@ -2789,8 +2790,6 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
         "committed UPDATE_SNAPSHOTS=0 tightened": ("UPDATE_SNAPSHOTS=0 THRESHOLD=0.05 npx playwright test",
                                                    "UPDATE_SNAPSHOTS=0 THRESHOLD=0.01 npx playwright test"),
         "threshold tightened to zero": ("npx playwright test --threshold 0.05", "npx playwright test --threshold 0"),
-        "comment + whitespace": (_EXPORTED, "export THRESHOLD=0.01;   python3 check.py  # visual check"),
-        "argv form": ("python3 check.py", ["python3", "check.py"]),
     }
 
     def _checked_repo(self, home: Path, command: str) -> Path:
@@ -2894,8 +2893,7 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
         self._assert_clean(self._CLEAN)
         with isolated_hermes_home() as home:
             for n, label in enumerate(("export tightened", "sh -c tightened", "committed --reporter=list tightened",
-                                       "quoted prefix tightened", "committed UPDATE_SNAPSHOTS=0 tightened",
-                                       "comment + whitespace")):
+                                       "quoted prefix tightened", "committed UPDATE_SNAPSHOTS=0 tightened")):
                 base, live = self._CLEAN[label]
                 with self.subTest(label):
                     repo = self._visual_repo(home, base, name=f"svc{n}")
@@ -3149,6 +3147,9 @@ class TestFixRound13StructuralGuardHardening(unittest.TestCase):
             # Round 19: the script keeps its committed outer quote style even without expansions
             "single -> double quotes without expansions": ("bash -c 'export THRESHOLD=0.05; python3 check.py'",
                                                            'bash -c "export THRESHOLD=0.01; python3 check.py"'),
+            # Round 20: an argv list and a shell string have no common bytes to compare verbatim
+            "argv list -> plain string": (["python3", "check.py", "--threshold", "0.05"],
+                                          "python3 check.py --threshold 0.01"),
         })
         # `T` is not a threshold name, so `T=0.05` -> `T=0.01` is an unverifiable edit; a threshold-named
         # variable is tightened in place inside the single-quoted script.
@@ -3156,17 +3157,18 @@ class TestFixRound13StructuralGuardHardening(unittest.TestCase):
             "single-quoted tightening": (
                 "bash -c 'T_THRESHOLD=0.05; export THRESHOLD=$T_THRESHOLD; python3 check.py'",
                 "bash -c 'T_THRESHOLD=0.01; export THRESHOLD=$T_THRESHOLD; python3 check.py'"),
-            "argv list -> plain string": (["python3", "check.py", "--threshold", "0.05"],
-                                          "python3 check.py --threshold 0.01"),
+            "argv list tightened": (["python3", "check.py", "--threshold", "0.05"],
+                                    ["python3", "check.py", "--threshold", "0.01"]),
             "unchanged double-quoted": (double, double),
             "unchanged argv list": (argv, argv),
         })
         self._assert_executed_bypasses_rejected([(single, double), (argv, double)])
 
-    def test_whitespace_before_an_operator_is_inert(self):
+    def test_whitespace_before_an_operator_is_a_rejected_edit(self):
         from factonio.harness import _tokenize_visual_cmd
 
-        self._assert_clean({
+        # Round 20: whitespace is compared verbatim on an edited command, even where the shell ignores it
+        self._assert_rejected({
             "space before ;": ("export T=0.01; echo $T; python3 check.py",
                                "export T=0.01; echo $T ; python3 check.py"),
             "space before &&": ("echo $T&& python3 check.py", "echo $T && python3 check.py"),
@@ -3750,13 +3752,14 @@ class TestFixRound17ExactThresholdsAndRawQuoting(unittest.TestCase):
                                                     "2>/dev/null 'THRESHOLD=0.05' node check.js"),
             "quoted plain argument": ("node check.js snapshots/home.png", "node check.js 'snapshots/home.png'"),
             "quoted export argument": ("export THRESHOLD=0.05; node check.js", "export 'THRESHOLD=0.05'; node check.js"),
+            # Round 20: quoting is outside the value span, so adding or dropping it is a verbatim mismatch
+            "value quoting added": (assign, "THRESHOLD='0.05'; export THRESHOLD; node check.js"),
+            "flag value quoting tightened": ("node check.js --threshold 0.05", "node check.js --threshold '0.01'"),
         })
         self._assert_clean({
             "unchanged quoted assignment word": ("'THRESHOLD=0.05'; node check.js", "'THRESHOLD=0.05'; node check.js"),
             "unchanged quoted value": ("THRESHOLD='0.05' node check.js", "THRESHOLD='0.05' node check.js"),
             "quoted value tightened": ("THRESHOLD='0.05' node check.js", "THRESHOLD='0.01' node check.js"),
-            "value quoting added": (assign, "THRESHOLD='0.05'; export THRESHOLD; node check.js"),
-            "flag value quoting tightened": ("node check.js --threshold 0.05", "node check.js --threshold '0.01'"),
             "unchanged quoted export argument": ("export 'THRESHOLD=0.05'; node check.js",
                                                  "export 'THRESHOLD=0.05'; node check.js"),
         })
@@ -3995,8 +3998,8 @@ class TestFixRound19PureInPlaceTightening(unittest.TestCase):
             "single -> double": ("sh -c 'node c.js --threshold 0.05'", 'sh -c "node c.js --threshold 0.01"'),
             "double -> single": ('sh -c "node c.js --threshold 0.05"', "sh -c 'node c.js --threshold 0.01'"),
         })
+        self._assert_rejected({"blank lines": ("a\nb", "a\n\n\nb\n")})
         self._assert_clean({
-            "blank lines": ("a\nb", "a\n\n\nb\n"),
             "single-quoted tightened": ("sh -c 'node c.js --threshold 0.05'", "sh -c 'node c.js --threshold 0.01'"),
             "double-quoted tightened": ('sh -c "node c.js --threshold 0.05"', 'sh -c "node c.js --threshold 0.01"'),
         })
@@ -4023,8 +4026,8 @@ class TestFixRound19PureInPlaceTightening(unittest.TestCase):
         self._assert_clean({
             "= tightened": (self._EQ_JS, "node eq.js --threshold=0.01"),
             "space tightened": (self._SPACE_JS, "node space.js --threshold 0.01"),
-            "quoted value tightened": (self._SPACE_JS, "node space.js --threshold '0.01'"),
         })
+        self._assert_rejected({"quoted value tightened": (self._SPACE_JS, "node space.js --threshold '0.01'")})
 
     @unittest.skipUnless(shutil.which("bash"), "bash is required for `[[`, `time` and heredocs in `bash -c`")
     def test_heredoc_and_insertion_bypasses_are_rejected_end_to_end(self):
@@ -4047,6 +4050,176 @@ class TestFixRound19PureInPlaceTightening(unittest.TestCase):
         with isolated_hermes_home() as home:
             for n, (base, live) in enumerate(cases):
                 with self.subTest(base=base, live=live):
+                    repo = self._repo(home, f"svc{n}", base)
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(chk["hook_results"]["failed_required"], ["pixels"])  # the bar still holds
+                    self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+                    audit = audit_harness(str(repo))
+                    self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("clean", False))
+
+
+class TestFixRound20VerbatimOutsideThresholdValueSpans(unittest.TestCase):
+    """Round 20: an edited committed command is clean only when every byte outside its tightened threshold value
+    spans is verbatim the committed byte, and every validation regex anchors with `\\A...\\Z` + `fullmatch`, so a
+    trailing newline never passes as a strict decimal."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    # A Go/`strconv.ParseFloat`-style strict reader: anything but a plain decimal falls back to the lenient 0.10
+    # default. The visual diff is 0.08, so only a threshold below 0.08 fails the hook.
+    _STRICT = ("import os, re, sys\n"
+               "def strict(v):\n"
+               "    return float(v) if v is not None and re.fullmatch(r'[0-9]+(?:\\.[0-9]+)?', v) else 0.10\n"
+               "args = sys.argv[1:]\n"
+               "raw = os.environ.get('THRESHOLD')\n"
+               "for k, a in enumerate(args):\n"
+               "    if a.startswith('--threshold='):\n"
+               "        raw = a[len('--threshold='):]\n"
+               "    elif a == '--threshold' and k + 1 < len(args):\n"
+               "        raw = args[k + 1]\n"
+               "sys.exit(1 if 0.08 > strict(raw) else 0)\n")
+    # Compares only when `--baseline=` names an existing file (the committed snapshot differs: exit 1).
+    _BASELINE = ("import os, sys\n"
+                 "p = next((a.split('=', 1)[1] for a in sys.argv[1:] if a.startswith('--baseline=')), '')\n"
+                 "sys.exit(1 if os.path.isfile(p) else 0)\n")
+    _COUNT = "print(5)\n"  # 5 differing pixels
+    _NEWLINES = (
+        ("python3 check.py --threshold 0.05", 'python3 check.py --threshold "0.01\n"'),
+        ("python3 check.py --threshold=0.05", "python3 check.py --threshold='0.01\n'"),
+        ("THRESHOLD=0.05 python3 check.py", 'THRESHOLD="0.01\n" python3 check.py'),
+    )
+    _EXTGLOB = "bash -c 'shopt -s extglob\n[[ $(cat report.txt) != @(FAIL|ERROR)* ]]'"
+    _ARITH = "bash -c 'diff=$(python3 check.py); if ((\n  diff != 0\n)); then exit 1; fi'"
+    _WHITESPACE = (
+        ("python3 check.py --baseline=$(pwd)/snapshots/home.png",
+         "python3 check.py --baseline=$(pwd) /snapshots/home.png"),
+        ("if [ $(python3 check.py)x != 0x ]; then exit 1; fi", "if [ $(python3 check.py) x != 0x ]; then exit 1; fi"),
+        (_EXTGLOB, "bash -c 'shopt -s extglob\n[[ $(cat report.txt) != @( FAIL|ERROR)* ]]'"),
+        (_EXTGLOB, "bash -c 'shopt -s extglob\n[[ $(cat report.txt) != @(FAIL | ERROR)* ]]'"),
+    )
+    _COMMENT = ((_ARITH, "bash -c 'diff=$(python3 check.py); if ((\n  diff != 0 # ok\n)); then exit 1; fi'"),)
+    _CHECKS = {
+        **dict.fromkeys((base for base, _ in _NEWLINES), _STRICT),
+        _WHITESPACE[0][0]: _BASELINE,
+        _WHITESPACE[1][0]: _COUNT,
+        _ARITH: _COUNT,
+    }
+    _TIGHTENED = (
+        ("python3 check.py --threshold=0.05", "python3 check.py --threshold=0.01"),
+        ("python3 check.py --threshold 0.05", "python3 check.py --threshold 0.01"),
+        ("THRESHOLD=0.05 python3 check.py", "THRESHOLD=0.01 python3 check.py"),
+        ("THRESHOLD='0.05' python3 check.py", "THRESHOLD='0.01' python3 check.py"),
+        ("sh -c 'node check.js --max-diff-pixels=5'", "sh -c 'node check.js --max-diff-pixels=1'"),
+    )
+    _UNCHANGED = (
+        "python3 check.py  --threshold 0.05   # pixel-exact",
+        _EXTGLOB, _ARITH, *(live for _, live in _COMMENT),
+        "if (( $(python3 check.py) > 0 )); then exit 1; fi",
+        "cat <<EOF >/dev/null\nunused\nEOF\npython3 check.py",
+    )
+
+    def _repo(self, home: Path, name: str, command: Any) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "check.py", self._CHECKS.get(command, "import sys\nsys.exit(1)\n"))
+        _write(repo, "report.txt", "FAIL: 100 pixels differ\n")
+        _commit_all(repo, "visual checks + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def test_every_validation_regex_rejects_a_trailing_newline(self):
+        from decimal import Decimal
+
+        from factonio import harness
+
+        for regex, value in ((harness._ASCII_THRESHOLD_RE, "0.01"), (harness._ASCII_VALUE_RE, "1%"),
+                             (harness._PYTHON_RE, "python3"),
+                             (harness._REGEN_FLAG_RE, "--update-snapshots")):
+            with self.subTest(pattern=regex.pattern):
+                self.assertTrue(regex.fullmatch(value))
+                self.assertIsNone(regex.fullmatch(value + "\n"))
+                self.assertNotIn("^", regex.pattern.replace("[^", ""))
+                self.assertNotIn("$", regex.pattern)
+        # `_ASSIGN_RE` keeps a multi-line value whole (the value regex then rejects it); its name cannot end in LF
+        self.assertIsNone(harness._ASSIGN_RE.fullmatch("THRESHOLD\n=0.01"))
+        self.assertEqual(harness._ASSIGN_RE.fullmatch("THRESHOLD=0.01\n").group(2), "0.01\n")
+        self.assertNotIn("$", harness._ASSIGN_RE.pattern)
+        self.assertEqual(harness._parse_value("0.01\n"), (None, False))
+        self.assertEqual(harness._parse_value("0.01"), (Decimal("0.01"), False))
+        self.assertIsNone(harness._REGEN_ENV_RE.search("UPDATE_SNAPSHOTS\n_X"))
+        self.assertFalse(harness.glob_matches("src/*.py", "src/a.py\n"))
+        self.assertTrue(harness.glob_matches("src/*.py", "src/a.py"))
+
+    def test_value_spans_cover_only_the_bare_number(self):
+        from factonio.harness import _value_spans
+
+        def spans(cmd: Any) -> list[str]:
+            items = cmd if isinstance(cmd, list) else [cmd]
+            return [items[u][s:e] for u, s, e in _value_spans(cmd)]
+
+        self.assertEqual(spans("THRESHOLD='0.05' a --threshold=\"1%\" --max-diff-pixels 5"), ["0.05", "1%", "5"])
+        self.assertEqual(spans("sh -c 'node c.js --max-diff-pixels=5'"), ["5"])
+        self.assertEqual(spans(["bash", "-c", "node c.js --threshold 0.05"]), ["0.05"])
+        self.assertEqual(spans('a --threshold "0.01\n"'), [])
+        self.assertEqual(spans("[[ $x =~ --threshold=0.05 ]] && (( --threshold=5 )) && $((--threshold=5))"), [])
+        self.assertEqual(spans('sh -c "node c.js --threshold=\\"0.05\\""'), [])  # escapes: offsets do not map 1:1
+
+    def test_any_edit_outside_a_value_span_is_rejected(self):
+        exported = "export THRESHOLD=0.01; python3 check.py"
+        self._assert_rejected({
+            **{live: (base, live) for base, live in (*self._NEWLINES, *self._WHITESPACE, *self._COMMENT)},
+            "comment + whitespace": (exported, "export THRESHOLD=0.01;   python3 check.py  # visual check"),
+            "comment added": ("python3 check.py --threshold 0.05", "python3 check.py --threshold 0.01  # ok"),
+            "argv form": ("python3 check.py", ["python3", "check.py"]),
+            "quoting added": ("THRESHOLD=0.05 python3 check.py", "THRESHOLD='0.01' python3 check.py"),
+            "quoting dropped": ("THRESHOLD='0.05' python3 check.py", "THRESHOLD=0.01 python3 check.py"),
+            "argv value quoted": (["node", "c.js", "--threshold=0.05"], ["node", "c.js", "--threshold='0.01'"]),
+            "[[ ]] word": ("bash -c '[[ $x =~ --threshold=0.05 ]]'", "bash -c '[[ $x =~ --threshold=0.01 ]]'"),
+            "(( )) word": ("(( --threshold=5 ))", "(( --threshold=1 ))"),
+            "escaped double-quoted script": ('sh -c "node c.js --threshold=\\"0.05\\""',
+                                             'sh -c "node c.js --threshold=\\"0.01\\""'),
+            "loosened": ("python3 check.py --threshold=0.05", "python3 check.py --threshold=0.06"),
+            "integer to decimal": ("sh -c 'node check.js --max-diff-pixels=5'",
+                                   "sh -c 'node check.js --max-diff-pixels=0.5'"),
+            "unit dropped": ("a --threshold=5%", "a --threshold=1"),
+            "no threshold": ("python3 check.py a", "python3 check.py b"),
+        })
+
+    def test_verbatim_tightening_and_unchanged_commands_stay_clean(self):
+        self._assert_clean({
+            **{live: (base, live) for base, live in self._TIGHTENED},
+            **{f"unchanged {cmd!r}": (cmd, cmd) for cmd in self._UNCHANGED},
+            "double-quoted script": ('sh -c "node c.js --threshold 0.05"', 'sh -c "node c.js --threshold 0.01"'),
+            "argv tightened": (["bash", "-c", "node c.js --threshold 0.05"], ["bash", "-c", "node c.js --threshold 0.01"]),
+            "comment and spacing kept": ("a  --threshold=5%  # c", "a  --threshold=1%  # c"),
+        })
+
+    def test_trailing_newline_thresholds_are_rejected_end_to_end(self):
+        """A quoted LF turns `0.01` into a value the strict checker rejects, so it falls back to its looser 0.10
+        default and passes the failing committed check."""
+        self._assert_executed_bypasses_rejected(list(self._NEWLINES))
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is required for `[[`, extglob and `((` in `bash -c`")
+    def test_whitespace_and_comment_edits_are_rejected_end_to_end(self):
+        """A space splits a word or a pattern and a `#` is an arithmetic syntax error: each turns the failing
+        committed hook green."""
+        self._assert_executed_bypasses_rejected([*self._WHITESPACE, *self._COMMENT])
+
+    def test_plain_tightening_still_fails_the_hook_and_stays_clean(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            for n, (base, live) in enumerate(self._NEWLINES[:2]):
+                live = live.replace("\n", "").replace('"', "").replace("'", "")
+                with self.subTest(live=live):
                     repo = self._repo(home, f"svc{n}", base)
                     self._set_command(repo, live)
                     chk = check_harness(str(repo), run_hooks=True)
