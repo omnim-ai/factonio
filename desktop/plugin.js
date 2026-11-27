@@ -529,6 +529,62 @@ button.fc-trail-pill { font: inherit; font-family: var(--dt-font-mono); font-siz
 @media (prefers-reduced-motion: reduce) {
   .fc-trend-skel span, .fc-vp-skel { animation: none !important; }
 }
+
+/* v0.4.0 Wave 5 — workstream modes, /arena strip, 12-phase trail, harness badge: host tokens, transparent, currentColor and color-mix only. */
+.fc-sb-ws-labelrow { display: flex; align-items: center; gap: 5px; min-width: 0; container-type: inline-size; }
+.fc-sb-ws-labelrow > .fc-sb-ws-label { flex: 0 1 auto; min-width: 0; }
+.fc-sb-mode { flex: none; display: inline-flex; align-items: center; gap: 3px; height: 16px; padding: 0 5px 0 4px; border: 1px solid transparent; border-radius: 4px; font-family: var(--dt-font-mono); font-size: 10px; font-weight: 500; line-height: 1; white-space: nowrap; color: var(--ui-text-secondary); background: var(--ui-row-active-background); }
+.fc-sb-mode[data-mode="perf"] { color: var(--fc-info-text); background: color-mix(in srgb, var(--ui-accent) 14%, transparent); }
+.fc-sb-mode[data-mode="investigate"] { color: var(--fc-info-text); background: transparent; border: 1px dashed color-mix(in srgb, var(--ui-accent) 55%, transparent); }
+.fc-sb-mode-ro { color: var(--ui-text-secondary); }
+@container (max-width: 230px) { .fc-sb-mode-ro { display: none; } }
+.fc-sb-report { display: inline-flex; align-items: center; gap: 3px; font-weight: 500; }
+.fc-sb-report[data-ready="true"] { color: var(--fc-sb-success-text); }
+.fc-sb-report[data-ready="false"] { color: var(--ui-text-secondary); }
+.fc-sb-arena { container-type: inline-size; }
+.fc-sb-arena .fc-sb-panel-top { flex-wrap: nowrap; }
+.fc-sb-arena .fc-sb-panel-id { flex: 1 1 24px; min-width: 0; }
+.fc-sb-arena-k { flex: none; display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; font-weight: 600; color: var(--ui-text-primary); }
+.fc-sb-arena-k .fc-sb-ico { color: var(--ui-text-secondary); }
+@container (max-width: 270px) { .fc-sb-arena-word { display: none; } }
+.fc-sb-arena-target { flex: none; font-family: var(--dt-font-mono); font-size: 10px; line-height: 14px; padding: 0 4px; border-radius: 4px; border: 1px solid var(--ui-stroke-primary, var(--ui-stroke-secondary)); color: var(--ui-text-primary); }
+.fc-sb-vendor[data-run="ready"] { color: var(--fc-ok-text); }
+.fc-sb-vendor[data-run="running"] { color: var(--fc-info-text); }
+.fc-sb-vendor[data-run="no-artifact"] { color: var(--fc-warn-text); border-color: color-mix(in srgb, var(--fc-warn) 40%, var(--ui-stroke-secondary)); }
+.fc-sb-vendor[data-run="failed"] { color: var(--fc-bad-text); border-color: color-mix(in srgb, var(--dt-destructive) 40%, var(--ui-stroke-secondary)); }
+.fc-sb-vendor[data-role="judge"] { border-style: dashed; }
+.fc-sb-vendor[data-role="judge"][data-cross="true"] { border-color: color-mix(in srgb, var(--ui-accent) 50%, transparent); }
+.fc-sb-vendor[data-role="judge"][data-cross="false"] { color: var(--fc-warn-text); background: color-mix(in srgb, var(--fc-warn) 14%, transparent); }
+.fc-sb-arena-tag { flex: 0 1 auto; min-width: 0; color: var(--fc-info-text); border-color: color-mix(in srgb, var(--ui-accent) 45%, transparent); }
+/* Blocked arena callout: same 48% foreground mix as the amber callouts, so it stays legible in dark themes. */
+.fc-sb-arena .fc-sb-callout[data-kind="blocked"] { color: color-mix(in srgb, var(--dt-destructive) 48%, var(--ui-text-primary)); }
+/* Drawer Arena row: id, target and status wrap instead of crowding at 280px / 344px. */
+.fc-sb-drawer dd[data-field="arena"] { flex-wrap: wrap; row-gap: 3px; }
+.fc-sb-drawer dd[data-field="arena"] .fc-sb-mono { min-width: 0; overflow-wrap: anywhere; }
+.fc-trail-phases { order: 1; flex: 1 1 100%; align-items: center; }
+.fc-trail-phase-sep { flex: none; width: 1px; height: 14px; margin: 0 3px; background: var(--ui-stroke-secondary); }
+@container (max-width: 760px) { .fc-trail-phase-sep { display: none; } }
+.fc-trail-phases button[data-empty="true"]:not([aria-pressed="true"]) { color: var(--ui-text-tertiary); }
+.fc-trail-pill[data-tone="warn"] { border-color: color-mix(in srgb, var(--fc-trail-warn) 50%, transparent); color: var(--fc-trail-warn-text); }
+.fc-trail-pill[data-tone="info"] { border-color: color-mix(in srgb, var(--ui-accent) 45%, transparent); color: var(--fc-trail-info-text); }
+.fc-trail-mode { margin-left: 1px; padding-left: 5px; border-left: 1px solid var(--ui-stroke-secondary); color: var(--fc-trail-info-text); }
+.fc-sb-trail-ev .fc-sb-chip[data-tone="warn"] { color: var(--fc-sb-warn-text); border-color: color-mix(in srgb, var(--fc-sb-warn) 45%, transparent); }
+.fc-sb-trail-ev .fc-sb-chip[data-tone="info"] { color: var(--fc-info-text); border-color: color-mix(in srgb, var(--ui-accent) 45%, transparent); }
+@container (max-width: 640px) {
+  .fc-trail-sel { flex: 1 1 220px; }
+  .fc-trail-sel .fc-input { flex: 1; min-width: 0; max-width: none; }
+  .fc-trail-bar-end { margin-left: 0; }
+  .fc-trail-row { grid-template-columns: minmax(0, 1fr); }
+  .fc-trail-when { flex-direction: row; flex-wrap: wrap; gap: 8px; }
+}
+.fc-harness { display: flex; width: fit-content; align-items: center; gap: 4px; max-width: 100%; height: 18px; margin-top: 4px; padding: 0 6px 0 5px; border-radius: 999px; border: 1px solid var(--ui-stroke-secondary); font-family: var(--dt-font-mono); font-size: 10.5px; color: var(--ui-text-secondary); white-space: nowrap; overflow: hidden; box-sizing: border-box; }
+.fc-harness .fc-sb-ico { flex: none; }
+.fc-harness-k { flex: none; font-family: var(--dt-font-sans); color: var(--ui-text-tertiary); }
+.fc-harness-t { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.fc-harness[data-state="ok"] .fc-sb-ico { color: var(--fc-ok-text); }
+.fc-harness[data-state="error"] { color: var(--fc-warn-text); border-color: color-mix(in srgb, var(--fc-warn) 50%, transparent); background: color-mix(in srgb, var(--fc-warn) 12%, transparent); font-weight: 600; }
+.fc-harness[data-state="error"] .fc-harness-k { color: inherit; font-weight: 400; }
+.fc-harness[data-state="absent"] { border-style: dashed; border-color: color-mix(in srgb, var(--ui-text-secondary) 38%, transparent); color: var(--ui-text-tertiary); }
 `
 
 function fmtDur(seconds) {
@@ -856,6 +912,58 @@ function PolicyCell({ field, value }) {
   })
 }
 
+// Read-only `.factonio/` harness badge from GET /repos `harness`; null (render nothing) when an older
+// backend omits it. A malformed manifest is checked first so it never reads as healthy.
+const HARNESS_ICON = { ok: 'shieldOk', error: 'attention', absent: 'shield' }
+function summarizeHarnessBadge(h) {
+  if (!h || typeof h !== 'object' || Array.isArray(h)) return null
+  const n = v => (Number.isSafeInteger(v) && v >= 0 ? v : 0)
+  const one = (title, sr) => ({ title: title.join('\n'), sr })
+  if (h.has_manifest_error === true) {
+    return {
+      state: 'error', key: 'harness', text: 'error',
+      ...one(['Harness manifest error', '.factonio/harness.json is malformed or uses an unsupported schema_version.', 'Hook counts are not trusted until it is fixed.', 'Run: hermes factonio harness check'],
+        'Harness manifest error: .factonio/harness.json is malformed or uses an unsupported schema_version; run hermes factonio harness check.')
+    }
+  }
+  if (h.present === true && (h.mode === 'verify_md_only' || h.mode === 'markdown_only')) {
+    return { state: 'ok', key: 'harness', text: 'md only', ...one(['Harness · markdown only', '.factonio/verify.md present, no harness.json hooks'], 'Harness markdown only: verify.md present, no hooks declared.') }
+  }
+  if (h.present === true) {
+    const req = n(h.required_hooks)
+    const opt = n(h.optional_hooks)
+    const frozen = n(h.frozen_visual_hooks)
+    const mode = typeof h.mode === 'string' && /^[a-z_]{1,24}$/.test(h.mode) ? h.mode : 'unknown'
+    const text = plural(req + opt, 'hook', 'hooks') + (frozen > 0 ? ` · ${frozen} frozen` : '')
+    return {
+      state: 'ok', key: 'harness', text,
+      ...one([
+        `Harness · ${mode} mode`,
+        `${req} required + ${opt} optional hooks`,
+        `${n(h.invariant_hooks)} invariant · ${n(h.visual_diff_hooks)} visual_diff (${plural(frozen, 'frozen baseline', 'frozen baselines')})`,
+        'Read from .factonio/harness.json'
+      ], `Harness ${mode} mode: ${req} required and ${opt} optional hooks, ${n(h.invariant_hooks)} invariant, ${n(h.visual_diff_hooks)} visual diff, ${frozen} frozen.`)
+    }
+  }
+  return { state: 'absent', key: null, text: 'no harness', ...one(['No .factonio/ harness in this repository.', 'Verification falls back to repository defaults.'], 'No harness: verification falls back to repository defaults.') }
+}
+
+function HarnessBadge({ harness }) {
+  const b = summarizeHarnessBadge(harness)
+  if (!b) return null
+  return jsxs('span', {
+    className: 'fc-harness',
+    'data-state': b.state,
+    title: b.title,
+    children: [
+      jsx(Icon, { key: 'i', name: HARNESS_ICON[b.state], size: 11 }),
+      b.key ? jsx('span', { key: 'k', className: 'fc-harness-k', 'aria-hidden': 'true', children: b.key }) : null,
+      jsx('span', { key: 't', className: 'fc-harness-t', 'aria-hidden': 'true', children: b.text }),
+      jsx('span', { key: 'sr', className: 'fc-sr', children: b.sr })
+    ]
+  })
+}
+
 function RepoRow({ repo: r, defaults, editing, busy, editorId, onEdit, buttonRef }) {
   return jsxs('tr', {
     'data-slug': r.slug,
@@ -864,7 +972,8 @@ function RepoRow({ repo: r, defaults, editing, busy, editorId, onEdit, buttonRef
       jsxs('td', {
         children: [
           jsx('span', { className: 'fc-trunc fc-repo-name', title: r.repo || r.slug, children: r.repo || r.slug }),
-          jsx('span', { className: 'fc-trunc fc-repo-path', title: r.path || '', children: r.path || '—' })
+          jsx('span', { className: 'fc-trunc fc-repo-path', title: r.path || '', children: r.path || '—' }),
+          jsx(HarnessBadge, { harness: r.harness })
         ]
       }),
       jsx('td', { children: jsx('span', { className: 'fc-trunc fc-mono', title: r.default_branch || '', children: r.default_branch || '—' }) }),
@@ -1322,15 +1431,21 @@ function ReposSection({ ctx, reposQ }) {
 
 const TRAIL_LIMIT = 200
 const TRAIL_QUERY_KEY = ['factonio', 'trail', TRAIL_LIMIT]
-const TRAIL_PHASE_ORDER = ['define', 'design', 'implement', 'verify', 'publish', 'gate', 'merge', 'escape', 'watchdog']
+const TRAIL_PHASE_ORDER = ['define', 'design', 'implement', 'verify', 'publish', 'gate', 'merge', 'intake', 'harness', 'eval', 'escape', 'watchdog']
+// Phase filter runs (delivery | Wave 5 | safety), separated in the bar.
+const TRAIL_PHASE_GROUPS = [['define', 'design', 'implement', 'verify', 'publish', 'gate', 'merge'], ['intake', 'harness', 'eval'], ['escape', 'watchdog']]
 const TRAIL_TONE = {
   merged: 'ok', pass: 'ok', approved: 'ok', ready: 'ok', published: 'ok',
+  synthesized: 'ok', verified_fix: 'ok', decided: 'ok', clean: 'ok',
   reject: 'bad', stalled: 'bad', dead_worker: 'bad', blocked: 'bad', refused: 'bad', error: 'bad',
+  stop_the_line: 'bad', fix_incomplete: 'bad', no_winner: 'bad', proof_failed: 'bad', product_regression: 'bad',
   inconclusive: 'warn', pivot: 'warn', escape: 'warn',
-  spawned: 'info', recorded: 'info', queued: 'info'
+  flaky: 'warn', not_reproduced: 'warn', tie: 'warn', harness_gap: 'warn', doc_drift: 'warn',
+  spawned: 'info', recorded: 'info', queued: 'info',
+  actionable: 'info', no_action: 'info'
 }
 const TRAIL_SB_TONE = { ok: 'pass', bad: 'reject', warn: 'warn', info: 'info' }
-const TRAIL_ACTOR_ICON = { orchestrator: 'dash', worker: 'running', watchdog: 'queued', human: 'person' }
+const TRAIL_ACTOR_ICON = { orchestrator: 'dash', worker: 'running', watchdog: 'queued', human: 'person', eval: 'split' }
 const TRAIL_KNOWN_EVIDENCE = new Set(['pr_number', 'head_sha', 'patch_id', 'tests_passed', 'tests_failed', 'escaped_from', 'side_effect_age_s', 'worker_pid', 'card_id', 'branch', 'base_branch', 'draft'])
 const GH_SLUG = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 
@@ -1388,9 +1503,101 @@ function trailGithubRepo(slug, ghBySlug) {
   return GH_SLUG.test(s) ? s : null
 }
 
+// Information barrier, client side: drop anything that mentions holdout scenarios. Text is
+// NFKC-folded and stripped of ANSI escapes and control/format characters first, so fullwidth,
+// zero-width or escape-split spellings cannot slip past the match. Fails closed on nesting.
+const HOLDOUT_RE = /holdout/i
+const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g
+const barrierText = s => String(s).normalize('NFKC').replace(ANSI_RE, '').replace(/[\p{Cc}\p{Cf}]/gu, '')
+function mentionsHoldout(v, depth = 0) {
+  if (v == null || typeof v === 'boolean') return false
+  if (typeof v === 'string' || typeof v === 'number' || typeof v === 'bigint') return HOLDOUT_RE.test(barrierText(v))
+  if (depth > 6) return true
+  if (Array.isArray(v)) return v.some(x => mentionsHoldout(x, depth + 1))
+  if (typeof v === 'object') return Object.entries(v).some(([k, x]) => mentionsHoldout(k, depth + 1) || mentionsHoldout(x, depth + 1))
+  return false
+}
+const safeEvidence = e => Object.fromEntries(Object.entries(e).filter(([k, v]) => !mentionsHoldout(k) && !mentionsHoldout(v)))
+const barrierStr = v => (typeof v === 'string' && v.trim() && !mentionsHoldout(v) ? v : null)
+// Basename only: a report path is never rendered with its directory.
+function safeBasename(p) {
+  const s = barrierStr(p)
+  if (!s) return null
+  return barrierStr(s.split(/[\\/]/).filter(Boolean).pop() || '')
+}
+
+const evidenceList = v => (Array.isArray(v) ? v.filter(x => x != null && x !== '') : [])
+const evidenceCount = v => (Array.isArray(v) ? evidenceList(v).length : Number.isSafeInteger(v) && v > 0 ? v : 0)
+const isArenaDecision = (d, e) => /(^|_)arena(_|$)/.test(String(d?.decision || '')) || (e.arena_id != null && e.arena_id !== '')
+const isIntakeDecision = d => /^issue_intake/.test(String(d?.decision || ''))
+
+// Wave 5 structured pills (start_workstream, arena, issue intake, skill eval). Marks handled keys in `used`.
+function wave5Pills(d, e, gh, used) {
+  const out = []
+  const has = k => e[k] != null && e[k] !== ''
+  const add = (key, pill, keys = [key]) => {
+    keys.forEach(k => used.add(k))
+    out.push({ key, title: `${key} ${Array.isArray(e[key]) ? e[key].join(', ') : e[key]}`, ...pill })
+  }
+  const short = v => String(v).slice(0, 32)
+  if (d?.decision === 'start_workstream') {
+    used.add('kind'); used.add('read_only')
+    if (has('kind') && typeof e.kind === 'string') add('kind', { label: 'mode', text: short(e.kind), tone: 'info' })
+    if (e.read_only === true) add('read_only', { text: 'read-only', tone: 'warn' })
+  }
+  if (isArenaDecision(d, e)) {
+    if (has('arena_id') && typeof e.arena_id !== 'object') add('arena_id', { label: 'arena', text: short(e.arena_id) })
+    if (has('target') && typeof e.target !== 'object') add('target', { label: 'target', text: short(e.target) })
+    if (Array.isArray(e.candidates) && e.candidates.length) {
+      const vendors = e.candidates.map(c => (c && typeof c === 'object' ? c.vendor : c)).filter(v => typeof v === 'string' && v)
+      const text = vendors.length && vendors.length <= 3 && vendors.length === e.candidates.length ? vendors.join(' · ') : String(e.candidates.length)
+      add('candidates', { label: 'candidates', text: short(text), title: `candidates ${vendors.join(', ') || e.candidates.length}` })
+    }
+    if (has('judge_vendor') && typeof e.judge_vendor !== 'object') add('judge_vendor', { label: 'judge', text: short(e.judge_vendor) })
+  }
+  if (isIntakeDecision(d)) {
+    if (has('issue_number')) {
+      const n = Number(e.issue_number)
+      const repo = gh || (typeof e.repo === 'string' && GH_SLUG.test(e.repo) ? e.repo : null)
+      const href = repo && Number.isSafeInteger(n) && n > 0 ? `https://github.com/${repo}/issues/${n}` : null
+      add('issue_number', href
+        ? { text: `#${n}`, href, title: `Open ${repo} issue #${n}` }
+        : { label: 'issue', text: `#${short(e.issue_number)}` })
+    }
+    if (has('verdict') && typeof e.verdict !== 'object') {
+      const v = String(e.verdict)
+      add('verdict', { label: 'verdict', text: short(v), tone: v === 'verified_fix' ? 'ok' : v === 'fix_incomplete' ? 'bad' : undefined })
+    }
+    for (const [key, text, tone] of [['stop_the_line', 'stop the line', 'bad'], ['actionable', 'actionable', 'info']]) {
+      used.add(key)
+      const n = Array.isArray(e[key]) ? evidenceList(e[key]).length : 0
+      if (e[key] === true || n) add(key, { text: n ? `${text} ${n}` : text, tone })
+    }
+    used.add('counts')
+    const issues = evidenceCount(e.issue_numbers) ||
+      (e.counts && typeof e.counts === 'object' && !Array.isArray(e.counts) ? Object.values(e.counts).reduce((s, x) => s + (Number.isSafeInteger(x) && x > 0 ? x : 0), 0) : 0)
+    if (issues || has('issue_numbers')) add('issue_numbers', { label: 'issues', text: String(issues), title: `issues ${issues}` }, ['issue_numbers', 'counts'])
+  }
+  if (d?.decision === 'skill_eval') {
+    used.add('verdict')
+    const winner = has('winner_label') ? e.winner_label : e.winner
+    used.add('winner'); used.add('winner_label')
+    if (winner != null && winner !== '' && winner !== 'none' && typeof winner !== 'object') {
+      add(has('winner_label') ? 'winner_label' : 'winner', { label: 'winner', text: short(winner), tone: winner === 'tie' ? 'warn' : 'ok' }, ['winner', 'winner_label'])
+    }
+    const dq = Array.isArray(e.disqualified) ? evidenceList(e.disqualified).filter(x => typeof x !== 'object') : (has('disqualified') && typeof e.disqualified !== 'object' && e.disqualified !== false ? [e.disqualified] : [])
+    used.add('disqualified')
+    if (dq.length) add('disqualified', { label: 'disqualified', text: short(dq.join(', ')), tone: 'bad' })
+    if (has('eval_phase') && typeof e.eval_phase !== 'object') add('eval_phase', { label: 'eval phase', text: short(e.eval_phase) })
+    if (has('decided_by') && typeof e.decided_by !== 'object') add('decided_by', { label: 'decided by', text: short(e.decided_by) })
+  }
+  return out
+}
+
 // Ordered evidence pills: { key, text, label?, tone?, href?, title }.
 function evidencePills(d, gh) {
-  const e = d?.evidence && typeof d.evidence === 'object' && !Array.isArray(d.evidence) ? d.evidence : {}
+  const raw = d?.evidence && typeof d.evidence === 'object' && !Array.isArray(d.evidence) ? d.evidence : {}
+  const e = safeEvidence(raw)
   const has = k => e[k] != null && e[k] !== ''
   const out = []
   if (has('pr_number')) {
@@ -1418,8 +1625,10 @@ function evidencePills(d, gh) {
   if (has('side_effect_age_s')) out.push({ key: 'side_effect_age_s', label: 'idle', text: fmtIdle(e.side_effect_age_s), tone: 'bad', title: `side_effect_age_s ${e.side_effect_age_s}` })
   if (has('worker_pid')) out.push({ key: 'worker_pid', label: 'pid', text: String(e.worker_pid), title: `worker_pid ${e.worker_pid}` })
   if (has('card_id')) out.push({ key: 'card_id', text: String(e.card_id), title: `card_id ${e.card_id}` })
+  const used = new Set()
+  out.push(...wave5Pills(d, e, gh, used))
   for (const [k, v] of Object.entries(e)) {
-    if (TRAIL_KNOWN_EVIDENCE.has(k) || v == null || v === '' || typeof v === 'object') continue
+    if (TRAIL_KNOWN_EVIDENCE.has(k) || used.has(k) || v == null || v === '' || typeof v === 'object') continue
     out.push({ key: k, label: k.replace(/_/g, ' '), text: String(v).slice(0, 32), title: `${k} ${v}` })
   }
   return out
@@ -1472,7 +1681,20 @@ function TrailPill({ ctx, pill }) {
   return jsxs('span', { className: 'fc-trail-pill', 'data-ev': pill.key, 'data-tone': pill.tone || undefined, title: pill.title, children: kids })
 }
 
-function TrailRow({ ctx, d, gh, flash, showWs, wsLabel, onJump, rowRef }) {
+function TrailWsPill({ label, title, kind }) {
+  return jsxs('span', {
+    className: 'fc-trail-pill',
+    'data-ev': 'tenant',
+    title,
+    children: [
+      jsx('span', { key: 'k', className: 'fc-trail-k', children: 'ws' }),
+      label,
+      BADGED_MODES.has(kind) ? jsx('span', { key: 'm', className: 'fc-trail-mode', children: kind }) : null
+    ]
+  })
+}
+
+function TrailRow({ ctx, d, gh, flash, showWs, wsLabel, wsKind, onJump, rowRef }) {
   const tone = resultTone(d.result)
   const superseded = !!d.is_superseded
   const lineage = [
@@ -1501,7 +1723,7 @@ function TrailRow({ ctx, d, gh, flash, showWs, wsLabel, onJump, rowRef }) {
   ]
   const pills = evidencePills(d, gh).map(p => jsx(TrailPill, { key: p.key, ctx, pill: p }))
   const ws = showWs && d.tenant
-    ? jsxs('span', { key: 'ws', className: 'fc-trail-pill', 'data-ev': 'tenant', title: d.tenant, children: [jsx('span', { className: 'fc-trail-k', children: 'ws' }), wsLabel] })
+    ? jsx(TrailWsPill, { key: 'ws', label: wsLabel, title: d.tenant, kind: d.decision === 'start_workstream' ? null : wsKind })
     : null
   return jsxs('li', {
     className: 'fc-trail-row',
@@ -1648,15 +1870,23 @@ function TrailSection({ ctx, reposQ }) {
     ...all.map(d => d.tenant).filter(Boolean),
     ...(tenant ? [tenant] : [])
   ])].sort()
+  const byTenantRows = groupBy(all.filter(d => d.tenant), d => d.tenant)
+  const modeKind = t => workstreamMode(t, null, [], byTenantRows.get(t) || []).kind
+  const wsOptionLabel = t => {
+    const k = modeKind(t)
+    const slug = trailWsLabel(t, ghRepos)
+    if (!BADGED_MODES.has(k)) return slug
+    return k === 'investigate' ? `${slug} · investigate · read-only` : `${slug} · ${k}`
+  }
   const inScope = d => (!repo || d.repo_slug === repo) && (!tenant || d.tenant === tenant)
   const visibleOf = (r, t, p, h) => all.filter(d => (!r || d.repo_slug === r) && (!t || d.tenant === t) && (!p || d.phase === p) && !(h && d.is_superseded))
   const visible = visibleOf(repo, tenant, phase, hideSup)
   const anyFilter = !!(repo || tenant || phase)
   const present = new Set(all.map(d => d.phase).filter(Boolean))
   if (phase) present.add(phase)
-  const phases = hasData
-    ? [...TRAIL_PHASE_ORDER.filter(p => present.has(p)), ...[...present].filter(p => !TRAIL_PHASE_ORDER.includes(p)).sort()]
-    : TRAIL_PHASE_ORDER
+  // Every known phase stays visible (zero counts dim); unknown phases from newer backends follow.
+  const extraPhases = [...present].filter(p => !TRAIL_PHASE_ORDER.includes(p)).sort()
+  const phaseRuns = extraPhases.length ? [...TRAIL_PHASE_GROUPS, extraPhases] : TRAIL_PHASE_GROUPS
   const phaseN = p => all.filter(d => d.phase === p && inScope(d)).length
   const controlsOff = !hasData
 
@@ -1794,7 +2024,7 @@ function TrailSection({ ctx, reposQ }) {
         'data-disabled': String(controlsOff),
         children: [
           select('fc-trail-repo', 'repo', 'Repository', 'All repos', repoOpts.map(r => ({ v: r, l: r })), repo),
-          select('fc-trail-ws', 'tenant', 'Workstream', 'All workstreams', tenantOpts.map(t => ({ v: t, l: trailWsLabel(t, ghRepos) })), tenant),
+          select('fc-trail-ws', 'tenant', 'Workstream', 'All workstreams', tenantOpts.map(t => ({ v: t, l: wsOptionLabel(t) })), tenant),
           jsxs('div', {
             className: 'fc-trail-phases',
             role: 'group',
@@ -1809,15 +2039,22 @@ function TrailSection({ ctx, reposQ }) {
                 onClick: () => { setPhase(''); announce(repo, tenant, '', hideSup) },
                 children: 'All'
               }),
-              ...phases.map(p => jsxs('button', {
-                key: p,
-                type: 'button',
-                'data-phase': p,
-                'aria-pressed': String(phase === p),
-                disabled: controlsOff,
-                onClick: () => { setPhase(p); announce(repo, tenant, p, hideSup) },
-                children: [p, hasData ? jsx('span', { key: 'n', className: 'fc-trail-n', children: String(phaseN(p)) }) : null]
-              }))
+              ...phaseRuns.flatMap((run, i) => [
+                i ? jsx('span', { key: `sep-${i}`, className: 'fc-trail-phase-sep', 'aria-hidden': 'true' }) : null,
+                ...run.map(p => {
+                  const n = hasData ? phaseN(p) : null
+                  return jsxs('button', {
+                    key: p,
+                    type: 'button',
+                    'data-phase': p,
+                    'data-empty': n === 0 ? 'true' : undefined,
+                    'aria-pressed': String(phase === p),
+                    disabled: controlsOff,
+                    onClick: () => { setPhase(p); announce(repo, tenant, p, hideSup) },
+                    children: [p, n != null ? jsx('span', { key: 'n', className: 'fc-trail-n', children: String(n) }) : null]
+                  })
+                })
+              ])
             ]
           }),
           jsxs('span', {
@@ -1878,19 +2115,23 @@ function TrailSection({ ctx, reposQ }) {
       ]
     })
   } else if (!visible.length) {
+    const pill = (key, children) => jsxs('span', { key, className: 'fc-trail-pill', children })
+    const tenantKind = tenant ? modeKind(tenant) : null
     const chips = [
-      repo && `repo ${repo}`,
-      tenant && `workstream ${trailWsLabel(tenant, ghRepos)}`,
-      phase && `phase ${phase}`,
-      hideSup && 'superseded hidden'
-    ].filter(Boolean)
+      repo ? pill('repo', [`repo ${repo}`]) : null,
+      tenant
+        ? pill('ws', [`workstream ${trailWsLabel(tenant, ghRepos)}`, BADGED_MODES.has(tenantKind) ? jsx('span', { key: 'm', className: 'fc-trail-mode', children: tenantKind }) : null])
+        : null,
+      phase ? pill('phase', [`phase ${phase}`]) : null,
+      hideSup ? pill('sup', ['superseded hidden']) : null
+    ]
     body = jsxs('div', {
       className: 'fc-trail-state',
       'data-state': 'filtered',
       children: [
         jsx('span', { className: 'fc-trail-state-ico', children: jsx(Icon, { name: 'filter', size: 16 }) }),
         jsx('h3', { children: 'No decisions match these filters' }),
-        jsx('div', { className: 'fc-trail-active', children: chips.map(c => jsx('span', { key: c, className: 'fc-trail-pill', children: c })) }),
+        jsx('div', { className: 'fc-trail-active', children: chips }),
         jsx('p', { children: `${plural(all.length, 'decision exists', 'decisions exist')} outside this view.` }),
         jsx('button', { type: 'button', className: 'fc-btn fc-btn--primary', 'data-action': 'clear', onClick: clearAll, children: 'Clear filters' })
       ]
@@ -1908,6 +2149,7 @@ function TrailSection({ ctx, reposQ }) {
         flash: flash === d.id,
         showWs,
         wsLabel: trailWsLabel(d.tenant, ghRepos),
+        wsKind: d.tenant ? modeKind(d.tenant) : null,
         onJump: jump,
         rowRef: el => { rowEls.current[d.id] = el }
       }))
@@ -3173,6 +3415,267 @@ function PanelStrip({ panel: p }) {
   })
 }
 
+// --- Wave 5: workstream modes and /arena ------------------------------------
+const WORKSTREAM_KINDS = new Set(['feature', 'bug', 'quick', 'refactor', 'perf', 'investigate'])
+const BADGED_MODES = new Set(['refactor', 'perf', 'investigate'])
+const MODE_GLYPH = { perf: 'trend', refactor: 'retry', investigate: 'eye' }
+const MODE_TITLE = {
+  perf: 'Performance mode: benchmark checklist contract',
+  refactor: 'Refactor mode: behaviour-preservation contract',
+  investigate: 'Investigate mode · read-only: workers may not change the repository'
+}
+const isWsKind = k => typeof k === 'string' && WORKSTREAM_KINDS.has(k)
+const newestFirst = (a, b) => (b.created_at || 0) - (a.created_at || 0) || String(b.id || '').localeCompare(String(a.id || ''))
+
+// { kind, readOnly, reportName, reportExists } for one workstream. Sources, in order: GET /cards
+// `workstreams`, the newest card `workstream_kind` (older backend), the newest start_workstream row.
+function workstreamMode(tenant, workstreams, wsCards, trailRows) {
+  const t = String(tenant || '')
+  let kind = null
+  let readOnly = false
+  let reportPath = null
+  let reportExists = false
+  const ws = t && workstreams && typeof workstreams === 'object' && !Array.isArray(workstreams) ? workstreams[t] : null
+  if (ws && typeof ws === 'object' && isWsKind(ws.kind)) {
+    kind = ws.kind
+    readOnly = ws.read_only === true
+    reportPath = ws.report_path
+    reportExists = ws.report_exists === true
+  } else {
+    const card = (Array.isArray(wsCards) ? wsCards : []).filter(c => c && isWsKind(c.workstream_kind)).sort(newestFirst)[0]
+    if (card) {
+      kind = card.workstream_kind
+    } else {
+      const row = (Array.isArray(trailRows) ? trailRows : [])
+        .filter(d => d && d.decision === 'start_workstream' && (!t || !d.tenant || d.tenant === t) && d.evidence && isWsKind(d.evidence.kind))
+        .sort((a, b) => (trailMs(b.ts) ?? 0) - (trailMs(a.ts) ?? 0))[0]
+      if (row) {
+        kind = row.evidence.kind
+        readOnly = row.evidence.read_only === true
+      }
+    }
+  }
+  const investigate = kind === 'investigate'
+  return { kind, readOnly: readOnly || investigate, reportName: investigate ? safeBasename(reportPath) : null, reportExists: investigate && reportExists }
+}
+
+function ModePill({ mode, suffix }) {
+  if (!mode || !BADGED_MODES.has(mode.kind)) return null
+  const ro = suffix && mode.kind === 'investigate'
+  return jsxs('span', {
+    className: 'fc-sb-mode',
+    'data-mode': mode.kind,
+    title: MODE_TITLE[mode.kind],
+    children: [jsx(Icon, { key: 'i', name: MODE_GLYPH[mode.kind], size: 10 }), mode.kind, ro ? jsx('span', { key: 'ro', className: 'fc-sb-mode-ro', children: ' · read-only' }) : null]
+  })
+}
+
+function ReportIndicator({ mode }) {
+  const ready = !!mode.reportExists
+  return jsxs('span', {
+    className: 'fc-sb-report',
+    'data-ready': String(ready),
+    title: ready ? 'investigation.md ready' : 'investigation.md not written yet',
+    children: [jsx(Icon, { key: 'i', name: ready ? 'check' : 'queued', size: 10 }), ready ? 'report ready' : 'report pending']
+  })
+}
+
+const ARENA_STATUS = {
+  candidates_in_progress: { label: 'in progress', tone: 'info' },
+  ready_for_synthesis: { label: 'ready', tone: 'info' },
+  judging: { label: 'judging', tone: 'info' },
+  synthesized: { label: 'synthesized', tone: 'pass' },
+  needs_attention: { label: 'attention', tone: 'warn', callout: 'advisory', copy: 'A candidate needs attention before the judge can run.' },
+  degraded: { label: 'degraded', tone: 'warn', callout: 'degraded', copy: 'No cross-vendor judge was available; the judge shares a vendor with a candidate.' },
+  blocked: { label: 'blocked', tone: 'reject', callout: 'blocked', copy: 'The arena cannot reach a judge. Unblock a candidate card or start a new arena.' }
+}
+const ARENA_RUN_ICON = { ready: 'check', done: 'check', running: 'spin', 'no-artifact': 'attention', failed: 'x' }
+const ARENA_FAILED = new Set(['blocked', 'failed', 'error'])
+
+function arenaRunState(status, artifactReady) {
+  const s = String(status || '').toLowerCase()
+  if (s === 'done') return artifactReady === true ? 'ready' : artifactReady === false ? 'no-artifact' : 'done'
+  if (s === 'running') return 'running'
+  if (ARENA_FAILED.has(s)) return 'failed'
+  return null
+}
+
+const arenaStr = barrierStr
+function arenaCandidate(c) {
+  if (!c || typeof c !== 'object') return null
+  return {
+    slot: arenaStr(c.slot),
+    vendor: arenaStr(c.vendor),
+    model: arenaStr(c.model),
+    task_id: arenaStr(c.task_id),
+    status: arenaStr(c.status),
+    artifact_ready: typeof c.artifact_ready === 'boolean' ? c.artifact_ready : null
+  }
+}
+function arenaJudge(j) {
+  if (!j || typeof j !== 'object') return null
+  return {
+    task_id: arenaStr(j.task_id),
+    status: arenaStr(j.status),
+    vendor: arenaStr(j.vendor),
+    model: arenaStr(j.model),
+    cross_vendor: typeof j.cross_vendor === 'boolean' ? j.cross_vendor : null
+  }
+}
+
+// Newest-first arenas of one workstream from GET /cards `arenas`; when an older backend omits
+// `arenas`, rebuilt from card `arena_*` tags (status unknown, marked `legacy`).
+function computeWorkstreamArenas(tenant, wsCards, apiArenas) {
+  const t = String(tenant || '')
+  if (!t) return []
+  if (Array.isArray(apiArenas)) {
+    return apiArenas
+      .filter(a => a && typeof a === 'object' && a.tenant === t && arenaStr(a.arena_id))
+      .map(a => ({
+        arena_id: a.arena_id,
+        tenant: t,
+        title: arenaStr(a.title),
+        target: arenaStr(a.target),
+        status: arenaStr(a.status),
+        legacy: false,
+        created_at: Number.isFinite(a.created_at) ? a.created_at : null,
+        candidates: (Array.isArray(a.candidates) ? a.candidates : []).map(arenaCandidate).filter(Boolean),
+        judge: arenaJudge(a.judge),
+        advisories: (Array.isArray(a.advisories) ? a.advisories : []).filter(x => arenaStr(x))
+      }))
+  }
+  const tagged = (Array.isArray(wsCards) ? wsCards : []).filter(c => c && arenaStr(c.arena_id) && (c.arena_role === 'candidate' || c.arena_role === 'judge'))
+  const out = []
+  for (const [id, cards] of groupBy(tagged, c => String(c.arena_id))) {
+    const ordered = [...cards].sort((a, b) => (a.created_at || 0) - (b.created_at || 0) || String(a.id).localeCompare(String(b.id)))
+    const judgeCard = ordered.filter(c => c.arena_role === 'judge').sort(newestFirst)[0]
+    out.push({
+      arena_id: id,
+      tenant: t,
+      title: null,
+      target: arenaStr(ordered.find(c => arenaStr(c.arena_target))?.arena_target),
+      status: null,
+      legacy: true,
+      created_at: Math.max(0, ...ordered.map(c => c.created_at || 0)),
+      candidates: ordered.filter(c => c.arena_role === 'candidate').map(c => arenaCandidate({ slot: c.arena_slot, vendor: c.arena_vendor, model: formatPhaseModelLabel(c), task_id: c.id, status: c.status })),
+      judge: judgeCard ? arenaJudge({ task_id: judgeCard.id, status: judgeCard.status, vendor: judgeCard.arena_vendor, model: formatPhaseModelLabel(judgeCard) }) : null,
+      advisories: []
+    })
+  }
+  return out.sort((a, b) => b.created_at - a.created_at || b.arena_id.localeCompare(a.arena_id))
+}
+
+function arenaStatusInfo(a) {
+  if (a.legacy || !a.status) return { label: 'from cards', tone: undefined, title: 'Older backend: rebuilt from card tags; arena status and artifact readiness unknown' }
+  const s = ARENA_STATUS[a.status]
+  return s ? { ...s, title: `Status: ${a.status}` } : { label: a.status, tone: undefined, title: `Status: ${a.status}` }
+}
+
+function arenaCounts(a) {
+  const n = a.candidates.length
+  if (a.legacy) {
+    const done = a.candidates.filter(c => c.status === 'done').length
+    return { n, k: done, text: `${done}/${n} done`, title: `${done} of ${n} candidate cards done` }
+  }
+  const ready = a.candidates.filter(c => c.artifact_ready === true).length
+  return { n, k: ready, text: `${ready}/${n} ready`, title: `${ready} of ${n} candidate artifacts ready` }
+}
+
+function ArenaCandidateChip({ cand }) {
+  const run = arenaRunState(cand.status, cand.artifact_ready)
+  const label = [cand.slot, cand.model].filter(Boolean).join(' · ') || 'candidate'
+  return jsxs('span', {
+    className: 'fc-sb-vendor',
+    'data-run': run || undefined,
+    title: `${label}: ${cand.status || 'queued'}${cand.artifact_ready === true ? ', artifact ready' : ''}`,
+    children: [jsx(Icon, { key: 'i', name: ARENA_RUN_ICON[run] || 'queued', size: 10 }), cand.vendor || 'unknown']
+  })
+}
+
+function ArenaJudgeChip({ judge }) {
+  const run = judge?.task_id ? arenaRunState(judge.status, null) : null
+  const cross = judge?.cross_vendor
+  let glyph = judge?.task_id ? (run === 'done' ? 'check' : ARENA_RUN_ICON[run] || 'queued') : 'pending'
+  if (cross === false) glyph = 'attention'
+  const crossText = cross === true ? ', cross-vendor' : cross === false ? ', same vendor as a candidate' : ''
+  return jsxs('span', {
+    className: 'fc-sb-vendor',
+    'data-role': 'judge',
+    'data-cross': cross == null ? undefined : String(cross),
+    'data-run': run || undefined,
+    title: `Judge${judge?.model ? ` · ${judge.model}` : ''}: ${judge?.task_id ? judge.status || 'queued' : 'not spawned yet'}${crossText}`,
+    children: [jsx(Icon, { key: 'i', name: glyph, size: 10 }), judge?.vendor ? `judge · ${judge.vendor}` : 'judge']
+  })
+}
+
+function arenaCallout(a) {
+  const s = a.legacy ? null : ARENA_STATUS[a.status]
+  const advisories = a.advisories || []
+  if (!s?.callout && !advisories.length) return null
+  const kind = s?.callout || 'advisory'
+  return { kind, tone: kind === 'blocked' ? undefined : 'warn', text: advisories[0] || s.copy, title: advisories.length ? advisories.join('\n') : s.copy }
+}
+
+function ArenaStrip({ arena: a }) {
+  const st = arenaStatusInfo(a)
+  const cnt = arenaCounts(a)
+  const judge = a.judge
+  const judgeLabel = judge
+    ? ` Judge ${judge.vendor || 'unknown'} ${judge.task_id ? judge.status || 'queued' : 'not spawned'}${judge.cross_vendor === true ? ', cross-vendor' : judge.cross_vendor === false ? ', same vendor as a candidate' : ''}.`
+    : ' No judge yet.'
+  const label = a.legacy
+    ? `Arena ${a.arena_id}${a.target ? ` on ${a.target}` : ''}: rebuilt from cards. ${cnt.k} of ${cnt.n} candidate cards done.${judgeLabel}`
+    : `Arena ${a.arena_id}${a.target ? ` on ${a.target}` : ''}: ${st.label}. ${cnt.k} of ${cnt.n} candidate artifacts ready.${judgeLabel}`
+  const co = arenaCallout(a)
+  return jsxs('div', {
+    className: 'fc-sb-panel fc-sb-arena',
+    role: 'group',
+    'aria-label': label,
+    'data-arena': a.arena_id,
+    'data-status': a.status || (a.legacy ? 'legacy' : ''),
+    children: [
+      jsxs('div', {
+        key: 'top',
+        className: 'fc-sb-panel-top',
+        children: [
+          jsxs('span', {
+            key: 'k',
+            className: 'fc-sb-arena-k',
+            title: a.title ? `Arena · ${a.title}` : 'Arena',
+            children: [jsx(Icon, { key: 'i', name: 'arena', size: 11 }), jsx('span', { key: 'w', className: 'fc-sb-arena-word', children: 'arena' })]
+          }),
+          a.target ? jsx('span', { key: 't', className: 'fc-sb-arena-target', title: 'Arena target', children: a.target }) : null,
+          jsx('span', { key: 's', className: 'fc-sb-tag', 'data-tone': st.tone, title: st.title, children: st.label }),
+          jsx('span', { key: 'id', className: 'fc-sb-panel-id fc-sb-mono', title: a.arena_id, children: a.arena_id }),
+          jsx('span', { key: 'n', className: 'fc-sb-panel-lanes', title: cnt.title, children: cnt.text })
+        ]
+      }),
+      jsx('div', {
+        key: 'v',
+        className: 'fc-sb-vendors',
+        'aria-label': 'Candidates and judge',
+        children: [
+          ...a.candidates.map((c, i) => jsx(ArenaCandidateChip, { key: c.task_id || `c${i}`, cand: c })),
+          jsx(ArenaJudgeChip, { key: 'judge', judge })
+        ]
+      }),
+      co
+        ? jsxs('div', {
+            key: 'co',
+            className: 'fc-sb-callout',
+            'data-tone': co.tone,
+            'data-kind': co.kind,
+            role: 'note',
+            children: [
+              jsx(Icon, { key: 'i', name: 'attention' }),
+              jsxs('span', { key: 'b', className: 'fc-sb-callout-body', title: co.title, children: [jsx('span', { key: 'k', className: 'fc-sb-kind', children: co.kind }), co.text] })
+            ]
+          })
+        : null
+    ]
+  })
+}
+
 function openExternalUrl(ctx, url) {
   const fallback = () => {
     try { globalThis.window?.open?.(url, '_blank', 'noopener,noreferrer') } catch { /* ignore */ }
@@ -3230,7 +3733,11 @@ const ICON = {
   down: [['path', { d: 'M6 2.4v7M3.4 6.8 6 9.4l2.6-2.6' }]],
   trend: [['path', { d: 'M1.8 8.6l2.7-2.7 1.9 1.9 3.8-3.8' }], ['path', { d: 'M7.6 4h2.6v2.6' }]],
   dot: [['circle', { cx: 6, cy: 6, r: 2, fill: 'currentColor', stroke: 'none' }]],
-  spin: [['circle', { cx: 6, cy: 6, r: 4.2, strokeDasharray: '15 11' }]]
+  spin: [['circle', { cx: 6, cy: 6, r: 4.2, strokeDasharray: '15 11' }]],
+  arena: [['path', { d: 'M1.8 2.6 5 6 1.8 9.4' }], ['path', { d: 'M10.2 2.6 7 6l3.2 3.4' }]],
+  eye: [['path', { d: 'M1.2 6S3 2.8 6 2.8 10.8 6 10.8 6 9 9.2 6 9.2 1.2 6 1.2 6z' }], ['circle', { cx: 6, cy: 6, r: 1.5 }]],
+  shield: [['path', { d: 'M6 1.5 9.8 3v3c0 2.2-1.6 3.8-3.8 4.5C3.8 9.8 2.2 8.2 2.2 6V3z' }]],
+  shieldOk: [['path', { d: 'M6 1.5 9.8 3v3c0 2.2-1.6 3.8-3.8 4.5C3.8 9.8 2.2 8.2 2.2 6V3z' }], ['path', { d: 'M4.4 6.1 5.5 7.2 7.6 4.9' }]]
 }
 
 function Icon({ name, size = 12, className = '' }) {
@@ -3442,7 +3949,50 @@ function panelRows(c, panel, row) {
   ]
 }
 
-function CardDrawer({ card: c, id, trail, panel }) {
+function modeRows(mode, row) {
+  if (!mode?.kind) return []
+  const out = row('mode', 'Mode', BADGED_MODES.has(mode.kind)
+    ? [
+        jsx(ModePill, { key: 'p', mode }),
+        mode.readOnly ? jsx('span', { key: 'ro', className: 'fc-sb-tag', 'data-tone': 'warn', children: 'read-only' }) : null
+      ]
+    : [
+        jsx('span', { key: 'k', className: 'fc-sb-mono', children: mode.kind }),
+        mode.readOnly ? jsx('span', { key: 'ro', className: 'fc-sb-tag', 'data-tone': 'warn', children: 'read-only' }) : null
+      ])
+  if (mode.kind !== 'investigate') return out
+  return [
+    ...out,
+    ...row('report', 'Report', [
+      jsx('span', { key: 's', className: 'fc-sb-tag', 'data-tone': mode.reportExists ? 'pass' : undefined, children: mode.reportExists ? 'ready' : 'pending' }),
+      mode.reportName ? jsx('span', { key: 'n', className: 'fc-sb-mono', title: mode.reportName, children: mode.reportName }) : null
+    ])
+  ]
+}
+
+function arenaRows(c, arena, row) {
+  const id = barrierStr(c.arena_id)
+  if (!id || (c.arena_role !== 'candidate' && c.arena_role !== 'judge')) return []
+  const target = arena?.target || barrierStr(c.arena_target)
+  const st = arena && !arena.legacy ? arenaStatusInfo(arena) : null
+  const slot = barrierStr(c.arena_slot)
+  const out = [
+    ...row('arena', 'Arena', [
+      jsx('span', { key: 'id', className: 'fc-sb-mono', title: id, children: id }),
+      target ? jsx('span', { key: 't', className: 'fc-sb-arena-target', title: 'Arena target', children: target }) : null,
+      st ? jsx('span', { key: 's', className: 'fc-sb-tag', 'data-tone': st.tone, title: st.title, children: st.label }) : null
+    ]),
+    ...row('role', 'Role', c.arena_role === 'judge' ? 'judge' : `candidate${slot ? ` · ${slot}` : ''}`, { className: 'fc-sb-mono' })
+  ]
+  if (!arena || arena.legacy) return out
+  return [
+    ...out,
+    ...(arena.candidates.length ? row('candidates', 'Candidates', arena.candidates.map((x, i) => jsx(ArenaCandidateChip, { key: x.task_id || `c${i}`, cand: x }))) : []),
+    ...row('judge', 'Judge', jsx(ArenaJudgeChip, { judge: arena.judge }))
+  ]
+}
+
+function CardDrawer({ card: c, id, trail, panel, mode, arena }) {
   const rework = c.phase === 'implement' && c.runs > 1
   const tone = verdictTone(c.verdict)
   const row = (k, label, value, extra) => [
@@ -3455,7 +4005,9 @@ function CardDrawer({ card: c, id, trail, panel }) {
     // Clicks inside the drawer never toggle the card, so its text stays selectable.
     onClick: e => e?.stopPropagation?.(),
     children: [
+      ...modeRows(mode, row),
       ...row('model', 'Model', formatPhaseModelLabel(c), { className: 'fc-sb-mono' }),
+      ...arenaRows(c, arena, row),
       ...(panel ? panelRows(c, panel, row) : []),
       ...row('runs', 'Runs', [
         jsx('span', { key: 'n', className: 'fc-sb-mono', children: String(c.runs ?? 1) }),
@@ -3477,7 +4029,17 @@ function CardDrawer({ card: c, id, trail, panel }) {
   })
 }
 
-function CardRow({ ctx, card: c, wsCards, open, onToggle, trail, panel }) {
+// `arena:<vendor>` / `arena:judge` tag for arena candidate and judge cards.
+function cardArenaTag(c) {
+  const id = barrierStr(c.arena_id)
+  if (!id) return null
+  if (c.arena_role === 'judge') return { text: 'arena:judge', title: `Arena judge · ${id}` }
+  if (c.arena_role !== 'candidate') return null
+  const slot = barrierStr(c.arena_slot)
+  return { text: `arena:${barrierStr(c.arena_vendor) || 'unknown'}`, title: `Arena candidate ${slot ? `${slot} ` : ''}· ${id}` }
+}
+
+function CardRow({ ctx, card: c, wsCards, open, onToggle, trail, panel, mode, arena }) {
   const rej = isUnresolvedReject(c, wsCards)
   const inc = !rej && isUnresolvedInconclusive(c, wsCards)
   const attn = isAttention(c, wsCards)
@@ -3489,6 +4051,7 @@ function CardRow({ ctx, card: c, wsCards, open, onToggle, trail, panel }) {
   const callouts = cardCallouts(c, wsCards)
   const dotStatus = rej ? 'reject' : inc ? 'inconclusive' : c.status
   const repoName = c.pr?.repo ? String(c.pr.repo).split('/').pop() : ''
+  const arenaTag = cardArenaTag(c)
   return jsxs('article', {
     className: 'fc-sb-card',
     'data-id': c.id,
@@ -3507,7 +4070,9 @@ function CardRow({ ctx, card: c, wsCards, open, onToggle, trail, panel }) {
         children: [
           jsx('span', { className: 'fc-sb-dot', 'data-status': dotStatus, role: 'img', 'aria-label': `Status: ${rej ? 'rejected' : inc ? 'inconclusive' : c.status}` }),
           jsx('span', { className: 'fc-sb-tag', 'data-phase': c.phase, children: PHASE_LABEL[c.phase] || c.phase || 'other' }),
-          c.panel_vendor ? jsx('span', { className: 'fc-sb-vendor', 'data-panel-vendor': String(c.panel_vendor), title: 'Panel lane vendor', children: String(c.panel_vendor) }) : null,
+          arenaTag
+            ? jsx('span', { className: 'fc-sb-vendor fc-sb-arena-tag', 'data-arena-role': c.arena_role, title: arenaTag.title, children: arenaTag.text })
+            : c.panel_vendor ? jsx('span', { className: 'fc-sb-vendor', 'data-panel-vendor': String(c.panel_vendor), title: 'Panel lane vendor', children: String(c.panel_vendor) }) : null,
           c.verdict ? jsx('span', { className: 'fc-sb-tag', 'data-tone': tone || undefined, 'data-verdict': c.verdict, children: String(c.verdict) }) : null,
           rework && !open ? jsx('span', { className: 'fc-sb-tag', 'data-tone': 'warn', title: `${c.runs} runs`, children: 'rework' }) : null,
           jsx('span', { className: 'fc-sb-dur', title: `Active ${fmtDur(c.active_duration_seconds)} · Wall ${fmtDur(c.elapsed_seconds)}`, children: fmtDur(dur) })
@@ -3525,7 +4090,7 @@ function CardRow({ ctx, card: c, wsCards, open, onToggle, trail, panel }) {
           jsxs('span', { className: 'fc-sb-callout-body', children: [jsx('span', { className: 'fc-sb-kind', children: co.kind }), co.text] })
         ]
       })),
-      open ? jsx(CardDrawer, { key: 'drawer', card: c, id: drawerId, trail, panel }) : null,
+      open ? jsx(CardDrawer, { key: 'drawer', card: c, id: drawerId, trail, panel, mode, arena }) : null,
       jsxs('div', {
         className: 'fc-sb-card-foot',
         children: [
@@ -3567,7 +4132,7 @@ function CardRow({ ctx, card: c, wsCards, open, onToggle, trail, panel }) {
   })
 }
 
-function DoneGroup({ ctx, wsKey, cards, wsCards, open, onToggle, cardOpen, toggleCard, trail, panelOf }) {
+function DoneGroup({ ctx, wsKey, cards, wsCards, open, onToggle, cardOpen, toggleCard, trail, panelOf, mode, arenaOf }) {
   const listId = `fc-sb-done-${domSafe(wsKey)}`
   return [
     jsxs('button', {
@@ -3589,7 +4154,7 @@ function DoneGroup({ ctx, wsKey, cards, wsCards, open, onToggle, cardOpen, toggl
           key: 'done-list',
           className: 'fc-sb-done-list',
           id: listId,
-          children: cards.map(c => jsx(CardRow, { key: c.id, ctx, card: c, wsCards, open: !!cardOpen[c.id], onToggle: () => toggleCard(c.id), trail, panel: panelOf(c) }))
+          children: cards.map(c => jsx(CardRow, { key: c.id, ctx, card: c, wsCards, open: !!cardOpen[c.id], onToggle: () => toggleCard(c.id), trail, panel: panelOf(c), mode, arena: arenaOf(c) }))
         })
       : null
   ]
@@ -3606,6 +4171,10 @@ function Workstream({ ctx, ws, ui }) {
     .find(c => safePrUrl(c.pr))
   const glyph = { attention: 'attention', active: 'running', completed: 'check' }[ws.state]
   const tone = { attention: 'attention', active: 'running', completed: 'done' }[ws.state]
+  const wsTrail = ui.trail?.status === 'ready' ? ui.trail.byTenant.get(ws.tenant || '') || [] : []
+  const mode = workstreamMode(ws.tenant, ui.workstreams, ws.wsCards, wsTrail)
+  const badged = BADGED_MODES.has(mode.kind)
+  const investigate = mode.kind === 'investigate'
   const meta = [
     ws.name.repo ? jsx('span', { key: 'repo', className: 'fc-sb-ws-repo', children: ws.name.repo }) : null,
     ws.name.repo ? jsx('span', { key: 'd1', 'aria-hidden': 'true', children: '·' }) : null,
@@ -3623,7 +4192,9 @@ function Workstream({ ctx, ws, ui }) {
           children: [jsx('span', {}), jsx('span', {}), jsx('span', {}), jsx('span', {})]
         })
       : null,
-    !open && ws.state === 'completed' ? jsx(Icon, { key: 'ok', name: 'check', size: 10, className: 'fc-sb-tone-done' }) : null
+    !open && ws.state === 'completed' ? jsx(Icon, { key: 'ok', name: 'check', size: 10, className: 'fc-sb-tone-done' }) : null,
+    investigate ? jsx('span', { key: 'd4', 'aria-hidden': 'true', children: '·' }) : null,
+    investigate ? jsx(ReportIndicator, { key: 'report', mode }) : null
   ]
   const head = jsxs('div', {
     key: 'head',
@@ -3643,7 +4214,13 @@ function Workstream({ ctx, ws, ui }) {
           jsxs('span', {
             className: 'fc-sb-ws-text',
             children: [
-              jsx('span', { className: 'fc-sb-ws-label', children: ws.name.slug }),
+              jsxs('span', {
+                className: 'fc-sb-ws-labelrow',
+                children: [
+                  jsx('span', { key: 'l', className: 'fc-sb-ws-label', children: ws.name.slug }),
+                  badged ? jsx(ModePill, { key: 'm', mode, suffix: true }) : null
+                ]
+              }),
               jsx('span', { className: 'fc-sb-ws-meta', children: meta })
             ]
           })
@@ -3658,7 +4235,8 @@ function Workstream({ ctx, ws, ui }) {
     className: 'fc-sb-ws',
     'data-state': ws.state,
     'data-tenant': ws.tenant || '',
-    'aria-label': `${ws.name.slug} workstream, ${ws.state}`
+    'aria-label': `${ws.name.slug} workstream, ${ws.state}${badged ? `, ${mode.kind} mode` : ''}${investigate ? `, read-only, report ${mode.reportExists ? 'ready' : 'pending'}` : ''}`,
+    'data-mode': badged ? mode.kind : undefined
   }
   if (!open) return jsx('section', { ...sectionProps, children: head })
 
@@ -3671,8 +4249,10 @@ function Workstream({ ctx, ws, ui }) {
   }
   const doneOpen = ui.doneOpen[key] ?? (ui.status === 'done')
   const toggleCard = id => ui.setCardOpen({ ...ui.cardOpen, [id]: !ui.cardOpen[id] })
-  const panels = computeWorkstreamPanels(ws.wsCards, ui.trail?.status === 'ready' ? ui.trail.byTenant.get(ws.tenant || '') : [])
+  const panels = computeWorkstreamPanels(ws.wsCards, wsTrail)
   const panelOf = c => (c.panel_id ? panels.find(p => p.id === String(c.panel_id)) || null : null)
+  const arenas = computeWorkstreamArenas(ws.tenant, ws.wsCards, ui.arenas)
+  const arenaOf = c => (c.arena_id && c.arena_role ? arenas.find(a => a.arena_id === String(c.arena_id)) || null : null)
   return jsxs('section', {
     ...sectionProps,
     children: [
@@ -3682,11 +4262,12 @@ function Workstream({ ctx, ws, ui }) {
         id: bodyId,
         children: [
           jsx(Pipeline, { pipe: computePipelineStages(ws.wsCards) }),
+          arenas.length ? jsx(ArenaStrip, { key: 'arena', arena: arenas[0] }) : null,
           panels.length ? jsx(PanelStrip, { key: 'panel', panel: panels[0] }) : null,
           jsxs('div', {
             className: 'fc-sb-ws-cards',
             children: [
-              ...main.map(c => jsx(CardRow, { key: c.id, ctx, card: c, wsCards: ws.wsCards, open: !!ui.cardOpen[c.id], onToggle: () => toggleCard(c.id), trail: ui.trail, panel: panelOf(c) })),
+              ...main.map(c => jsx(CardRow, { key: c.id, ctx, card: c, wsCards: ws.wsCards, open: !!ui.cardOpen[c.id], onToggle: () => toggleCard(c.id), trail: ui.trail, panel: panelOf(c), mode, arena: arenaOf(c) })),
               doneCards.length
                 ? jsx(DoneGroup, {
                     key: 'done',
@@ -3699,7 +4280,9 @@ function Workstream({ ctx, ws, ui }) {
                     cardOpen: ui.cardOpen,
                     toggleCard,
                     trail: ui.trail,
-                    panelOf
+                    panelOf,
+                    mode,
+                    arenaOf
                   })
                 : null,
               jsx(TrailStrip, {
@@ -3821,7 +4404,7 @@ function ThreadCardsPane({ ctx, visible = true }) {
       })
     } else {
       const repos = [...new Set(scoped.filter(c => c.pr?.repo).map(c => c.pr.repo))]
-      const ui = { status, wsOpen, setWsOpen, doneOpen, setDoneOpen, cardOpen, setCardOpen, trail, trailOpen, setTrailOpen }
+      const ui = { status, wsOpen, setWsOpen, doneOpen, setDoneOpen, cardOpen, setCardOpen, trail, trailOpen, setTrailOpen, workstreams: data?.workstreams, arenas: data?.arenas }
       body = groupWorkstreams(byTenant, visibleCards, repos).map(ws =>
         jsx(Workstream, { key: ws.tenant || '__ungrouped', ctx, ws, ui })
       )
@@ -3939,7 +4522,10 @@ function YourTurnCard({ attrs, sessionId }) {
 }
 
 // Pure helpers exposed for clean-room tests; the host only consumes the default export.
-export { validateRepoDraft, repoDraftChanges, seedRepoDraft, describeSaveError, verdictTone, computeWorkstreamPanels, sparkPoints, sparkPath }
+export {
+  validateRepoDraft, repoDraftChanges, seedRepoDraft, describeSaveError, verdictTone, computeWorkstreamPanels, sparkPoints, sparkPath,
+  workstreamMode, computeWorkstreamArenas, evidencePills, summarizeHarnessBadge
+}
 
 export default {
   id: 'factonio',

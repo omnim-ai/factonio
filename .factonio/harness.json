@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-27T19:00:00Z",
+  "generated_at": "2026-11-27T19:40:00Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -350,7 +350,12 @@
         "Repo table shows 9 columns with Merge/Publish policy .fc-pol cells; repo editor has a Publish policy select (auto/ask, no inherit) and PATCHes only publish_policy when it alone changes; an API null/invalid publish_policy shows a disabled Invalid / unknown placeholder (never auto) in the editor, — in the table and publish unknown in the defaults line, while an omitted publish_policy (older backend) falls back to the global default with no spurious PATCH key; Decision Trail has a publish phase filter, published reads as ok, and branch/base_branch render as one `branch X → Y` pill with draft shown only when true",
         "Trends strip renders populated/empty/loading/error states from GET /metrics/history",
         "Sidebar verification panel consensus is fail-closed and never shows pass without the recorded verify_panel_consensus",
-        "Sidebar panel shows inconclusive (never pass) when any expected lane from spawn_verify panel_lanes or the recorded consensus lanes is missing"
+        "Sidebar panel shows inconclusive (never pass) when any expected lane from spawn_verify panel_lanes or the recorded consensus lanes is missing",
+        "Sidebar workstream headers badge only refactor, perf and `investigate · read-only` (report ready/pending indicator) from GET /cards `workstreams`, falling back to card `workstream_kind` then the newest start_workstream row; drawers add Mode (and Report, basename only) rows",
+        "Sidebar renders a per-workstream /arena strip above the verification panel strip covering all 7 arena statuses (advisory/degraded/blocked callouts, same-vendor judge marked with an attention glyph) and rebuilds it from card arena_* tags (`from cards`) when an older backend omits `arenas`; arena cards show `arena:<vendor>` / `arena:judge` tags and Arena/Role/Candidates/Judge drawer rows",
+        "Decision Trail filters all 12 phases (intake, harness, eval included, zero counts dimmed), maps Wave 5 result tones, annotates workstream selects and pills with their mode, and renders start_workstream, arena, issue_intake_* (GitHub issue link) and skill_eval evidence pills",
+        "Registered Repositories show a `.factonio/` harness badge (hooks / frozen, md only, manifest error, absent) inside the Repository cell of the 9-column table and nothing when an older backend omits `harness`",
+        "No evidence pill, arena chip, callout, tooltip or report label renders holdout text (keys, values, nested, fullwidth, ANSI-split, zero-width or control-char spellings)"
       ]
     },
     {
