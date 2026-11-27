@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shlex
 import sqlite3
 import time
 import uuid
@@ -17,7 +18,9 @@ from .config import (
     get_root_hermes_home_path,
     load_settings,
     resolve_design_provider,
+    resolve_default_publish_policy,
     resolve_phase_model,
+    resolve_publish_policy,
     resolve_rigor,
     resolve_verify_panel,
     single_line,
@@ -238,13 +241,39 @@ def mode_contract_section(kind: str, *, report_path: Optional[Path] = None) -> s
 
 
 def _completion_contract_for_repo(repo: dict[str, Any]) -> str:
-    """Use native GitHub PR contract when branch protection defines required checks."""
+    """Use native GitHub PR contract when branch protection defines required checks.
+
+    ``publish_policy: ask`` always yields ``"local-only"``: the card delivers a verified local
+    branch and no PR exists until an explicit ``factonio_publish_pr``. Invalid policy raises.
+    """
+    if resolve_publish_policy(repo=repo) == "ask":
+        return "local-only"
     ci_mode = str(repo.get("ci_contract") or "auto").lower()
     if ci_mode == "local-only":
         return "local-only"
     if ci_mode == "github" or (ci_mode == "auto" and repo.get("has_required_checks")):
         return str(repo["repo"])
     return "local-only"
+
+
+def local_only_delivery_section(base_branch: str) -> str:
+    """Implementation-card section for ``publish_policy: ask``: commit locally, never push or open a PR."""
+    return (
+        "## Local-Only Delivery (publish_policy: ask)\n"
+        "This repository requires an explicit publish approval, so these rules replace the skill's publish steps. "
+        "Deliver a verified local branch only:\n"
+        "1. Commit on this local worktree branch. Do NOT run `git push` and do NOT run `gh pr create`: no remote "
+        "branch, no pull request, and no `factonio_pr_gate` from this card.\n"
+        "2. Run the repository's local build, lint and test commands (and the `.factonio/` harness when present) "
+        "until they pass.\n"
+        "3. Prepare a PR briefing of <= 40 lines (Why / What changed / Scope / Tradeoffs / Blast Radius / "
+        "Verification) without publishing it.\n"
+        f"4. Report in `kanban_complete` metadata: `branch` (this worktree branch), `base_branch` (`{base_branch}`), "
+        "`head_sha` (the full `git rev-parse HEAD`), `pr_title`, and `pr_body` (the briefing), plus `repo` and "
+        "`checks_run`.\n"
+        "The orchestrator verifies this exact local `head_sha` (`factonio_spawn_verify` with `branch` + `head_sha`) "
+        "and publishes it only after explicit approval with `factonio_publish_pr`.\n"
+    )
 
 
 RECALL_SECTION_MAX_CHARS = 2000
@@ -315,6 +344,7 @@ def start_workstream(
     mode_section = mode_contract_section(canon_kind, report_path=report_path)
 
     go_direct = skip_define or canon_kind == "quick"
+    publish_policy = resolve_publish_policy(repo=repo)
     recall_count = 0
     phase = "implement" if go_direct else "define"
     model_info = _phase_model_kwargs(phase, slug)
@@ -330,14 +360,24 @@ def start_workstream(
             f"- Repository: `{full_repo}` (`{repo_path}`)\n"
             f"- Workstream tenant: `{tenant}`\n"
             f"- Merge policy: `{repo.get('merge_policy', 'auto')}`\n"
+            f"- Publish policy: `{publish_policy}`\n"
             f"- Max fix rounds: `{repo.get('max_fix_rounds', 3)}`\n"
             f"{issue_line}{escape_line}\n"
             f"## Task\n{request.strip()}\n\n"
             f"## Instructions\n"
-            f"Follow the preloaded `factonio:implement` skill. Implement the scoped change in this worktree, "
-            f"run repository tests, push the branch, open a PR against `{repo.get('default_branch', 'main')}`, "
-            f"and record `pr_number`, `published_pr`, `head_sha`, and `repo` in completion metadata.\n"
         )
+        if publish_policy == "ask":
+            card_body += (
+                "Follow the preloaded `factonio:implement` skill, except that publication is replaced by the "
+                "Local-Only Delivery rules below.\n\n"
+                + local_only_delivery_section(str(repo.get("default_branch") or "main"))
+            )
+        else:
+            card_body += (
+                f"Follow the preloaded `factonio:implement` skill. Implement the scoped change in this worktree, "
+                f"run repository tests, push the branch, open a PR against `{repo.get('default_branch', 'main')}`, "
+                f"and record `pr_number`, `published_pr`, `head_sha`, and `repo` in completion metadata.\n"
+            )
         if mode_section:
             card_body += "\n" + mode_section
         skill_name = "factonio:implement"
@@ -438,6 +478,7 @@ def start_workstream(
             "read_only": read_only,
             "escaped_from": escaped_from,
             "completion_contract": contract,
+            "publish_policy": publish_policy,
         },
         result="spawned",
     )
@@ -465,6 +506,7 @@ def start_workstream(
         "holdout_dir": str(holdout_dir),
         "model": model_info["resolved"],
         "completion_contract": contract,
+        "publish_policy": publish_policy,
         "subscribed": subscribed,
         "kind": canon_kind,
         "read_only": read_only,
@@ -640,6 +682,7 @@ def spawn_implementation_card(
     spec_path = spec_file_path(tenant)
     design_dir = _has_design_artifacts(tenant)
     model_info = _phase_model_kwargs("implement", slug)
+    publish_policy = resolve_publish_policy(repo=repo)
     contract = _completion_contract_for_repo(repo)
     design_line = f"- Approved Design directory: `{design_dir}` (treat `DESIGN.md` and previews as binding UI acceptance)\n" if design_dir else ""
     design_barrier_note = f" and `{design_dir}`" if design_dir else ""
@@ -653,13 +696,22 @@ def spawn_implementation_card(
         stack_lines = f"- Target base branch: `{target_base}`\n"
         if stack_parent_pr is not None:
             stack_lines += f"- Stack parent PR: `{full_repo}#{stack_parent_pr}`\n"
-        stack_section = (
-            f"\n## Stacked PR\n"
-            f"This unit stacks on `{target_base}`, not `{default_branch}`. Run `git fetch origin {target_base}`, "
-            f"rebase onto and diff against `origin/{target_base}...HEAD`, and open the PR with "
-            f"`gh pr create --base {target_base}`. After the parent lands, the orchestrator restacks this PR "
-            f"with `factonio_restack_pr`.\n"
-        )
+        if publish_policy == "ask":
+            stack_section = (
+                f"\n## Stacked PR\n"
+                f"This unit stacks on `{target_base}`, not `{default_branch}`. Rebase onto and diff against "
+                f"`{target_base}` locally and report `base_branch: {target_base}`; the orchestrator opens the PR "
+                f"against `{target_base}` with `factonio_publish_pr` after approval.\n"
+            )
+        else:
+            stack_section = (
+                f"\n## Stacked PR\n"
+                f"This unit stacks on `{target_base}`, not `{default_branch}`. Run `git fetch origin {target_base}`, "
+                f"rebase onto and diff against `origin/{target_base}...HEAD`, and open the PR with "
+                f"`gh pr create --base {target_base}`. After the parent lands, the orchestrator restacks this PR "
+                f"with `factonio_restack_pr`.\n"
+            )
+    local_section = "\n" + local_only_delivery_section(target_base) if publish_policy == "ask" else ""
 
     body = (
         f"## Factonio Implementation Card\n"
@@ -669,9 +721,10 @@ def spawn_implementation_card(
         f"{design_line}"
         f"- Default branch: `{repo.get('default_branch', 'main')}`\n"
         f"{stack_lines}"
+        f"- Publish policy: `{publish_policy}`\n"
         f"- Max fix rounds: `{repo.get('max_fix_rounds', 3)}`\n\n"
         f"## Work Unit\n{unit_body.strip()}\n"
-        f"{stack_section}\n"
+        f"{stack_section}{local_section}\n"
         f"## Information Barrier\n"
         f"Read only the repository, `{spec_path}`{design_barrier_note}. Do not search for or read any `holdout/` files.\n"
     )
@@ -721,6 +774,7 @@ def spawn_implementation_card(
             "parents": list(parents or []),
             "design_linked": bool(design_dir),
             "completion_contract": contract,
+            "publish_policy": publish_policy,
             "base_branch": target_base,
             "is_stacked": is_stacked,
             "stack_parent_pr": stack_parent_pr,
@@ -739,6 +793,7 @@ def spawn_implementation_card(
         "repo": full_repo,
         "model": model_info["resolved"],
         "completion_contract": contract,
+        "publish_policy": publish_policy,
         "subscribed": subscribed,
         "base_branch": target_base,
         "is_stacked": is_stacked,
@@ -748,7 +803,7 @@ def spawn_implementation_card(
     }
 
 
-def _format_harness_section(repo_path: str | Path) -> str:
+def _format_harness_section(repo_path: str | Path, *, checkout: str = "the PR head", fallback: str = "the PR") -> str:
     """Black-Box-only card section pointing at the repo's `.factonio/` harness ("" when absent)."""
     try:
         info = discover_harness(repo_path)
@@ -772,8 +827,8 @@ def _format_harness_section(repo_path: str | Path) -> str:
         lines.append(f"- Declared hooks: {rendered}")
     lines += [
         "",
-        f"Read `.factonio/verify.md` (and `.factonio/harness.json` when present) from your fresh checkout of the PR head "
-        f"(fall back to the paths above if the PR does not carry them). Execute its stages in order: {stages}. "
+        f"Read `.factonio/verify.md` (and `.factonio/harness.json` when present) from your fresh checkout of {checkout} "
+        f"(fall back to the paths above if {fallback} does not carry them). Execute its stages in order: {stages}. "
         f"Run every declared hook ({', '.join(HOOK_KINDS)}) or `hermes factonio harness check <repo> --run-doctor "
         f"--run-hooks --json` from the checkout: a failing required hook is a `reject`, a failing optional hook is a "
         f"`disclosed_limits` entry. The harness is a black-box playbook, not implementation source: it does not lift "
@@ -787,15 +842,44 @@ def _diff_card_body(
     full_repo: str,
     repo_path: str,
     pr_ref: str,
-    pr_number: int,
+    pr_number: Optional[int],
     sha_line: str,
     tenant: str,
     spec_path: Path,
     design_dir: Optional[Path],
     panel_line: str = "",
+    local: Optional[dict[str, str]] = None,
 ) -> str:
     # Diff Check: sees spec + approved design (if any) + PR diff; NEVER given holdout_dir.
     design_line = f"- Approved Design directory: `{design_dir}`\n" if design_dir else ""
+    design_note = f" and `{design_dir}`" if design_dir else ""
+    if local is not None:
+        branch, base, sha = local["branch"], local["base_branch"], local["head_sha"]
+        cmds = _local_verify_commands(repo_path, local)
+        return (
+            f"## Factonio Diff Verification Card (local branch target)\n"
+            f"- Repository: `{full_repo}` (`{repo_path}`)\n"
+            f"{_local_target_lines(local)}"
+            f"{sha_line}"
+            f"- Workstream tenant: `{tenant}`\n"
+            f"{panel_line}"
+            f"- Spec: `{spec_path}`\n"
+            f"{design_line}\n"
+            f"## Local Target (unpublished; no pull request)\n"
+            f"1. Confirm this command prints exactly `{sha}` (expected_head_sha). Any other value is a `reject` "
+            f"with finding `head_drift`; never verify a moving tip.\n"
+            f"{_shell_block(cmds['rev_parse'])}"
+            f"2. Audit the diff against `origin/{base}` when that remote-tracking ref exists (fetch it first):\n"
+            f"{_shell_block(cmds['fetch_base'] + chr(10) + cmds['diff_remote'])}"
+            f"   otherwise against `refs/heads/{base}`:\n"
+            f"{_shell_block(cmds['diff_local'])}"
+            f"3. There is no PR: skip `gh pr diff`, `factonio_pr_gate` and GitHub CI. Do not push, create branches "
+            f"or edit the checkout; run probes in a scratch clone.\n\n"
+            f"## Information Barrier\n"
+            f"Audit the local diff against `{spec_path}`{design_note}. "
+            f"Do not inspect any `holdout/` directory. Return structured metadata with `verdict: pass|reject`, "
+            f"`repo: {full_repo}`, `branch: {branch}`, `base_branch: {base}`, `head_sha: {sha}`, and `findings: [...]`.\n"
+        )
     return (
         f"## Factonio Diff Verification Card\n"
         f"- Repository: `{full_repo}` (`{repo_path}`)\n"
@@ -807,7 +891,7 @@ def _diff_card_body(
         f"{design_line}\n"
         f"## Information Barrier\n"
         f"Audit the PR diff (`gh pr diff {pr_number} --repo {full_repo}`) against `{spec_path}`"
-        f"{f' and `{design_dir}`' if design_dir else ''}. "
+        f"{design_note}. "
         f"Do not inspect any `holdout/` directory. Return structured metadata with `verdict: pass|reject`, "
         f"`pr_number: {pr_number}`, `repo: {full_repo}`, and `findings: [...]`.\n"
     )
@@ -818,7 +902,7 @@ def _blackbox_card_body(
     full_repo: str,
     repo_path: str,
     pr_ref: str,
-    pr_number: int,
+    pr_number: Optional[int],
     sha_line: str,
     tenant: str,
     spec_path: Path,
@@ -826,10 +910,38 @@ def _blackbox_card_body(
     holdout_dir: Path,
     hint_section: str,
     panel_line: str = "",
+    local: Optional[dict[str, str]] = None,
 ) -> str:
     # Black-Box Check: sees acceptance criteria + approved design previews (if any) + holdout + built app;
     # FORBIDDEN from reading git diff or source files.
     design_line = f"- Approved Design directory: `{design_dir}`\n" if design_dir else ""
+    design_note = f", comparing rendered UI fidelity against `{design_dir}`" if design_dir else ""
+    if local is not None:
+        branch, base, sha = local["branch"], local["base_branch"], local["head_sha"]
+        cmds = _local_verify_commands(repo_path, local)
+        return (
+            f"## Factonio Black-Box Verification Card (local branch target)\n"
+            f"- Repository: `{full_repo}` (`{repo_path}`)\n"
+            f"{_local_target_lines(local)}"
+            f"{sha_line}"
+            f"- Workstream tenant: `{tenant}`\n"
+            f"{panel_line}"
+            f"- Acceptance spec: `{spec_path}` (read ONLY the Goals & Acceptance Criteria sections)\n"
+            f"{design_line}"
+            f"- Hidden holdout directory: `{holdout_dir}`\n"
+            f"{hint_section}\n"
+            f"## Local Target (unpublished; no pull request)\n"
+            f"Build an isolated scratch checkout of the exact commit from the local repository (no network, no PR):\n"
+            f"{_shell_block(cmds['checkout'])}"
+            f"Confirm `git rev-parse HEAD` prints exactly `{sha}` before running anything; a mismatch is `inconclusive`. "
+            f"Never modify `{repo_path}` or its worktrees, and never push.\n\n"
+            f"## Information Barrier\n"
+            f"Verify observable behavior only by building/running that checkout and executing the acceptance criteria "
+            f"plus every scenario under `{holdout_dir}`{design_note}. "
+            f"NEVER run `git diff`, NEVER inspect diffs, and NEVER read implementation source code. "
+            f"Return structured metadata with `verdict: pass|reject|inconclusive`, `repo: {full_repo}`, "
+            f"`branch: {branch}`, `base_branch: {base}`, `head_sha: {sha}`, `scenarios_run`, and `findings: [...]`.\n"
+        )
     return (
         f"## Factonio Black-Box Verification Card\n"
         f"- Repository: `{full_repo}` (`{repo_path}`)\n"
@@ -844,11 +956,88 @@ def _blackbox_card_body(
         f"## Information Barrier\n"
         f"Verify observable behavior only by building/running the PR branch in a fresh checkout or test harness "
         f"and executing the acceptance criteria plus every scenario under `{holdout_dir}`"
-        f"{f', comparing rendered UI fidelity against `{design_dir}`' if design_dir else ''}. "
+        f"{design_note}. "
         f"NEVER run `git diff`, NEVER inspect PR diffs, and NEVER read implementation source code. "
         f"Return structured metadata with `verdict: pass|reject|inconclusive`, `pr_number: {pr_number}`, "
         f"`repo: {full_repo}`, `scenarios_run`, and `findings: [...]`.\n"
     )
+
+
+def _local_verify_commands(repo_path: str, local: dict[str, str]) -> dict[str, str]:
+    """Runnable shell commands for a local-branch target; every dynamic argument is ``shlex.quote``-d.
+
+    Git ref validation guarantees a well-formed ref, not a shell-safe word: names such as
+    ``feat/x;id`` or ``feat/$(id)`` are valid refs, so quoting is required independently.
+    """
+    q = shlex.quote
+    repo, branch, base, sha = q(str(repo_path)), local["branch"], local["base_branch"], local["head_sha"]
+    return {
+        "rev_parse": f"git -C {repo} rev-parse {q(f'refs/heads/{branch}')}",
+        "fetch_base": f"git -C {repo} fetch origin {q(base)}",
+        "diff_remote": f"git -C {repo} diff {q(f'origin/{base}...{sha}')}",
+        "diff_local": f"git -C {repo} diff {q(f'refs/heads/{base}...{sha}')}",
+        "checkout": f"git clone --no-hardlinks {repo} app && cd app && git checkout --detach {q(sha)}",
+    }
+
+
+def _shell_block(command: str) -> str:
+    longest = max((len(m) for m in re.findall(r"`+", command)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}sh\n{command}\n{fence}\n"
+
+
+def _local_target_lines(local: dict[str, str]) -> str:
+    # The `Local branch target:` stamp is parsed by metrics._local_target_from_body; keep the format stable.
+    return (
+        f"- Local branch target: `{local['branch']}` (base=`{local['base_branch']}`, head=`{local['head_sha']}`)\n"
+        f"- Pull Request: none (unpublished local branch; publish later with `factonio_publish_pr`)\n"
+    )
+
+
+def _validate_local_branch(value: Any, field: str, cwd: Path) -> str:
+    """Strict plain-branch validation for a local verification target (mirrors `repos.publish_pr`)."""
+    from .repos import _require_clean_str, _validate_branch_field, _validate_git_ref_name
+
+    _require_clean_str(value, field)
+    name = _validate_branch_field(value, field)
+    if "`" in name:
+        raise ValueError(f"{field} must not contain backticks; got {value!r}")
+    _validate_git_ref_name(cwd, name, field)
+    return name
+
+
+def _resolve_verify_target(
+    repo: dict[str, Any],
+    pr_number: Any,
+    branch: Any,
+    base_branch: Any,
+    head_sha: Any,
+) -> tuple[Optional[int], Optional[dict[str, str]]]:
+    """Validate the PR-XOR-local-branch verification target; raises ``ValueError`` (fail closed)."""
+    import tempfile
+
+    from .repos import _validate_full_sha, _validate_pr_number
+
+    if pr_number is not None and branch is not None:
+        raise ValueError("Pass either pr_number (PR target) or branch + head_sha (local target), not both.")
+    if pr_number is None and branch is None:
+        raise ValueError("Pass pr_number (PR target) or branch + head_sha (unpublished local branch target).")
+    if pr_number is not None:
+        if base_branch is not None:
+            raise ValueError("base_branch applies only to a local branch target; the PR defines its own base.")
+        return _validate_pr_number(pr_number), None
+
+    repo_dir = Path(str(repo.get("path") or "")).expanduser()
+    cwd = repo_dir if str(repo.get("path") or "") and repo_dir.is_dir() else Path(tempfile.gettempdir())
+    clean_branch = _validate_local_branch(branch, "branch", cwd)
+    sha = _validate_full_sha(head_sha, "head_sha")
+    if base_branch is not None:
+        target_base = _validate_local_branch(base_branch, "base_branch", cwd)
+    else:
+        target_base = _validate_local_branch(str(repo.get("default_branch") or "main"), "default_branch", cwd)
+    if clean_branch == target_base:
+        raise ValueError(f"branch {clean_branch!r} must differ from the target base branch {target_base!r}.")
+    return None, {"branch": clean_branch, "base_branch": target_base, "head_sha": sha}
 
 
 _PANEL_LANE_NOTE = (
@@ -873,8 +1062,10 @@ def _panel_card_line(panel_id: str, entry: dict[str, Any]) -> str:
 def spawn_verification_pair(
     repo_spec: str,
     tenant: str,
-    pr_number: int,
+    pr_number: Optional[int] = None,
     *,
+    branch: Optional[str] = None,
+    base_branch: Optional[str] = None,
     impl_card_id: Optional[str] = None,
     head_sha: Optional[str] = None,
     run_hint: Optional[str] = None,
@@ -889,6 +1080,13 @@ def spawn_verification_pair(
     ``"high"`` resolves a multi-vendor ``verify_panel`` and spawns one Diff + Black-Box pair per
     panel member, tagged with a shared ``panel_id``; it raises ``ValueError`` (fail closed) when the
     panel has fewer than 2 members or fewer than 2 distinct known vendor families.
+
+    The target is either a PR (``pr_number``) or, for ``publish_policy: ask``, an unpublished local
+    branch (``branch`` + full ``head_sha``, optional ``base_branch`` defaulting to the repo's default
+    branch). Passing both, neither, a local target without a full SHA, an invalid branch ref, or
+    ``branch == base`` raises ``ValueError`` before any card is created. Local cards verify the exact
+    local commit (Diff: ``git diff <base_ref>...<head_sha>``; Black-Box: a ``--no-hardlinks`` clone
+    detached at ``head_sha``) with the same barriers and panel fan-out as PR cards.
     """
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
@@ -897,6 +1095,9 @@ def spawn_verification_pair(
     if repo is None:
         raise ValueError(f"Repository {repo_spec!r} is not registered with Factonio.")
 
+    pr, local = _resolve_verify_target(repo, pr_number, branch, base_branch, head_sha)
+    if local is not None:
+        head_sha = local["head_sha"]
     slug = str(repo["slug"])
     effective_rigor = resolve_rigor(repo_slug=slug, override=rigor)
     panel: Optional[dict[str, Any]] = None
@@ -912,20 +1113,37 @@ def spawn_verification_pair(
     design_dir = _has_design_artifacts(tenant)
     parents = [impl_card_id] if impl_card_id else []
     sha_line = f"- Expected HEAD SHA: `{head_sha}`\n" if head_sha else ""
-    pr_ref = f"{full_repo}#{int(pr_number)}"
+    pr_ref = f"{full_repo}@{local['branch']}" if local else f"{full_repo}#{pr}"
     common = {
         "full_repo": full_repo,
         "repo_path": repo_path,
         "pr_ref": pr_ref,
-        "pr_number": int(pr_number),
+        "pr_number": pr,
         "sha_line": sha_line,
         "tenant": tenant,
         "spec_path": spec_path,
         "design_dir": design_dir,
+        "local": local,
     }
+    target_info: dict[str, Any] = {
+        "target_mode": "local" if local else "pr",
+        "branch": local["branch"] if local else None,
+        "base_branch": local["base_branch"] if local else None,
+        "head_sha": head_sha,
+    }
+    target_why = (
+        f"Local branch {local['branch']} (base {local['base_branch']}) at {local['head_sha'][:12]}"
+        if local
+        else f"PR #{pr} opened" + (f" at {head_sha[:12]}" if head_sha else "")
+    )
 
     hint_section = f"\n## Run / Target Hint\n{run_hint.strip()}\n" if run_hint else ""
-    harness_section = _format_harness_section(repo_path)
+    if local:
+        harness_section = _format_harness_section(
+            repo_path, checkout=f"`{local['head_sha']}`", fallback="that commit"
+        )
+    else:
+        harness_section = _format_harness_section(repo_path)
     harness_path = str(Path(repo_path) / HARNESS_DIR_NAME / VERIFY_MD_NAME) if harness_section else None
     if harness_section:
         hint_section += f"\n{harness_section}"
@@ -977,10 +1195,10 @@ def spawn_verification_pair(
             repo_slug=slug,
             phase="verify",
             card_id=impl_card_id or "",
-            why=f"PR #{int(pr_number)} opened" + (f" at {head_sha[:12]}" if head_sha else ""),
+            why=target_why,
             evidence={
-                "pr_number": int(pr_number),
-                "head_sha": head_sha,
+                "pr_number": pr,
+                **target_info,
                 "verify_diff_task_id": diff_id,
                 "verify_blackbox_task_id": bb_id,
                 "harness_present": bool(harness_section),
@@ -993,7 +1211,8 @@ def spawn_verification_pair(
             "ok": True,
             "tenant": tenant,
             "repo": full_repo,
-            "pr_number": int(pr_number),
+            "pr_number": pr,
+            **target_info,
             "verify_diff_task_id": diff_id,
             "verify_blackbox_task_id": bb_id,
             "diff_model": diff_model["resolved"],
@@ -1059,11 +1278,10 @@ def spawn_verification_pair(
         repo_slug=slug,
         phase="verify",
         card_id=impl_card_id or "",
-        why=f"PR #{int(pr_number)} opened" + (f" at {head_sha[:12]}" if head_sha else "")
-        + f"; high-rigor panel {panel_id} ({', '.join(panel['vendors'])})",
+        why=target_why + f"; high-rigor panel {panel_id} ({', '.join(panel['vendors'])})",
         evidence={
-            "pr_number": int(pr_number),
-            "head_sha": head_sha,
+            "pr_number": pr,
+            **target_info,
             "verify_diff_task_id": lanes[0]["verify_diff_task_id"],
             "verify_blackbox_task_id": lanes[0]["verify_blackbox_task_id"],
             "harness_present": bool(harness_section),
@@ -1083,7 +1301,8 @@ def spawn_verification_pair(
         "ok": True,
         "tenant": tenant,
         "repo": full_repo,
-        "pr_number": int(pr_number),
+        "pr_number": pr,
+        **target_info,
         "verify_diff_task_id": lanes[0]["verify_diff_task_id"],
         "verify_blackbox_task_id": lanes[0]["verify_blackbox_task_id"],
         "diff_model": lanes[0]["model_resolved"],
@@ -1163,27 +1382,40 @@ def evaluate_verification_panel(
     panel_id: Optional[str] = None,
     tenant: Optional[str] = None,
     pr_number: Optional[int] = None,
+    branch: Optional[str] = None,
     board: Optional[str] = None,
     record_trail: bool = True,
 ) -> dict[str, Any]:
     """Aggregate a high-rigor panel's lanes from `kanban.db` (read-only) into a fail-closed consensus.
 
     Selects the panel by ``panel_id`` or, failing that, the most recent panel matching ``tenant``
-    and/or ``pr_number``. When ``record_trail`` and the consensus is terminal (pass, reject,
+    and/or ``pr_number`` (or a local ``branch`` target). When ``record_trail`` and the consensus is terminal (pass, reject,
     inconclusive), logs ``verify_panel_consensus`` to `trail.db` (once per identical outcome).
     """
     pid = str(panel_id or "").strip() or None
-    if pid is None and not tenant and pr_number is None:
-        raise ValueError("Pass panel_id, or tenant and/or pr_number, to select a verification panel.")
+    if branch is not None and (not isinstance(branch, str) or not branch.strip()):
+        raise ValueError(f"branch must be a non-empty branch name; got {branch!r}")
+    branch_filter = branch.strip() if isinstance(branch, str) else None
+    if branch_filter is not None and pr_number is not None:
+        raise ValueError("Pass either pr_number or branch to select a verification panel, not both.")
+    if pid is None and not tenant and pr_number is None and branch_filter is None:
+        raise ValueError("Pass panel_id, or tenant, pr_number and/or branch, to select a verification panel.")
     grouped = load_panel_lanes(
         _kanban_db_file(board),
         panel_ids=[pid] if pid else None,
         tenant=tenant or None,
         pr_number=int(pr_number) if pr_number is not None else None,
+        branch=branch_filter,
     )
     if not grouped:
         target = pid or ", ".join(
-            x for x in (f"tenant={tenant}" if tenant else "", f"pr={pr_number}" if pr_number is not None else "") if x
+            x
+            for x in (
+                f"tenant={tenant}" if tenant else "",
+                f"pr={pr_number}" if pr_number is not None else "",
+                f"branch={branch_filter}" if branch_filter is not None else "",
+            )
+            if x
         )
         return {"ok": False, "error": f"No verification panel found for {target}.", "panel_id": pid}
 
@@ -1205,15 +1437,20 @@ def evaluate_verification_panel(
         decision_id = _already_recorded(summary["panel_id"], summary.get("tenant"), summary["consensus"], fingerprint)
         if decision_id is None:
             pr = summary.get("pr") or {}
+            local = summary.get("local_target") or {}
+            local_evidence = (
+                {k: local.get(k) for k in ("branch", "base_branch", "head_sha")} if local else {}
+            )
             row = record_transition(
                 "verify_panel_consensus",
                 tenant=summary.get("tenant") or tenant or "",
-                repo_slug=str(pr.get("repo") or ""),
+                repo_slug=str(pr.get("repo") or local.get("repo") or ""),
                 phase="verify",
                 why=(summary.get("disagreement_summary") or summary["reason"])[:500],
                 evidence={
                     "panel_id": summary["panel_id"],
                     "pr_number": pr.get("number"),
+                    **local_evidence,
                     "vendors": summary["vendors"],
                     "lanes": [
                         {k: lane.get(k) for k in ("task_id", "phase", "vendor", "model", "status", "verdict")}
@@ -1233,15 +1470,17 @@ def evaluate_verification_panel(
     snapshot_id: Optional[str] = None
     if recorded:
         pr = summary.get("pr") or {}
+        local = summary.get("local_target") or {}
         snapshot = capture_metrics_snapshot(
             _kanban_db_file(board),
             source="panel_consensus",
-            repo_slug=str(pr.get("repo") or ""),
+            repo_slug=str(pr.get("repo") or local.get("repo") or ""),
             tenant=summary.get("tenant") or tenant or "",
             extra={
                 "panel_id": summary["panel_id"],
                 "consensus": summary["consensus"],
                 "pr_number": pr.get("number"),
+                "branch": local.get("branch"),
                 "has_disagreement": summary["has_disagreement"],
                 "decision_id": decision_id,
             },
@@ -1256,6 +1495,14 @@ def evaluate_verification_panel(
         "decision_id": decision_id,
         "metrics_snapshot_id": snapshot_id,
     }
+
+
+def _settings_publish_policy() -> dict[str, Any]:
+    """Global ``default_publish_policy`` for status; an invalid value surfaces as an error, never ``auto``."""
+    try:
+        return {"settings_publish_policy": resolve_default_publish_policy()}
+    except ValueError as exc:
+        return {"settings_publish_policy": None, "settings_publish_policy_error": str(exc)}
 
 
 def workstream_status(
@@ -1283,6 +1530,7 @@ def workstream_status(
         "ok": True,
         "tenant": tenant,
         "settings_merge_policy": load_settings(use_root=True).get("default_merge_policy", "auto"),
+        **_settings_publish_policy(),
         **data,
         "panels": panels,
     }

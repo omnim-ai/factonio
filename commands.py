@@ -187,12 +187,26 @@ def _print_harness(action: str, res: dict[str, Any]) -> None:
         print(f"  -> {rec}")
 
 
+def _target_badge(item: dict[str, Any]) -> str:
+    """``owner/repo#N`` for a PR target, ``owner/repo@branch`` for an unpublished local branch, else ``""``."""
+    pr = item.get("pr") or {}
+    if pr:
+        return f"{pr.get('repo')}#{pr.get('number')}"
+    local = item.get("local_target") or {}
+    if local:
+        return f"{local.get('repo') or ''}@{local.get('branch')}"
+    return ""
+
+
 def _print_panel(res: dict[str, Any]) -> None:
-    pr = res.get("pr") or {}
-    pr_label = f" {pr.get('repo')}#{pr.get('number')}" if pr else ""
+    badge = _target_badge(res)
+    pr_label = f" {badge}" if badge else ""
     merge = "merge allowed" if res.get("merge_allowed") else "merge blocked"
     print(f"{str(res['consensus']).upper()}: panel {res['panel_id']}{pr_label} ({merge})")
     print(f"  Vendors: {', '.join(res.get('vendors') or []) or '-'} | {res.get('reason')}")
+    local = res.get("local_target") or {}
+    if local:
+        print(f"  Local target: {local.get('branch')} (base {local.get('base_branch') or '-'}) at {local.get('head_sha')}")
     for lane in res.get("lanes") or []:
         verdict = lane.get("verdict") or "-"
         print(f"  {lane.get('task_id')} | {lane.get('status'):<8} | {lane.get('phase'):<15} | {lane.get('vendor')} ({lane.get('model')}) -> {verdict}")
@@ -542,6 +556,9 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
         p_panel.add_argument("--tenant", default=None, help="Workstream tenant (latest panel when panel_id is omitted).")
         p_panel.add_argument("--pr", dest="pr_number", type=int, default=None, help="PR number filter.")
         p_panel.add_argument(
+            "--branch", default=None, help="Unpublished local branch target filter (publish_policy: ask)."
+        )
+        p_panel.add_argument(
             "--record",
             action="store_true",
             help="Record a terminal consensus as verify_panel_consensus in trail.db.",
@@ -579,6 +596,12 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
 
         p_status = sub.add_parser("status", help="Show active Factonio Kanban workstreams and cards.")
         p_status.add_argument("--tenant", default=None, help="Filter by workstream tenant.")
+        p_status.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Output machine-readable JSON.",
+        )
 
         p_pr = sub.add_parser("pr-gate", help="Inspect a GitHub PR's live HEAD and CI check status.")
         p_pr.add_argument("repo", help="Repo slug or 'owner/repo'.")
@@ -993,6 +1016,7 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                     panel_id=args.panel_id,
                     tenant=args.tenant,
                     pr_number=args.pr_number,
+                    branch=args.branch,
                     record_trail=bool(args.record),
                 )
             except ValueError as exc:
@@ -1042,13 +1066,18 @@ def register_cli(ctx: Any, plugin_dir: Path) -> None:
                 return
             c = res["counts"]
             print(f"Factonio cards: running={c['running']} ready={c['ready']} blocked={c['blocked']} triage={c['triage']} done={c['done']}")
+            if res.get("settings_publish_policy_error"):
+                print(f"Warning: {res['settings_publish_policy_error']}")
             for card in res["cards"][:20]:
-                pr = f" [{card['pr']['repo']}#{card['pr']['number']}]" if card.get("pr") else ""
-                print(f"  {card['id']} | {card['status']:<7} | {card['phase']:<15} | {card['title']}{pr}")
+                badge = _target_badge(card)
+                target = f" [{badge}]" if badge else ""
+                print(f"  {card['id']} | {card['status']:<7} | {card['phase']:<15} | {card['title']}{target}")
             for panel_summary in res.get("panels") or []:
+                badge = _target_badge(panel_summary)
                 print(
                     f"  Panel {panel_summary['panel_id']}: {panel_summary['consensus']}"
                     f" ({panel_summary['completed_count']}/{panel_summary['lane_count']} lanes done)"
+                    + (f" [{badge}]" if badge else "")
                 )
             return
 

@@ -403,6 +403,7 @@ class TestPanelSpawn(unittest.TestCase):
     STANDARD_KEYS = {
         "ok", "tenant", "repo", "pr_number", "verify_diff_task_id", "verify_blackbox_task_id", "diff_model",
         "blackbox_model", "subscribed", "harness_present", "harness_path",
+        "target_mode", "branch", "base_branch", "head_sha",
     }
 
     def test_standard_rigor_unchanged(self):

@@ -449,10 +449,13 @@ def register_tools(ctx: Any) -> None:
 
     def handle_spawn_verify(args: dict[str, Any], **kwargs: Any) -> str:
         try:
+            # Target fields pass through raw so spawn_verification_pair fails closed on bad input.
             res = spawn_verification_pair(
                 str(args["repo"]),
                 str(args["tenant"]),
-                int(args["pr_number"]),
+                args.get("pr_number"),
+                branch=args.get("branch"),
+                base_branch=args.get("base_branch"),
                 impl_card_id=args.get("impl_card_id"),
                 head_sha=args.get("head_sha"),
                 run_hint=args.get("run_hint"),
@@ -472,6 +475,8 @@ def register_tools(ctx: Any) -> None:
             "description": (
                 "Spawn Factonio's two isolated parallel Verification cards for a PR: Diff Check (spec + git diff, "
                 "no holdout) and Black-Box Check (built artifact + holdout, no diff), both using the Verification model. "
+                "Target either pr_number OR (publish_policy: ask) an unpublished local branch via branch + full head_sha "
+                "(+ optional base_branch); passing both, neither, or a branch without a full SHA fails closed. "
                 "rigor='high' (or the repo's default_rigor) instead fans out one Diff + Black-Box pair per member of a "
                 "multi-vendor verify panel under a shared panel_id, failing closed unless the panel spans >= 2 vendor "
                 "families; aggregate the lanes with factonio_evaluate_panel."
@@ -481,9 +486,23 @@ def register_tools(ctx: Any) -> None:
                 "properties": {
                     "repo": {"type": "string", "description": "Registered repo slug or 'owner/repo'."},
                     "tenant": {"type": "string", "description": "Workstream tenant slug."},
-                    "pr_number": {"type": "integer", "description": "GitHub pull request number."},
+                    "pr_number": {
+                        "type": "integer",
+                        "description": "GitHub pull request number (PR target; mutually exclusive with branch).",
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Unpublished local branch to verify (local target; requires a full head_sha).",
+                    },
+                    "base_branch": {
+                        "type": "string",
+                        "description": "Local target only: base branch to diff against (default: repo default branch).",
+                    },
                     "impl_card_id": {"type": "string", "description": "Optional parent Implementation card id."},
-                    "head_sha": {"type": "string", "description": "Expected PR HEAD commit SHA."},
+                    "head_sha": {
+                        "type": "string",
+                        "description": "Expected HEAD commit SHA (PR head, or the required full 40/64-hex local branch SHA).",
+                    },
                     "run_hint": {"type": "string", "description": "Optional build/run/preview command hint for Black-Box Check."},
                     "rigor": {
                         "type": "string",
@@ -509,7 +528,7 @@ def register_tools(ctx: Any) -> None:
                         "description": "rigor=high: explicit panel members overriding the configured verify_panel.",
                     },
                 },
-                "required": ["repo", "tenant", "pr_number"],
+                "required": ["repo", "tenant"],
             },
         },
         handler=handle_spawn_verify,
@@ -522,6 +541,7 @@ def register_tools(ctx: Any) -> None:
                 panel_id=args.get("panel_id") or None,
                 tenant=args.get("tenant") or None,
                 pr_number=int(pr_number) if pr_number is not None else None,
+                branch=args.get("branch"),
                 record_trail=bool(args.get("record", True)),
             )
             return _json_ok(res)
@@ -545,6 +565,10 @@ def register_tools(ctx: Any) -> None:
                     "panel_id": {"type": "string", "description": "Panel id (vp_...) from factonio_spawn_verify."},
                     "tenant": {"type": "string", "description": "Workstream tenant (latest panel when panel_id is omitted)."},
                     "pr_number": {"type": "integer", "description": "PR number (latest panel when panel_id is omitted)."},
+                    "branch": {
+                        "type": "string",
+                        "description": "Local branch target filter (latest local-branch panel when panel_id is omitted).",
+                    },
                     "record": {
                         "type": "boolean",
                         "default": True,
