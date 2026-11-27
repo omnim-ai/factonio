@@ -1656,7 +1656,7 @@ def _merge_baseline_changes(*groups: list[dict[str, Any]]) -> list[dict[str, Any
 
 
 _REGEN_FLAGS = frozenset({
-    "-u", "--update", "--update-snapshots", "--update-snapshot", "--updatesnapshot", "--snapshot-update",
+    "-u", "-update", "--update", "--update-snapshots", "--update-snapshot", "--updatesnapshot", "--snapshot-update",
     "--update-baseline", "--update-baselines", "--regenerate", "--regen", "--update-goldens", "--update-golden",
     "--overwrite-baselines", "--force-update-snapshots", "--accept", "--accept-snapshots",
 })
@@ -1684,8 +1684,39 @@ def _is_shell_op(tok: str) -> bool:
     return bool(tok) and all(ch in _SHELL_PUNCT for ch in tok)
 
 
+def _strip_shell_comments(text: str) -> str:
+    """Drop POSIX comments: an unquoted `#` starting a word, up to (not including) the next newline. A mid-word
+    `#` (`foo#bar`, `--color=#fff`) and a quoted or escaped one are literal."""
+    out: list[str] = []
+    quote: Optional[str] = None
+    word_start = True
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote == "'":
+            quote = None if ch == "'" else quote
+        elif ch == "\\" and i + 1 < n:
+            out.append(text[i:i + 2])
+            i, word_start = i + 2, False
+            continue
+        elif quote == '"':
+            quote = None if ch == '"' else quote
+        elif ch == "#" and word_start:
+            end = text.find("\n", i)
+            i = n if end < 0 else end
+            continue
+        elif ch in "'\"":
+            quote = ch
+        out.append(ch)
+        word_start = quote is None and (ch in " \t\r" or ch in _SHELL_PUNCT)
+        i += 1
+    return "".join(out)
+
+
 def _split_shell(text: str) -> list[str]:
-    """POSIX words with shell operators (`;`, `&&`, `|`, `(`, `)`, ...) split into their own tokens."""
+    """POSIX words with shell operators (`;`, `&&`, `|`, `(`, `)`, ...) split into their own tokens; comments
+    are dropped."""
+    text = _strip_shell_comments(text)
     lexer = shlex.shlex(text, posix=True, punctuation_chars="();<>|&\n")
     lexer.whitespace_split = True
     lexer.whitespace = " \t\r"  # an unquoted newline separates commands like `;`
@@ -1908,7 +1939,7 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
                 has_c = has_c or "c" in opt[1:]
                 # every `o`/`O` in a cluster takes the next word: `-euo pipefail`, `-oc pipefail SCRIPT`
                 j = min(len(tokens), j + sum(ch in "oO" for ch in opt[1:]))
-            if j < len(tokens) and tokens[j] == "--":
+            if j < len(tokens) and tokens[j] in ("--", "-"):  # POSIX: a lone `-` also ends the options
                 j += 1
             if has_c and j < len(tokens):
                 out.extend([";", *_unwrap_shell_scripts(_split_shell(tokens[j]), depth + 1), ";"])
@@ -1916,7 +1947,11 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
                 # of a non-exempt placeholder command rather than letting `$0` pose as an exempt command head.
                 end = next((k for k in range(j + 1, len(tokens)) if _is_shell_op(tokens[k])), len(tokens))
                 if end > j + 1:
-                    out.extend([_SH_ARGS_HEAD, *tokens[j + 1:end]])
+                    out.append(_SH_ARGS_HEAD)
+                    for arg in tokens[j + 1:end]:
+                        # an unquoted `$0`/`$@` is field-split, so `'python3 check.py -u'` delivers its words
+                        words = _split_shell(arg)
+                        out.extend([arg] if words == [arg] else _unwrap_shell_scripts(words, depth + 1))
                 at_head, i = False, end
                 continue
         out.append(tok)
@@ -2018,7 +2053,7 @@ def _shell_args_start(seg: list[str], i: int) -> int:
             i += 2 if seg[i] in _SHELL_LONG_VALUE_OPTS else 1
         else:
             i += 1 + sum(ch in "oO" for ch in seg[i][1:])  # `-ou errexit`: one word per `o`/`O`
-    if i < len(seg) and seg[i] == "--":
+    if i < len(seg) and seg[i] in ("--", "-"):
         i += 1
     return i + 1
 
@@ -2050,7 +2085,7 @@ def _regen_flags(tokens: list[str]) -> set[str]:
                 flag = flag.lower()
             elif not short_ok:
                 continue
-            if flag not in _REGEN_FLAGS and not _grouped_update(flag, eq):
+            if flag not in _REGEN_FLAGS and not _grouped_update(flag, eq, name):
                 continue
             if not eq and flag in _REGEN_MODE_FLAGS and _value_after(seg, i) is not None:
                 if seg[i + 1].strip().lower() in _REGEN_DISABLED:
@@ -2061,10 +2096,20 @@ def _regen_flags(tokens: list[str]) -> set[str]:
     return found
 
 
-def _grouped_update(flag: str, eq: str) -> bool:
+# CLIs whose single-dash options are long words (`go test -run`, `compare -fuzz`), never bundled short flags.
+_SINGLE_DASH_LONG_CLIS = frozenset({"go", "compare", "magick", "convert", "ffmpeg", "find", "java"})
+_SINGLE_DASH_WORDS = frozenset({
+    "run", "count", "timeout", "cpu", "quiet", "out", "output", "url", "user", "num", "full", "debug", "auto",
+    "suite", "summary", "junit", "sub", "module", "include", "exclude",
+})
+
+
+def _grouped_update(flag: str, eq: str, name: str = "") -> bool:
     """A bundled short-option cluster carrying `-u` (`-vu`, `-uv`), which argparse-style CLIs expand."""
-    return (not eq and not flag.startswith("--") and len(flag) > 2 and flag[1:].isalpha()
-            and "u" in flag[1:])
+    word = flag[1:]
+    return (not eq and not flag.startswith("--") and len(flag) > 2 and word.isalpha() and "u" in word
+            and not _THRESHOLD_KEY_RE.search(word) and name not in _SINGLE_DASH_LONG_CLIS
+            and word.lower() not in _SINGLE_DASH_WORDS)
 
 
 # A finite threshold as (value, given in `%`); a percentage is stored as its ratio (`5%` -> 0.05).
@@ -2136,7 +2181,8 @@ def _threshold_segments(tokens: list[str]) -> list[tuple[tuple[str, ...], _Occur
 
 def _compare_thresholds(key: str, base_vals: list[_Threshold], live_vals: list[_Threshold],
                         where: str) -> list[str]:
-    """Reasons ``live_vals`` loosen ``base_vals`` (positional, with any extra occurrence capped by the base max)."""
+    """Reasons ``live_vals`` loosen ``base_vals`` (positional, with any extra occurrence capped by the strictest
+    base value, which is the effective bar under both last-wins and strictest-wins semantics)."""
     if not base_vals:
         return []
     base_s, live_s = ", ".join(map(_fmt_threshold, base_vals)), ", ".join(map(_fmt_threshold, live_vals))
@@ -2146,8 +2192,8 @@ def _compare_thresholds(key: str, base_vals: list[_Threshold], live_vals: list[_
     if len(live_vals) < len(base_vals):
         reasons.append(f"removes {len(base_vals) - len(live_vals)} of {len(base_vals)} `{key}` threshold(s) "
                        f"({base_s} -> {live_s}){where}")
-    top = max(base_vals, key=lambda t: t[0])
-    pairs = [*zip(base_vals, live_vals), *((top, c) for c in live_vals[len(base_vals):])]
+    bar = min(base_vals, key=lambda t: t[0])
+    pairs = [*zip(base_vals, live_vals), *((bar, c) for c in live_vals[len(base_vals):])]
     if any(_unit_ambiguous(c, b) for b, c in pairs):
         reasons.append(f"changes threshold `{key}` unit from {base_s} to {live_s}{where} (`%` against a plain "
                        "value above 1 cannot be ordered)")
@@ -2159,7 +2205,10 @@ def _compare_thresholds(key: str, base_vals: list[_Threshold], live_vals: list[_
 def _is_env_modifier(sig: tuple[str, ...]) -> bool:
     """A bare `VAR=val`, `export`/`declare`/... or `sh -c` argument segment: it feeds every check rather than
     being an independent check with its own bar."""
-    return not sig or sig[0] == _SH_ARGS_HEAD or _system_name(sig[0]) in _ENV_BUILTINS
+    k = 0
+    while k < len(sig) and _ENV_ASSIGN_RE.match(sig[k]):
+        k += 1  # `CI=1 export THRESHOLD=0.5`, `CI=1 THRESHOLD=0.5`
+    return k == len(sig) or sig[k] == _SH_ARGS_HEAD or _system_name(sig[k]) in _ENV_BUILTINS
 
 
 def _threshold_loosening(base_tokens: list[str], live_tokens: list[str]) -> list[str]:
@@ -2393,6 +2442,12 @@ def detect_harness_gate_loosening(repo_path: str | Path, base_ref: Optional[str]
             result["findings"].extend(
                 f"Gate loosening: visual_diff hook {name!r} {why} (vs {short})" for why in reasons
             )
+    # A live hook may freeze more files than the committed one (or be new): its existing baselines count too.
+    for hook in live_hooks:
+        name = str(hook.get("name") or "").strip() if isinstance(hook, dict) else ""
+        globs = _frozen_baseline_globs(hook) if name else []
+        if globs:
+            frozen[name] = list(dict.fromkeys([*frozen.get(name, []), *globs]))
     result["visual_baseline_changes"] = _frozen_baseline_changes(root, frozen, sha)
     for change in result["visual_baseline_changes"]:
         files = ", ".join(change["changed_files"][:5])

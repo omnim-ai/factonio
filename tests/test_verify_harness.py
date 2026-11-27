@@ -2973,5 +2973,192 @@ class TestFixRound8GroupedFlagsEnvDashShellClustersAndEnvOrder(unittest.TestCase
                                 ["export THRESHOLD=0.01; export THRESHOLD=0.9; python3 check.py a"], [exported])
 
 
+class TestFixRound9LiveFrozenShellArgsWordFlagsCommentsAndOverrides(unittest.TestCase):
+    """Live-declared frozen baselines, field-split `sh -c` positional args, `sh -c -`, single-dash word options,
+    leading `VAR=val` before `export`, trailing threshold overrides and POSIX `#` comments."""
+
+    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_cases = TestFixRound4CompoundThresholdsAndShortFlags._assert_cases
+    _assert_end_to_end = TestFixRound7TargetAwareThresholdsUnitsEnvAndShellArgs._assert_end_to_end
+
+    # last `--threshold` wins (argparse), `$THRESHOLD` is the default, unknown words such as `||` are ignored
+    _CHECK = ("import argparse, os, sys\n"
+              "p = argparse.ArgumentParser()\n"
+              "p.add_argument('-u', action='store_true')\n"
+              "p.add_argument('-v', action='store_true')\n"
+              "p.add_argument('--threshold', type=float, default=float(os.environ.get('THRESHOLD', '0.01')))\n"
+              "a, _ = p.parse_known_args()\n"
+              "sys.exit(0 if a.u or a.threshold >= 0.25 else 1)\n")
+
+    @staticmethod
+    def _repo_without_visual_hook(home: Path) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        bootstrap_verify_harness(str(repo), hooks=[{"name": "lint", "kind": "invariant", "command": "true"}])
+        _commit_all(repo, "harness + committed baseline image")
+        return repo
+
+    @staticmethod
+    def _add_live_visual_hook(repo: Path, command: str, **meta: Any) -> None:
+        hj = repo / ".factonio" / "harness.json"
+        manifest = json.loads(hj.read_text(encoding="utf-8"))
+        manifest["hooks"].append({"name": "pixels", "kind": "visual_diff", "command": command,
+                                  "baseline_paths": ["snapshots/**"], **meta})
+        hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    def test_live_added_frozen_hook_protects_existing_committed_baselines(self):
+        from factonio.harness import audit_harness, check_harness, detect_harness_gate_loosening
+
+        for meta in ({}, {"frozen_baseline": True}):
+            with self.subTest(meta=meta), isolated_hermes_home() as home:
+                repo = self._repo_without_visual_hook(home)
+                self._add_live_visual_hook(repo, "true", **meta)
+                clean = check_harness(str(repo), run_hooks=True)
+                self.assertTrue(clean["valid"], clean["errors"])
+                self.assertEqual(clean["visual_baseline_changes"], [])
+
+                _write(repo, "snapshots/home.png", "png-tampered\n")
+                gate = detect_harness_gate_loosening(repo)
+                self.assertEqual(gate["visual_baseline_changes"], [
+                    {"name": "pixels", "baseline_paths": ["snapshots/**"], "changed_files": ["snapshots/home.png"]}
+                ])
+                chk = check_harness(str(repo), run_hooks=True)
+                self.assertFalse(chk["valid"])
+                self.assertEqual(chk["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+                self.assertEqual(audit_harness(str(repo))["visual_baseline_changes"][0]["changed_files"],
+                                 ["snapshots/home.png"])
+                _git(repo, "checkout", "--", "snapshots/home.png")
+
+                # a hook that regenerates the existing image while it runs is caught by the post-hook re-check
+                hj = repo / ".factonio" / "harness.json"
+                manifest = json.loads(hj.read_text(encoding="utf-8"))
+                manifest["hooks"][-1]["command"] = "printf regen > snapshots/home.png"
+                hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+                self.assertFalse(detect_harness_gate_loosening(repo)["loosened"])
+                post = check_harness(str(repo), run_hooks=True)
+                self.assertEqual(post["hook_results"]["failed_required"], [])
+                self.assertFalse(post["valid"])
+                self.assertEqual(post["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+
+    def test_live_added_frozen_hook_allows_brand_new_baselines_and_unfrozen_hooks(self):
+        from factonio.harness import check_harness, detect_harness_gate_loosening
+
+        with isolated_hermes_home() as home:
+            repo = self._repo_without_visual_hook(home)
+            self._add_live_visual_hook(repo, "printf new > snapshots/new-screen.png")
+            _write(repo, "snapshots/other.png", "png-new\n")
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertTrue((repo / "snapshots" / "new-screen.png").exists())
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual(chk["visual_baseline_changes"], [])
+        with isolated_hermes_home() as home:
+            repo = self._repo_without_visual_hook(home)
+            self._add_live_visual_hook(repo, "true", frozen_baseline=False)
+            _write(repo, "snapshots/home.png", "png-regenerated\n")
+            self.assertFalse(detect_harness_gate_loosening(repo)["loosened"])
+            self.assertTrue(check_harness(str(repo), run_hooks=True)["valid"])
+
+    def test_live_hook_cannot_unfreeze_or_drop_committed_frozen_globs(self):
+        from factonio.harness import check_harness
+
+        with isolated_hermes_home() as home:
+            repo = self._visual_repo(home, "true")
+            _write(repo, "snapshots/home.png", "png-tampered\n")
+            for meta in ({"frozen_baseline": False}, {"baseline_paths": ["other/**"]}):
+                with self.subTest(meta=meta):
+                    hj = repo / ".factonio" / "harness.json"
+                    manifest = json.loads(hj.read_text(encoding="utf-8"))
+                    manifest["hooks"][0].update({"baseline_paths": ["snapshots/**"], "frozen_baseline": True, **meta})
+                    hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+                    chk = check_harness(str(repo))
+                    self.assertFalse(chk["valid"])
+                    self.assertEqual(chk["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+
+    def test_sh_c_positional_args_are_field_split(self):
+        loosening = ["sh -c '$0' 'python3 check.py -u'", "sh -c '$1' sh 'python3 check.py -u'",
+                     "sh -c '$0' 'python3 check.py --threshold 0.99'", "bash -c '$0' 'python3 check.py -u'",
+                     "sh -c 'python3 check.py \"$@\"' sh -u"]
+        cases = {live: ("python3 check.py", live, True) for live in loosening}
+        cases.update({
+            "$0 || fallback": ("python3 check.py", "sh -c '$0' 'python3 check.py || true'", True),
+            "nested sh -c in $0": ("python3 check.py", "sh -c '$0' 'sh -c \"python3 check.py -u\"'", True),
+            "$0 plain": ("python3 check.py", "sh -c '$0' 'python3 check.py'", False),
+            "$0 = sh": ("python3 check.py", "sh -c 'python3 check.py \"$@\"' sh", False),
+        })
+        self._assert_cases(cases)
+        self._assert_end_to_end(self._CHECK, "python3 check.py", loosening, ["sh -c '$0' 'python3 check.py'"])
+
+    def test_lone_dash_ends_shell_options(self):
+        loosening = ["sh -c - 'python3 check.py -u'", "sh -c - 'python3 check.py --threshold 0.99'",
+                     "sh -c - 'python3 check.py || true'", "bash -c - 'python3 check.py -u'"]
+        cases = {live: ("python3 check.py", live, True) for live in loosening}
+        cases["sh -c - plain"] = ("python3 check.py", "sh -c - 'python3 check.py'", False)
+        cases["sh - script args"] = ("python3 check.py", "sh - check.sh -v", False)
+        self._assert_cases(cases)
+        self._assert_end_to_end(self._CHECK, "python3 check.py", loosening, ["sh -c - 'python3 check.py'"])
+
+    def test_single_dash_word_options_are_not_bundled_update_flags(self):
+        from factonio.harness import _command_tokens, _regen_flags
+
+        for cmd in ("compare -metric AE -fuzz 0% a.png b.png d.png", "magick compare -fuzz 5% a.png b.png d.png",
+                    "go test -run TestVisual -count 1 -timeout 60s -cpu 2 ./...", "find . -user root",
+                    "pytest -quiet -suite visual -junit out.xml -summary -debug -full -auto",
+                    "node check.js -out o -output o -url u -num 3 -sub s -module m -include i -exclude e"):
+            with self.subTest(clean=cmd):
+                self.assertEqual(_regen_flags(_command_tokens(cmd)), set(), cmd)
+        for cmd in ("python3 check.py -vu", "python3 check.py -uv", "npx jest -qu", "npx jest -su", "npx jest -xu",
+                    "npx jest -vsu", "npx jest -u", "go test -update ./...", "node check.js -update"):
+            with self.subTest(cmd):
+                self.assertTrue(_regen_flags(_command_tokens(cmd)), cmd)
+        self._assert_cases({
+            "compare -fuzz 0%": ("compare -metric AE a.png b.png d.png",
+                                 "compare -metric AE -fuzz 0% a.png b.png d.png", False),
+            "go test word flags": ("go test ./...", "go test -run TestVisual -count 1 -timeout 60s -cpu 2 ./...",
+                                   False),
+            "go test -update": ("go test ./...", "go test -update ./...", True),
+            "-vu": ("python3 check.py", "python3 check.py -vu", True),
+            "-uv": ("python3 check.py", "python3 check.py -uv", True),
+        })
+
+    def test_leading_assignments_before_export_still_feed_every_command(self):
+        check = "python3 check.py"
+        loosening = [f"CI=1 export THRESHOLD=0.5; {check}", f"CI=1 THRESHOLD=0.5; export THRESHOLD; {check}"]
+        cases = {live: (check, live, True) for live in loosening}
+        cases["CI=1 export CI"] = (check, f"CI=1 export CI; {check}", False)
+        self._assert_cases(cases)
+        self._assert_end_to_end(self._CHECK, check, loosening, [f"CI=1 export CI; {check}"])
+
+    def test_trailing_threshold_override_is_capped_by_the_strictest_base_value(self):
+        exported = "export THRESHOLD=0.9; export THRESHOLD=0.01; python3 check.py"
+        cli = "python3 check.py --threshold 0.9 --threshold 0.01"
+        env_live = "export THRESHOLD=0.9; export THRESHOLD=0.01; export THRESHOLD=0.9; python3 check.py"
+        self._assert_cases({
+            "env override": (exported, env_live, True),
+            "cli override": (cli, cli + " --threshold 0.9", True),
+            "cli strict extra": (cli, cli + " --threshold 0.005", False),
+        })
+        self._assert_end_to_end(self._CHECK, exported, [env_live], [exported])
+        self._assert_end_to_end(self._CHECK, cli, [cli + " --threshold 0.9"], [cli, cli + " --threshold 0.005"])
+
+    def test_posix_comments_are_not_live_tokens(self):
+        from factonio.harness import _split_shell
+
+        self.assertEqual(_split_shell("true # --threshold 0.01\npython3 check.py"),
+                         ["true", "\n", "python3", "check.py"])
+        self.assertEqual(_split_shell("a --color=#fff foo#bar '#q' \"#d\" \\#e"),
+                         ["a", "--color=#fff", "foo#bar", "#q", "#d", "#e"])
+        base = "python3 check.py --threshold 0.01"
+        loosening = [f"# {base}", "true # --threshold 0.01"]
+        clean = ["python3 check.py --label foo#bar --threshold 0.01",
+                 'python3 check.py --label "#notacomment" --threshold 0.01']
+        cases = {live: (base, live, True) for live in loosening}
+        cases.update({live: (base, live, False) for live in clean})
+        self._assert_cases(cases)
+        self._assert_end_to_end(self._CHECK, base, loosening, clean)
+
+
 if __name__ == "__main__":
     unittest.main()
