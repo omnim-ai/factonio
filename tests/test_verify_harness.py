@@ -3067,12 +3067,14 @@ class TestFixRound13StructuralGuardHardening(unittest.TestCase):
         ])
 
     def test_parse_value_accepts_only_strict_ascii_decimal_syntax(self):
+        from decimal import Decimal
+
         from factonio.harness import _parse_value
 
-        for raw, value in (("0", 0.0), ("0.05", 0.05), (".01", 0.01), ("1%", 0.01), ("10%", 0.1),
-                           ("1e-2", 0.01), ("5e-3", 0.005), ("1E+0", 1.0)):
+        for raw, value in (("0", "0"), ("0.05", "0.05"), (".01", "0.01"), ("1%", "1"), ("10%", "10"),
+                           ("1e-2", "0.01"), ("5e-3", "0.005"), ("1E+0", "1")):
             with self.subTest(raw=raw):
-                self.assertAlmostEqual(_parse_value(raw)[0], value)
+                self.assertEqual(_parse_value(raw)[0], Decimal(value))
         for raw in ("0.0_1", "0_1%", "\uff10.\uff10\uff11", "\u0660.\u0660\u0661", "\uff11%", "+0.01", "-0.01",
                     "NaN", "inf", "1.", "01", " 0.01", "0.01 ", "0x1", "1e", "%", ""):
             with self.subTest(raw=raw):
@@ -3607,6 +3609,124 @@ class TestFixRound16IntegerThresholdsAndStrictRunners(unittest.TestCase):
                     ("pnpm run go", "pnpm run go -v"),
                     ("go test ./... -args", "go test ./... -args -v"),
                 ])
+
+
+class TestFixRound17ExactThresholdsAndRawQuoting(unittest.TestCase):
+    """Round 17: thresholds compare as exact `Decimal`s (binary64 equates integers past 2**53), and words compare
+    by source spelling, so quoting an assignment (`'T=1'`) or `!` cannot silently turn it into a command."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    _JS_CHECK = TestFixRound13StructuralGuardHardening._JS_CHECK
+    _DIFF = 9007199254740993  # 2**53 + 1 differing pixels, against an exact integer `--max-diff-pixels`
+    _PIXELS_PY = (
+        "import sys\n"
+        "arg = next((a for a in sys.argv[1:] if a.startswith('--max-diff-pixels=')), '--max-diff-pixels=0')\n"
+        f"sys.exit(1 if {_DIFF} > int(arg.split('=', 1)[1]) else 0)\n"
+    )
+
+    def _repo(self, home: Path, name: str, command: Any) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "check.js", self._JS_CHECK)
+        _write(repo, "pixels.py", self._PIXELS_PY)
+        _commit_all(repo, "visual checks + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def test_parse_value_is_exact_decimal(self):
+        from decimal import Decimal
+
+        from factonio.harness import _parse_value
+
+        for raw, value, pct in (("9007199254740993", "9007199254740993", False), ("1%", "1", True),
+                                ("0.05", "0.05", False), ("1" + "0" * 39 + "1", "1" + "0" * 39 + "1", False)):
+            with self.subTest(raw=raw):
+                self.assertEqual(_parse_value(raw), (Decimal(value), pct))
+        self.assertNotEqual(_parse_value("9007199254740992")[0], _parse_value("9007199254740993")[0])
+        for raw in ("1e99999999999999999999", "1e-99999999999999999999"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(_parse_value(raw)[0])
+
+    def test_thresholds_compare_exactly_past_binary64_and_decimal_context_precision(self):
+        big = "1" + "0" * 39
+        tiny = "0." + "0" * 39
+        base = "python3 pixels.py --max-diff-pixels={}"
+        self._assert_rejected({
+            "2**53 -> 2**53 + 1": (base.format(9007199254740992), base.format(9007199254740993)),
+            "40-digit integer + 1": (base.format(big), base.format(big[:-1] + "1")),
+            "40-digit percent + 1": (base.format(big + "%"), base.format(big[:-1] + "1%")),
+            "40-digit decimal + ulp": ("node check.js --threshold " + tiny + "1", "node check.js --threshold " + tiny + "2"),
+            "env 2**53 + 1": ("MAX_DIFF_PIXELS=9007199254740992 python3 pixels.py",
+                              "MAX_DIFF_PIXELS=9007199254740993 python3 pixels.py"),
+        })
+        self._assert_clean({
+            "2**53 + 1 unchanged": (base.format(9007199254740993), base.format(9007199254740993)),
+            "2**53 + 1 -> 2**53": (base.format(9007199254740993), base.format(9007199254740992)),
+            "40-digit integer - 1": (base.format(big[:-1] + "1"), base.format(big)),
+            "40-digit percent - 1": (base.format(big[:-1] + "1%"), base.format(big + "%")),
+            "40-digit decimal - ulp": ("node check.js --threshold " + tiny + "2", "node check.js --threshold " + tiny + "1"),
+        })
+
+    def test_raised_integer_threshold_past_2_53_is_rejected_end_to_end(self):
+        self._assert_executed_bypasses_rejected([
+            ("python3 pixels.py --max-diff-pixels=9007199254740992",
+             "python3 pixels.py --max-diff-pixels=9007199254740993"),
+        ])
+
+    def test_quoted_assignments_and_negations_are_not_collapsed(self):
+        assign = "THRESHOLD=0.05; export THRESHOLD; node check.js"
+        neg_if = "if ! node check.js --threshold 0.05; then exit 1; fi"
+        neg_and = "! node check.js --threshold 0.05 && exit 1; true"
+        nested = "bash -c 'if ! node check.js --threshold 0.05; then exit 1; fi'"
+        self._assert_rejected({
+            "single-quoted assignment": (assign, "'THRESHOLD=0.05'; export THRESHOLD; node check.js"),
+            "escaped =": (assign, "THRESHOLD\\=0.05; export THRESHOLD; node check.js"),
+            "double-quoted name": (assign, '"THRESHOLD"=0.05; export THRESHOLD; node check.js'),
+            "quoted tightened assignment": (assign, "'THRESHOLD=0.01'; export THRESHOLD; node check.js"),
+            "quoted ! in if": (neg_if, "if '!' node check.js --threshold 0.05; then exit 1; fi"),
+            "double-quoted ! in if": (neg_if, 'if "!" node check.js --threshold 0.05; then exit 1; fi'),
+            "escaped ! in if": (neg_if, "if \\! node check.js --threshold 0.05; then exit 1; fi"),
+            "quoted ! before &&": (neg_and, "'!' node check.js --threshold 0.05 && exit 1; true"),
+            "quoted ! in bash -c": (nested, "bash -c 'if \"!\" node check.js --threshold 0.05; then exit 1; fi'"),
+            "quoted assignment after assignment": ("A=1 THRESHOLD=0.05 node check.js",
+                                                   "A=1 'THRESHOLD=0.05' node check.js"),
+            "quoted ! after then": ("if true; then ! node check.js --threshold 0.05; fi",
+                                    "if true; then '!' node check.js --threshold 0.05; fi"),
+            "quoted assignment after redirection": ("2>/dev/null THRESHOLD=0.05 node check.js",
+                                                    "2>/dev/null 'THRESHOLD=0.05' node check.js"),
+        })
+        self._assert_clean({
+            "unchanged quoted assignment word": ("'THRESHOLD=0.05'; node check.js", "'THRESHOLD=0.05'; node check.js"),
+            "unchanged quoted value": ("THRESHOLD='0.05' node check.js", "THRESHOLD='0.05' node check.js"),
+            "quoted value tightened": ("THRESHOLD='0.05' node check.js", "THRESHOLD='0.01' node check.js"),
+            "value quoting added": (assign, "THRESHOLD='0.05'; export THRESHOLD; node check.js"),
+            "flag value quoting tightened": ("node check.js --threshold 0.05", "node check.js --threshold '0.01'"),
+            "quoted plain argument": ("node check.js snapshots/home.png", "node check.js 'snapshots/home.png'"),
+            "quoted export argument": ("export THRESHOLD=0.05; node check.js", "export 'THRESHOLD=0.05'; node check.js"),
+        })
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
+    def test_quoted_assignments_and_negations_are_rejected_end_to_end(self):
+        """Each mutation exits 127 on the quoted word: the assignment never happens and `if`/`&&` see failure."""
+        assign = "THRESHOLD=0.05; export THRESHOLD; node check.js"
+        neg_if = "if ! node check.js --threshold 0.05; then exit 1; fi"
+        self._assert_executed_bypasses_rejected([
+            (assign, "'THRESHOLD=0.05'; export THRESHOLD; node check.js"),
+            (assign, "THRESHOLD\\=0.05; export THRESHOLD; node check.js"),
+            (assign, '"THRESHOLD"=0.05; export THRESHOLD; node check.js'),
+            (assign, "'THRESHOLD=0.01'; export THRESHOLD; node check.js"),
+            (neg_if, "if '!' node check.js --threshold 0.05; then exit 1; fi"),
+            ("! node check.js --threshold 0.05 && exit 1; true", "'!' node check.js --threshold 0.05 && exit 1; true"),
+            ("bash -c 'if ! node check.js --threshold 0.05; then exit 1; fi'", "bash -c 'if \"!\" node check.js --threshold 0.05; then exit 1; fi'"),
+        ])
 
 
 if __name__ == "__main__":

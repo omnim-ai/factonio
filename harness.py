@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import re
 import secrets
@@ -25,6 +24,7 @@ import tempfile
 import time
 from collections import Counter
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, NamedTuple, Optional
 
@@ -1749,23 +1749,51 @@ class _Tok(NamedTuple):
     is_op: bool
     quoted: bool
     from_argv: bool = False  # an argv-list item: never seen by a shell
+    key: str = ""  # comparison identity, set by `_keyed`
 
-    @property
-    def key(self) -> str:
-        """Comparison identity: quoting is harmless unless the word expands (`'$HOME'` vs `$HOME`, `'*'`)."""
-        return self.raw if re.search(r"[$*?\[~`{]", self.raw) else self.text
+
+# Reserved words after which the shell still expects a command (so `if ! T=1 cmd` has three command words).
+_COMMAND_CONTINUES = frozenset({"!", "if", "then", "elif", "else", "do", "while", "until", "time", "coproc"})
+
+
+def _keyed(toks: list[_Tok]) -> list[_Tok]:
+    """Set each token's comparison ``key``: the source spelling, except that a plain argument word (after the
+    command name, not a redirection target, nothing to expand) drops its harmless quoting (`"check.py"`). In
+    command position quoting is never harmless: `'T=1'` / `T\\=1` is a command instead of an assignment and
+    `'!'` a command instead of negation; a quoted heredoc delimiter disables expansion of the body."""
+    out: list[_Tok] = []
+    command, target = True, False
+    for tok in toks:
+        if tok.is_op:
+            key = tok.text
+            if _is_redirect(tok.text):
+                target = True
+            else:
+                command, target = True, False
+        elif tok.from_argv:
+            key = tok.raw
+        else:
+            plain_arg = not command and not target and not re.search(r"[$*?\[~`{]", tok.raw)
+            key = tok.text if plain_arg else tok.raw
+            if target:
+                target = False
+            elif command:
+                command = bool(_ASSIGN_RE.match(tok.raw)) or tok.raw in _COMMAND_CONTINUES
+        out.append(tok._replace(key=key))
+    return out
 
 
 class _Slot(NamedTuple):
     """A threshold: `--flag val` / `--flag=val` (kind `flag`) or `VAR=val` (kind `env`), keyed by the exact
-    spelling (dashes, case, `-` vs `_`: `--THRESHOLD` is another, unknown, flag); ``value`` is the ratio
-    (`1%` -> 0.01) or None when not strict ASCII decimal syntax."""
+    spelling (dashes, case, `-` vs `_`: `--THRESHOLD` is another, unknown, flag). ``raw`` is the source spelling
+    of the value and ``text`` the word the program receives; ``value`` is its exact number (`1%` -> 1 with
+    ``percent``) or None when not strict ASCII decimal syntax."""
     kind: str
     key: str
     raw: str
-    value: Optional[float]
+    text: str
+    value: Optional[Decimal]
     percent: bool
-    eq: bool
 
 
 def _tokenize_visual_cmd(command: Any) -> list[_Tok]:
@@ -1773,7 +1801,7 @@ def _tokenize_visual_cmd(command: Any) -> list[_Tok]:
     `#` at a word start comments to the end of the line, runs of `;` collapse and edge `;` are dropped, and a
     redirection keeps its fd (`2>`). Raises ValueError on an unclosed quote or a trailing lone backslash."""
     if isinstance(command, list):
-        return [_Tok(str(c), str(c), False, True, True) for c in command]
+        return [_Tok(str(c), str(c), False, True, True, str(c)) for c in command]
     text = str(command or "")
     toks: list[_Tok] = []
     word: Optional[list[str]] = None
@@ -1840,7 +1868,7 @@ def _tokenize_visual_cmd(command: Any) -> list[_Tok]:
             out.append(tok)
     while out and out[-1].is_op and out[-1].text == ";":
         out.pop()
-    return out
+    return _keyed(out)
 
 
 def _segments(toks: list[_Tok]) -> tuple[list[str], list[list[_Tok]]]:
@@ -1856,33 +1884,46 @@ def _segments(toks: list[_Tok]) -> tuple[list[str], list[list[_Tok]]]:
     return ops, segs
 
 
-def _parse_value(raw: str) -> tuple[Optional[float], bool]:
-    """Strict ASCII decimal/scientific syntax only: Python's `float` also takes `0.0_1`, `inf` and non-ASCII
-    digits, which JS/Go/Rust checkers read as NaN or an error (and `0.8 > NaN` passes)."""
+def _parse_value(raw: str) -> tuple[Optional[Decimal], bool]:
+    """Strict ASCII decimal/scientific syntax only (Python also takes `0.0_1`, `inf` and non-ASCII digits, which
+    JS/Go/Rust checkers read as NaN or an error), as an exact `Decimal`: binary64 `float` equates adjacent
+    integers past 2**53, and `Decimal` construction and ordering never round to the context precision."""
     pct = raw.endswith("%")
     number = raw[:-1] if pct else raw
     if not _ASCII_THRESHOLD_RE.match(number):
         return None, pct
-    value = float(number)
-    if not math.isfinite(value) or value < 0:
+    try:
+        value = Decimal(number)
+    except InvalidOperation:  # an exponent beyond the context's Emax/Emin
         return None, pct
-    return (value / 100.0 if pct else value), pct
+    if not value.is_finite() or value < 0:
+        return None, pct
+    return value, pct
 
 
-def _slot_items(words: list[str]) -> list[Any]:
-    """``words`` with each threshold (`--flag val`, `--flag=val`, `VAR=val`) collapsed into one `_Slot`."""
+def _slot_items(words: list[str], texts: Optional[list[str]] = None) -> list[Any]:
+    """``words`` (source spellings) with each threshold (`--flag val`, `--flag=val`, `VAR=val`) collapsed into one
+    `_Slot`; ``texts`` are the same words after quote removal (default: ``words``). Only an unquoted `NAME=` is
+    an assignment: `'T=0.01'`, `"T"=0.01` and `T\\=0.01` are command words the shell cannot find."""
+    texts = words if texts is None else texts
+
+    def value_text(k: int, prefix: str) -> str:
+        return texts[k][len(prefix):] if texts[k].startswith(prefix) else words[k][len(prefix):]
+
     items: list[Any] = []
     i = 0
     while i < len(words):
         tok = words[i]
         m = _ASSIGN_RE.match(tok)
         if m and _THRESHOLD_KEY_RE.search(m.group(1)):
-            items.append(_Slot("env", m.group(1), m.group(2), *_parse_value(m.group(2)), True))
+            text = value_text(i, m.group(1) + "=")
+            items.append(_Slot("env", m.group(1), m.group(2), text, *_parse_value(text)))
         elif tok.startswith("-") and tok not in ("-", "--") and _THRESHOLD_KEY_RE.search(tok.partition("=")[0]):
             name, eq, raw = tok.partition("=")
+            text = value_text(i, name + "=") if eq else raw
             if not eq and i + 1 < len(words) and not words[i + 1].startswith("--"):
-                i, raw = i + 1, words[i + 1]
-            items.append(_Slot("flag", name, raw, *_parse_value(raw), bool(eq)))
+                i, raw, text = i + 1, words[i + 1], texts[i + 1]
+            items.append(_Slot("flag", name, raw, text, *_parse_value(text)))
         else:
             items.append(tok)
         i += 1
@@ -1908,7 +1949,7 @@ def _integer_syntax_lost(base: _Slot, live: _Slot) -> bool:
     """A committed integer threshold rewritten as a decimal or scientific number: integer parsers read
     `parseInt("999e-3", 10)` as 999, `parseInt(".0", 10)` as NaN, and Go/Rust integer parsing errors out."""
     def number(slot: _Slot) -> str:
-        return slot.raw[:-1] if slot.percent else slot.raw
+        return slot.text[:-1] if slot.percent else slot.text
 
     return number(base).isascii() and number(base).isdigit() and not (
         number(live).isascii() and number(live).isdigit())
@@ -2025,7 +2066,8 @@ def _segment_ok(base_toks: list[_Tok], live_toks: list[_Tok], depth: int, sealed
     base, live = [t.key for t in base_toks], [t.key for t in live_toks]
     if base == live:
         return True
-    b_items, l_items = _slot_items(base), _slot_items(live)
+    b_items = _slot_items(base, [t.text for t in base_toks])
+    l_items = _slot_items(live, [t.text for t in live_toks])
     head = next((k for k, t in enumerate(base) if not _ASSIGN_RE.match(t)), None)
     name = os.path.basename(base[head]) if head is not None else None
     if name in _SHELLS and len(base) == len(live):
@@ -2113,7 +2155,7 @@ def _threshold_reasons(base_segs: list[list[str]], live_segs: list[list[str]]) -
             continue
         if len(l_vals) < len(b_vals):
             reasons.append(f"removes {len(b_vals) - len(l_vals)} of {len(b_vals)} {label} threshold(s)")
-        strictest = min(b_vals, key=lambda s: math.inf if s.value is None else s.value)
+        strictest = min(b_vals, key=lambda s: Decimal("Infinity") if s.value is None else s.value)
         pairs = [*zip(b_vals, l_vals), *((strictest, s) for s in l_vals[len(b_vals):])]
         bad = [(b, s) for b, s in pairs if not _slot_ok(b, s)]
         if any(s.value is None for _, s in bad):
