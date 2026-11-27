@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-27T01:30:00Z",
+  "generated_at": "2026-11-27T02:10:00Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -225,7 +225,8 @@
         "Edited + reordered thresholds keep target identity (`a --threshold 0.01 && b --threshold 0.9` -> `b --verbose --threshold 0.01 && a --verbose --threshold 0.5` flagged, exact reorder clean); `%` compares as a ratio (`1%` -> `0.5` flagged, `0.5` -> `10%` clean, `1%` -> `5` fails closed); `export THRESHOLD=0.5; python3 check.py` is gate loosening; `sh -c 'python3 check.py \"$@\"' sh -u` and `bash --rcfile /dev/null -c 'python3 check.py -u'` are regeneration",
         "Bundled `python3 check.py -vu` / `-uv` are regeneration (`python3 -Bu check.py`, `diff -ru a b`, `sh -eu check.sh`, `set -eu` clean); `env - sh -c 'python3 check.py -u'` is regeneration while `env - python3 -u check.py` passes; `bash -oc pipefail 'python3 check.py -u'` and `bash -oo pipefail errexit -c ...` are unwrapped (`bash -ou errexit -u script.sh` clean); `export THRESHOLD=0.9;` beside a default-threshold command and `THRESHOLD=0.9; THRESHOLD=0.01` -> `THRESHOLD=0.01; THRESHOLD=0.9` are gate loosening",
         "Fix round 9: a live-added frozen `visual_diff` hook protects existing committed images (`check --run-hooks` fails on tampering, brand-new baselines clean); `sh -c '$0' 'python3 check.py -u'`, `sh -c - 'python3 check.py -u'`, `CI=1 export THRESHOLD=0.5; python3 check.py`, `--threshold 0.9 --threshold 0.01` -> `... --threshold 0.9` and `# python3 check.py --threshold 0.01` are gate loosening; `compare -metric AE -fuzz 0%` and `go test -run TestVisual -count 1 -timeout 60s -cpu 2` are clean while `go test -update` is regeneration",
-        "Fix round 10: a first, uncommitted harness (or a PR adding `.factonio/`) with a frozen `visual_diff` hook fails `check` when an existing committed image is modified before or while hooks run (`baseline_source: live`; brand-new baselines clean); `eval 'python3 check.py -u'` and `eval -- 'python3 check.py --threshold 0.5'` are gate loosening; `export THRESHOLD=0.01;` plus `unset THRESHOLD`, `export -n THRESHOLD`, `env -u THRESHOLD`, `env -i` or `env -` is gate loosening while `unset FOO`, `env -u FOO` and `env -i THRESHOLD=0.01` stay clean"
+        "Fix round 10: a first, uncommitted harness (or a PR adding `.factonio/`) with a frozen `visual_diff` hook fails `check` when an existing committed image is modified before or while hooks run (`baseline_source: live`; brand-new baselines clean); `eval 'python3 check.py -u'` and `eval -- 'python3 check.py --threshold 0.5'` are gate loosening; `export THRESHOLD=0.01;` plus `unset THRESHOLD`, `export -n THRESHOLD`, `env -u THRESHOLD`, `env -i` or `env -` is gate loosening while `unset FOO`, `env -u FOO` and `env -i THRESHOLD=0.01` stay clean",
+        "Fix round 11: a hook or Doctor command that unfreezes/removes its own frozen `visual_diff` hook while regenerating a committed image still fails `check --run-hooks` (pre-execution contract); against `export THRESHOLD=0.01; python3 check.py`, `THRESHOLD=0.01; python3 check.py`, `python3 check.py; export THRESHOLD=0.01`, `(export THRESHOLD=0.01); python3 check.py`, `env -S '-u THRESHOLD python3 check.py'`, `env -S '-i python3 check.py'`, `unset -- -f THRESHOLD` and `bash -c 'builtin unset THRESHOLD; python3 check.py'` are gate loosening while `THRESHOLD=0.01; export THRESHOLD; python3 check.py`, `env -S '-u FOO python3 -u check.py'` and `env -S '-i THRESHOLD=0.01 python3 check.py'` stay clean"
       ]
     },
     {
