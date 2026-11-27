@@ -1661,16 +1661,13 @@ class TestInvestigationReportApi(unittest.TestCase):
             self.assertEqual((body["truncated"], body["redacted"]), (True, True))
             self.assertLessEqual(len(body["content"].encode("utf-8")), cap)
 
-            text = ("See /home/alice/private/case.md and `src/app.py`, dashboard/plugin_api.py,\n"
-                    "https://github.com/a/b, (/var/log/x.log) C:\\Users\\bob\\notes.txt and /Users/c/d.\n")
+            text = ("See /home/alice/private/case.md and `src/app.py`.\n"
+                    "Edit dashboard/plugin_api.py; see https://github.com/a/b\n"
+                    "(/var/log/x.log) and C:\\Users\\bob\\notes.txt\n")
             report.write_text(text, encoding="utf-8")
             body = client.get(f"{_CP}/workstreams/ws-u/report").json()
-            self.assertTrue(body["redacted"])
-            for gone in ("/home/alice", "/var/log", "C:\\Users", "/Users/c"):
-                self.assertNotIn(gone, body["content"])
-            for kept in ("src/app.py", "dashboard/plugin_api.py", "https://github.com/a/b"):
-                self.assertIn(kept, body["content"])
-            self.assertEqual(body["content"].count("[REDACTED]"), 4)
+            self.assertEqual((body["content"], body["redacted"]),
+                             ("[redacted]\nEdit dashboard/plugin_api.py; see https://github.com/a/b\n[redacted]\n", True))
             report.write_text("plain src/app.py https://github.com/a/b\n", encoding="utf-8")
             self.assertFalse(client.get(f"{_CP}/workstreams/ws-u/report").json()["redacted"])
 
@@ -1680,28 +1677,25 @@ class TestInvestigationReportApi(unittest.TestCase):
             run = self._runs(home) / "ws-r"
             run.mkdir(parents=True)
             report = run / "investigation.md"
-            leaks = {
-                "See /data/customer/private.txt now.": "/data/customer",
-                "Open /workspace/project/secrets.txt.": "/workspace/project",
-                "[key](/srv2/app/key.pem)": "/srv2/app",
-                "Log at C:/Users/alice/private.txt": "C:/Users",
-                "Log at D:/builds/log.txt": "D:/builds",
-                "Notes C:\\Users\\alice\\private.txt": "C:\\Users",
-                "Share \\\\fileserver\\share\\secret.txt": "fileserver",
-                "Share //fileserver/share/secret.txt": "fileserver",
-                "Link file:///data/secret.md here": "/data/secret",
-                "Link FILE://host/share/x.md here": "host/share",
-            }
-            for text, gone in leaks.items():
-                with self.subTest(text=text):
-                    report.write_text(text + "\n", encoding="utf-8")
+            leaks = (
+                "See /data/customer/private.txt now.", "Open /workspace/project/secrets.txt.",
+                "[key](/srv2/app/key.pem)", "Home /home/alice/private/case.md", "Config in /etc/",
+                "Root /\u5ba2\u6237/private.txt", "Root /a+b/private.txt", "Root /my data/private.txt",
+                'Quoted "/my data/private.txt"', 'Quoted "/my data/sub dir/secret.txt"',
+                "\uff08/\u5ba2\u6237/private.txt\uff09", "src/app.py https://example.com/a/b /my data/x",
+                "Log at C:/Users/alice/private.txt", "Notes C:\\Program Files\\secret.txt", "Log at D:/\u5ba2\u6237/x",
+                "Share \\\\fileserver\\share\\secret.txt", "Share //fileserver/share/secret.txt",
+                "Link file:///my data/secret.md here", "Link FILE://host/share/x.md here",
+            )
+            for leak in leaks:
+                with self.subTest(text=leak):
+                    report.write_text(f"intro src/app.py\n{leak}\noutro\n", encoding="utf-8")
                     body = client.get(f"{_CP}/workstreams/ws-r/report").json()
-                    self.assertTrue(body["redacted"])
-                    self.assertNotIn(gone, body["content"])
-                    self.assertIn("[REDACTED]", body["content"])
+                    self.assertEqual((body["content"], body["redacted"]), ("intro src/app.py\n[redacted]\noutro\n", True))
             kept = ("Edit src/app.py and dashboard/plugin_api.py; see https://github.com/omnim-ai/factonio/pull/47,\n"
                     "http://localhost:8000/api/plugins/factonio/cards, foo/bar prose, v1/v2 and the /factonio page.\n"
-                    "# Heading\n`code` [link](https://example.com/a/b)\n")
+                    "# Heading\n`code` [link](https://example.com/a/b)\n./a/b ../a/b\n"
+                    "src/app.py https://example.com/a/b /factonio\n// ordinary comment\n")
             report.write_text(kept, encoding="utf-8")
             body = client.get(f"{_CP}/workstreams/ws-r/report").json()
             self.assertEqual((body["content"], body["redacted"]), (kept, False))

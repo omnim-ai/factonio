@@ -445,29 +445,20 @@ def log_human_decision(payload: Any = Body(None), profile: Optional[str] = Query
 
 _REPORT_NAME = "investigation.md"
 _REPORT_MAX_BYTES = 256 * 1024
-# Root-independent absolute filesystem paths: file:// URLs, UNC, Windows drive (either slash) and any
-# multi-segment POSIX path. http(s) URLs match first as a pass-through group; relative paths never match.
-_PATH_TAIL = r"[^\s`'\"<>)\]]+"
-_ABS_PATH_RE = re.compile(
-    rf"(?P<url>(?i:https?)://{_PATH_TAIL})"
-    rf"|(?i:file)://{_PATH_TAIL}"
-    rf"|(?<![A-Za-z0-9_.:/\\])(?:\\\\|//)[A-Za-z0-9._$-]+[\\/]{_PATH_TAIL}"
-    rf"|(?<![A-Za-z0-9_])[A-Za-z]:[\\/]{_PATH_TAIL}"
-    rf"|(?<![A-Za-z0-9_.:/\\])/[A-Za-z0-9._-]+(?:/{_PATH_TAIL})+"
+# Fail-closed line policy: span-parsing paths inside free-form prose cannot cover every legal
+# filename (Unicode, spaces, `+`), so a line holding any absolute-path marker (file://, drive,
+# UNC, or a slash-delimited root segment) is withheld whole once http(s) URLs are stripped.
+_HTTP_URL_RE = re.compile(r"(?i:https?)://[^\s`'\"<>)\]]+")
+_ABS_PATH_LINE_RE = re.compile(
+    r"(?i:file)://"
+    r"|(?<![A-Za-z0-9_])[A-Za-z]:[\\/]"
+    r"|(?<![\w./\\])(?:\\\\|//)[^\s/\\]+[/\\]"
+    r"|(?<![\w./\\])/[^\n/]+/"
 )
 
 
-def _scrub_abs_paths(text: str) -> tuple[str, bool]:
-    hits = 0
-
-    def repl(match: re.Match) -> str:
-        nonlocal hits
-        if match.group("url") is not None:
-            return match.group(0)
-        hits += 1
-        return "[REDACTED]"
-
-    return _ABS_PATH_RE.sub(repl, text), hits > 0
+def _line_is_sensitive(line: str) -> bool:
+    return _trail.contains_holdout_reference(line) or bool(_ABS_PATH_LINE_RE.search(_HTTP_URL_RE.sub("", line)))
 
 
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -486,14 +477,13 @@ def _trim_utf8_bytes(value: str | bytes, max_bytes: int = _REPORT_MAX_BYTES) -> 
 
 
 def _redact_report(text: str) -> tuple[str, bool]:
-    """Withhold every line naming holdout (the whole report if a reference spans lines), then absolute paths."""
+    """Withhold every line naming holdout or an absolute path (the whole report if holdout spans lines)."""
     lines = text.split("\n")
-    kept = ["[redacted]" if _trail.contains_holdout_reference(line) else line for line in lines]
+    kept = ["[redacted]" if _line_is_sensitive(line) else line for line in lines]
     out = "\n".join(kept)
     if _trail.contains_holdout_reference(out):
         return "[redacted]", True
-    out, paths = _scrub_abs_paths(out)
-    return out, kept != lines or paths
+    return out, kept != lines
 
 
 def _read_confined_report(tenant_dir: str) -> Optional[tuple[bytes, os.stat_result]]:
