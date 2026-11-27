@@ -905,8 +905,11 @@ class TestRepoDogfoodHarness(unittest.TestCase):
             self.assertEqual((audit["severity"], audit["drifted"]), ("clean", False), audit)
             self.assertEqual(audit["base_source"], "last commit touching .factonio/")
             for key in ("uncovered_changed_files", "orphaned_globs", "new_routes", "removed_routes",
-                        "new_cli_commands", "removed_cli_commands"):
+                        "new_cli_commands", "removed_cli_commands", "stale_invariants", "dead_cover_globs",
+                        "unresolved_sync_commits", "visual_baseline_changes"):
                 self.assertEqual(audit[key], [], key)
+            self.assertTrue(chk["formal_invariants"]["checked"])
+            self.assertEqual(chk["formal_invariants"]["dead_cover_globs"], [])
 
 
 def _fenced_block_after(text: str, marker: str) -> str:
@@ -1290,7 +1293,7 @@ class TestGateLoosening(unittest.TestCase):
             self.assertEqual(_git(repo, "status", "--porcelain"), before_status)
             self.assertEqual(set(res), {"checked", "loosened", "base_ref", "base_commit", "baseline_source",
                                         "removed_required_hooks", "downgraded_hooks", "removed_doctor_commands",
-                                        "findings"})
+                                        "loosened_visual_hooks", "visual_baseline_changes", "findings"})
             self.assertTrue(res["checked"] and res["loosened"])
             self.assertEqual(res["removed_required_hooks"], ["lint"])
             self.assertEqual(res["downgraded_hooks"], ["types"])
@@ -1623,6 +1626,3390 @@ class TestHybridBaselineAndMalformedManifest(unittest.TestCase):
             self.assertEqual(audit["manifest_errors"], [])
             self.assertEqual((audit["severity"], audit["drifted"]), ("clean", False))
             self.assertEqual(audit["drift_classification"]["classification"], "clean")
+
+
+class TestFormalInvariantHookMetadata(unittest.TestCase):
+    """Optional `covers`/`sync_commit` (invariant) and `baseline_paths`/`frozen_baseline` (visual_diff) metadata."""
+
+    def test_validate_accepts_normalizes_and_rejects_by_kind(self):
+        from factonio.harness import validate_hooks
+
+        hooks = validate_hooks([
+            {"name": "model", "kind": "invariant", "command": "true", "covers": [" api/** ", "svc/*.py"],
+             "sync_commit": " abc123 "},
+            {"name": "pixels", "kind": "visual_diff", "command": "true", "baseline_paths": ["snapshots/**"]},
+            {"name": "thawed", "kind": "visual_diff", "command": "true", "baseline_paths": ["s/**"], "frozen_baseline": False},
+            {"name": "plain", "kind": "invariant", "command": "true", "covers": None},
+        ])
+        self.assertEqual((hooks[0]["covers"], hooks[0]["sync_commit"]), (["api/**", "svc/*.py"], "abc123"))
+        self.assertEqual((hooks[1]["baseline_paths"], hooks[1]["frozen_baseline"]), (["snapshots/**"], True))
+        self.assertIs(hooks[2]["frozen_baseline"], False)
+        self.assertEqual(set(hooks[3]), {"name", "kind", "command", "optional"})
+
+        bad = [
+            {"kind": "custom", "covers": ["a/**"]},
+            {"kind": "visual_diff", "sync_commit": "HEAD", "covers": ["a"]},
+            {"kind": "invariant", "baseline_paths": ["s/**"]},
+            {"kind": "custom", "frozen_baseline": True},
+            {"kind": "invariant", "covers": []},
+            {"kind": "invariant", "covers": ["ok", " "]},
+            {"kind": "invariant", "covers": "a/**"},
+            {"kind": "invariant", "sync_commit": "HEAD"},
+            {"kind": "invariant", "covers": ["a"], "sync_commit": "--output=x"},
+            {"kind": "invariant", "covers": ["a"], "sync_commit": "a b"},
+            {"kind": "invariant", "covers": ["a"], "sync_commit": "a\x07"},
+            {"kind": "invariant", "covers": ["a"], "sync_commit": "  "},
+            {"kind": "invariant", "covers": ["a"], "sync_commit": 7},
+            {"kind": "visual_diff", "baseline_paths": []},
+            {"kind": "visual_diff", "baseline_paths": ["s/**"], "frozen_baseline": "yes"},
+        ]
+        for extra in bad:
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                validate_hooks([{"name": "h", "command": "true", **extra}])
+
+    def test_render_parse_round_trip_and_force_preserves_metadata(self):
+        from factonio.harness import HOOK_KINDS, _HOOK_LINE_RE, bootstrap_verify_harness, discover_harness
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            _write(repo, "snapshots/home.png", "png-v1\n")
+            hooks = [
+                {"name": "model", "kind": "invariant", "command": "true", "covers": ["api/**"], "sync_commit": "HEAD"},
+                {"name": "pixels", "kind": "visual_diff", "command": "true", "baseline_paths": ["snapshots/**"]},
+            ]
+            bootstrap_verify_harness(str(repo), hooks=hooks)
+            md = (repo / ".factonio" / "verify.md").read_text(encoding="utf-8")
+            self.assertIn("- **model** (`invariant`, required): `true` [covers: `api/**`; sync_commit: `HEAD`]", md)
+            self.assertIn(
+                "- **pixels** (`visual_diff`, required): `true` [baseline_paths: `snapshots/**`; frozen_baseline: `true`]", md
+            )
+            self.assertEqual([m.group("cmd") for m in _HOOK_LINE_RE.finditer(md)], ["true", "true"])
+            self.assertEqual(len(HOOK_KINDS), 3)
+
+            res = bootstrap_verify_harness(str(repo), force=True)
+            self.assertTrue(res["preserved_hooks"])
+            saved = {h["name"]: h for h in json.loads((repo / ".factonio" / "harness.json").read_text())["hooks"]}
+            self.assertEqual((saved["model"]["covers"], saved["model"]["sync_commit"]), (["api/**"], "HEAD"))
+            self.assertEqual((saved["pixels"]["baseline_paths"], saved["pixels"]["frozen_baseline"]), (["snapshots/**"], True))
+
+            (repo / ".factonio" / "harness.json").unlink()
+            parsed = {h["name"]: h for h in discover_harness(repo)["hooks"]}
+            self.assertEqual((parsed["model"]["covers"], parsed["model"]["sync_commit"]), (["api/**"], "HEAD"))
+            self.assertEqual((parsed["pixels"]["baseline_paths"], parsed["pixels"]["frozen_baseline"]), (["snapshots/**"], True))
+
+
+class TestFormalInvariantDrift(unittest.TestCase):
+    """Read-only `stale_invariants` drift vs unresolved `sync_commit` vs failing required hook."""
+
+    def _repo(self, home: Path, hooks: list[dict[str, Any]]) -> tuple[Path, str]:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home)
+        initial = _git(repo, "rev-parse", "HEAD")
+        bootstrap_verify_harness(str(repo), hooks=hooks)
+        _commit_all(repo, "harness")
+        return repo, initial
+
+    def test_covered_change_after_sync_commit_is_stale_doc_drift_and_read_only(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            sync = _git(repo, "rev-parse", "HEAD")
+            from factonio.harness import bootstrap_verify_harness
+
+            bootstrap_verify_harness(str(repo), hooks=[
+                {"name": "api-model", "kind": "invariant", "command": "true", "covers": ["api/**"], "sync_commit": sync},
+                {"name": "cli-model", "kind": "invariant", "command": "true", "covers": ["svc/**"], "optional": True},
+            ])
+            _commit_all(repo, "harness")
+            chk = check_harness(str(repo), run_doctor=True, run_hooks=True)
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual(chk["warnings"], [])
+            formal = chk["formal_invariants"]
+            self.assertTrue(formal["checked"])
+            self.assertEqual([(i["name"], i["status"]) for i in formal["invariants"]],
+                             [("api-model", "in_sync"), ("cli-model", "in_sync")])
+            self.assertEqual(formal["invariants"][1]["sync_source"], "harness.json base_commit")
+            clean = audit_harness(str(repo))
+            self.assertEqual((clean["severity"], clean["stale_invariants"]), ("clean", []))
+
+            _write(repo, "api/server.py", "# changed\n")
+            _commit_all(repo, "touch api")
+            _write(repo, "svc/cli.py", "# changed\n")
+            before_status = _git(repo, "status", "--porcelain")  # also refreshes the stat cache before fingerprinting
+            before_index = _index_fingerprint(repo)
+            audit = audit_harness(str(repo))
+            self.assertEqual(_index_fingerprint(repo), before_index)
+            self.assertEqual(_git(repo, "status", "--porcelain"), before_status)
+            self.assertEqual((audit["drifted"], audit["severity"]), (True, "stale"))
+            stale = {i["name"]: i for i in audit["stale_invariants"]}
+            self.assertEqual(stale["api-model"], {
+                "name": "api-model", "sync_commit": sync, "sync_source": "sync_commit", "covers": ["api/**"],
+                "changed_files": ["api/server.py"], "optional": False,
+            })
+            self.assertEqual(stale["cli-model"]["changed_files"], ["svc/cli.py"])
+            self.assertTrue(stale["cli-model"]["optional"])
+            self.assertEqual((audit["unresolved_sync_commits"], audit["manifest_errors"]), ([], []))
+            self.assertEqual(audit["drift_classification"]["classification"], "doc_drift")
+            self.assertTrue(any("formal invariants" in r for r in audit["drift_classification"]["reasons"]))
+            self.assertTrue(any("bump `sync_commit`" in r for r in audit["recommendations"]))
+            chk = check_harness(str(repo))
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual({i["name"] for i in chk["formal_invariants"]["stale_invariants"]}, {"api-model", "cli-model"})
+
+            run = TestSurfaces()._cli()
+            code, out, _ = run("harness", "audit", str(repo), "--json")
+            self.assertEqual(code, 1)
+            self.assertEqual(len(json.loads(out)["stale_invariants"]), 2)
+            code, out, _ = run("harness", "audit", str(repo))
+            self.assertIn("stale_invariants: api-model (sync_commit", out)
+            code, out, _ = run("harness", "check", str(repo))
+            self.assertEqual(code, 0, out)
+            self.assertIn("Invariant: [stale] api-model covers api/**", out)
+
+    def test_unresolved_sync_commit_is_harness_gap_but_hooks_still_run(self):
+        from factonio.harness import audit_harness, check_harness, classify_harness_drift
+
+        with isolated_hermes_home() as home:
+            repo, _ = self._repo(home, [
+                {"name": "model", "kind": "invariant", "command": "true", "covers": ["api/**"], "sync_commit": "ab" * 20},
+                {"name": "tests", "kind": "custom", "command": "true"},
+            ])
+            chk = check_harness(str(repo), run_doctor=True, run_hooks=True)
+            self.assertFalse(chk["valid"])
+            self.assertEqual(chk["formal_invariants"]["unresolved_sync_commits"], [{"name": "model", "sync_commit": "ab" * 20}])
+            self.assertTrue(any("does not resolve" in e for e in chk["manifest_errors"]))
+            self.assertEqual(chk["hook_results"]["ran"], 2)
+            self.assertEqual(classify_harness_drift(None, chk)["classification"], "harness_gap")
+            audit = audit_harness(str(repo))
+            self.assertEqual((audit["drifted"], audit["severity"]), (True, "stale"))
+            self.assertEqual(audit["drift_classification"]["classification"], "harness_gap")
+            self.assertEqual(audit["stale_invariants"], [])
+
+    def test_failing_required_formal_hook_outranks_as_product_regression(self):
+        from factonio.harness import audit_harness, check_harness, classify_harness_drift
+
+        with isolated_hermes_home() as home:
+            repo, _ = self._repo(home, [
+                {"name": "model", "kind": "invariant", "command": "exit 1", "covers": ["api/**"], "sync_commit": "no-such"},
+            ])
+            _write(repo, "api/server.py", "# drift\n")
+            audit = audit_harness(str(repo))
+            chk = check_harness(str(repo), run_doctor=True, run_hooks=True)
+            self.assertEqual(chk["hook_results"]["failed_required"], ["model"])
+            res = classify_harness_drift(audit, chk)
+            self.assertEqual(res["classification"], "product_regression")
+            self.assertEqual(res["classifications"], ["product_regression", "harness_gap", "doc_drift"])
+
+    def test_dead_cover_glob_is_check_error_and_doc_drift(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo, _ = self._repo(home, [{"name": "model", "kind": "invariant", "command": "true", "covers": ["nope/**"]}])
+            chk = check_harness(str(repo))
+            self.assertFalse(chk["valid"])
+            self.assertEqual(chk["formal_invariants"]["dead_cover_globs"], [{"hook": "model", "glob": "nope/**"}])
+            self.assertTrue(any("covers glob `nope/**` matches no files" in e for e in chk["errors"]))
+            self.assertEqual(chk["manifest_errors"], [])
+            audit = audit_harness(str(repo))
+            self.assertEqual(audit["dead_cover_globs"], [{"hook": "model", "glob": "nope/**"}])
+            self.assertEqual(audit["drift_classification"]["classification"], "doc_drift")
+
+    def test_every_git_probe_is_no_optional_locks(self):
+        import factonio.harness as harness
+
+        with isolated_hermes_home() as home:
+            repo, sync = self._repo(home, [
+                {"name": "model", "kind": "invariant", "command": "true", "covers": ["api/**"], "sync_commit": "HEAD~1"},
+                {"name": "pixels", "kind": "visual_diff", "command": "true", "baseline_paths": ["api/**"]},
+            ])
+            _write(repo, "api/server.py", "# drift\n")
+            calls: list[list[str]] = []
+            real_run = subprocess.run
+
+            def spy(cmd, *args, **kwargs):
+                if isinstance(cmd, list) and cmd and cmd[0] == "git":
+                    calls.append(list(cmd))
+                return real_run(cmd, *args, **kwargs)
+
+            with mock.patch.object(harness.subprocess, "run", side_effect=spy):
+                audit = harness.audit_harness(str(repo))
+                harness.check_harness(str(repo), base_ref=sync)
+            self.assertTrue(audit["stale_invariants"] and audit["visual_baseline_changes"])
+            self.assertTrue(any("diff" in c for c in calls))
+            self.assertEqual([c for c in calls if c[1] != "--no-optional-locks"], [])
+
+
+class TestFrozenVisualBaselines(unittest.TestCase):
+    """`visual_diff` anti-shortcut: regenerated/loosened commands and tampered frozen baselines."""
+
+    COMMAND = "npx playwright test --max-diff-pixels=0"
+
+    def _repo(self, home: Path, **meta: Any) -> tuple[Path, str]:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "lint", "kind": "invariant", "command": "true"},
+            {"name": "pixels", "kind": "visual_diff", "command": self.COMMAND,
+             "baseline_paths": ["snapshots/**"], **meta},
+        ])
+        return repo, _commit_all(repo, "harness + baselines")
+
+    @staticmethod
+    def _set_pixels(repo: Path, **changes: Any) -> None:
+        hj = repo / ".factonio" / "harness.json"
+        manifest = json.loads(hj.read_text(encoding="utf-8"))
+        for hook in manifest["hooks"]:
+            if hook["name"] == "pixels":
+                for key, value in changes.items():
+                    if value is None:
+                        hook.pop(key, None)
+                    else:
+                        hook[key] = value
+        hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    def test_regeneration_and_threshold_mutations_are_gate_loosening(self):
+        from factonio.harness import audit_harness, check_harness, detect_harness_gate_loosening
+
+        with isolated_hermes_home() as home:
+            repo, _ = self._repo(home)
+            clean = detect_harness_gate_loosening(repo)
+            self.assertEqual((clean["loosened"], clean["loosened_visual_hooks"], clean["visual_baseline_changes"]),
+                             (False, [], []))
+            hj = repo / ".factonio" / "harness.json"
+            committed = hj.read_text(encoding="utf-8")
+            loosening = {
+                "--update-snapshots": {"command": self.COMMAND + " --update-snapshots"},
+                "-u": {"command": self.COMMAND + " -u"},
+                "--update": {"command": self.COMMAND + " --update"},
+                "--regenerate": {"command": self.COMMAND + " --regenerate"},
+                "UPDATE_SNAPSHOTS=1": {"command": "UPDATE_SNAPSHOTS=1 " + self.COMMAND},
+                "max-diff-pixels": {"command": "npx playwright test --max-diff-pixels=500"},
+                "threshold": {"command": self.COMMAND + " --max-diff 0.3"},
+                "zero threshold added": {"command": self.COMMAND + " --max-diff 0"},
+                "unfrozen": {"frozen_baseline": False},
+                "unpinned": {"baseline_paths": None, "frozen_baseline": None},
+                # Round 19: an edit is clean only as pure in-place tightening; syntax swaps and insertions fail closed
+                "respelled in place": {"command": "npx playwright test --max-diff-pixels 0"},
+                "reworded": {"command": "npx playwright test --reporter=line --max-diff-pixels=0"},
+                "zero-env": {"command": "UPDATE_SNAPSHOTS=0 " + self.COMMAND},
+                # Round 20: every byte outside a tightened threshold value is compared verbatim
+                "comment added": {"command": self.COMMAND + "  # pixel-exact"},
+            }
+            for label, change in loosening.items():
+                with self.subTest(label):
+                    hj.write_text(committed, encoding="utf-8")
+                    self._set_pixels(repo, **change)
+                    before_index = _index_fingerprint(repo)
+                    gate = detect_harness_gate_loosening(repo)
+                    self.assertEqual(_index_fingerprint(repo), before_index)
+                    self.assertTrue(gate["loosened"], gate)
+                    self.assertEqual(gate["loosened_visual_hooks"], ["pixels"])
+                    self.assertTrue(any("visual_diff hook 'pixels'" in f for f in gate["findings"]), gate["findings"])
+                    chk = check_harness(str(repo))
+                    self.assertFalse(chk["valid"])
+                    audit = audit_harness(str(repo))
+                    self.assertEqual(audit["gate_loosening"]["loosened_visual_hooks"], ["pixels"])
+                    self.assertEqual(audit["drift_classification"]["classification"], "doc_drift")
+
+            for label, change in {
+                "unchanged": {"command": self.COMMAND},
+            }.items():
+                with self.subTest(label):
+                    hj.write_text(committed, encoding="utf-8")
+                    self._set_pixels(repo, **change)
+                    gate = detect_harness_gate_loosening(repo)
+                    self.assertFalse(gate["loosened"], gate["findings"])
+
+    def test_tampered_frozen_baseline_is_flagged_but_new_or_unfrozen_is_not(self):
+        from factonio.harness import audit_harness, check_harness, detect_harness_gate_loosening
+
+        with isolated_hermes_home() as home:
+            repo, harness_commit = self._repo(home)
+            _write(repo, "snapshots/new-screen.png", "png-new\n")
+            self.assertFalse(detect_harness_gate_loosening(repo)["loosened"])
+            self.assertEqual(audit_harness(str(repo))["visual_baseline_changes"], [])
+
+            _write(repo, "snapshots/home.png", "png-regenerated\n")
+            before_index = _index_fingerprint(repo)
+            gate = detect_harness_gate_loosening(repo)
+            self.assertEqual(_index_fingerprint(repo), before_index)
+            self.assertEqual(gate["visual_baseline_changes"], [
+                {"name": "pixels", "baseline_paths": ["snapshots/**"], "changed_files": ["snapshots/home.png"]}
+            ])
+            self.assertTrue(gate["loosened"])
+            chk = check_harness(str(repo))
+            self.assertFalse(chk["valid"])
+            self.assertEqual(chk["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+            audit = audit_harness(str(repo))
+            self.assertEqual(audit["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+            self.assertEqual((audit["drifted"], audit["drift_classification"]["classification"]), (True, "doc_drift"))
+            self.assertTrue(any("Restore the modified frozen visual baselines" in r for r in audit["recommendations"]))
+
+            _commit_all(repo, "regenerate baselines")
+            self.assertTrue(check_harness(str(repo))["valid"])
+            committed = check_harness(str(repo), base_ref=harness_commit)
+            self.assertFalse(committed["valid"])
+            self.assertEqual(committed["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+            self.assertEqual(audit_harness(str(repo))["visual_baseline_changes"][0]["name"], "pixels")
+
+        with isolated_hermes_home() as home:
+            repo, _ = self._repo(home, frozen_baseline=False)
+            _write(repo, "snapshots/home.png", "png-regenerated\n")
+            self.assertFalse(detect_harness_gate_loosening(repo)["loosened"])
+            self.assertEqual(audit_harness(str(repo))["visual_baseline_changes"], [])
+
+    def _assert_tampered(self, repo: Path, base_ref: Any = None, path: str = "snapshots/home.png") -> None:
+        from factonio.harness import audit_harness, check_harness, detect_harness_gate_loosening
+
+        before_index = _index_fingerprint(repo)
+        gate = detect_harness_gate_loosening(repo, base_ref=base_ref) if base_ref else detect_harness_gate_loosening(repo)
+        chk = check_harness(str(repo), base_ref=base_ref)
+        audit = audit_harness(str(repo), base_ref=base_ref)
+        self.assertEqual(_index_fingerprint(repo), before_index)
+        self.assertTrue(gate["loosened"], gate)
+        self.assertIn(path, gate["visual_baseline_changes"][0]["changed_files"])
+        self.assertFalse(chk["valid"])
+        self.assertIn(path, chk["visual_baseline_changes"][0]["changed_files"])
+        self.assertTrue(audit["drifted"])
+        self.assertEqual(audit["severity"], "stale")
+        self.assertIn(path, audit["visual_baseline_changes"][0]["changed_files"])
+
+    def test_staged_removal_or_rename_with_replacement_is_flagged(self):
+        from factonio.harness import detect_harness_gate_loosening
+
+        scenarios = {
+            "rm-cached": [("git", "rm", "-q", "--cached", "snapshots/home.png")],
+            "rm-cached+regenerated": [("git", "rm", "-q", "--cached", "snapshots/home.png"),
+                                      ("write", "snapshots/home.png")],
+            "rm+recreated": [("git", "rm", "-q", "snapshots/home.png"), ("write", "snapshots/home.png")],
+            "mv+recreated": [("git", "mv", "snapshots/home.png", "snapshots/home_backup.png"),
+                             ("write", "snapshots/home.png")],
+            "rm-cached+recreated+add": [("git", "rm", "-q", "--cached", "snapshots/home.png"),
+                                        ("write", "snapshots/home.png"), ("git", "add", "snapshots/home.png")],
+        }
+        for label, steps in scenarios.items():
+            with self.subTest(label), isolated_hermes_home() as home:
+                repo, _ = self._repo(home)
+                for step in steps:
+                    if step[0] == "write":
+                        _write(repo, step[1], "png-regenerated\n")
+                    else:
+                        _git(repo, *step[1:])
+                self._assert_tampered(repo)
+
+        for replacement in ("untracked", "staged"):
+            with self.subTest(f"committed-untrack+{replacement}"), isolated_hermes_home() as home:
+                repo, harness_commit = self._repo(home)
+                _git(repo, "rm", "-q", "--cached", "snapshots/home.png")
+                _git(repo, "commit", "-q", "-m", "untrack baseline")
+                _write(repo, "snapshots/home.png", "png-regenerated\n")
+                if replacement == "staged":
+                    _git(repo, "add", "snapshots/home.png")
+                self._assert_tampered(repo, base_ref=harness_commit)
+
+        with isolated_hermes_home() as home:
+            repo, harness_commit = self._repo(home)
+            _write(repo, "snapshots/brand_new.png", "png-new\n")
+            self.assertFalse(detect_harness_gate_loosening(repo)["loosened"])
+            _git(repo, "add", "snapshots/brand_new.png")
+            self.assertFalse(detect_harness_gate_loosening(repo)["loosened"])
+            _git(repo, "commit", "-q", "-m", "new baseline")
+            self.assertFalse(detect_harness_gate_loosening(repo, base_ref=harness_commit)["loosened"])
+            _write(repo, "snapshots/brand_new.png", "png-new-v2\n")
+            self.assertEqual(
+                detect_harness_gate_loosening(repo, base_ref=harness_commit)["visual_baseline_changes"], []
+            )
+
+    def test_disabled_regeneration_values_are_not_active_regeneration(self):
+        from factonio.harness import detect_harness_gate_loosening
+
+        hj_cases = {
+            "=none -> =all": ("--update-snapshots=none", "--update-snapshots=all", True),
+            "=none -> bare": ("--update-snapshots=none", "--update-snapshots", True),
+            "none -> all (separate)": ("--update-snapshots none", "--update-snapshots all", True),
+            "=false -> =all": ("--update-snapshots=false", "--update-snapshots=all", True),
+            "plain -> =none": ("", "--update-snapshots=none", True),  # Round 19: no insertion is inert
+            "plain -> =false": ("", "--update-snapshots=false", True),
+            "unchanged =none": ("--update-snapshots=none", "--update-snapshots=none", False),
+            "unchanged =false": ("--update-snapshots=false", "--update-snapshots=false", False),
+            "plain -> none (separate)": ("", "--update-snapshots none", True),  # fail closed: only `=none` is inert
+        }
+        for label, (base_flag, live_flag, loosened) in hj_cases.items():
+            with self.subTest(label), isolated_hermes_home() as home:
+                base_cmd = (self.COMMAND + " " + base_flag).strip()
+                repo, _ = self._repo(home, command=base_cmd)
+                self._set_pixels(repo, command=self.COMMAND + " " + live_flag)
+                gate = detect_harness_gate_loosening(repo)
+                self.assertEqual(gate["loosened"], loosened, gate["findings"])
+                self.assertEqual(gate["loosened_visual_hooks"], ["pixels"] if loosened else [])
+
+    def test_repos_without_optional_fields_stay_clean(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo, _ = TestFormalInvariantDrift()._repo(home, [
+                {"name": "lint", "kind": "invariant", "command": "true"},
+                {"name": "pixels", "kind": "visual_diff", "command": "true -u"},
+            ])
+            _write(repo, "snapshots/home.png", "x\n")
+            chk = check_harness(str(repo), run_doctor=True, run_hooks=True)
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual(chk["warnings"], [])
+            self.assertFalse(chk["formal_invariants"]["checked"])
+            self.assertEqual(chk["visual_baseline_changes"], [])
+            self.assertFalse(chk["gate_loosening"]["loosened"])
+            (repo / "snapshots" / "home.png").unlink()
+            audit = audit_harness(str(repo))
+            self.assertEqual((audit["severity"], audit["drifted"]), ("clean", False))
+            for key in ("stale_invariants", "dead_cover_globs", "unresolved_sync_commits", "visual_baseline_changes"):
+                self.assertEqual(audit[key], [], key)
+
+    def test_agent_tool_schema_and_handler_surface_metadata(self):
+        from factonio.agent_tools import register_tools
+
+        with isolated_hermes_home() as home:
+            ctx = _FakeCtx()
+            register_tools(ctx)
+            tool = ctx.tools["factonio_bootstrap_verify"]
+            props = tool["schema"]["parameters"]["properties"]["hooks"]["items"]["properties"]
+            for key in ("covers", "sync_commit", "baseline_paths", "frozen_baseline"):
+                self.assertIn(key, props)
+            repo = _make_repo(home)
+            _write(repo, "snapshots/home.png", "png-v1\n")
+            res = json.loads(tool["handler"]({"action": "init", "repo": str(repo), "hooks": [
+                {"name": "pixels", "kind": "visual_diff", "command": "true", "baseline_paths": ["snapshots/**"]},
+                {"name": "model", "kind": "invariant", "command": "true", "covers": ["api/**"]},
+            ]}))
+            self.assertTrue(res["written"], res)
+            self.assertIs(res["manifest"]["hooks"][0]["frozen_baseline"], True)
+            _commit_all(repo, "harness")
+            _write(repo, "snapshots/home.png", "png-v2\n")
+            chk = json.loads(tool["handler"]({"action": "check", "repo": str(repo)}))
+            self.assertFalse(chk["valid"])
+            self.assertEqual(chk["visual_baseline_changes"][0]["name"], "pixels")
+            self.assertTrue(chk["formal_invariants"]["checked"])
+            bad = json.loads(tool["handler"]({"action": "init", "repo": str(repo), "force": True, "hooks": [
+                {"name": "x", "kind": "custom", "command": "true", "covers": ["api/**"]},
+            ]}))
+            self.assertFalse(bad.get("ok", True))
+
+
+class TestFixRound2VisualGuardAndHarnessGaps(unittest.TestCase):
+    """Post-hook frozen-baseline re-check, verify.md hook validation and the audit gate base."""
+
+    @staticmethod
+    def _visual_repo(home: Path, command: Any, *, name: str = "svc") -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness + baselines")
+        return repo
+
+    @staticmethod
+    def _set_command(repo: Path, command: Any) -> None:
+        hj = repo / ".factonio" / "harness.json"
+        manifest = json.loads(hj.read_text(encoding="utf-8"))
+        manifest["hooks"][0]["command"] = command
+        hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    def test_check_run_hooks_rechecks_frozen_baselines_after_hooks(self):
+        from factonio.harness import check_harness, classify_harness_drift
+
+        with isolated_hermes_home() as home:
+            repo = self._visual_repo(home, "printf png-regenerated > snapshots/home.png")
+            before = check_harness(str(repo))
+            self.assertTrue(before["valid"], before["errors"])
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertEqual((repo / "snapshots" / "home.png").read_text(encoding="utf-8"), "png-regenerated")
+            self.assertEqual(chk["hook_results"]["failed_required"], [])
+            self.assertFalse(chk["valid"])
+            self.assertFalse(chk["ok"])
+            self.assertTrue(chk["gate_loosening"]["loosened"])
+            self.assertEqual(chk["visual_baseline_changes"], [
+                {"name": "pixels", "baseline_paths": ["snapshots/**"], "changed_files": ["snapshots/home.png"]}
+            ])
+            self.assertEqual(chk["gate_loosening"]["visual_baseline_changes"], chk["visual_baseline_changes"])
+            self.assertTrue(any("frozen baseline of visual_diff hook 'pixels'" in e for e in chk["errors"]))
+            self.assertEqual(classify_harness_drift(None, chk)["classification"], "doc_drift")
+
+        with isolated_hermes_home() as home:
+            repo = self._visual_repo(home, "printf png-new > snapshots/brand_new.png")
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual(chk["visual_baseline_changes"], [])
+
+    def _assert_md_hooks_harness_gap(self, repo: Path) -> None:
+        from factonio.harness import audit_harness, check_harness, classify_harness_drift
+
+        for kwargs in ({}, {"run_doctor": True, "run_hooks": True}):
+            chk = check_harness(str(repo), **kwargs)
+            self.assertFalse(chk["valid"], kwargs)
+            self.assertTrue(any(e.startswith("verify.md hooks invalid:") for e in chk["errors"]), chk["errors"])
+            self.assertTrue(any(e.startswith("verify.md hooks invalid:") for e in chk["manifest_errors"]), chk)
+            res = classify_harness_drift(None, chk)
+            self.assertEqual(res["classification"], "harness_gap", res)
+            self.assertTrue(res["reasons"][0].startswith("harness_gap: Malformed .factonio/verify.md"), res)
+        audit = audit_harness(str(repo))
+        self.assertEqual((audit["drifted"], audit["severity"]), (True, "stale"))
+        self.assertTrue(any(e.startswith("verify.md hooks invalid:") for e in audit["manifest_errors"]), audit)
+        self.assertEqual(audit["drift_classification"]["classification"], "harness_gap")
+
+    def test_malformed_verify_md_hook_metadata_is_harness_gap(self):
+        from factonio.harness import bootstrap_verify_harness
+
+        md_line = "- **lint** (`custom`, required): `true`"
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            bootstrap_verify_harness(str(repo), hooks=[{"name": "lint", "kind": "custom", "command": "true"}])
+            hj = repo / ".factonio" / "harness.json"
+            manifest = json.loads(hj.read_text(encoding="utf-8"))
+            del manifest["hooks"]
+            hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            md = repo / ".factonio" / "verify.md"
+            text = md.read_text(encoding="utf-8")
+            self.assertIn(md_line, text)
+            md.write_text(text.replace(md_line, md_line + " [covers: `api/**`]"), encoding="utf-8")
+            _commit_all(repo, "hook-less harness.json + malformed verify.md hook")
+            self._assert_md_hooks_harness_gap(repo)
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            bootstrap_verify_harness(str(repo), hooks=[{"name": "model", "kind": "invariant", "command": "true"}])
+            (repo / ".factonio" / "harness.json").unlink()
+            md = repo / ".factonio" / "verify.md"
+            line = "- **model** (`invariant`, required): `true`"
+            text = md.read_text(encoding="utf-8")
+            self.assertIn(line, text)
+            md.write_text(text.replace(line, line + " [sync_commit: `HEAD`]"), encoding="utf-8")
+            _commit_all(repo, "verify.md-only harness with sync_commit but no covers")
+            self._assert_md_hooks_harness_gap(repo)
+
+    def test_default_audit_after_init_gates_against_last_harness_commit(self):
+        from factonio.harness import audit_harness, bootstrap_verify_harness
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            _write(repo, "snapshots/home.png", "png-v1\n")
+            c1 = _commit_all(repo, "baseline")
+            bootstrap_verify_harness(str(repo), hooks=[
+                {"name": "pixels", "kind": "visual_diff", "command": "true", "baseline_paths": ["snapshots/**"]},
+            ])
+            self.assertEqual(json.loads((repo / ".factonio" / "harness.json").read_text())["base_commit"], c1)
+            c2 = _commit_all(repo, "harness")
+            clean = audit_harness(str(repo))
+            self.assertEqual((clean["severity"], clean["gate_loosening"]["checked"]), ("clean", True))
+            self.assertEqual(clean["gate_loosening"]["base_commit"], c2)
+            _write(repo, "snapshots/home.png", "png-regenerated\n")
+            _commit_all(repo, "regenerate baseline")
+            audit = audit_harness(str(repo))
+            self.assertEqual(audit["base_commit"], c1)
+            gate = audit["gate_loosening"]
+            self.assertEqual((gate["checked"], gate["loosened"], gate["base_commit"]), (True, True, c2))
+            self.assertEqual(gate["visual_baseline_changes"], audit["visual_baseline_changes"])
+            self.assertEqual(audit["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+            self.assertTrue(any("frozen baseline" in f for f in gate["findings"]))
+
+            run = TestSurfaces()._cli()
+            code, out, _ = run("harness", "audit", str(repo), "--json")
+            self.assertEqual(code, 1)
+            self.assertTrue(json.loads(out)["gate_loosening"]["loosened"])
+
+
+class TestFixRound3PinnedAuditBase(unittest.TestCase):
+    """Default audit keeps a pinned approved `base_commit`; non-finite thresholds; missing-harness baselines."""
+
+    @staticmethod
+    def _pinned_repo(home: Path) -> tuple[Path, str]:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _commit_all(repo, "baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "req-inv", "kind": "invariant", "command": "true"},
+            {"name": "ui-snap", "kind": "visual_diff", "command": "true", "baseline_paths": ["snapshots/**"],
+             "frozen_baseline": True},
+        ])
+        approved = _commit_all(repo, "approved harness")
+        hj = repo / ".factonio" / "harness.json"
+        manifest = json.loads(hj.read_text(encoding="utf-8"))
+        manifest["base_commit"] = approved
+        hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        _commit_all(repo, "pin base_commit")
+        return repo, approved
+
+    @staticmethod
+    def _edit(repo: Path, mutate: Any) -> None:
+        hj = repo / ".factonio" / "harness.json"
+        manifest = json.loads(hj.read_text(encoding="utf-8"))
+        mutate(manifest)
+        hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    def test_default_audit_gates_against_pinned_base_commit(self):
+        from factonio.harness import audit_harness
+
+        def drop_hook(m):
+            m["hooks"] = [h for h in m["hooks"] if h["name"] != "req-inv"]
+
+        def downgrade_and_drop_doctor(m):
+            for h in m["hooks"]:
+                if h["name"] == "req-inv":
+                    h["optional"] = True
+            m["phases"]["doctor"] = m["phases"]["doctor"][1:]
+
+        def regenerate(m):
+            for h in m["hooks"]:
+                if h["name"] == "ui-snap":
+                    h["command"] = "true --update-snapshots"
+
+        def unfreeze(m):
+            for h in m["hooks"]:
+                if h["name"] == "ui-snap":
+                    h["frozen_baseline"] = False
+
+        cases = {
+            "removed": (drop_hook, "removed_required_hooks"),
+            "downgraded": (downgrade_and_drop_doctor, "downgraded_hooks"),
+            "regenerate": (regenerate, "loosened_visual_hooks"),
+            "unfreeze": (unfreeze, "visual_baseline_changes"),
+        }
+        for label, (mutate, field) in cases.items():
+            with self.subTest(label), isolated_hermes_home() as home:
+                repo, approved = self._pinned_repo(home)
+                clean = audit_harness(str(repo))
+                self.assertEqual((clean["severity"], clean["gate_loosening"]["base_commit"]), ("clean", approved))
+                self._edit(repo, mutate)
+                if label == "unfreeze":
+                    _write(repo, "snapshots/home.png", "png-regenerated\n")
+                _commit_all(repo, f"loosen: {label}")
+                audit = audit_harness(str(repo))
+                gate = audit["gate_loosening"]
+                self.assertEqual((audit["base_commit"], audit["base_source"]), (approved, "harness.json base_commit"))
+                self.assertEqual((gate["checked"], gate["loosened"], gate["base_commit"]), (True, True, approved))
+                self.assertTrue(gate[field], gate)
+                self.assertTrue(gate["findings"])
+                self.assertEqual((audit["drifted"], audit["severity"]), (True, "stale"))
+                if label == "downgraded":
+                    self.assertTrue(gate["removed_doctor_commands"], gate)
+                if label == "unfreeze":
+                    self.assertEqual(audit["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+                code, out, _ = TestSurfaces()._cli()("harness", "audit", str(repo), "--json")
+                self.assertEqual(code, 1)
+                self.assertTrue(json.loads(out)["gate_loosening"]["loosened"])
+
+    def test_non_finite_threshold_is_threshold_removal(self):
+        from factonio.harness import detect_harness_gate_loosening
+
+        for value in ("nan", "inf", "-inf", "NaN%"):
+            with self.subTest(value), isolated_hermes_home() as home:
+                repo = TestFixRound2VisualGuardAndHarnessGaps._visual_repo(home, "true --max-diff 0.01")
+                TestFixRound2VisualGuardAndHarnessGaps._set_command(repo, f"true --max-diff {value}")
+                gate = detect_harness_gate_loosening(repo)
+                self.assertTrue(gate["loosened"], gate)
+                self.assertEqual(gate["loosened_visual_hooks"], ["pixels"])
+                self.assertTrue(any("threshold" in f for f in gate["findings"]), gate["findings"])
+
+    def test_missing_harness_reports_top_level_baseline_changes(self):
+        from factonio.harness import audit_harness
+
+        with isolated_hermes_home() as home:
+            repo = TestFixRound2VisualGuardAndHarnessGaps._visual_repo(home, "true")
+            (repo / ".factonio" / "verify.md").unlink()
+            _write(repo, "snapshots/home.png", "png-regenerated\n")
+            audit = audit_harness(str(repo))
+            self.assertEqual(audit["severity"], "missing")
+            changes = audit["gate_loosening"]["visual_baseline_changes"]
+            self.assertTrue(changes)
+            self.assertEqual(audit["visual_baseline_changes"], changes)
+            self.assertIn("snapshots/home.png", audit["visual_baseline_changes"][0]["changed_files"])
+
+
+class TestHarnessDirFormalInvariants(unittest.TestCase):
+    """Formal invariants covering `.factonio/` files are inventoried without leaking into the general inventory."""
+
+    def test_invariant_covering_harness_dir_file_is_inventoried_and_drifts(self):
+        from factonio.harness import audit_harness, bootstrap_verify_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            _write(repo, ".factonio/model.cfg", "states = 3\n")
+            _commit_all(repo, "model")
+            sync = _git(repo, "rev-parse", "HEAD")
+            bootstrap_verify_harness(str(repo), hooks=[
+                {"name": "model", "kind": "invariant", "command": "true", "covers": [".factonio/model.cfg"],
+                 "sync_commit": sync},
+            ])
+            _commit_all(repo, "harness")
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual(chk["formal_invariants"]["dead_cover_globs"], [])
+            self.assertEqual([i["status"] for i in chk["formal_invariants"]["invariants"]], ["in_sync"])
+            clean = audit_harness(str(repo))
+            self.assertEqual((clean["severity"], clean["dead_cover_globs"], clean["stale_invariants"]),
+                             ("clean", [], []))
+
+            _write(repo, ".factonio/model.cfg", "states = 4\n")
+            _commit_all(repo, "change model")
+            before_index = _index_fingerprint(repo)
+            chk = check_harness(str(repo))
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual([i["status"] for i in chk["formal_invariants"]["invariants"]], ["stale"])
+            self.assertEqual([i["changed_files"] for i in chk["formal_invariants"]["stale_invariants"]],
+                             [[".factonio/model.cfg"]])
+            audit = audit_harness(str(repo))
+            self.assertEqual(_index_fingerprint(repo), before_index)
+            self.assertEqual((audit["drifted"], audit["severity"]), (True, "stale"))
+            self.assertEqual([i["changed_files"] for i in audit["stale_invariants"]], [[".factonio/model.cfg"]])
+            self.assertEqual(audit["drift_classification"]["classification"], "doc_drift")
+            self.assertEqual(audit["orphaned_globs"], [])
+
+    def test_harness_dir_stays_out_of_general_inventory(self):
+        from factonio.harness import _changed_files, _list_repo_files
+
+        with isolated_hermes_home() as home:
+            repo = _make_repo(home)
+            base = _git(repo, "rev-parse", "HEAD")
+            _write(repo, ".factonio/model.cfg", "x\n")
+            _write(repo, ".venv/lib/x.py", "x\n")
+            self.assertNotIn(".factonio/model.cfg", _list_repo_files(repo)[0])
+            self.assertNotIn(".factonio/model.cfg", _changed_files(repo, base))
+            self.assertIn(".factonio/model.cfg", _changed_files(repo, base, include_harness_dir=True))
+
+
+class TestFixRound9LiveFrozenBaselines(unittest.TestCase):
+    """Live-declared frozen `visual_diff` baselines protect existing committed images."""
+
+    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
+
+    @staticmethod
+    def _repo_without_visual_hook(home: Path) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        bootstrap_verify_harness(str(repo), hooks=[{"name": "lint", "kind": "invariant", "command": "true"}])
+        _commit_all(repo, "harness + committed baseline image")
+        return repo
+
+    @staticmethod
+    def _add_live_visual_hook(repo: Path, command: str, **meta: Any) -> None:
+        hj = repo / ".factonio" / "harness.json"
+        manifest = json.loads(hj.read_text(encoding="utf-8"))
+        manifest["hooks"].append({"name": "pixels", "kind": "visual_diff", "command": command,
+                                  "baseline_paths": ["snapshots/**"], **meta})
+        hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    def test_live_added_frozen_hook_protects_existing_committed_baselines(self):
+        from factonio.harness import audit_harness, check_harness, detect_harness_gate_loosening
+
+        for meta in ({}, {"frozen_baseline": True}):
+            with self.subTest(meta=meta), isolated_hermes_home() as home:
+                repo = self._repo_without_visual_hook(home)
+                self._add_live_visual_hook(repo, "true", **meta)
+                clean = check_harness(str(repo), run_hooks=True)
+                self.assertTrue(clean["valid"], clean["errors"])
+                self.assertEqual(clean["visual_baseline_changes"], [])
+
+                _write(repo, "snapshots/home.png", "png-tampered\n")
+                gate = detect_harness_gate_loosening(repo)
+                self.assertEqual(gate["visual_baseline_changes"], [
+                    {"name": "pixels", "baseline_paths": ["snapshots/**"], "changed_files": ["snapshots/home.png"]}
+                ])
+                chk = check_harness(str(repo), run_hooks=True)
+                self.assertFalse(chk["valid"])
+                self.assertEqual(chk["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+                self.assertEqual(audit_harness(str(repo))["visual_baseline_changes"][0]["changed_files"],
+                                 ["snapshots/home.png"])
+                _git(repo, "checkout", "--", "snapshots/home.png")
+
+                # a hook that regenerates the existing image while it runs is caught by the post-hook re-check
+                hj = repo / ".factonio" / "harness.json"
+                manifest = json.loads(hj.read_text(encoding="utf-8"))
+                manifest["hooks"][-1]["command"] = "printf regen > snapshots/home.png"
+                hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+                self.assertFalse(detect_harness_gate_loosening(repo)["loosened"])
+                post = check_harness(str(repo), run_hooks=True)
+                self.assertEqual(post["hook_results"]["failed_required"], [])
+                self.assertFalse(post["valid"])
+                self.assertEqual(post["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+
+    def test_live_added_frozen_hook_allows_brand_new_baselines_and_unfrozen_hooks(self):
+        from factonio.harness import check_harness, detect_harness_gate_loosening
+
+        with isolated_hermes_home() as home:
+            repo = self._repo_without_visual_hook(home)
+            self._add_live_visual_hook(repo, "printf new > snapshots/new-screen.png")
+            _write(repo, "snapshots/other.png", "png-new\n")
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertTrue((repo / "snapshots" / "new-screen.png").exists())
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual(chk["visual_baseline_changes"], [])
+        with isolated_hermes_home() as home:
+            repo = self._repo_without_visual_hook(home)
+            self._add_live_visual_hook(repo, "true", frozen_baseline=False)
+            _write(repo, "snapshots/home.png", "png-regenerated\n")
+            self.assertFalse(detect_harness_gate_loosening(repo)["loosened"])
+            self.assertTrue(check_harness(str(repo), run_hooks=True)["valid"])
+
+    def test_live_hook_cannot_unfreeze_or_drop_committed_frozen_globs(self):
+        from factonio.harness import check_harness
+
+        with isolated_hermes_home() as home:
+            repo = self._visual_repo(home, "true")
+            _write(repo, "snapshots/home.png", "png-tampered\n")
+            for meta in ({"frozen_baseline": False}, {"baseline_paths": ["other/**"]}):
+                with self.subTest(meta=meta):
+                    hj = repo / ".factonio" / "harness.json"
+                    manifest = json.loads(hj.read_text(encoding="utf-8"))
+                    manifest["hooks"][0].update({"baseline_paths": ["snapshots/**"], "frozen_baseline": True, **meta})
+                    hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+                    chk = check_harness(str(repo))
+                    self.assertFalse(chk["valid"])
+                    self.assertEqual(chk["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+
+
+class TestFixRound10FirstHarnessFrozenBaselines(unittest.TestCase):
+    """Frozen baselines of a first, not-yet-committed harness (`baseline_source: live`)."""
+
+    @staticmethod
+    def _uncommitted_harness(home: Path, command: str, **meta: Any) -> tuple[Path, str]:
+        """A repo whose committed `snapshots/home.png` predates a freshly initialised, uncommitted harness."""
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        main_sha = _commit_all(repo, "committed baseline image, no harness yet")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"], **meta},
+        ])
+        return repo, main_sha
+
+    def test_uncommitted_first_harness_protects_existing_committed_baselines(self):
+        from factonio.harness import audit_harness, check_harness, detect_harness_gate_loosening
+
+        expected = [{"name": "pixels", "baseline_paths": ["snapshots/**"], "changed_files": ["snapshots/home.png"]}]
+        with isolated_hermes_home() as home:
+            repo, _ = self._uncommitted_harness(home, "true")
+            self.assertTrue(check_harness(str(repo), run_hooks=True)["valid"])
+            _write(repo, "snapshots/home.png", "png-tampered\n")
+            gate = detect_harness_gate_loosening(repo)
+            self.assertEqual((gate["checked"], gate["loosened"], gate["baseline_source"]), (True, True, "live"))
+            self.assertEqual(gate["visual_baseline_changes"], expected)
+            chk = check_harness(str(repo))
+            self.assertFalse(chk["valid"])
+            self.assertEqual(chk["visual_baseline_changes"], expected)
+            self.assertEqual(audit_harness(str(repo))["visual_baseline_changes"], expected)
+        with isolated_hermes_home() as home:
+            repo, _ = self._uncommitted_harness(home, "printf regen > snapshots/home.png")
+            self.assertFalse(detect_harness_gate_loosening(repo)["loosened"])
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertEqual((repo / "snapshots" / "home.png").read_text(encoding="utf-8"), "regen")
+            self.assertEqual(chk["hook_results"]["failed_required"], [])
+            self.assertFalse(chk["valid"])
+            self.assertTrue(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+            self.assertEqual(chk["visual_baseline_changes"], expected)
+
+    def test_pr_introducing_the_first_harness_cannot_modify_existing_baselines(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo, main_sha = self._uncommitted_harness(home, "true")
+            _git(repo, "checkout", "-q", "-b", "feature")
+            _write(repo, "snapshots/home.png", "png-regenerated\n")
+            _commit_all(repo, "add harness and regenerate the committed baseline")
+            chk = check_harness(str(repo), base_ref=main_sha)
+            self.assertFalse(chk["valid"])
+            self.assertEqual(chk["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+            self.assertTrue(any("frozen baseline" in e for e in chk["errors"]), chk["errors"])
+            audit = audit_harness(str(repo), base_ref=main_sha)
+            self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("stale", True))
+            self.assertTrue(check_harness(str(repo))["valid"])  # vs HEAD the committed image is the baseline
+
+    def test_first_harness_controls_stay_clean(self):
+        from factonio.harness import check_harness, detect_harness_gate_loosening
+
+        with isolated_hermes_home() as home:  # brand-new baseline files are new surfaces, not tampering
+            repo, main_sha = self._uncommitted_harness(home, "printf new > snapshots/new-screen.png")
+            _write(repo, "snapshots/other.png", "png-new\n")
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertTrue((repo / "snapshots" / "new-screen.png").exists())
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual(chk["visual_baseline_changes"], [])
+            _commit_all(repo, "harness + new baselines")
+            self.assertTrue(check_harness(str(repo), base_ref=main_sha)["valid"])
+        for meta in ({"frozen_baseline": False}, {"baseline_paths": None}):
+            with self.subTest(meta=meta), isolated_hermes_home() as home:  # no frozen hook: Wave 4 contract
+                repo, _ = self._uncommitted_harness(home, "printf regen > snapshots/home.png")
+                hj = repo / ".factonio" / "harness.json"
+                manifest = json.loads(hj.read_text(encoding="utf-8"))
+                manifest["hooks"][0].update(meta)
+                manifest["hooks"][0] = {k: v for k, v in manifest["hooks"][0].items() if v is not None}
+                hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+                gate = detect_harness_gate_loosening(repo)
+                self.assertEqual((gate["checked"], gate["loosened"], gate["baseline_source"]), (False, False, None))
+                self.assertIn("no .factonio/ harness committed", gate["reason"])
+                self.assertTrue(check_harness(str(repo), run_hooks=True)["valid"])
+
+    def test_audit_still_falls_back_to_the_committed_harness(self):
+        from factonio.harness import audit_harness
+
+        with isolated_hermes_home() as home:
+            repo, main_sha = self._uncommitted_harness(home, "true")
+            hj = repo / ".factonio" / "harness.json"
+            manifest = json.loads(hj.read_text(encoding="utf-8"))
+            manifest["hooks"].append({"name": "lint", "kind": "invariant", "command": "true"})
+            hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            _commit_all(repo, "commit harness")
+            manifest["hooks"] = [h for h in manifest["hooks"] if h["name"] != "lint"]
+            hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            _write(repo, "snapshots/home.png", "png-tampered\n")
+            audit = audit_harness(str(repo), base_ref=main_sha)
+            gate = audit["gate_loosening"]
+            self.assertEqual(gate["removed_required_hooks"], ["lint"], gate)
+            self.assertEqual(gate["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+            self.assertEqual(audit["severity"], "stale")
+
+
+class TestFixRound11ImmutablePreExecutionFrozenContract(unittest.TestCase):
+    """The frozen-baseline contract fixed before Doctor/hooks run, even when they unfreeze or remove the hook."""
+
+    _uncommitted_harness = staticmethod(TestFixRound10FirstHarnessFrozenBaselines._uncommitted_harness)
+
+    # run by a hook or Doctor command: drop the `pixels` hook's frozen contract, then regenerate its baseline
+    _MUTATE = ("import json, pathlib, sys\n"
+               "hj = pathlib.Path('.factonio/harness.json')\n"
+               "m = json.loads(hj.read_text())\n"
+               "if sys.argv[1] == 'remove':\n"
+               "    m['hooks'] = [h for h in m['hooks'] if h['name'] != 'pixels']\n"
+               "else:\n"
+               "    for h in m['hooks']:\n"
+               "        if h['name'] == 'pixels':\n"
+               "            h['frozen_baseline'] = False\n"
+               "hj.write_text(json.dumps(m, indent=2))\n"
+               "pathlib.Path('snapshots/home.png').write_text('regenerated')\n")
+    _EXPECTED = [{"name": "pixels", "baseline_paths": ["snapshots/**"], "changed_files": ["snapshots/home.png"]}]
+
+    def _assert_contract_kept(self, repo: Path, **run: bool) -> None:
+        from factonio.harness import check_harness
+
+        chk = check_harness(str(repo), **run)
+        self.assertEqual((repo / "snapshots" / "home.png").read_text(encoding="utf-8"), "regenerated")
+        self.assertFalse(chk["ok"])
+        self.assertFalse(chk["valid"])
+        self.assertTrue(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+        self.assertEqual(chk["visual_baseline_changes"], self._EXPECTED)
+        self.assertTrue(any("removed or unfrozen while Doctor/hooks ran" in e for e in chk["errors"]), chk["errors"])
+
+    def test_first_harness_hook_cannot_unfreeze_itself_and_regenerate(self):
+        for mode in ("unfreeze", "remove"):
+            with self.subTest(mode=mode), isolated_hermes_home() as home:
+                repo, _ = self._uncommitted_harness(home, f"python3 mutate.py {mode}")
+                _write(repo, "mutate.py", self._MUTATE)
+                self._assert_contract_kept(repo, run_hooks=True)
+
+    def test_live_added_hook_cannot_unfreeze_itself_and_regenerate(self):
+        from factonio.harness import bootstrap_verify_harness
+
+        for mode in ("unfreeze", "remove"):
+            with self.subTest(mode=mode), isolated_hermes_home() as home:
+                repo = _make_repo(home)
+                _write(repo, "snapshots/home.png", "png-v1\n")
+                _write(repo, "mutate.py", self._MUTATE)
+                bootstrap_verify_harness(str(repo), hooks=[{"name": "lint", "kind": "invariant", "command": "true"}])
+                _commit_all(repo, "committed harness without a visual hook")
+                hj = repo / ".factonio" / "harness.json"
+                manifest = json.loads(hj.read_text(encoding="utf-8"))
+                manifest["hooks"].append({"name": "pixels", "kind": "visual_diff", "baseline_paths": ["snapshots/**"],
+                                          "command": f"python3 mutate.py {mode}"})
+                hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+                self._assert_contract_kept(repo, run_hooks=True)
+
+    def test_doctor_command_cannot_unfreeze_and_regenerate(self):
+        for mode in ("unfreeze", "remove"):
+            for committed in (False, True):
+                with self.subTest(mode=mode, committed=committed), isolated_hermes_home() as home:
+                    repo, _ = self._uncommitted_harness(home, "true")
+                    _write(repo, "mutate.py", self._MUTATE)
+                    hj = repo / ".factonio" / "harness.json"
+                    manifest = json.loads(hj.read_text(encoding="utf-8"))
+                    manifest.setdefault("phases", {})["doctor"] = [f"python3 mutate.py {mode}"]
+                    hj.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+                    if committed:
+                        _commit_all(repo, "harness with a mutating Doctor command")
+                    self._assert_contract_kept(repo, run_doctor=True)
+
+    def test_frozen_contract_controls_stay_clean(self):
+        from factonio.harness import check_harness
+
+        with isolated_hermes_home() as home:  # a new baseline file is a new surface, not tampering
+            repo, _ = self._uncommitted_harness(home, "printf new > snapshots/new.png")
+            chk = check_harness(str(repo), run_doctor=True, run_hooks=True)
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertEqual(chk["visual_baseline_changes"], [])
+        with isolated_hermes_home() as home:  # unfrozen before anything ran: the Wave 4 contract
+            repo, _ = self._uncommitted_harness(home, "python3 mutate.py unfreeze", frozen_baseline=False)
+            _write(repo, "mutate.py", self._MUTATE)
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertTrue(chk["valid"], chk["errors"])
+            self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+
+
+class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
+    """The fail-closed structural `visual_diff` command guard: a byte-identical committed command is always
+    clean; an edited one passes only as a pure in-place threshold tightening (the same tokens 1-to-1, nothing
+    inserted or deleted). Shell rewrites fail closed."""
+
+    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    # The visual diff is 0.25: the committed MAX_DIFF=0.01 fails it, the lenient default (MAX_DIFF unset) or a
+    # regenerating `-u` passes it, so every bypass below turns the failing committed check green.
+    _CHECK = ("import os, sys\n"
+              "t = os.environ.get('MAX_DIFF')\n"
+              "sys.exit(0 if '-u' in sys.argv[1:] or 0.25 <= float(t if t is not None else '1.0') else 1)\n")
+    _EXPORTED = "export MAX_DIFF=0.01; python3 check.py"
+    _UNVERIFIABLE = "unverifiable shell/structural rewrite"
+
+    # Round 12 attack classes against the committed `_EXPORTED` hook, each executed by `/bin/sh` (dash or bash).
+    _EXECUTED_BYPASSES = (
+        "export threshold=0.01; python3 check.py",                                  # case-renamed variable
+        "false && export MAX_DIFF=0.01; python3 check.py",                         # short-circuited export
+        "export MAX_DIFF=0.01; bash -c 'exec -c python3 check.py'",               # bash `exec -c`
+        "export MAX_DIFF=0.01; bash -c 'exec -ca visual python3 check.py'",
+        "export MAX_DIFF=0.01; bash -c 'unset \"$0\"; python3 check.py' MAX_DIFF",  # positional expansion
+        "unset MAX_DIFF; (export MAX_DIFF=0.01); python3 check.py",               # subshell re-export
+        "sh -c 'export MAX_DIFF=0.01'; python3 check.py",                          # child-shell re-export
+        "export MAX_DIFF=0.01 | true; python3 check.py",                           # pipeline re-export
+        "eval 'export MAX_DIFF=0.01' | true; python3 check.py",                    # `eval` in a pipeline
+        "{ export MAX_DIFF=0.01; } | true; python3 check.py",                      # brace group in a pipeline
+        "export MAX_DIFF=0.01; env -u MAX_DIFF python3 check.py",                 # env mutators
+        "export MAX_DIFF=0.01; env -i PATH=\"$PATH\" python3 check.py",
+        "bash -c 'export -f MAX_DIFF=0.01; python3 check.py'",                      # function-mode export
+        "f() { export MAX_DIFF=0.01; }; python3 check.py",                         # uncalled function body
+        "export MAX_DIFF=0.01; python3 check.py || true",                          # `||` fallback
+        "export MAX_DIFF=0.01; python3 check.py -u",                               # regeneration flag
+        "export MAX_DIFF=0.01; eval 'python3 check.py -u'",
+        "export MAX_DIFF=0.01\nunset MAX_DIFF\npython3 check.py",                 # newline injection
+    )
+    # Parser-level attacks (bash/GNU-only forms or non-executing fixtures) that must be rejected as well.
+    _REJECTED = {
+        "env --split-str": (_EXPORTED, "export MAX_DIFF=0.01; env --split-str='-u MAX_DIFF python3 check.py'"),
+        "env -S": (_EXPORTED, "export MAX_DIFF=0.01; env -S '-u MAX_DIFF python3 check.py'"),
+        "env -": (_EXPORTED, "export MAX_DIFF=0.01; env - python3 check.py"),
+        "env -u $0": (_EXPORTED, "export MAX_DIFF=0.01; bash -c 'env -u \"$0\" python3 check.py' MAX_DIFF"),
+        "export -f": (_EXPORTED, "export -f MAX_DIFF=0.01; python3 check.py"),
+        "assign + export -f": (_EXPORTED, "MAX_DIFF=0.01; export -f MAX_DIFF; python3 check.py"),
+        "declare -xf": (_EXPORTED, "declare -xf MAX_DIFF=0.01; python3 check.py"),
+        "typeset -xf": (_EXPORTED, "typeset -xf MAX_DIFF=0.01; python3 check.py"),
+        "builtin eval": ("python3 check.py", "builtin eval 'python3 check.py -u'"),
+        "python3 -c": ("python3 check.py", "python3 -c 'import sys; sys.exit(0)' check.py"),
+        "option swallowing": ("npx playwright test --max-diff 0.01", "npx playwright test --output --max-diff 0.01"),
+        "-- bypass": ("npx playwright test --max-diff 0.01", "npx playwright test -- --max-diff 0.01"),
+        "new positive threshold": ("python3 check.py", "python3 check.py --max-diff 0.5"),
+        "threshold removed": ("python3 check.py --max-diff 0.01", "python3 check.py"),
+        "NaN": ("python3 check.py --max-diff 0.01", "python3 check.py --max-diff NaN"),
+        "inf": ("python3 check.py --max-diff 0.01", "python3 check.py --max-diff=inf"),
+        "% loosened": ("python3 check.py --max-diff 1%", "python3 check.py --max-diff 0.05"),
+        "ratio to %": ("python3 check.py --max-diff 0.05", "python3 check.py --max-diff 10%"),
+        "% to ratio": ("python3 check.py --max-diff 5%", "python3 check.py --max-diff 0.01"),
+        "% vs pixels": ("python3 check.py --max-diff 1%", "python3 check.py --max-diff 5"),
+        "swapped thresholds": ("a --max-diff 0.01 && b --max-diff 0.05", "a --max-diff 0.05 && b --max-diff 0.01"),
+        "prefix loosened": ("MAX_DIFF=0.05 python3 check.py", "MAX_DIFF=0.5 python3 check.py"),
+        "new env threshold": ("python3 check.py", "MAX_DIFF=0 python3 check.py"),
+        "jest -u": ("npx jest", "npx jest -u"),
+        "bundled -vu": ("npx jest", "npx jest -vu"),
+        "UPDATE_SNAPSHOTS=1": ("npx jest", "UPDATE_SNAPSHOTS=1 npx jest"),
+        "--update-snapshots=all": ("npx playwright test --update-snapshots=none",
+                                   "npx playwright test --update-snapshots=all"),
+        "go -update": ("go test ./...", "go test ./... -update"),
+        "argv -u": ("python3 check.py", ["python3", "check.py", "-u"]),
+        "test filter": ("pytest tests/visual", "pytest tests/visual -k home"),
+        "--grep=": ("npx playwright test", "npx playwright test --grep=home"),
+        "--help exits 0": ("python3 check.py", "python3 check.py --help"),
+        "positional added": ("npx playwright test", "npx playwright test home.spec.ts"),
+        "sudo": ("python3 check.py", "sudo python3 check.py"),
+        "--env-file=": ("uv run python3 check.py", "uv run --env-file=.env python3 check.py"),
+        "--snapshot-dir=": ("npx playwright test", "npx playwright test --snapshot-dir=tmp"),
+        "--project= filter": ("npx playwright test", "npx playwright test --project=chromium"),
+        "-u not after the interpreter": ("npx jest python3 tests", "npx jest python3 -u tests"),
+        "fd becomes positional": ("npx playwright test 2>err.log", "npx playwright test 2 >err.log"),
+        "quoted expansion": ("python3 check.py '$HOME'", "python3 check.py $HOME"),
+        "redirect target": ("npx playwright test > log.txt", "npx playwright test > UPDATE_SNAPSHOTS=0 log.txt"),
+        "heredoc body": ("python3 - <<'EOF'\nt = 0.01\nEOF", "python3 - <<'EOF'\nt = 0.01 --True\nEOF"),
+        "unclosed quote": ("python3 check.py", "python3 check.py 'unclosed"),
+        "trailing backslash": ("python3 check.py", "python3 check.py \\"),
+        # quoting is never normalized away: a quote-only edit of any word is an unverifiable rewrite
+        "quoted export argument": (_EXPORTED, "export 'MAX_DIFF=0.01'; python3 check.py"),
+        "quoted script argument": (_EXPORTED, "export MAX_DIFF=0.01; python3 \"check.py\""),
+        "quote mutations": (_EXPORTED, "export 'MAX_DIFF=0.01'; python3 \"check.py\""),
+        # Round 19: nothing may be inserted, and operators, flag syntax and line structure keep their spelling
+        "--flag val -> --flag=val": ("python3 check.py --max-diff 0.05", "python3 check.py --max-diff=0.01"),
+        "--reporter=list inserted": ("npx playwright test --max-diff 0.01",
+                                     "npx playwright test --reporter=list --max-diff 0.01"),
+        "--color=never inserted": ("npx playwright test", "npx playwright test --color=never"),
+        "--no-color inserted": ("npx playwright test", "npx playwright test --no-color"),
+        "--verbose inserted": ("npx playwright test", "npx playwright test --verbose"),
+        "-q inserted": ("pytest tests/visual", "pytest tests/visual -q"),
+        "python3 -u inserted": ("python3 check.py", "python3 -u check.py"),
+        "--update-snapshots=false inserted": ("npx playwright test", "npx playwright test --update-snapshots=false"),
+        "UPDATE_SNAPSHOTS=0 inserted": ("npx playwright test", "UPDATE_SNAPSHOTS=0 npx playwright test"),
+        "; -> newline": (_EXPORTED, "export MAX_DIFF=0.01\npython3 check.py\n"),
+        "line continuation": ("python3 check.py --max-diff 0.01", "python3 check.py \\\n  --max-diff 0.01"),
+        # Round 22: an edited command carries no non-threshold option (it could consume the threshold word)
+        "committed --reporter=list tightened": ("npx playwright test --reporter=list --max-diff 0.05",
+                                                "npx playwright test --reporter=list --max-diff 0.01"),
+    }
+    _UNCHANGED = (
+        _EXPORTED, "export 'MAX_DIFF=0.01'; python3 \"check.py\"", "env - python3 -u check.py", "env -S '-u FOO python3 -u check.py'",
+        "bash -c 'export MAX_DIFF=0.01; python3 check.py'", "go test -run TestVisual -fuzz=FuzzUI ./...",
+        "npx playwright test --project=chromium",
+        "timeout 30 python3 -u check.py", "UPDATE_SNAPSHOTS=0 npx playwright test",
+        "npx playwright test --update-snapshots=false", "npx jest -u", "python3 check.py || true",
+        ["sh", "-c", "python3 check.py -u"],
+        "npx playwright test --reporter=list --color=never --verbose", "python3 -u check.py", "pytest -q tests/visual",
+        "npx playwright test --reporter=list --max-diff 0.05",
+        "cat <<EOF >/dev/null\nunused\nEOF\npython3 check.py", "python3 check.py | tee log.txt",
+        "python3 check.py \\\n  --max-diff 0.01", "node check.js --max-diff 1e-2",
+    )
+    _CLEAN = {
+        "--max-diff tightened": ("python3 check.py --max-diff 0.05", "python3 check.py --max-diff 0.01"),
+        "--max-diff= tightened": ("python3 check.py --max-diff=0.05", "python3 check.py --max-diff=0.01"),
+        "% tightened": ("python3 check.py --max-diff 5%", "python3 check.py --max-diff 1%"),
+        "prefix tightened": ("MAX_DIFF=0.05 python3 check.py", "MAX_DIFF=0.01 python3 check.py"),
+        "quoted prefix tightened": ("MAX_DIFF='0.05' python3 check.py", "MAX_DIFF='0.01' python3 check.py"),
+        "env tightened": ("env MAX_DIFF=0.05 python3 check.py", "env MAX_DIFF=0.01 python3 check.py"),
+        "sh -c prefix tightened": ("bash -c 'MAX_DIFF=0.05 python3 check.py'", "bash -c 'MAX_DIFF=0.01 python3 check.py'"),
+        "sh -c pixels tightened": ("sh -c 'node check.js --max-diff-pixels=5'",
+                                   "sh -c 'node check.js --max-diff-pixels=1'"),
+        "committed UPDATE_SNAPSHOTS=0 tightened": ("UPDATE_SNAPSHOTS=0 MAX_DIFF=0.05 npx playwright test",
+                                                   "UPDATE_SNAPSHOTS=0 MAX_DIFF=0.01 npx playwright test"),
+        "threshold tightened to zero": ("npx playwright test --max-diff 0.05", "npx playwright test --max-diff 0"),
+    }
+
+    def _checked_repo(self, home: Path, command: str) -> Path:
+        """A repo whose committed `check.py` predates the committed frozen `visual_diff` harness."""
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "check.py", self._CHECK)
+        _commit_all(repo, "visual check script + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def _assert_rejected(self, cases: dict[str, tuple[Any, Any]]) -> None:
+        from factonio.harness import _visual_hook_loosening
+
+        for label, (base, live) in cases.items():
+            with self.subTest(label):
+                self.assertTrue(_visual_hook_loosening({"command": base}, {"command": live}), (base, live))
+
+    def _assert_clean(self, cases: dict[str, tuple[Any, Any]]) -> None:
+        from factonio.harness import _visual_hook_loosening
+
+        for label, (base, live) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(_visual_hook_loosening({"command": base}, {"command": live}), [])
+
+    def test_round12_attack_classes_fail_check_and_audit_end_to_end(self):
+        from factonio.harness import audit_harness, check_harness
+
+        self._assert_rejected({live: (self._EXPORTED, live) for live in self._EXECUTED_BYPASSES})
+        with isolated_hermes_home() as home:
+            repo = self._checked_repo(home, self._EXPORTED)
+            committed = check_harness(str(repo), run_hooks=True)
+            self.assertEqual(committed["hook_results"]["failed_required"], ["pixels"], committed["hook_results"])
+            self.assertEqual(audit_harness(str(repo))["severity"], "clean")
+            for live in self._EXECUTED_BYPASSES:
+                with self.subTest(live=live):
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(chk["hook_results"]["failed_required"], [], chk["hook_results"])  # real bypass
+                    self.assertFalse(chk["ok"])
+                    self.assertFalse(chk["valid"])
+                    self.assertEqual(chk["gate_loosening"]["loosened_visual_hooks"], ["pixels"], chk["gate_loosening"])
+                    audit = audit_harness(str(repo))
+                    self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("stale", True))
+
+    def test_parser_level_attacks_are_rejected(self):
+        self._assert_rejected(self._REJECTED)
+
+    def test_specific_diagnostics_name_the_loosening(self):
+        from factonio.harness import _visual_hook_loosening
+
+        def reasons(base: Any, live: Any) -> list[str]:
+            return _visual_hook_loosening({"command": base}, {"command": live})
+
+        renamed = reasons(self._EXPORTED, "export threshold=0.01; python3 check.py")
+        self.assertIn("removes threshold `MAX_DIFF=0.01` (falls back to the tool default)", renamed)
+        self.assertTrue(any("adds threshold `threshold=0.01`" in r for r in renamed), renamed)
+        self.assertIn("loosens threshold `--max-diff` from 0.01 to 0.5",
+                      reasons("python3 check.py --max-diff 0.01", "python3 check.py --max-diff 0.5"))
+        self.assertIn("changes threshold unit `--max-diff` (`%` vs plain number) from 1% to 0.05",
+                      reasons("python3 check.py --max-diff 1%", "python3 check.py --max-diff 0.05"))
+        self.assertIn("loosens threshold `--max-diff` from 1% to 5%",
+                      reasons("python3 check.py --max-diff 1%", "python3 check.py --max-diff 5%"))
+        self.assertTrue(any(r.startswith("sets non-finite or unparseable threshold `--max-diff`")
+                            for r in reasons("x --max-diff 0.01", "x --max-diff nan")))
+        self.assertTrue(any(r.startswith("adds threshold `--max-diff=0.5`")
+                            for r in reasons("python3 check.py", "python3 check.py --max-diff 0.5")))
+        self.assertIn("adds snapshot-regeneration flag(s) `-u`", reasons("npx jest", "npx jest -u"))
+        self.assertIn("adds snapshot-regeneration flag(s) `UPDATE_SNAPSHOTS=1`",
+                      reasons("npx jest", "UPDATE_SNAPSHOTS=1 npx jest"))
+        self.assertIn("adds shell `||` fallback to visual_diff hook (a failing check can still pass)",
+                      reasons("python3 check.py", "python3 check.py || true"))
+        self.assertEqual(reasons("python3 check.py", "python3 check.py 'x"),
+                         ["mutates visual_diff command with unparseable shell syntax"])
+        self.assertEqual(reasons(self._EXPORTED, "export MAX_DIFF=0.01; (unset MAX_DIFF); python3 check.py"),
+                         ["mutates committed visual_diff command with an unverifiable shell/structural rewrite"])
+
+    def test_unchanged_commands_of_any_shell_complexity_stay_clean(self):
+        from factonio.harness import audit_harness, check_harness
+
+        self._assert_clean({json.dumps(cmd): (cmd, cmd) for cmd in self._UNCHANGED})
+        self._assert_clean({"malformed but unchanged": ("python3 check.py 'x", "python3 check.py 'x")})
+        with isolated_hermes_home() as home:
+            for n, cmd in enumerate(self._UNCHANGED[:4]):
+                with self.subTest(cmd=cmd):
+                    repo = self._visual_repo(home, cmd, name=f"svc{n}")
+                    self._set_command(repo, cmd)
+                    chk = check_harness(str(repo))
+                    self.assertTrue(chk["valid"], chk["errors"])
+                    self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+                    self.assertEqual(audit_harness(str(repo))["severity"], "clean")
+
+    def test_in_place_tightening_stays_clean(self):
+        from factonio.harness import audit_harness, check_harness
+
+        self._assert_clean(self._CLEAN)
+        with isolated_hermes_home() as home:
+            for n, label in enumerate(("env tightened", "sh -c prefix tightened", "sh -c pixels tightened",
+                                       "quoted prefix tightened", "committed UPDATE_SNAPSHOTS=0 tightened")):
+                base, live = self._CLEAN[label]
+                with self.subTest(label):
+                    repo = self._visual_repo(home, base, name=f"svc{n}")
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo))
+                    self.assertTrue(chk["valid"], chk["errors"])
+                    self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+                    audit = audit_harness(str(repo))
+                    self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("clean", False))
+
+    def test_scope_preserving_shell_rewrites_fail_closed(self):
+        """Injecting subshells, unsets or env mutators into a committed command is rejected even when it would keep
+        the effective threshold: the guard does not emulate the shell. Committing the same command is clean."""
+        from factonio.harness import _visual_hook_loosening, check_harness
+
+        rewrites = ("(unset MAX_DIFF); python3 check.py", "(export MAX_DIFF=0.9); python3 check.py",
+                    "export -n MAX_DIFF; export MAX_DIFF; python3 check.py", "unset -fv FOO; python3 check.py")
+        with isolated_hermes_home() as home:
+            repo = self._checked_repo(home, self._EXPORTED)
+            for live in (f"export MAX_DIFF=0.01; {r}" for r in rewrites):
+                with self.subTest(live=live):
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(chk["hook_results"]["failed_required"], ["pixels"])  # the bar still holds...
+                    self.assertTrue(chk["gate_loosening"]["loosened"])  # ...but the rewrite is unverifiable
+                    self.assertTrue(any(self._UNVERIFIABLE in f for f in chk["gate_loosening"]["findings"]))
+                    self.assertEqual(_visual_hook_loosening({"command": live}, {"command": live}), [])
+
+    def test_tokenizer_normalizes_only_inert_syntax(self):
+        from factonio.harness import _tokenize_visual_cmd
+
+        def sig(cmd: Any) -> list[tuple[str, bool]]:
+            return [(t.text, t.is_op) for t in _tokenize_visual_cmd(cmd)]
+
+        self.assertEqual(sig("a 'b c' \"d\" # e --max-diff 9\n\nf;;"), sig("a \"b c\" d; f;;"))
+        self.assertEqual(sig("x --color=#fff y#z"), [("x", False), ("--color=#fff", False), ("y#z", False)])
+        self.assertEqual(sig("cmd 2>&1 | tee log"), [("cmd", False), ("2>&", True), ("1", False), ("|", True),
+                                                      ("tee", False), ("log", False)])
+        self.assertEqual(sig("{ a; } && (b)"), [("{", True), ("a", False), (";", True), ("}", True),
+                                                 ("&&", True), ("(", True), ("b", False), (")", True)])
+        self.assertEqual(sig("${X} a{b,c}"), [("${X}", False), ("a{b,c}", False)])
+        for bad in ("a 'b", 'a "b', "a \\"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                _tokenize_visual_cmd(bad)
+        self.assertEqual(sig(["sh", "-c", "a; b"]), [("sh", False), ("-c", False), ("a; b", False)])
+
+
+
+class TestFixRound13StructuralGuardHardening(unittest.TestCase):
+    """Round 13 (insertions fully closed in round 19): exact flag spelling, strict ASCII threshold syntax,
+    preserved outer quoting of `sh -c` scripts / argv lists, and operator-adjacent whitespace."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    # Visual diff: ratio 0.25 / 100 pixels; the lenient defaults pass it. Runner-style options that skip
+    # collection or approve/regenerate snapshots exit 0, as `pytest --co`, `--fixtures` or `--approve` would.
+    _PY_CHECK = (
+        "import argparse, os, sys\n"
+        "SKIP = {'--co', '--collect-only', '--fixtures', '--markers', '--setup-plan', '--approve', '--bless',\n"
+        "        '--version', '-V', '-h', '--help', '-run=NEVER'}\n"
+        "if any(a in SKIP or a.split('=')[0] in ('--override-ini', '--mode', '--project') for a in sys.argv[1:]):\n"
+        "    sys.exit(0)\n"
+        "p = argparse.ArgumentParser(add_help=False)\n"
+        "p.add_argument('--max-diff', type=float, default=1.0)\n"
+        "p.add_argument('--max-diff-pixels', type=int, default=10 ** 9)\n"
+        "a, _ = p.parse_known_args()\n"
+        "t = float(os.environ.get('MAX_DIFF') or a.max_diff)\n"
+        "sys.exit(0 if 0.25 <= t and 100 <= a.max_diff_pixels else 1)\n"
+    )
+    # Visual diff 0.80 against a JS `Number(...)` threshold: NaN makes `0.80 > t` false, so the check passes.
+    _JS_CHECK = (
+        "const args = process.argv.slice(2);\n"
+        "let raw = process.env.MAX_DIFF;\n"
+        "for (let i = 0; i < args.length; i++) {\n"
+        "  if (args[i] === '--max-diff') raw = args[i + 1];\n"
+        "  else if (args[i].startsWith('--max-diff=')) raw = args[i].slice(12);\n"
+        "}\n"
+        "if (raw === undefined) raw = '1';\n"
+        "const t = raw.endsWith('%') ? Number(raw.slice(0, -1)) / 100 : Number(raw);\n"
+        "process.exit(0.80 > t ? 1 : 0);\n"
+    )
+
+    def _repo(self, home: Path, name: str, command: Any) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "check.py", self._PY_CHECK)
+        _write(repo, "check.js", self._JS_CHECK)
+        _commit_all(repo, "visual checks + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def _assert_executed_bypasses_rejected(self, pairs: list[tuple[Any, Any]]) -> None:
+        """Each committed command fails its hook; each mutation really passes it, yet check and audit flag it."""
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            for n, (base, live) in enumerate(pairs):
+                with self.subTest(base=base, live=live):
+                    repo = self._repo(home, f"svc{n}", base)
+                    committed = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(committed["hook_results"]["failed_required"], ["pixels"])
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(chk["hook_results"]["failed_required"], [], chk["hook_results"])  # real bypass
+                    self.assertFalse(chk["valid"])
+                    self.assertEqual(chk["gate_loosening"]["loosened_visual_hooks"], ["pixels"], chk["gate_loosening"])
+                    audit = audit_harness(str(repo))
+                    self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("stale", True))
+
+    def test_no_option_may_be_inserted(self):
+        self._assert_rejected({
+            "--override-ini snapshot-update": ("pytest tests/visual",
+                                               "pytest tests/visual --override-ini=addopts=--snapshot-update"),
+            "--override-ini collect-only": ("pytest tests/visual",
+                                            "pytest tests/visual --override-ini=addopts=--collect-only"),
+            "--co": ("pytest tests/visual", "pytest tests/visual --co"),
+            "--fixtures": ("pytest tests/visual", "pytest tests/visual --fixtures"),
+            "--markers": ("pytest tests/visual", "pytest tests/visual --markers"),
+            "--setup-plan": ("pytest tests/visual", "pytest tests/visual --setup-plan"),
+            "go -run=NEVER": ("go test ./...", "go test ./... -run=NEVER"),
+            "--mode=update": ("npx vitest run", "npx vitest run --mode=update"),
+            "--approve": ("python3 check.py", "python3 check.py --approve"),
+            "--bless": ("cargo test", "cargo test --bless"),
+            "--project=empty": ("npx playwright test", "npx playwright test --project=empty"),
+            "--config=": ("npx playwright test", "npx playwright test --config=empty.config.ts"),
+            "--version": ("pytest tests/visual", "pytest tests/visual --version"),
+            "-V": ("pytest tests/visual", "pytest tests/visual -V"),
+            "-h": ("pytest tests/visual", "pytest tests/visual -h"),
+            "unknown --flag=value": ("npx playwright test", "npx playwright test --workers=1"),
+            "unknown trailing flag": ("npx playwright test", "npx playwright test --headed"),
+            "node -v": ("node check.js", "node -v check.js"),
+            "node trailing -v": ("node check.js", "node check.js -v"),
+            "jest -v is --version": ("npx jest", "npx jest -v"),
+            "vitest -v is --version": ("npx vitest run", "npx vitest run -v"),
+            "-q on an unknown script": ("python3 check.py", "python3 check.py -q"),
+            "-v not trailing": ("pytest tests/visual", "pytest -v tests/visual"),
+            "python3 check.py -u": ("python3 check.py", "python3 check.py -u"),
+            "--reporter path": ("npx playwright test", "npx playwright test --reporter=./reporter.js"),
+            "--reporter plugin": ("npx playwright test", "npx playwright test --reporter=evil"),
+            "--color expansion": ("npx playwright test", "npx playwright test --color=$C"),
+            "--verbose not trailing": ("npx playwright test --max-diff 0.01",
+                                       "npx playwright test --verbose --max-diff 0.01"),
+            "swallowed by -run": ("go test -run TestVisual ./...", "go test -run --color=never TestVisual ./..."),
+            "UPDATE_SNAPSHOTS=$X": ("npx jest", "UPDATE_SNAPSHOTS=$X npx jest"),
+        })
+        # Round 19: formerly "inert" insertions are rejected too; committed as such, they stay clean
+        inserted = {
+            "pytest -q": ("pytest tests/visual", "pytest tests/visual -q"),
+            "pytest -v": ("pytest tests/visual", "pytest tests/visual -v"),
+            "uv run pytest -q": ("uv run pytest tests/visual", "uv run pytest tests/visual -q"),
+            "go -v": ("go test ./...", "go test ./... -v"),
+            "cargo test -q": ("cargo test", "cargo test -q"),
+            "cargo test -v": ("cargo test", "cargo test -v"),
+            "--reporter=list": ("npx playwright test", "npx playwright test --reporter=list"),
+            "--color=never": ("npx playwright test", "npx playwright test --color=never"),
+            "--color": ("npx playwright test", "npx playwright test --color"),
+            "--verbose": ("npx playwright test", "npx playwright test --verbose"),
+            "--quiet": ("npx playwright test", "npx playwright test --quiet"),
+            "--no-color": ("npx jest", "npx jest --no-color"),
+            "--silent": ("npx jest", "npx jest --silent"),
+            "python3 -u": ("python3 check.py", "python3 -u check.py"),
+            "UPDATE_SNAPSHOTS=0": ("npx playwright test", "UPDATE_SNAPSHOTS=0 npx playwright test"),
+            "--update-snapshots=false": ("npx playwright test", "npx playwright test --update-snapshots=false"),
+        }
+        self._assert_rejected(inserted)
+        self._assert_clean({
+            **{f"unchanged {k}": (live, live) for k, (_, live) in inserted.items()},
+            "unchanged --project": ("npx playwright test --project=chromium", "npx playwright test --project=chromium"),
+        })
+        self._assert_executed_bypasses_rejected([
+            ("python3 check.py tests/visual --max-diff 0.01",
+             f"python3 check.py tests/visual --max-diff 0.01 {opt}")
+            for opt in ("--override-ini=addopts=--collect-only", "--co", "--fixtures", "--markers", "--setup-plan",
+                        "-run=NEVER", "--mode=update", "--approve", "--bless", "--project=empty")
+        ])
+
+    def test_flag_thresholds_keep_their_exact_spelling(self):
+        self._assert_rejected({
+            "--MAX_DIFF": ("python3 check.py --max-diff 0.01", "python3 check.py --MAX_DIFF 0.01"),
+            "---max-diff": ("python3 check.py --max-diff 0.01", "python3 check.py ---max-diff 0.01"),
+            "-threshold": ("python3 check.py --max-diff 0.01", "python3 check.py -threshold 0.01"),
+            "--max_diff_pixels": ("python3 check.py --max-diff-pixels=0", "python3 check.py --max_diff_pixels=0"),
+        })
+        self._assert_rejected({  # Round 19: the `=` / space syntax is part of the flag's spelling
+            "--flag val -> --flag=val": ("python3 check.py --max-diff 0.05", "python3 check.py --max-diff=0.01"),
+            "--flag=val -> --flag val": ("python3 check.py --max-diff-pixels=5", "python3 check.py --max-diff-pixels 0"),
+        })
+        self._assert_clean({
+            "--flag val tightened": ("python3 check.py --max-diff 0.05", "python3 check.py --max-diff 0.01"),
+            "pixels tightened": ("python3 check.py --max-diff-pixels=5", "python3 check.py --max-diff-pixels=0"),
+        })
+        self._assert_executed_bypasses_rejected([
+            ("python3 check.py --max-diff 0.01", "python3 check.py --MAX_DIFF 0.01"),
+            ("python3 check.py --max-diff 0.01", "python3 check.py ---max-diff 0.01"),
+            ("python3 check.py --max-diff 0.01", "python3 check.py -threshold 0.01"),
+            ("python3 check.py --max-diff-pixels=0", "python3 check.py --max_diff_pixels=0"),
+        ])
+
+    def test_parse_value_accepts_only_strict_ascii_decimal_syntax(self):
+        from decimal import Decimal
+
+        from factonio.harness import _parse_value
+
+        for raw, value in (("0", "0"), ("0.05", "0.05"), ("1.5", "1.5"), ("1%", "1"), ("10%", "10"),
+                           ("0.5%", "0.5"), ("5", "5")):
+            with self.subTest(raw=raw):
+                self.assertEqual(_parse_value(raw)[0], Decimal(value))
+        for raw in ("0.0_1", "0_1%", "\uff10.\uff10\uff11", "\u0660.\u0660\u0661", "\uff11%", "+0.01", "-0.01",
+                    "NaN", "inf", "1.", "01", " 0.01", "0.01 ", "0x1", "1e", "%", "",
+                    ".01", ".0", "1e-2", "5e-3", "1E+0", "9e-2", "999e-3", "1e0%"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(_parse_value(raw)[0])
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
+    def test_thresholds_that_are_nan_in_node_are_rejected_end_to_end(self):
+        pairs: list[tuple[Any, Any]] = []
+        for v in ("0.0_1", "\uff10.\uff10\uff11", "\u0660.\u0660\u0661"):
+            pairs += [
+                ("node check.js --max-diff 0.05", f"node check.js --max-diff {v}"),
+                ("node check.js --max-diff=0.05", f"node check.js --max-diff={v}"),
+                ("MAX_DIFF=0.05 node check.js", f"MAX_DIFF={v} node check.js"),
+                ("export MAX_DIFF=0.05; node check.js", f"export MAX_DIFF={v}; node check.js"),
+                ("bash -c 'node check.js --max-diff 0.05'", f"bash -c 'node check.js --max-diff {v}'"),
+            ]
+        pairs += [("node check.js --max-diff 5%", f"node check.js --max-diff {v}") for v in ("0_1%", "\uff11%")]
+        self._assert_executed_bypasses_rejected(pairs)
+        self._assert_clean({v: ("node check.js --max-diff 0.05", f"node check.js --max-diff {v}")
+                            for v in ("0.01", "0.005", "0")})
+        self._assert_rejected({v: ("node check.js --max-diff 0.05", f"node check.js --max-diff {v}")
+                               for v in (".01", "1e-2")})
+        self._assert_clean({f"unchanged {v}": (f"node check.js --max-diff {v}", f"node check.js --max-diff {v}")
+                            for v in (".01", "1e-2")})
+        self._assert_clean({"unchanged odd literal": ("node check.js --max-diff 0.0_1",
+                                                      "node check.js --max-diff 0.0_1")})
+
+    def test_outer_quoting_of_sh_c_scripts_and_argv_lists_is_preserved(self):
+        single = "bash -c 'T=0.01; export MAX_DIFF=$T; python3 check.py'"
+        double = 'bash -c "T=0.01; export MAX_DIFF=$T; python3 check.py"'
+        argv = ["bash", "-c", "T=0.01; export MAX_DIFF=$T; python3 check.py"]
+        self._assert_rejected({
+            "single -> double quotes": (single, double),
+            "argv list -> double quotes": (argv, double),
+            "argv list -> unquoted glob": (["python3", "check.py", "*.png"], "python3 check.py *.png"),
+            "string -> argv with spaces": ("python3 check.py 'a b'", ["python3", "check.py", "a b"]),
+            # Round 19: the script keeps its committed outer quote style even without expansions
+            "single -> double quotes without expansions": ("bash -c 'export MAX_DIFF=0.05; python3 check.py'",
+                                                           'bash -c "export MAX_DIFF=0.01; python3 check.py"'),
+            # Round 20: an argv list and a shell string have no common bytes to compare verbatim
+            "argv list -> plain string": (["python3", "check.py", "--max-diff", "0.05"],
+                                          "python3 check.py --max-diff 0.01"),
+        })
+        # Round 21: an edited script must be one simple command, so even a threshold-named variable in a
+        # compound script is never editable; a leading assignment inside the single-quoted script is.
+        compound = "bash -c 'T_THRESHOLD=0.05; export MAX_DIFF=$T_THRESHOLD; python3 check.py'"
+        self._assert_rejected({"compound script tightened": (compound, compound.replace("0.05", "0.01"))})
+        self._assert_clean({
+            "single-quoted tightening": ("bash -c 'MAX_DIFF=0.05 python3 check.py'",
+                                         "bash -c 'MAX_DIFF=0.01 python3 check.py'"),
+            "unchanged compound script": (compound, compound),
+            "argv list tightened": (["python3", "check.py", "--max-diff", "0.05"],
+                                    ["python3", "check.py", "--max-diff", "0.01"]),
+            "unchanged double-quoted": (double, double),
+            "unchanged argv list": (argv, argv),
+        })
+        self._assert_executed_bypasses_rejected([(single, double), (argv, double)])
+
+    def test_whitespace_before_an_operator_is_a_rejected_edit(self):
+        from factonio.harness import _tokenize_visual_cmd
+
+        # Round 20: whitespace is compared verbatim on an edited command, even where the shell ignores it
+        self._assert_rejected({
+            "space before ;": ("export T=0.01; echo $T; python3 check.py",
+                               "export T=0.01; echo $T ; python3 check.py"),
+            "space before &&": ("echo $T&& python3 check.py", "echo $T && python3 check.py"),
+            "space before |": ("echo $T| cat", "echo $T | cat"),
+        })
+        self.assertEqual([t.raw for t in _tokenize_visual_cmd("echo $T; x 2>err")],
+                         ["echo", "$T", ";", "x", "2>", "err"])
+        self.assertTrue(all(t.from_argv for t in _tokenize_visual_cmd(["a", "$T"])))
+        self.assertFalse(any(t.from_argv for t in _tokenize_visual_cmd("a $T")))
+
+
+class TestFixRound14ShellWordsQuotingUnitsAndWrappers(unittest.TestCase):
+    """Round 14: `\\r` stays inside a shell word, `sh -c` outer quoting is preserved in both directions, a
+    threshold keeps its committed unit (`%` vs plain), and Python `-u` needs a real interpreter/wrapper head."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    # A repo-relative executable that "regenerates" (exits 0) on `-u`, as `vitest -u` / `jest -u` would.
+    # Visual diff 0.80 against a bare `Number(raw)` threshold (no `%` support): NaN passes the check.
+    _PLAIN_JS_CHECK = (
+        "const args = process.argv.slice(2);\n"
+        "let raw = '1';\n"
+        "for (let i = 0; i < args.length; i++) {\n"
+        "  if (args[i] === '--max-diff') raw = args[i + 1];\n"
+        "  else if (args[i].startsWith('--max-diff=')) raw = args[i].slice(12);\n"
+        "}\n"
+        "process.exit(0.80 > Number(raw) ? 1 : 0);\n"
+    )
+    _REGEN_EXE = '#!/bin/sh\nfor a in "$@"; do [ "$a" = -u ] && exit 0; done\nexit 1\n'
+
+    def _repo(self, home: Path, name: str, command: Any) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "check.py", TestFixRound13StructuralGuardHardening._PY_CHECK)
+        _write(repo, "check.js", TestFixRound13StructuralGuardHardening._JS_CHECK)
+        _write(repo, "plain.js", self._PLAIN_JS_CHECK)
+        for rel in ("vitest", "tests/python3"):
+            _write(repo, rel, self._REGEN_EXE)
+            (repo / rel).chmod(0o755)
+        _commit_all(repo, "visual checks + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def test_carriage_return_is_part_of_the_shell_word(self):
+        from factonio.harness import _tokenize_visual_cmd
+
+        self.assertEqual([t.text for t in _tokenize_visual_cmd("a --max-diff\r 0.01\r#c")],
+                         ["a", "--max-diff\r", "0.01\r#c"])
+        self._assert_rejected({
+            "python flag": ("python3 check.py --max-diff 0.01", "python3 check.py --max-diff\r 0.01"),
+            "value + comment": ("node check.js --max-diff 0.01", "node check.js --max-diff 0.01\r#comment"),
+            "bash -c flag": ("bash -c 'python3 check.py --max-diff 0.01'",
+                             "bash -c 'python3 check.py --max-diff\r 0.01'"),
+        })
+        pairs: list[tuple[Any, Any]] = [
+            ("python3 check.py --max-diff 0.01", "python3 check.py --max-diff\r 0.01"),
+            ("bash -c 'python3 check.py --max-diff 0.01'", "bash -c 'python3 check.py --max-diff\r 0.01'"),
+        ]
+        if shutil.which("node"):  # Node's `Number("0.01\r#comment")` / `Number("1%\r")` is NaN
+            pairs += [
+                ("node check.js --max-diff 0.01", "node check.js --max-diff\r 0.01"),
+                ("node check.js --max-diff 0.01", "node check.js --max-diff 0.01\r#comment"),
+                ("node check.js --max-diff=1% --color=never", "node check.js --max-diff=1%\r --color=never"),
+            ]
+        self._assert_executed_bypasses_rejected(pairs)
+
+    def test_sh_c_outer_quoting_is_preserved_in_both_directions(self):
+        flips = {
+            "${T:-...} double -> single": ('T=0.01; bash -c "python3 check.py --max-diff ${T:-0.99}"',
+                                           "T=0.01; bash -c 'python3 check.py --max-diff ${T:-0.99}'"),
+            "export $T double -> single": ('T=0.01; bash -c "export MAX_DIFF=$T; python3 check.py"',
+                                           "T=0.01; bash -c 'export MAX_DIFF=$T; python3 check.py'"),
+            "sh -c": ('T=0.01; sh -c "python3 check.py --max-diff ${T:-0.99}"',
+                      "T=0.01; sh -c 'python3 check.py --max-diff ${T:-0.99}'"),
+            "bash -ec": ('T=0.01; bash -ec "python3 check.py --max-diff ${T:-0.99}"',
+                         "T=0.01; bash -ec 'python3 check.py --max-diff ${T:-0.99}'"),
+            "$(...)": ('T=0.01; bash -c "python3 check.py --max-diff $(echo ${T:-0.99})"',
+                       "T=0.01; bash -c 'python3 check.py --max-diff $(echo ${T:-0.99})'"),
+            "backticks": ('T=0.01; bash -c "python3 check.py --max-diff `echo ${T:-0.99}`"',
+                          "T=0.01; bash -c 'python3 check.py --max-diff `echo ${T:-0.99}`'"),
+            "unquoted -> single": ("T=0.01; bash -c python3\\ check.py\\ --max-diff\\ ${T:-0.99}",
+                                   "T=0.01; bash -c 'python3 check.py --max-diff ${T:-0.99}'"),
+            "nested sh -c bash -c": ('T=0.01; sh -c "bash -c \'python3 check.py --max-diff ${T:-0.99}\'"',
+                                     "T=0.01; sh -c 'bash -c \"python3 check.py --max-diff ${T:-0.99}\"'"),
+        }
+        self._assert_rejected(flips)
+        self._assert_rejected({
+            "positional after an earlier -c": ("bash -c 'python3 check.py' -c 'x --max-diff 0.05'",
+                                               "bash -c 'python3 check.py' -c 'x --max-diff 0.01'"),
+            "option with a value": ("bash -o pipefail -c 'python3 check.py --max-diff 0.05'",
+                                    "bash -o pipefail -c 'python3 check.py --max-diff 0.01'"),
+            # Round 22: the one wrapper is exactly `sh|bash -c SCRIPT`, with no other shell option
+            "bash -e -c tightening": ("bash -e -c 'python3 check.py --max-diff 0.05'",
+                                      "bash -e -c 'python3 check.py --max-diff 0.01'"),
+        })
+        self._assert_clean({
+            "single-quoted tightening": ("bash -c 'python3 check.py --max-diff 0.05'",
+                                         "bash -c 'python3 check.py --max-diff 0.01'"),
+            "unchanged bash -e -c": ("bash -e -c 'python3 check.py --max-diff 0.05'",
+                                     "bash -e -c 'python3 check.py --max-diff 0.05'"),
+            "unchanged expanding script": (flips["sh -c"][0], flips["sh -c"][0]),
+        })
+        self._assert_executed_bypasses_rejected(list(flips.values()))
+
+    def test_threshold_keeps_its_committed_unit(self):
+        self._assert_rejected({
+            "plain -> %": ("node check.js --max-diff 0.05", "node check.js --max-diff 1%"),
+            "% -> plain": ("node check.js --max-diff 5%", "node check.js --max-diff 0.01"),
+            "env plain -> %": ("MAX_DIFF=0.05 node check.js", "MAX_DIFF=1% node check.js"),
+        })
+        self._assert_clean({
+            "plain tightened": ("node check.js --max-diff 0.05", "node check.js --max-diff 0.01"),
+            "% tightened": ("node check.js --max-diff 5%", "node check.js --max-diff 1%"),
+        })
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
+    def test_unit_change_that_is_nan_in_node_fails_end_to_end(self):
+        """`plain.js` reads `Number(raw)`: `Number("1%")` is NaN and `0.80 > NaN` is false, so the check passes."""
+        from factonio.harness import audit_harness, check_harness
+
+        self._assert_executed_bypasses_rejected([
+            ("node plain.js --max-diff 0.05", "node plain.js --max-diff 1%"),
+            ("node plain.js --max-diff=0.05", "node plain.js --max-diff=1%"),
+        ])
+        with isolated_hermes_home() as home:
+            for n, (base, live, loosened) in enumerate((
+                    ("node plain.js --max-diff 5%", "node plain.js --max-diff 0.01", True),
+                    ("node plain.js --max-diff 0.05", "node plain.js --max-diff 0.01", False),
+                    ("node check.js --max-diff=5%", "node check.js --max-diff=1%", False))):
+                with self.subTest(base=base, live=live):
+                    repo = self._repo(home, f"svc{n}", base)
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(chk["hook_results"]["failed_required"], ["pixels"])  # 0.80 > 0.01 either way
+                    self.assertEqual(chk["gate_loosening"]["loosened"], loosened, chk["gate_loosening"])
+                    audit = audit_harness(str(repo))
+                    self.assertEqual(audit["gate_loosening"]["loosened"], loosened)
+                    self.assertEqual(audit["severity"], "stale" if loosened else "clean")
+
+    def test_python_u_needs_a_real_interpreter_or_wrapper_head(self):
+        bypasses = [
+            ("./vitest run tests/python3 tests/visual.test.ts", "./vitest run tests/python3 -u tests/visual.test.ts"),
+            ("./vitest -t python3 tests/visual.test.ts", "./vitest -t python3 -u tests/visual.test.ts"),
+            ("timeout 30 tests/python3 check.py", "timeout 30 tests/python3 -u check.py"),
+        ]
+        self._assert_rejected({live: (base, live) for base, live in bypasses})
+        self._assert_rejected({
+            "relative wrapper": ("tests/timeout 30 python3 check.py", "tests/timeout 30 python3 -u check.py"),
+            "uv without run": ("uv tool python3 check.py", "uv tool python3 -u check.py"),
+            # Round 15: behind any wrapper `python3` may be a module, tool or option value, so `-u` is rejected
+            "timeout python3 -u": ("timeout 30 python3 check.py", "timeout 30 python3 -u check.py"),
+            "uv run python3 -u": ("uv run python3 check.py", "uv run python3 -u check.py"),
+            "nice -n 5 python3 -u": ("nice -n 5 python3 check.py", "nice -n 5 python3 -u check.py"),
+        })
+        self._assert_rejected({  # Round 19: no insertion at all, even behind a bare interpreter
+            "python3 -u": ("python3 check.py", "python3 -u check.py"),
+            "/usr/bin/python3 -u": ("/usr/bin/python3 check.py", "/usr/bin/python3 -u check.py"),
+        })
+        self._assert_clean({
+            "unchanged python3 -u": ("python3 -u check.py", "python3 -u check.py"),
+            "unchanged timeout python3 -u": ("timeout 30 python3 -u check.py", "timeout 30 python3 -u check.py"),
+            "unchanged uv run python3 -u": ("uv run python3 -u check.py", "uv run python3 -u check.py"),
+        })
+        self._assert_executed_bypasses_rejected(bypasses)
+
+
+class TestFixRound15BlobHashBaselinesAndNoNewInsertions(unittest.TestCase):
+    """Round 15: frozen baselines are hashed against their committed blobs (immune to `assume-unchanged` /
+    `skip-worktree`), no threshold may be newly inserted, and Python `-u` only follows a segment-head interpreter."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    # `uv run -m X` / `uv run -s X` stand-in: `python3 -m X ...` / `python3 X ...`, as real `uv run` executes them.
+    _UV_SHIM = ('#!/bin/sh\n[ "$1" = run ] || exit 2\nshift\n'
+                'case "$1" in -m) shift; exec python3 -m "$@";; -s) shift; exec python3 "$@";; esac\nexec "$@"\n')
+    # A module/script named `python3` that "regenerates" (exits 0) when `-u` reaches its argv.
+    _REGEN_PY = "import sys\nsys.exit(0 if '-u' in sys.argv[1:] else 1)\n"
+
+    def _repo(self, home: Path, name: str, command: Any, extra_hooks: list[dict[str, Any]] | None = None) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "plain.js", TestFixRound14ShellWordsQuotingUnitsAndWrappers._PLAIN_JS_CHECK)
+        _write(repo, "python3.py", self._REGEN_PY)
+        _write(repo, "python3", self._REGEN_PY)
+        _commit_all(repo, "visual checks + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+            *(extra_hooks or []),
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def _assert_baseline_tampered(self, repo: Path, chk: dict) -> None:
+        from factonio.harness import audit_harness, detect_harness_gate_loosening
+
+        self.assertFalse(chk["valid"], chk["errors"])
+        self.assertEqual(chk["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+        before_index = _index_fingerprint(repo)
+        gate = detect_harness_gate_loosening(repo)
+        audit = audit_harness(str(repo))
+        self.assertEqual(_index_fingerprint(repo), before_index)  # strictly read-only
+        self.assertEqual(gate["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+        self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("stale", True))
+        self.assertEqual(audit["visual_baseline_changes"][0]["changed_files"], ["snapshots/home.png"])
+
+    def test_index_flags_cannot_hide_an_overwritten_frozen_baseline(self):
+        from factonio.harness import audit_harness, check_harness
+
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag=flag), isolated_hermes_home() as home:
+                repo = self._repo(home, "svc", "true")
+                _git(repo, "update-index", flag, "snapshots/home.png")
+                before_index = _index_fingerprint(repo)
+                clean = check_harness(str(repo))
+                self.assertEqual(_index_fingerprint(repo), before_index)
+                self.assertTrue(clean["valid"], clean["errors"])  # the flag alone, with approved bytes, is clean
+                self.assertEqual(audit_harness(str(repo))["severity"], "clean")
+
+                _write(repo, "snapshots/home.png", "png-tampered\n")
+                self.assertEqual(_git(repo, "status", "--porcelain"), "")  # invisible to `git status`
+                before_index = _index_fingerprint(repo)
+                chk = check_harness(str(repo))
+                self.assertEqual(_index_fingerprint(repo), before_index)
+                self._assert_baseline_tampered(repo, chk)
+
+    def test_hook_that_flags_then_overwrites_a_baseline_fails_check(self):
+        from factonio.harness import check_harness
+
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag=flag), isolated_hermes_home() as home:
+                tamper = {"name": "tamper", "kind": "invariant",
+                          "command": f"git update-index {flag} snapshots/home.png && printf regen > snapshots/home.png"}
+                repo = self._repo(home, "svc", "true", [tamper])
+                pre = check_harness(str(repo))
+                self.assertTrue(pre["valid"], pre["errors"])
+                chk = check_harness(str(repo), run_hooks=True)
+                self.assertEqual(chk["hook_results"]["failed_required"], [], chk["hook_results"])
+                self.assertEqual((repo / "snapshots" / "home.png").read_text(encoding="utf-8"), "regen")
+                self.assertEqual(_git(repo, "status", "--porcelain"), "")
+                self._assert_baseline_tampered(repo, chk)
+
+    def test_blob_hash_covers_deletion_type_change_and_symlinks(self):
+        from factonio.harness import _frozen_baseline_changes, _git_blob_oid
+
+        self.assertEqual(_git_blob_oid(b"", 40), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+        with isolated_hermes_home() as home:
+            repo = self._repo(home, "svc", "true")
+            head = _git(repo, "rev-parse", "HEAD")
+            frozen = {"pixels": ["snapshots/**"]}
+            self.assertEqual(_frozen_baseline_changes(repo, frozen, head), [])
+
+            def changed() -> list[str]:
+                out = _frozen_baseline_changes(repo, frozen, head)
+                return out[0]["changed_files"] if out else []
+
+            _git(repo, "update-index", "--assume-unchanged", "snapshots/home.png")
+            live = repo / "snapshots" / "home.png"
+            _write(repo, "copy.png", "png-v1\n")
+            live.unlink()
+            self.assertEqual(changed(), ["snapshots/home.png"])
+            os.symlink("../copy.png", live)  # identical bytes, but a symlink: not the committed regular file
+            self.assertEqual(changed(), ["snapshots/home.png"])
+            live.unlink()
+            live.mkdir()
+            self.assertEqual(changed(), ["snapshots/home.png"])
+            live.rmdir()
+            _write(repo, "snapshots/home.png", "png-v1\n")
+            self.assertEqual(changed(), [])
+            os.symlink("home.png", repo / "snapshots" / "link.png")
+            head = _commit_all(repo, "symlinked baseline")
+            self.assertEqual(changed(), ["snapshots/link.png"])  # a committed symlink baseline fails closed
+
+    def test_no_threshold_may_be_newly_inserted(self):
+        from factonio.harness import _visual_hook_loosening
+
+        added = {
+            "duplicate =0%": ("node plain.js --max-diff 0.05", "node plain.js --max-diff 0.05 --max-diff=0%"),
+            "duplicate 0%": ("node plain.js --max-diff 0.05", "node plain.js --max-diff 0.05 --max-diff 0%"),
+            "duplicate =0": ("node plain.js --max-diff 0.05", "node plain.js --max-diff 0.05 --max-diff=0"),
+            "new =0%": ("node plain.js", "node plain.js --max-diff=0%"),
+            "new =0": ("node plain.js", "node plain.js --max-diff=0"),
+            "new 0": ("node plain.js", "node plain.js --max-diff 0"),
+            "new env 0": ("node plain.js", "MAX_DIFF=0 node plain.js"),
+        }
+        self._assert_rejected(added)
+        for label, (base, live) in added.items():
+            with self.subTest(label):
+                self.assertTrue(any(r.startswith("adds threshold `") and "tightened in place" in r
+                                    for r in _visual_hook_loosening({"command": base}, {"command": live})))
+        self._assert_clean({
+            "tightened to 0": ("node plain.js --max-diff 0.05", "node plain.js --max-diff 0"),
+            "tightened to =0": ("node plain.js --max-diff=0.05", "node plain.js --max-diff=0"),
+            "% tightened to 0%": ("node plain.js --max-diff 5%", "node plain.js --max-diff 0%"),
+        })
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
+    def test_duplicate_zero_percent_threshold_is_rejected_end_to_end(self):
+        """`plain.js` keeps the last `--max-diff`: `Number("0%")` is NaN and `0.80 > NaN` is false."""
+        from factonio.harness import audit_harness, check_harness
+
+        self._assert_executed_bypasses_rejected([
+            ("node plain.js --max-diff 0.05", "node plain.js --max-diff 0.05 --max-diff=0%"),
+            ("node plain.js --max-diff 0.05", "node plain.js --max-diff 0.05 --max-diff 0%"),
+        ])
+        with isolated_hermes_home() as home:
+            for n, live in enumerate(("node plain.js --max-diff=0%", "node plain.js --max-diff=0")):
+                with self.subTest(live=live):
+                    repo = self._repo(home, f"new{n}", "node plain.js")
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertFalse(chk["valid"])
+                    self.assertEqual(chk["gate_loosening"]["loosened_visual_hooks"], ["pixels"])
+                    self.assertEqual(audit_harness(str(repo))["severity"], "stale")
+
+    def test_python_u_only_after_a_segment_head_interpreter(self):
+        wrapped = {
+            "uv run -m": ("uv run -m python3 snapshots/a.png", "uv run -m python3 -u snapshots/a.png"),
+            "uv run -s": ("uv run -s python3 snapshots/a.png", "uv run -s python3 -u snapshots/a.png"),
+            "uv run --module": ("uv run --module python3 a.png", "uv run --module python3 -u a.png"),
+            "FOO=1 uv run -m": ("FOO=1 uv run -m python3 a.png", "FOO=1 uv run -m python3 -u a.png"),
+            "uvx": ("uvx python3 snapshots/a.png", "uvx python3 -u snapshots/a.png"),
+            "uv run --with": ("uv run --with python3 vitest", "uv run --with python3 -u vitest"),
+            "timeout -s": ("timeout -s python3 30 vitest", "timeout -s python3 -u 30 vitest"),
+            "xvfb-run -e": ("xvfb-run -e python3 vitest", "xvfb-run -e python3 -u vitest"),
+            "stdbuf -o": ("stdbuf -o python3 vitest", "stdbuf -o python3 -u vitest"),
+            "ionice -c": ("ionice -c python3 vitest", "ionice -c python3 -u vitest"),
+            "time -o": ("time -o python3 vitest", "time -o python3 -u vitest"),
+            "timeout 30": ("timeout 30 python3 check.py", "timeout 30 python3 -u check.py"),
+        }
+        self._assert_rejected({
+            **wrapped,  # Round 19: no insertion at all, even behind a bare interpreter
+            "python3 -u": ("python3 check.py", "python3 -u check.py"),
+            "/usr/bin/python3 -u": ("/usr/bin/python3 check.py", "/usr/bin/python3 -u check.py"),
+            "env prefix + python3 -u": ("FOO=1 python3 check.py", "FOO=1 python3 -u check.py"),
+        })
+        self._assert_clean({f"unchanged {k}": (live, live) for k, (_, live) in wrapped.items()})
+
+    def test_wrapper_python_u_reaching_module_argv_is_rejected_end_to_end(self):
+        with isolated_hermes_home() as home:
+            bin_dir = home / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "uv").write_text(self._UV_SHIM, encoding="utf-8")
+            (bin_dir / "uv").chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"}):
+                self._assert_executed_bypasses_rejected([
+                    ("uv run -m python3 snapshots/home.png", "uv run -m python3 -u snapshots/home.png"),
+                    ("uv run -s python3 snapshots/home.png", "uv run -s python3 -u snapshots/home.png"),
+                ])
+
+
+class TestFixRound16IntegerThresholdsAndStrictRunners(unittest.TestCase):
+    """Round 16: committed integer thresholds stay integers; trailing `-q`/`-v` may never be inserted (round 19
+    closed the strict-runner allowlist too), and committed as such they stay clean."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    # 100 differing pixels against an integer `--max-diff-pixels`, parsed with `parseInt` and a NaN guard.
+    _PIXELS_JS = (
+        "const arg = process.argv.slice(2).find((a) => a.startsWith('--max-diff-pixels='));\n"
+        "const limit = parseInt(arg ? arg.slice(18) : '0', 10);\n"
+        "if (Number.isNaN(limit)) process.exit(2);\n"
+        "process.exit(100 > limit ? 1 : 0);\n"
+    )
+    # A runner stand-in that "passes" (skips the visual check) whenever `-v` reaches its argv.
+    _VERBOSE_EXE = '#!/bin/sh\nfor a in "$@"; do [ "$a" = -v ] && exit 0; done\nexit 1\n'
+    _UV_SHIM = '#!/bin/sh\n[ "$1" = run ] || exit 2\nshift\nexec "$@"\n'
+
+    def _repo(self, home: Path, name: str, command: Any) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "pixels.js", self._PIXELS_JS)
+        _write(repo, "tests/pytest", self._VERBOSE_EXE)
+        (repo / "tests" / "pytest").chmod(0o755)
+        _commit_all(repo, "visual checks + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def test_committed_integer_threshold_stays_integer(self):
+        from factonio.harness import _visual_hook_loosening
+
+        base = "node pixels.js --max-diff-pixels=5"
+        rewritten = {
+            "scientific": "node pixels.js --max-diff-pixels=999e-3",
+            "leading dot": "node pixels.js --max-diff-pixels=.0",
+            "decimal": "node pixels.js --max-diff-pixels=0.5",
+            "decimal zero": "node pixels.js --max-diff-pixels=0.0",
+        }
+        self._assert_rejected({k: (base, live) for k, live in rewritten.items()})
+        self._assert_rejected({"spaced scientific": ("node pixels.js --max-diff-pixels 5",
+                                                     "node pixels.js --max-diff-pixels 1e0"),
+                               "percent": ("node pixels.js --max-diff-pixels=5%", "node pixels.js --max-diff-pixels=1e0%"),
+                               "env": ("MAX_DIFF_PIXELS=5 node pixels.js", "MAX_DIFF_PIXELS=.0 node pixels.js")})
+        reasons = _visual_hook_loosening({"command": base}, {"command": rewritten["scientific"]})
+        self.assertIn("sets non-finite or unparseable threshold `--max-diff-pixels` (999e-3)", reasons)
+        reasons = _visual_hook_loosening({"command": base}, {"command": rewritten["decimal"]})
+        self.assertTrue(any(r.startswith("rewrites integer threshold `--max-diff-pixels` as a non-integer (0.5")
+                            for r in reasons), reasons)
+        self.assertFalse(any(r.startswith("loosens threshold") for r in reasons), reasons)
+        self._assert_rejected({"float 0.05 -> 1e-2": ("node check.js --max-diff 0.05", "node check.js --max-diff 1e-2")})
+        self._assert_clean({
+            "5 -> 2": (base, "node pixels.js --max-diff-pixels=2"),
+            "5 -> 0": (base, "node pixels.js --max-diff-pixels=0"),
+            "5% -> 1%": ("node pixels.js --max-diff-pixels=5%", "node pixels.js --max-diff-pixels=1%"),
+            "float 0.05 -> 0.01": ("node check.js --max-diff 0.05", "node check.js --max-diff 0.01"),
+            "float 0.05 -> 0": ("node check.js --max-diff 0.05", "node check.js --max-diff 0"),
+            "float 0.05 -> 0.005": ("node check.js --max-diff 0.05", "node check.js --max-diff 0.005"),
+        })
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
+    def test_integer_threshold_rewrite_is_rejected_end_to_end(self):
+        """`parseInt("999e-3", 10)` is 999: the NaN guard does not help, and 100 differing pixels pass."""
+        from factonio.harness import check_harness
+
+        self._assert_executed_bypasses_rejected([
+            ("node pixels.js --max-diff-pixels=5", "node pixels.js --max-diff-pixels=999e-3"),
+        ])
+        with isolated_hermes_home() as home:
+            for n, live in enumerate(("node pixels.js --max-diff-pixels=.0", "node pixels.js --max-diff-pixels=0.5")):
+                with self.subTest(live=live):
+                    repo = self._repo(home, f"frac{n}", "node pixels.js --max-diff-pixels=5")
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertFalse(chk["valid"])
+                    self.assertEqual(chk["gate_loosening"]["loosened_visual_hooks"], ["pixels"])
+
+    def test_short_verbosity_flags_are_never_inserted(self):
+        rejected = {
+            "repo-relative pytest": ("tests/pytest snapshots/home.png", "tests/pytest snapshots/home.png -v"),
+            "dot-relative pytest": ("./pytest tests/visual", "./pytest tests/visual -q"),
+            "uv run relative pytest": ("uv run ./tests/pytest tests/visual", "uv run ./tests/pytest tests/visual -v"),
+            "uv run --with pytest": ("uv run --with x pytest tests/visual", "uv run --with x pytest tests/visual -v"),
+            "npx pytest": ("npx pytest tests/visual", "npx pytest tests/visual -v"),
+            "go run": ("go run ./cmd/visual", "go run ./cmd/visual -v"),
+            "cargo run": ("cargo run -- ./visual", "cargo run -- ./visual -v"),
+            "cargo run no --": ("cargo run ./visual", "cargo run ./visual -q"),
+            "pnpm run go": ("pnpm run go", "pnpm run go -v"),
+            "yarn run pytest": ("yarn run pytest", "yarn run pytest -q"),
+            "bun run cargo": ("bun run cargo test", "bun run cargo test -v"),
+            "pytest after --": ("pytest tests/visual -- arg", "pytest tests/visual -- arg -v"),
+            "cargo test after --": ("cargo test -- visual", "cargo test -- visual -q"),
+            "go test after -args": ("go test ./... -args", "go test ./... -args -v"),
+            "go test after --args": ("go test ./... --args x", "go test ./... --args x -v"),
+            "jest -v": ("npx jest", "npx jest -v"),
+        }
+        strict = {  # Round 19: rejected for strict runners too; committed as such, they stay clean
+            "pytest -q": ("pytest tests/visual", "pytest tests/visual -q"),
+            "pytest -v": ("pytest tests/visual", "pytest tests/visual -v"),
+            "absolute pytest -v": ("/usr/bin/pytest tests/visual", "/usr/bin/pytest tests/visual -v"),
+            "uv run pytest -q": ("uv run pytest tests/visual", "uv run pytest tests/visual -q"),
+            "go test -v": ("go test ./...", "go test ./... -v"),
+            "cargo test -q": ("cargo test", "cargo test -q"),
+            "cargo test -v": ("cargo test", "cargo test -v"),
+            "pytest --verbose after --": ("pytest tests/visual -- arg", "pytest tests/visual -- arg --verbose"),
+        }
+        self._assert_rejected({**rejected, **strict})
+        self._assert_clean({f"unchanged {k}": (live, live) for k, (_, live) in {**rejected, **strict}.items()})
+
+    def test_runner_verbosity_bypasses_are_rejected_end_to_end(self):
+        with isolated_hermes_home() as home:
+            bin_dir = home / "bin"
+            bin_dir.mkdir()
+            for tool in ("go", "cargo", "pnpm"):
+                (bin_dir / tool).write_text(self._VERBOSE_EXE, encoding="utf-8")
+                (bin_dir / tool).chmod(0o755)
+            (bin_dir / "uv").write_text(self._UV_SHIM, encoding="utf-8")
+            (bin_dir / "uv").chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"}):
+                self._assert_executed_bypasses_rejected([
+                    ("tests/pytest snapshots/home.png", "tests/pytest snapshots/home.png -v"),
+                    ("uv run ./tests/pytest tests/visual", "uv run ./tests/pytest tests/visual -v"),
+                    ("go run ./cmd/visual", "go run ./cmd/visual -v"),
+                    ("cargo run -- ./visual", "cargo run -- ./visual -v"),
+                    ("pnpm run go", "pnpm run go -v"),
+                    ("go test ./... -args", "go test ./... -args -v"),
+                ])
+
+
+class TestFixRound17ExactThresholdsAndRawQuoting(unittest.TestCase):
+    """Round 17: thresholds compare as exact `Decimal`s (binary64 equates integers past 2**53), and words compare
+    by source spelling, so quoting an assignment (`'T=1'`) or `!` cannot silently turn it into a command."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    _JS_CHECK = TestFixRound13StructuralGuardHardening._JS_CHECK
+    _DIFF = 9007199254740993  # 2**53 + 1 differing pixels, against an exact integer `--max-diff-pixels`
+    _PIXELS_PY = (
+        "import sys\n"
+        "arg = next((a for a in sys.argv[1:] if a.startswith('--max-diff-pixels=')), '--max-diff-pixels=0')\n"
+        f"sys.exit(1 if {_DIFF} > int(arg.split('=', 1)[1]) else 0)\n"
+    )
+
+    def _repo(self, home: Path, name: str, command: Any) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "check.js", self._JS_CHECK)
+        _write(repo, "pixels.py", self._PIXELS_PY)
+        _commit_all(repo, "visual checks + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def test_parse_value_is_exact_decimal(self):
+        from decimal import Decimal
+
+        from factonio.harness import _parse_value
+
+        for raw, value, pct in (("9007199254740993", "9007199254740993", False), ("1%", "1", True),
+                                ("0.05", "0.05", False), ("1" + "0" * 39 + "1", "1" + "0" * 39 + "1", False)):
+            with self.subTest(raw=raw):
+                self.assertEqual(_parse_value(raw), (Decimal(value), pct))
+        self.assertNotEqual(_parse_value("9007199254740992")[0], _parse_value("9007199254740993")[0])
+        for raw in ("1e99999999999999999999", "1e-99999999999999999999"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(_parse_value(raw)[0])
+
+    def test_thresholds_compare_exactly_past_binary64_and_decimal_context_precision(self):
+        big = "1" + "0" * 39
+        tiny = "0." + "0" * 39
+        base = "python3 pixels.py --max-diff-pixels={}"
+        self._assert_rejected({
+            "2**53 -> 2**53 + 1": (base.format(9007199254740992), base.format(9007199254740993)),
+            "40-digit integer + 1": (base.format(big), base.format(big[:-1] + "1")),
+            "40-digit percent + 1": (base.format(big + "%"), base.format(big[:-1] + "1%")),
+            "40-digit decimal + ulp": ("node check.js --max-diff " + tiny + "1", "node check.js --max-diff " + tiny + "2"),
+            "env 2**53 + 1": ("MAX_DIFF_PIXELS=9007199254740992 python3 pixels.py",
+                              "MAX_DIFF_PIXELS=9007199254740993 python3 pixels.py"),
+        })
+        self._assert_clean({
+            "2**53 + 1 unchanged": (base.format(9007199254740993), base.format(9007199254740993)),
+            "2**53 + 1 -> 2**53": (base.format(9007199254740993), base.format(9007199254740992)),
+            "40-digit integer - 1": (base.format(big[:-1] + "1"), base.format(big)),
+            "40-digit percent - 1": (base.format(big[:-1] + "1%"), base.format(big + "%")),
+            "40-digit decimal - ulp": ("node check.js --max-diff " + tiny + "2", "node check.js --max-diff " + tiny + "1"),
+        })
+
+    def test_raised_integer_threshold_past_2_53_is_rejected_end_to_end(self):
+        self._assert_executed_bypasses_rejected([
+            ("python3 pixels.py --max-diff-pixels=9007199254740992",
+             "python3 pixels.py --max-diff-pixels=9007199254740993"),
+        ])
+
+    def test_quoted_assignments_and_negations_are_not_collapsed(self):
+        assign = "MAX_DIFF=0.05; export MAX_DIFF; node check.js"
+        neg_if = "if ! node check.js --max-diff 0.05; then exit 1; fi"
+        neg_and = "! node check.js --max-diff 0.05 && exit 1; true"
+        nested = "bash -c 'if ! node check.js --max-diff 0.05; then exit 1; fi'"
+        self._assert_rejected({
+            "single-quoted assignment": (assign, "'MAX_DIFF=0.05'; export MAX_DIFF; node check.js"),
+            "escaped =": (assign, "MAX_DIFF\\=0.05; export MAX_DIFF; node check.js"),
+            "double-quoted name": (assign, '"MAX_DIFF"=0.05; export MAX_DIFF; node check.js'),
+            "quoted tightened assignment": (assign, "'MAX_DIFF=0.01'; export MAX_DIFF; node check.js"),
+            "quoted ! in if": (neg_if, "if '!' node check.js --max-diff 0.05; then exit 1; fi"),
+            "double-quoted ! in if": (neg_if, 'if "!" node check.js --max-diff 0.05; then exit 1; fi'),
+            "escaped ! in if": (neg_if, "if \\! node check.js --max-diff 0.05; then exit 1; fi"),
+            "quoted ! before &&": (neg_and, "'!' node check.js --max-diff 0.05 && exit 1; true"),
+            "quoted ! in bash -c": (nested, "bash -c 'if \"!\" node check.js --max-diff 0.05; then exit 1; fi'"),
+            "quoted assignment after assignment": ("A=1 MAX_DIFF=0.05 node check.js",
+                                                   "A=1 'MAX_DIFF=0.05' node check.js"),
+            "quoted ! after then": ("if true; then ! node check.js --max-diff 0.05; fi",
+                                    "if true; then '!' node check.js --max-diff 0.05; fi"),
+            "quoted assignment after redirection": ("2>/dev/null MAX_DIFF=0.05 node check.js",
+                                                    "2>/dev/null 'MAX_DIFF=0.05' node check.js"),
+            "quoted plain argument": ("node check.js snapshots/home.png", "node check.js 'snapshots/home.png'"),
+            "quoted export argument": ("export MAX_DIFF=0.05; node check.js", "export 'MAX_DIFF=0.05'; node check.js"),
+            # Round 20: quoting is outside the value span, so adding or dropping it is a verbatim mismatch
+            "value quoting added": (assign, "MAX_DIFF='0.05'; export MAX_DIFF; node check.js"),
+            "flag value quoting tightened": ("node check.js --max-diff 0.05", "node check.js --max-diff '0.01'"),
+        })
+        self._assert_clean({
+            "unchanged quoted assignment word": ("'MAX_DIFF=0.05'; node check.js", "'MAX_DIFF=0.05'; node check.js"),
+            "unchanged quoted value": ("MAX_DIFF='0.05' node check.js", "MAX_DIFF='0.05' node check.js"),
+            "quoted value tightened": ("MAX_DIFF='0.05' node check.js", "MAX_DIFF='0.01' node check.js"),
+            "unchanged quoted export argument": ("export 'MAX_DIFF=0.05'; node check.js",
+                                                 "export 'MAX_DIFF=0.05'; node check.js"),
+        })
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
+    def test_quoted_assignments_and_negations_are_rejected_end_to_end(self):
+        """Each mutation exits 127 on the quoted word: the assignment never happens and `if`/`&&` see failure."""
+        assign = "MAX_DIFF=0.05; export MAX_DIFF; node check.js"
+        neg_if = "if ! node check.js --max-diff 0.05; then exit 1; fi"
+        self._assert_executed_bypasses_rejected([
+            (assign, "'MAX_DIFF=0.05'; export MAX_DIFF; node check.js"),
+            (assign, "MAX_DIFF\\=0.05; export MAX_DIFF; node check.js"),
+            (assign, '"MAX_DIFF"=0.05; export MAX_DIFF; node check.js'),
+            (assign, "'MAX_DIFF=0.01'; export MAX_DIFF; node check.js"),
+            (neg_if, "if '!' node check.js --max-diff 0.05; then exit 1; fi"),
+            ("! node check.js --max-diff 0.05 && exit 1; true", "'!' node check.js --max-diff 0.05 && exit 1; true"),
+            ("bash -c 'if ! node check.js --max-diff 0.05; then exit 1; fi'", "bash -c 'if \"!\" node check.js --max-diff 0.05; then exit 1; fi'"),
+        ])
+
+
+class TestFixRound18RawQuotingAndFixedPointThresholds(unittest.TestCase):
+    """Round 18: words compare by exact source spelling everywhere (quoting changes meaning inside `[[ =~ ]]`,
+    `(( ))` and after `time -p`), and an edited threshold must be plain fixed-point decimal on both sides, so
+    a smaller value is never larger under `parseInt`, `parseFloat`/`Number` or `Decimal`."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    # 5 differing pixels against `parseInt(--max-diff-pixels, 10)`, with no NaN guard (`5 > NaN` is false).
+    _PARSEINT_JS = (
+        "const arg = process.argv.slice(2).find((a) => a.startsWith('--max-diff-pixels='));\n"
+        "const limit = parseInt(arg ? arg.slice(18) : '0', 10);\n"
+        "process.exit(5 > limit ? 1 : 0);\n"
+    )
+    _REGEX = "bash -c 'out=$(python3 check.py); [[ ! $out =~ ^FAIL ]]'"
+    _ARITH = "bash -c 'diff=$(python3 check.py); if (( diff != 0 )); then exit 1; fi'"
+    _TIME_NEG = "bash -c 'if time -p ! python3 check.py; then exit 1; fi'"
+    _TIME_ASSIGN = "bash -c 'time -p MAX_DIFF=0.05; export MAX_DIFF; python3 check.py'"
+    _QUOTE_MUTATIONS = (
+        (_REGEX, "bash -c 'out=$(python3 check.py); [[ ! $out =~ \"^FAIL\" ]]'"),
+        (_ARITH, "bash -c 'diff=$(python3 check.py); if (( diff \\!= 0 )); then exit 1; fi'"),
+        (_TIME_NEG, "bash -c 'if time -p \"!\" python3 check.py; then exit 1; fi'"),
+        (_TIME_ASSIGN, "bash -c 'time -p \"MAX_DIFF=0.05\"; export MAX_DIFF; python3 check.py'"),
+    )
+    # The `check.py` each committed command runs; every committed command fails its hook.
+    _CHECKS = {
+        _REGEX: "print('FAIL: 100 pixels differ')\n",
+        _ARITH: "print(100)\n",
+        _TIME_NEG: "import sys\nsys.exit(1)\n",
+        _TIME_ASSIGN: ("import os, sys\n"
+                       "sys.exit(0 if 0.25 <= float(os.environ.get('MAX_DIFF') or '1.0') else 1)\n"),
+    }
+
+    def _repo(self, home: Path, name: str, command: Any) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "check.py", self._CHECKS.get(command, "import sys\nsys.exit(1)\n"))
+        _write(repo, "check.js", self._PARSEINT_JS)
+        _commit_all(repo, "visual checks + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def test_quote_only_mutations_are_rejected_statically(self):
+        self._assert_rejected({live: (base, live) for base, live in self._QUOTE_MUTATIONS})
+        self._assert_clean({f"unchanged {live}": (live, live) for _, live in self._QUOTE_MUTATIONS})
+        self._assert_clean({f"unchanged {base}": (base, base) for base, _ in self._QUOTE_MUTATIONS})
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is required for `[[`, `((` and `time -p`")
+    def test_quote_only_mutations_are_rejected_end_to_end(self):
+        """Each quoted word changes bash semantics: a literal `=~` pattern, an arithmetic syntax error, a `!`
+        command instead of negation, a `MAX_DIFF=0.05` command instead of an assignment; each turns green."""
+        self._assert_executed_bypasses_rejected(list(self._QUOTE_MUTATIONS))
+
+    def test_edited_thresholds_must_be_plain_fixed_point(self):
+        from factonio.harness import _visual_hook_loosening
+
+        flag = "node check.js --max-diff-pixels={}"
+        self._assert_rejected({
+            "0.5 -> 9e-2": (flag.format("0.5"), flag.format("9e-2")),
+            "0.5 -> .0": (flag.format("0.5"), flag.format(".0")),
+            "1.5 -> 999e-3": (flag.format("1.5"), flag.format("999e-3")),
+            "0.05 -> 1e-2": ("node check.js --max-diff 0.05", "node check.js --max-diff 1e-2"),
+            "0.05 -> .01": ("node check.js --max-diff 0.05", "node check.js --max-diff .01"),
+            "1e-1 -> 1e-2": ("node check.js --max-diff 1e-1", "node check.js --max-diff 1e-2"),
+            ".05 -> 0.01": ("node check.js --max-diff .05", "node check.js --max-diff 0.01"),
+            "env 0.05 -> 1e-2": ("MAX_DIFF=0.05 node check.js", "MAX_DIFF=1e-2 node check.js"),
+        })
+        self.assertIn("sets non-finite or unparseable threshold `--max-diff-pixels` (9e-2)",
+                      _visual_hook_loosening({"command": flag.format("0.5")}, {"command": flag.format("9e-2")}))
+        self._assert_clean({
+            "0.5 -> 0.1": (flag.format("0.5"), flag.format("0.1")),
+            "1.5 -> 1.2": (flag.format("1.5"), flag.format("1.2")),
+            "1.5 -> 0.5": (flag.format("1.5"), flag.format("0.5")),
+            "0.05 -> 0": ("node check.js --max-diff 0.05", "node check.js --max-diff 0"),
+            "5% -> 1%": ("node check.js --max-diff 5%", "node check.js --max-diff 1%"),
+            "1.5% -> 0.5%": ("node check.js --max-diff 1.5%", "node check.js --max-diff 0.5%"),
+            "unchanged 1e-2": ("node check.js --max-diff 1e-2", "node check.js --max-diff 1e-2"),
+            "unchanged .01": ("node check.js --max-diff .01", "node check.js --max-diff .01"),
+            "quoted value tightened": ("MAX_DIFF='0.05' node check.js", "MAX_DIFF='0.01' node check.js"),
+        })
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
+    def test_parseint_threshold_rewrites_are_rejected_end_to_end(self):
+        """`parseInt("0.5", 10)` is 0 but `parseInt("9e-2", 10)` is 9, `parseInt(".0", 10)` NaN and
+        `parseInt("999e-3", 10)` 999: each exactly-smaller rewrite raises the effective limit past 5 pixels."""
+        flag = "node check.js --max-diff-pixels={}"
+        self._assert_executed_bypasses_rejected([
+            (flag.format("0.5"), flag.format("9e-2")),
+            (flag.format("0.5"), flag.format(".0")),
+            (flag.format("1.5"), flag.format("999e-3")),
+        ])
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
+    def test_fixed_point_tightening_keeps_the_parseint_bar(self):
+        from factonio.harness import audit_harness, check_harness
+
+        flag = "node check.js --max-diff-pixels={}"
+        # unchanged `.01` is `parseInt` NaN (`5 > NaN` passes): committed as such, it is not an edit to judge
+        cases = (("0.5", "0.1", True), ("1.5", "1.2", True), ("1.5", "0.5", True), ("1e-2", "1e-2", True),
+                 (".01", ".01", False))
+        with isolated_hermes_home() as home:
+            for n, (base, live, fails) in enumerate(cases):
+                with self.subTest(base=base, live=live):
+                    repo = self._repo(home, f"svc{n}", flag.format(base))
+                    self._set_command(repo, flag.format(live))
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(chk["hook_results"]["failed_required"], ["pixels"] if fails else [])
+                    self.assertEqual(chk["errors"], ["Required hook 'pixels' failed"] if fails else [])
+                    self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+                    audit = audit_harness(str(repo))
+                    self.assertFalse(audit["gate_loosening"]["loosened"], audit["gate_loosening"])
+
+
+class TestFixRound19PureInPlaceTightening(unittest.TestCase):
+    """Round 19: an edited committed command is clean only as a pure in-place threshold tightening. No token
+    may be inserted anywhere (`$(...)`, pipes, `&&`, after `time`, before a positional), heredocs and line
+    continuations fail closed unless byte-identical, and `--flag=val` / `--flag val` keep their syntax."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    _FAIL = "import sys\nsys.exit(1)\n"
+    _PRINT_FAIL = "print('FAIL: 100 pixels differ')\n"
+    _HEREDOC = "cat <<EOF >/dev/null\nunused\nEOF\npython3 check.py"
+    _NESTED_HEREDOC = "bash -c 'cat <<EOF >/dev/null\nunused\nEOF\npython3 check.py'"
+    _SUBST = "bash -c 'out=$(python3 check.py); [[ ! $out =~ ^FAIL ]]'"
+    _PIPE = "python3 check.py | awk '/FAIL/ { exit 1 }'"
+    _GREP = "grep -q FAIL report.txt && exit 1; true"
+    _TIME_ASSIGN = "bash -c 'time -p MAX_DIFF=0.05; export MAX_DIFF; python3 check.py'"
+    _TIME_NEG = "bash -c 'time ! python3 check.py'"
+    _POSITIONAL = "python3 check.py snapshots/home.png"
+    _EQ_JS = "node eq.js --max-diff=0.05"
+    _SPACE_JS = "node space.js --max-diff 0.05"
+    # The `check.py` each committed command runs; every committed command fails its hook.
+    _CHECKS = {
+        _SUBST: _PRINT_FAIL,
+        _PIPE: _PRINT_FAIL,
+        _TIME_ASSIGN: "import os, sys\nsys.exit(0 if 0.25 <= float(os.environ.get('MAX_DIFF') or '1.0') else 1)\n",
+        _TIME_NEG: "import sys\nsys.exit(0)\n",
+        _POSITIONAL: "import sys\nsys.exit(1 if sys.argv[1:2] == ['snapshots/home.png'] else 0)\n",
+    }
+    # Single-syntax Node checkers: visual diff 0.25, lenient default 1 when their one form is absent.
+    _EQ_CHECK = ("const a = process.argv.slice(2).find((x) => x.startsWith('--max-diff='));\n"
+                 "process.exit(0.25 > Number(a ? a.slice(12) : '1') ? 1 : 0);\n")
+    _SPACE_CHECK = ("const args = process.argv.slice(2); const i = args.indexOf('--max-diff');\n"
+                    "process.exit(0.25 > Number(i >= 0 ? args[i + 1] : '1') ? 1 : 0);\n")
+    _SWALLOWED = (
+        (_HEREDOC, "cat <<EOF >/dev/null\nunused\n EOF\npython3 check.py"),
+        (_NESTED_HEREDOC, "bash -c 'cat <<EOF >/dev/null\nunused\n EOF\npython3 check.py'"),
+    )
+    _INSERTED = (
+        (_SUBST, "bash -c 'out=$(python3 --color=never check.py); [[ ! $out =~ ^FAIL ]]'"),
+        (_PIPE, "python3 --color=never check.py | awk '/FAIL/ { exit 1 }'"),
+        (_GREP, "grep --reporter=list -q FAIL report.txt && exit 1; true"),
+        (_TIME_ASSIGN, "bash -c 'UPDATE_SNAPSHOTS=0 time -p MAX_DIFF=0.05; export MAX_DIFF; python3 check.py'"),
+        (_TIME_NEG, "bash -c 'time ! --color=never python3 check.py'"),
+        (_POSITIONAL, "python3 check.py --color=never snapshots/home.png"),
+    )
+    _SYNTAX_SWAPS = (
+        (_EQ_JS, "node eq.js --max-diff 0.01"),
+        (_SPACE_JS, "node space.js --max-diff=0.01"),
+    )
+
+    def _repo(self, home: Path, name: str, command: Any) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "check.py", self._CHECKS.get(command, self._FAIL))
+        _write(repo, "report.txt", "FAIL: 100 pixels differ\n")
+        _write(repo, "eq.js", self._EQ_CHECK)
+        _write(repo, "space.js", self._SPACE_CHECK)
+        _commit_all(repo, "visual checks + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def test_edited_heredocs_and_line_continuations_fail_closed_before_token_comparison(self):
+        from factonio.harness import _tokenize_visual_cmd, _UnsupportedEdit, _visual_hook_loosening
+
+        for cmd in ("cat <<EOF\nx\nEOF", "cat <<-EOF\n\tx\n\tEOF", "cat <<< x", "a $(cat <<E\nE\n)",
+                    "python3 check.py \\\n --max-diff 0.01", 'echo "a\\\nb"'):
+            with self.subTest(cmd=cmd), self.assertRaises(_UnsupportedEdit):
+                _tokenize_visual_cmd(cmd)
+        self.assertEqual([t.text for t in _tokenize_visual_cmd("echo '<<' \"<<<\" '\\\n'")], ["echo", "<<", "<<<", "\\\n"])
+        self._assert_rejected({live: (base, live) for base, live in self._SWALLOWED})
+        self._assert_rejected({
+            "heredoc body": (self._HEREDOC, "cat <<EOF >/dev/null\nused\nEOF\npython3 check.py"),
+            "heredoc added": ("python3 check.py", "cat <<EOF\nEOF\npython3 check.py"),
+            "heredoc removed": (self._HEREDOC, "python3 check.py"),
+            "herestring": ("python3 check.py", "python3 check.py <<< x"),
+            "continuation added": ("python3 check.py --max-diff 0.05", "python3 check.py \\\n --max-diff 0.01"),
+        })
+        reasons = _visual_hook_loosening({"command": self._HEREDOC}, {"command": self._SWALLOWED[0][1]})
+        self.assertEqual(reasons, ["mutates visual_diff command with a heredoc/herestring (allowed only when "
+                                   "byte-identical to the committed command)"])
+        self._assert_clean({f"unchanged {cmd!r}": (cmd, cmd) for cmd in (
+            self._HEREDOC, self._NESTED_HEREDOC, "python3 check.py \\\n --max-diff 0.01", "cat <<< x")})
+
+    def test_operators_and_sh_c_quote_style_keep_their_spelling(self):
+        self._assert_rejected({
+            "; -> newline": ("a --max-diff 0.05; b", "a --max-diff 0.01\nb"),
+            "newline -> ;": ("a\nb", "a; b"),
+            "trailing ; added": ("python3 check.py", "python3 check.py;"),
+            "( ( -> ((": ("( (python3 check.py) )", "((python3 check.py))"),
+            "$( -> $ (": ("x=$(python3 check.py)", "x=$ (python3 check.py)"),
+            "single -> double": ("sh -c 'node c.js --max-diff 0.05'", 'sh -c "node c.js --max-diff 0.01"'),
+            "double -> single": ('sh -c "node c.js --max-diff 0.05"', "sh -c 'node c.js --max-diff 0.01'"),
+        })
+        self._assert_rejected({"blank lines": ("a\nb", "a\n\n\nb\n")})
+        self._assert_clean({
+            "single-quoted tightened": ("sh -c 'node c.js --max-diff 0.05'", "sh -c 'node c.js --max-diff 0.01'"),
+            "double-quoted tightened": ('sh -c "node c.js --max-diff 0.05"', 'sh -c "node c.js --max-diff 0.01"'),
+        })
+
+    def test_no_token_may_be_inserted_anywhere(self):
+        self._assert_rejected({live: (base, live) for base, live in self._INSERTED})
+        self._assert_rejected({
+            "trailing inert flag": ("python3 check.py", "python3 check.py --verbose"),
+            "disabled regen env": ("npx jest", "UPDATE_SNAPSHOTS=0 npx jest"),
+            "token deleted": ("python3 check.py --verbose", "python3 check.py"),
+            "token moved": ("python3 check.py a b", "python3 check.py b a"),
+        })
+        self._assert_clean({f"unchanged {live}": (live, live) for _, live in self._INSERTED})
+
+    def test_flag_syntax_swaps_are_rejected_with_a_specific_reason(self):
+        from factonio.harness import _visual_hook_loosening
+
+        self._assert_rejected({live: (base, live) for base, live in self._SYNTAX_SWAPS})
+        for base, live in self._SYNTAX_SWAPS:
+            with self.subTest(live=live):
+                self.assertIn("changes threshold syntax `--max-diff` (`--flag=value` vs `--flag value`; checkers "
+                              "often read only one form)",
+                              _visual_hook_loosening({"command": base}, {"command": live}))
+        self._assert_clean({
+            "= tightened": (self._EQ_JS, "node eq.js --max-diff=0.01"),
+            "space tightened": (self._SPACE_JS, "node space.js --max-diff 0.01"),
+        })
+        self._assert_rejected({"quoted value tightened": (self._SPACE_JS, "node space.js --max-diff '0.01'")})
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is required for `[[`, `time` and heredocs in `bash -c`")
+    def test_heredoc_and_insertion_bypasses_are_rejected_end_to_end(self):
+        """Each mutation really turns the failing committed hook green: an indented delimiter makes `cat` swallow
+        the checker, and an inserted option makes `python3`/`grep` exit 2 with no `FAIL` output, `time` lose its
+        reserved-word meaning, `!` negate a missing command, or the checker read the wrong positional."""
+        self._assert_executed_bypasses_rejected([*self._SWALLOWED, *self._INSERTED])
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checkers")
+    def test_flag_syntax_swaps_are_rejected_end_to_end(self):
+        self._assert_executed_bypasses_rejected(list(self._SYNTAX_SWAPS))
+
+    def test_unchanged_and_in_place_tightening_controls_stay_clean_end_to_end(self):
+        from factonio.harness import audit_harness, check_harness
+
+        cases = ((self._HEREDOC, self._HEREDOC), (self._PIPE, self._PIPE),
+                 ("MAX_DIFF='0.05' python3 check.py", "MAX_DIFF='0.01' python3 check.py"),
+                 ("python3 check.py --max-diff=0.05", "python3 check.py --max-diff=0.01"),
+                 ("sh -c 'python3 check.py --max-diff-pixels=5'", "sh -c 'python3 check.py --max-diff-pixels=1'"))
+        with isolated_hermes_home() as home:
+            for n, (base, live) in enumerate(cases):
+                with self.subTest(base=base, live=live):
+                    repo = self._repo(home, f"svc{n}", base)
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(chk["hook_results"]["failed_required"], ["pixels"])  # the bar still holds
+                    self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+                    audit = audit_harness(str(repo))
+                    self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("clean", False))
+
+
+class TestFixRound20VerbatimOutsideThresholdValueSpans(unittest.TestCase):
+    """Round 20: an edited committed command is clean only when every byte outside its tightened threshold value
+    spans is verbatim the committed byte, and every validation regex anchors with `\\A...\\Z` + `fullmatch`, so a
+    trailing newline never passes as a strict decimal."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    # A Go/`strconv.ParseFloat`-style strict reader: anything but a plain decimal falls back to the lenient 0.10
+    # default. The visual diff is 0.08, so only a threshold below 0.08 fails the hook.
+    _STRICT = ("import os, re, sys\n"
+               "def strict(v):\n"
+               "    return float(v) if v is not None and re.fullmatch(r'[0-9]+(?:\\.[0-9]+)?', v) else 0.10\n"
+               "args = sys.argv[1:]\n"
+               "raw = os.environ.get('MAX_DIFF')\n"
+               "for k, a in enumerate(args):\n"
+               "    if a.startswith('--max-diff='):\n"
+               "        raw = a[len('--max-diff='):]\n"
+               "    elif a == '--max-diff' and k + 1 < len(args):\n"
+               "        raw = args[k + 1]\n"
+               "sys.exit(1 if 0.08 > strict(raw) else 0)\n")
+    # Compares only when `--baseline=` names an existing file (the committed snapshot differs: exit 1).
+    _BASELINE = ("import os, sys\n"
+                 "p = next((a.split('=', 1)[1] for a in sys.argv[1:] if a.startswith('--baseline=')), '')\n"
+                 "sys.exit(1 if os.path.isfile(p) else 0)\n")
+    _COUNT = "print(5)\n"  # 5 differing pixels
+    _NEWLINES = (
+        ("python3 check.py --max-diff 0.05", 'python3 check.py --max-diff "0.01\n"'),
+        ("python3 check.py --max-diff=0.05", "python3 check.py --max-diff='0.01\n'"),
+        ("MAX_DIFF=0.05 python3 check.py", 'MAX_DIFF="0.01\n" python3 check.py'),
+    )
+    _EXTGLOB = "bash -c 'shopt -s extglob\n[[ $(cat report.txt) != @(FAIL|ERROR)* ]]'"
+    _ARITH = "bash -c 'diff=$(python3 check.py); if ((\n  diff != 0\n)); then exit 1; fi'"
+    _WHITESPACE = (
+        ("python3 check.py --baseline=$(pwd)/snapshots/home.png",
+         "python3 check.py --baseline=$(pwd) /snapshots/home.png"),
+        ("if [ $(python3 check.py)x != 0x ]; then exit 1; fi", "if [ $(python3 check.py) x != 0x ]; then exit 1; fi"),
+        (_EXTGLOB, "bash -c 'shopt -s extglob\n[[ $(cat report.txt) != @( FAIL|ERROR)* ]]'"),
+        (_EXTGLOB, "bash -c 'shopt -s extglob\n[[ $(cat report.txt) != @(FAIL | ERROR)* ]]'"),
+    )
+    _COMMENT = ((_ARITH, "bash -c 'diff=$(python3 check.py); if ((\n  diff != 0 # ok\n)); then exit 1; fi'"),)
+    _CHECKS = {
+        **dict.fromkeys((base for base, _ in _NEWLINES), _STRICT),
+        _WHITESPACE[0][0]: _BASELINE,
+        _WHITESPACE[1][0]: _COUNT,
+        _ARITH: _COUNT,
+    }
+    _TIGHTENED = (
+        ("python3 check.py --max-diff=0.05", "python3 check.py --max-diff=0.01"),
+        ("python3 check.py --max-diff 0.05", "python3 check.py --max-diff 0.01"),
+        ("MAX_DIFF=0.05 python3 check.py", "MAX_DIFF=0.01 python3 check.py"),
+        ("MAX_DIFF='0.05' python3 check.py", "MAX_DIFF='0.01' python3 check.py"),
+        ("sh -c 'node check.js --max-diff-pixels=5'", "sh -c 'node check.js --max-diff-pixels=1'"),
+    )
+    _UNCHANGED = (
+        "python3 check.py  --max-diff 0.05   # pixel-exact",
+        _EXTGLOB, _ARITH, *(live for _, live in _COMMENT),
+        "if (( $(python3 check.py) > 0 )); then exit 1; fi",
+        "cat <<EOF >/dev/null\nunused\nEOF\npython3 check.py",
+    )
+
+    def _repo(self, home: Path, name: str, command: Any) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "check.py", self._CHECKS.get(command, "import sys\nsys.exit(1)\n"))
+        _write(repo, "report.txt", "FAIL: 100 pixels differ\n")
+        _commit_all(repo, "visual checks + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def test_every_validation_regex_rejects_a_trailing_newline(self):
+        from decimal import Decimal
+
+        from factonio import harness
+
+        for regex, value in ((harness._ASCII_THRESHOLD_RE, "0.01"), (harness._ASCII_VALUE_RE, "1%"),
+                             (harness._PYTHON_RE, "python3"),
+                             (harness._REGEN_FLAG_RE, "--update-snapshots")):
+            with self.subTest(pattern=regex.pattern):
+                self.assertTrue(regex.fullmatch(value))
+                self.assertIsNone(regex.fullmatch(value + "\n"))
+                self.assertNotIn("^", regex.pattern.replace("[^", ""))
+                self.assertNotIn("$", regex.pattern)
+        # `_ASSIGN_RE` keeps a multi-line value whole (the value regex then rejects it); its name cannot end in LF
+        self.assertIsNone(harness._ASSIGN_RE.fullmatch("MAX_DIFF\n=0.01"))
+        self.assertEqual(harness._ASSIGN_RE.fullmatch("MAX_DIFF=0.01\n").group(2), "0.01\n")
+        self.assertNotIn("$", harness._ASSIGN_RE.pattern)
+        self.assertEqual(harness._parse_value("0.01\n"), (None, False))
+        self.assertEqual(harness._parse_value("0.01"), (Decimal("0.01"), False))
+        self.assertIsNone(harness._REGEN_ENV_RE.search("UPDATE_SNAPSHOTS\n_X"))
+        self.assertFalse(harness.glob_matches("src/*.py", "src/a.py\n"))
+        self.assertTrue(harness.glob_matches("src/*.py", "src/a.py"))
+
+    def test_value_spans_cover_only_the_bare_number(self):
+        from factonio.harness import _value_spans
+
+        def spans(cmd: Any) -> list[str]:
+            items = cmd if isinstance(cmd, list) else [cmd]
+            return [items[u][s:e] for u, s, e in _value_spans(cmd)]
+
+        self.assertEqual(spans("MAX_DIFF='0.05' a --max-diff=\"1%\" --max-diff-pixels 5"), ["0.05", "1%", "5"])
+        self.assertEqual(spans("sh -c 'node c.js --max-diff-pixels=5'"), ["5"])
+        self.assertEqual(spans(["bash", "-c", "node c.js --max-diff 0.05"]), ["0.05"])
+        for compound in ("[[ $x =~ --max-diff=0.05 ]] && (( --max-diff=5 )) && $((--max-diff=5))",
+                         "a --max-diff=0.05 # c", 'a --max-diff "0.01\n"'):
+            with self.assertRaises(ValueError):
+                spans(compound)
+        with self.assertRaises(ValueError):  # escapes: offsets do not map 1:1
+            spans('sh -c "node c.js --max-diff=\\"0.05\\""')
+
+    def test_any_edit_outside_a_value_span_is_rejected(self):
+        exported = "export MAX_DIFF=0.01; python3 check.py"
+        self._assert_rejected({
+            **{live: (base, live) for base, live in (*self._NEWLINES, *self._WHITESPACE, *self._COMMENT)},
+            "comment + whitespace": (exported, "export MAX_DIFF=0.01;   python3 check.py  # visual check"),
+            "comment added": ("python3 check.py --max-diff 0.05", "python3 check.py --max-diff 0.01  # ok"),
+            "argv form": ("python3 check.py", ["python3", "check.py"]),
+            "quoting added": ("MAX_DIFF=0.05 python3 check.py", "MAX_DIFF='0.01' python3 check.py"),
+            "quoting dropped": ("MAX_DIFF='0.05' python3 check.py", "MAX_DIFF=0.01 python3 check.py"),
+            "argv value quoted": (["node", "c.js", "--max-diff=0.05"], ["node", "c.js", "--max-diff='0.01'"]),
+            "[[ ]] word": ("bash -c '[[ $x =~ --max-diff=0.05 ]]'", "bash -c '[[ $x =~ --max-diff=0.01 ]]'"),
+            "(( )) word": ("(( --max-diff=5 ))", "(( --max-diff=1 ))"),
+            "escaped double-quoted script": ('sh -c "node c.js --max-diff=\\"0.05\\""',
+                                             'sh -c "node c.js --max-diff=\\"0.01\\""'),
+            "loosened": ("python3 check.py --max-diff=0.05", "python3 check.py --max-diff=0.06"),
+            "comment kept": ("a  --max-diff=5%  # c", "a  --max-diff=1%  # c"),
+            "integer to decimal": ("sh -c 'node check.js --max-diff-pixels=5'",
+                                   "sh -c 'node check.js --max-diff-pixels=0.5'"),
+            "unit dropped": ("a --max-diff=5%", "a --max-diff=1"),
+            "no threshold": ("python3 check.py a", "python3 check.py b"),
+        })
+
+    def test_verbatim_tightening_and_unchanged_commands_stay_clean(self):
+        self._assert_clean({
+            **{live: (base, live) for base, live in self._TIGHTENED},
+            **{f"unchanged {cmd!r}": (cmd, cmd) for cmd in self._UNCHANGED},
+            "double-quoted script": ('sh -c "node c.js --max-diff 0.05"', 'sh -c "node c.js --max-diff 0.01"'),
+            "argv tightened": (["bash", "-c", "node c.js --max-diff 0.05"], ["bash", "-c", "node c.js --max-diff 0.01"]),
+            "spacing kept": ("a  --max-diff=5%  ", "a  --max-diff=1%  "),
+        })
+
+    def test_trailing_newline_thresholds_are_rejected_end_to_end(self):
+        """A quoted LF turns `0.01` into a value the strict checker rejects, so it falls back to its looser 0.10
+        default and passes the failing committed check."""
+        self._assert_executed_bypasses_rejected(list(self._NEWLINES))
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is required for `[[`, extglob and `((` in `bash -c`")
+    def test_whitespace_and_comment_edits_are_rejected_end_to_end(self):
+        """A space splits a word or a pattern and a `#` is an arithmetic syntax error: each turns the failing
+        committed hook green."""
+        self._assert_executed_bypasses_rejected([*self._WHITESPACE, *self._COMMENT])
+
+    def test_plain_tightening_still_fails_the_hook_and_stays_clean(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            for n, (base, live) in enumerate(self._NEWLINES[:2]):
+                live = live.replace("\n", "").replace('"', "").replace("'", "")
+                with self.subTest(live=live):
+                    repo = self._repo(home, f"svc{n}", base)
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(chk["hook_results"]["failed_required"], ["pixels"])  # the bar still holds
+                    self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+                    audit = audit_harness(str(repo))
+                    self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("clean", False))
+
+
+class TestFixRound21SingleSimpleCommandTightening(unittest.TestCase):
+    """Round 21: an edited committed command may tighten a threshold in place only on a single simple command
+    (or `sh -c`/`bash -c` wrapping one), with `env` slots only as leading assignments before a real command
+    head and `flag` slots only after that head and before `--`. A `NAME=val` word anywhere else is data."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    _repo = TestFixRound20VerbatimOutsideThresholdValueSpans._repo
+    # Fails (exit 1) while its argv still holds the committed literal: an edited literal turns it green.
+    _ARGV_CHECK = "import sys\nsys.exit(1 if {!r} in sys.argv[1:] else 0)\n"
+    _STRICT = TestFixRound20VerbatimOutsideThresholdValueSpans._STRICT
+    _EXECUTED = (
+        # OpenAI Diff t_19be3775: a POSIX `[` comparison literal is not an environment threshold
+        ('out=MAX_DIFF=0.05; if [ "$out" = MAX_DIFF=0.05 ]; then exit 1; fi',
+         'out=MAX_DIFF=0.05; if [ "$out" = MAX_DIFF=0.01 ]; then exit 1; fi'),
+        ('out=--max-diff=0.05; if [ "$out" = --max-diff=0.05 ]; then exit 1; fi',
+         'out=--max-diff=0.05; if [ "$out" = --max-diff=0.01 ]; then exit 1; fi'),
+        ("python3 check.py MAX_DIFF=0.05", "python3 check.py MAX_DIFF=0.01"),            # positional, not leading
+        ("python3 check.py -- --max-diff=0.05", "python3 check.py -- --max-diff=0.01"),  # after `--`
+        ("python3 -c 'import sys; sys.exit(\"--max-diff=0.05\" in sys.argv)' --max-diff=0.05",
+         "python3 -c 'import sys; sys.exit(\"--max-diff=0.05\" in sys.argv)' --max-diff=0.01"),  # inline code
+    )
+    _CHECKS = {
+        "python3 check.py MAX_DIFF=0.05": _ARGV_CHECK.format("MAX_DIFF=0.05"),
+        "python3 check.py -- --max-diff=0.05": _ARGV_CHECK.format("--max-diff=0.05"),
+        "MAX_DIFF=0.05 python3 check.py": _STRICT,
+        "env MAX_DIFF=0.05 python3 check.py": _STRICT,
+        "python3 check.py --max-diff=0.05": _STRICT,
+        "python3 check.py --max-diff 0.05": _STRICT,
+        "sh -c 'python3 check.py --max-diff=0.05'": _STRICT,
+    }
+    _REJECTED = {
+        "node -e": ("node -e 'process.exit(process.argv.includes(\"--max-diff=0.05\") ? 1 : 0)' --max-diff=0.05",
+                    "node -e 'process.exit(process.argv.includes(\"--max-diff=0.05\") ? 1 : 0)' --max-diff=0.01"),
+        "[ ] head": ("[ x = --max-diff=0.05 ]", "[ x = --max-diff=0.01 ]"),
+        "test head": ("test x = MAX_DIFF=0.05", "test x = MAX_DIFF=0.01"),
+        "assignment only": ("MAX_DIFF=0.05", "MAX_DIFF=0.01"),
+        "env without head": ("env MAX_DIFF=0.05", "env MAX_DIFF=0.01"),
+        "env -S": ("env -S 'node check.js' MAX_DIFF=0.05 node c.js", "env -S 'node check.js' MAX_DIFF=0.01 node c.js"),
+        "env -S split string": ("env -S 'node c.js' --max-diff=0.05", "env -S 'node c.js' --max-diff=0.01"),
+        "env -u": ("env -u X node c.js --max-diff=0.05", "env -u X node c.js --max-diff=0.01"),
+        "echo head": ("echo --max-diff=0.05", "echo --max-diff=0.01"),
+        "grep head": ("grep -q --max-diff=0.05 report.txt", "grep -q --max-diff=0.01 report.txt"),
+        "wrapper head": ("timeout 60 test x = --max-diff=0.05", "timeout 60 test x = --max-diff=0.01"),
+        "export head": ("export MAX_DIFF=0.05", "export MAX_DIFF=0.01"),
+        "export then run": ("export MAX_DIFF=0.05; python3 check.py", "export MAX_DIFF=0.01; python3 check.py"),
+        "assign; export; run": ("MAX_DIFF=0.05; export MAX_DIFF; node check.js",
+                                "MAX_DIFF=0.01; export MAX_DIFF; node check.js"),
+        "export &&": ("export MAX_DIFF=0.05 && node check.js", "export MAX_DIFF=0.01 && node check.js"),
+        "compound &&": ("a --max-diff 0.05 && b --max-diff 0.02", "a --max-diff 0.01 && b --max-diff 0.01"),
+        "pipeline": ("node check.js --max-diff=0.05 | cat", "node check.js --max-diff=0.01 | cat"),
+        "sh -c compound": ("bash -c 'export MAX_DIFF=0.05; python3 check.py'",
+                           "bash -c 'export MAX_DIFF=0.01; python3 check.py'"),
+        "sh -c test": ("sh -c '[ x = --max-diff=0.05 ]'", "sh -c '[ x = --max-diff=0.01 ]'"),
+        "sh -c extra args": ("sh -c 'node c.js --max-diff=0.05' x", "sh -c 'node c.js --max-diff=0.01' x"),
+        "$ expansion": ('node check.js "$X" --max-diff=0.05', 'node check.js "$X" --max-diff=0.01'),
+        "comment": ("node check.js --max-diff=0.05 # c", "node check.js --max-diff=0.01 # c"),
+        "argv positional": (["python3", "check.py", "MAX_DIFF=0.05"], ["python3", "check.py", "MAX_DIFF=0.01"]),
+        "argv after --": (["python3", "check.py", "--", "--max-diff=0.05"],
+                          ["python3", "check.py", "--", "--max-diff=0.01"]),
+        "argv test": (["test", "x", "=", "--max-diff=0.05"], ["test", "x", "=", "--max-diff=0.01"]),
+        "-pe cluster": ("perl -pe 1 --max-diff=0.05", "perl -pe 1 --max-diff=0.01"),
+        "--eval=": ("deno --eval=1 --max-diff=0.05", "deno --eval=1 --max-diff=0.01"),
+        # Round 22: no `env` option and no option word other than a threshold flag (`--` included)
+        "env -i assignment": ("env -i MAX_DIFF=0.05 node check.js", "env -i MAX_DIFF=0.01 node check.js"),
+        "flag before --": ("npx jest --max-diff=0.05 -- x", "npx jest --max-diff=0.01 -- x"),
+    }
+    _CLEAN = {
+        "leading assignment": ("MAX_DIFF=0.05 node check.js", "MAX_DIFF=0.01 node check.js"),
+        "env assignment": ("env MAX_DIFF=0.05 node check.js", "env MAX_DIFF=0.01 node check.js"),
+        "--flag=": ("node check.js --max-diff=0.05", "node check.js --max-diff=0.01"),
+        "--flag value": ("node check.js --max-diff 0.05", "node check.js --max-diff 0.01"),
+        "playwright": ("npx playwright test --max-diff-pixel-ratio=0.05", "npx playwright test --max-diff-pixel-ratio=0.01"),
+        "sh -c pixels": ("sh -c 'node check.js --max-diff-pixels=5'", "sh -c 'node check.js --max-diff-pixels=1'"),
+        "argv env": (["env", "MAX_DIFF=0.05", "node", "check.js"], ["env", "MAX_DIFF=0.01", "node", "check.js"]),
+        "argv flag": (["node", "check.js", "--max-diff=0.05"], ["node", "check.js", "--max-diff=0.01"]),
+    }
+    _UNCHANGED = (
+        *(base for base, _ in _EXECUTED), *(base for base, _ in _REJECTED.values()),
+        "if [ -f a ]; then node check.js; fi | tee log\nnode -e 1 -c --eval=2 # done",
+        "cat <<EOF >/dev/null\nTHRESHOLD=0.05\nEOF\nnode check.js",
+    )
+
+    def test_non_simple_or_non_slot_edits_are_rejected(self):
+        self._assert_rejected({**{live: (base, live) for base, live in self._EXECUTED}, **self._REJECTED})
+
+    def test_single_simple_command_tightening_and_unchanged_commands_stay_clean(self):
+        self._assert_clean({**self._CLEAN, **{f"unchanged {cmd!r}": (cmd, cmd) for cmd in self._UNCHANGED}})
+
+    def test_comparison_positional_and_inline_code_edits_are_rejected_end_to_end(self):
+        """Each committed command fails; each edited literal really turns it green, yet check and audit flag it."""
+        self._assert_executed_bypasses_rejected(list(self._EXECUTED))
+
+    def test_value_spans_ignore_non_slot_positions(self):
+        from factonio.harness import _value_spans
+
+        def spans(cmd: Any) -> list[str]:
+            items = cmd if isinstance(cmd, list) else [cmd]
+            return [items[u][s:e] for u, s, e in _value_spans(cmd)]
+
+        self.assertEqual(spans("A=1 MAX_DIFF=0.05 MAX_DIFF=2 node c.js --max-diff 4"), ["0.05", "2", "4"])
+        self.assertEqual(spans(["env", "MAX_DIFF=1", "node", "--max-diff", "2"]), ["1", "2"])
+        for cmd in ('[ "$out" = MAX_DIFF=0.05 ]', "MAX_DIFF=0.05", "x=1; node c.js --max-diff=1",
+                    "A=1 MAX_DIFF=0.05 env -i MAX_DIFF=2 node c.js", "node c.js MAX_DIFF=3 --max-diff 4",
+                    "node c.js --max-diff 4 -- --max-diff=5",
+                    ["env", "MAX_DIFF=1", "node", "--max-diff", "2", "--", "--max-diff=3"],
+                    "node -e 1 --max-diff=1", "bash -c 'a; b --max-diff=1'", "test 1 --max-diff=1"):
+            with self.subTest(cmd=cmd), self.assertRaises(ValueError):
+                spans(cmd)
+
+    def test_single_command_tightening_still_fails_the_hook_and_stays_clean(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            for n, base in enumerate(cmd for cmd, src in self._CHECKS.items() if src == self._STRICT):
+                live = base.replace("0.05", "0.01")
+                with self.subTest(live=live):
+                    repo = self._repo(home, f"svc{n}", base)
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(chk["hook_results"]["failed_required"], ["pixels"])  # the bar still holds
+                    self.assertEqual(chk["errors"], ["Required hook 'pixels' failed"])  # no gate finding
+                    self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+                    audit = audit_harness(str(repo))
+                    self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("clean", False))
+
+
+class TestFixRound22SymlinkReferentsAndPositiveCommandGrammar(unittest.TestCase):
+    """Round 22: a symlinked ancestor of a frozen baseline fails closed (frozen baselines must be regular files;
+    see `TestFrozenBaselinesAreRegularFiles`). An edited command follows a positive grammar: at most one top-level exact
+    `sh|bash -c SCRIPT`, leading assignments or a bare flagless `env`, then only threshold flags with plain
+    numbers and plain positionals; any other option word fails closed."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    # A test runner whose `--grep` takes the next word as a test-name filter; the one test fails.
+    _GREP = ("import sys\n"
+             "a = sys.argv[1:]\n"
+             "pat = a[a.index('--grep') + 1] if '--grep' in a else ''\n"
+             "sys.exit(1 if pat in 'visual --max-diff=0.05 home' else 0)\n")
+    # Passes only when its argv carries the edited `0.01` literal.
+    _CHECKER = "#!/usr/bin/env python3\nimport sys\nsys.exit(0 if '0.01' in sys.argv[1:] else 1)\n"
+    _PY_CODE = "import sys; sys.exit(0 if \"--max-diff=0.01\" in sys.argv or \"0.01\" in sys.argv else 1)"
+    _EXECUTED = (
+        ("python3 visual.py --grep --max-diff=0.05", "python3 visual.py --grep --max-diff=0.01"),
+        (f"python3 -Bc'{_PY_CODE}' --max-diff=0.05", f"python3 -Bc'{_PY_CODE}' --max-diff=0.01"),
+        (f"python3 -Ic'{_PY_CODE}' --max-diff 0.05", f"python3 -Ic'{_PY_CODE}' --max-diff 0.01"),
+        (f"python3 -EsBc '{_PY_CODE}' --max-diff=0.05", f"python3 -EsBc '{_PY_CODE}' --max-diff=0.01"),
+        (["python3", f"-Bc{_PY_CODE}", "--max-diff", "0.05"], ["python3", f"-Bc{_PY_CODE}", "--max-diff", "0.01"]),
+        ("sh -c \"sh -c './checker.py --max-diff 0.05'\"", "sh -c \"sh -c './checker.py --max-diff 0.01'\""),
+        ("bash -c \"bash -c './checker.py --max-diff 0.05'\"", "bash -c \"bash -c './checker.py --max-diff 0.01'\""),
+    )
+    _INTERPRETERS = (
+        ("perl", "MAX_DIFF=0.05 perl -E 'exit($ENV{MAX_DIFF} eq \"0.01\" ? 0 : 1)'"),
+        ("perl", "MAX_DIFF=0.05 perl -we'exit($ENV{MAX_DIFF} eq \"0.01\" ? 0 : 1)'"),
+        ("ruby", "MAX_DIFF=0.05 ruby -we'exit(ENV[\"MAX_DIFF\"] == \"0.01\" ? 0 : 1)'"),
+        ("jq", "MAX_DIFF=0.05 jq -n --exit-status 'env.MAX_DIFF == \"0.01\"'"),
+    )
+    _REJECTED = {
+        "--grep operand": ("python3 visual.py --grep --max-diff=0.05", "python3 visual.py --grep --max-diff=0.01"),
+        "playwright --grep": ("npx playwright test --grep --max-diff=0.05", "npx playwright test --grep --max-diff=0.01"),
+        "-k operand": ("pytest -k --max-diff=0.05", "pytest -k --max-diff=0.01"),
+        "-wlne cluster": ("perl -wlne 1 --max-diff=0.05", "perl -wlne 1 --max-diff=0.01"),
+        "node -p": ("node -p 1 --max-diff=0.05", "node -p 1 --max-diff=0.01"),
+        "python3 -m": ("python3 -m pytest --max-diff=0.05", "python3 -m pytest --max-diff=0.01"),
+        "--project=": ("npx playwright test --project=chromium --max-diff=0.05",
+                       "npx playwright test --project=chromium --max-diff=0.01"),
+        "php -r": ("MAX_DIFF=0.05 php -r 'exit(1);'", "MAX_DIFF=0.01 php -r 'exit(1);'"),
+        "php -R": ("MAX_DIFF=0.05 php -R 1", "MAX_DIFF=0.01 php -R 1"),
+        "jq positional": ("MAX_DIFF=0.05 jq . report.json", "MAX_DIFF=0.01 jq . report.json"),
+        "yq head": ("MAX_DIFF=0.05 yq report.yml", "MAX_DIFF=0.01 yq report.yml"),
+        "lua head": ("MAX_DIFF=0.05 lua check.lua", "MAX_DIFF=0.01 lua check.lua"),
+        "git head": ("MAX_DIFF=0.05 git diff", "MAX_DIFF=0.01 git diff"),
+        "find head": ("MAX_DIFF=0.05 find snapshots", "MAX_DIFF=0.01 find snapshots"),
+        "env before env -i": ("MAX_DIFF=0.05 env -i ./checker.py", "MAX_DIFF=0.01 env -i ./checker.py"),
+        "env before env": ("MAX_DIFF=0.05 env ./checker.py", "MAX_DIFF=0.01 env ./checker.py"),
+        "env -": ("env - MAX_DIFF=0.05 node check.js", "env - MAX_DIFF=0.01 node check.js"),
+        "env --ignore-environment": ("env --ignore-environment MAX_DIFF=0.05 node check.js",
+                                     "env --ignore-environment MAX_DIFF=0.01 node check.js"),
+        "env -u": ("env -u X MAX_DIFF=0.05 node check.js", "env -u X MAX_DIFF=0.01 node check.js"),
+        "argv env -i": (["env", "-i", "MAX_DIFF=0.05", "node", "c.js"], ["env", "-i", "MAX_DIFF=0.01", "node", "c.js"]),
+        "bash -x -c": ("bash -x -c 'node c.js --max-diff=0.05'", "bash -x -c 'node c.js --max-diff=0.01'"),
+        "sh -ec": ("sh -ec 'node c.js --max-diff=0.05'", "sh -ec 'node c.js --max-diff=0.01'"),
+        "nested argv sh -c": (["sh", "-c", "sh -c 'node c.js --max-diff=0.05'"],
+                              ["sh", "-c", "sh -c 'node c.js --max-diff=0.01'"]),
+        "sh -c env -i": ("sh -c 'env -i MAX_DIFF=0.05 node c.js'", "sh -c 'env -i MAX_DIFF=0.01 node c.js'"),
+        "positional assignment": ("node c.js key=1 --max-diff=0.05", "node c.js key=1 --max-diff=0.01"),
+        "eval positional": ("deno eval 1 --max-diff=0.05", "deno eval 1 --max-diff=0.01"),
+        "exec positional": ("npm exec x --max-diff=0.05", "npm exec x --max-diff=0.01"),
+        "grep positional": ("cargo grep x --max-diff=0.05", "cargo grep x --max-diff=0.01"),
+        "threshold flag with a word": ("node c.js --max-diff=low --max-diff=5", "node c.js --max-diff=low --max-diff=1"),
+        "quoted flag name": ("node c.js '--max-diff'=0.05", "node c.js '--max-diff'=0.01"),
+    }
+    _CLEAN = {
+        "--flag=": ("node check.js --max-diff=0.05", "node check.js --max-diff=0.01"),
+        "--flag value": ("node check.js --max-diff 0.05", "node check.js --max-diff 0.01"),
+        "playwright": ("npx playwright test --max-diff-pixel-ratio=0.05", "npx playwright test --max-diff-pixel-ratio=0.01"),
+        "leading assignment": ("MAX_DIFF=0.05 node check.js", "MAX_DIFF=0.01 node check.js"),
+        "bare env": ("env MAX_DIFF=0.05 node check.js", "env MAX_DIFF=0.01 node check.js"),
+        "sh -c pixels": ("sh -c 'node check.js --max-diff-pixels=5'", "sh -c 'node check.js --max-diff-pixels=1'"),
+        "bash -c": ("bash -c 'node check.js --max-diff 0.05'", "bash -c 'node check.js --max-diff 0.01'"),
+        "argv sh -c": (["sh", "-c", "node c.js --max-diff=0.05"], ["sh", "-c", "node c.js --max-diff=0.01"]),
+        "positional paths": ("node check.js tests/visual.spec.ts snapshots/home.png --max-diff=0.05",
+                             "node check.js tests/visual.spec.ts snapshots/home.png --max-diff=0.01"),
+    }
+    _UNCHANGED = (
+        *(base for base, _ in _EXECUTED), *(cmd for _, cmd in _INTERPRETERS),
+        *(base for base, _ in _REJECTED.values()),
+        "npx playwright test --project=chromium | tee log # c",
+    )
+
+    def _repo(self, home: Path, name: str, command: Any) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "visual.py", self._GREP)
+        _write(repo, "checker.py", self._CHECKER)
+        (repo / "checker.py").chmod(0o755)
+        _commit_all(repo, "visual checks + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def test_symlinked_parent_directory_fails_closed_even_with_identical_bytes(self):
+        from factonio.harness import _frozen_baseline_changes
+
+        with isolated_hermes_home() as home:
+            repo = TestFixRound2VisualGuardAndHarnessGaps._visual_repo(home, "true")
+            head = _git(repo, "rev-parse", "HEAD")
+            frozen = {"pixels": ["snapshots/**"]}
+            self.assertEqual(_frozen_baseline_changes(repo, frozen, head), [])
+            (repo / "snapshots").rename(repo / "alt_snapshots")
+            os.symlink("alt_snapshots", repo / "snapshots")
+            self.assertEqual((repo / "snapshots" / "home.png").read_text(encoding="utf-8"), "png-v1\n")
+            out = _frozen_baseline_changes(repo, frozen, head)
+            self.assertIn("snapshots/home.png", out[0]["changed_files"])
+
+    def test_non_threshold_options_nested_shells_and_env_flags_are_rejected(self):
+        self._assert_rejected({
+            **{repr(live): (base, live) for base, live in self._EXECUTED},
+            **{cmd: (cmd, cmd.replace("0.05", "0.01")) for _, cmd in self._INTERPRETERS},
+            **self._REJECTED,
+        })
+
+    def test_positive_grammar_tightening_and_unchanged_commands_stay_clean(self):
+        self._assert_clean({**self._CLEAN, **{f"unchanged {cmd!r}": (cmd, cmd) for cmd in self._UNCHANGED}})
+
+    def test_value_spans_raise_on_any_non_threshold_option(self):
+        from factonio.harness import _value_spans
+
+        self.assertEqual(len(_value_spans("env MAX_DIFF=1 node c.js a/b.png --max-diff 2 --max-diff=3")), 3)
+        for cmd in ("node c.js --grep x --max-diff=1", "node c.js --max-diff=1 --", "node c.js -x --max-diff=1",
+                    "python3 -Bc'1' --max-diff=1", "T=1 env node c.js", "env -i T=1 node c.js",
+                    "sh -c \"sh -c 'node c.js --max-diff=1'\"", "bash -e -c 'node c.js --max-diff=1'",
+                    "perl c.pl --max-diff=1", "jq . --max-diff=1", "node c.js --max-diff"):
+            with self.subTest(cmd=cmd), self.assertRaises(ValueError):
+                _value_spans(cmd)
+
+    def test_option_and_nested_shell_bypasses_are_rejected_end_to_end(self):
+        """Each committed command fails; each edited literal really turns it green, yet check and audit flag it."""
+        self._assert_executed_bypasses_rejected(list(self._EXECUTED))
+
+    def test_interpreter_bypasses_are_rejected_end_to_end(self):
+        available = [(cmd, cmd.replace("0.05", "0.01")) for tool, cmd in self._INTERPRETERS if shutil.which(tool)]
+        if not available:
+            self.skipTest("perl, ruby and jq are all unavailable")
+        self._assert_executed_bypasses_rejected(available)
+
+
+class TestFrozenBaselinesAreRegularFiles(unittest.TestCase):
+    """Frozen `visual_diff` baselines must be regular tracked files, never symlinks or reached through one.
+    Every committed regular baseline is pinned in the index, the `HEAD` tree and the live disk (`lstat` walk +
+    blob hash); a committed or live symlink matching `baseline_paths`, at a concrete glob directory prefix,
+    escaping the repository or exposing matching files fails closed; unrelated symlinks stay clean; and
+    `baseline_paths` must be normalized repo-relative globs."""
+
+    @staticmethod
+    def _changed(result: dict) -> list[str]:
+        return sorted({f for c in result["visual_baseline_changes"] for f in c["changed_files"]})
+
+    @staticmethod
+    def _repo(home: Path, name: str, files: dict[str, str], links: dict[str, str], hooks: Any) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        for rel, text in files.items():
+            _write(repo, rel, text)
+        for rel, target in links.items():
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(target, repo / rel)
+        _commit_all(repo, "baselines")
+        if hooks is not None:
+            bootstrap_verify_harness(str(repo), hooks=hooks)
+            _commit_all(repo, "harness")
+        return repo
+
+    @staticmethod
+    def _visual(globs: list[str], command: str = "true") -> list[dict[str, Any]]:
+        return [{"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": globs}]
+
+    def _assert_clean(self, repo: Path) -> None:
+        from factonio.harness import audit_harness, check_harness
+
+        head = _git(repo, "rev-parse", "HEAD")
+        for label, res in (("check", check_harness(str(repo))), ("check --run-hooks", check_harness(str(repo), run_hooks=True))):
+            with self.subTest(label):
+                self.assertTrue(res["valid"], res["errors"])
+                self.assertFalse(res["gate_loosening"]["loosened"], res["gate_loosening"])
+                self.assertEqual(res["visual_baseline_changes"], [])
+        for label, res in (("audit", audit_harness(str(repo))), ("audit --base HEAD", audit_harness(str(repo), base_ref=head))):
+            with self.subTest(label):
+                self.assertEqual((res["severity"], res["visual_baseline_changes"]), ("clean", []), res)
+
+    def _assert_tampered(self, repo: Path, expected: list[str], *, run_hooks: bool = False) -> None:
+        from factonio.harness import audit_harness, check_harness
+
+        chk = check_harness(str(repo), run_hooks=run_hooks)
+        self.assertFalse(chk["valid"])
+        self.assertTrue(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+        self.assertEqual(self._changed(chk), expected)
+        audit = audit_harness(str(repo))
+        self.assertTrue(audit["drifted"])
+        self.assertEqual(self._changed(audit), expected)
+
+    def _assert_tampered_since(self, repo: Path, base: str, expected: list[str]) -> None:
+        from factonio.harness import audit_harness, check_harness
+
+        for run_hooks in (False, True):
+            with self.subTest(run_hooks=run_hooks):
+                chk = check_harness(str(repo), base_ref=base, run_hooks=run_hooks)
+                self.assertFalse(chk["valid"])
+                self.assertTrue(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+                self.assertEqual(self._changed(chk), expected)
+        audit = audit_harness(str(repo), base_ref=base)
+        self.assertEqual(audit["severity"], "stale", audit)
+        self.assertEqual(self._changed(audit), expected)
+
+    # -- committed symlinks that are, or lead to, frozen baselines fail closed even when unchanged ---------
+
+    _GOLDEN = {"golden.png": "pixels-v1\n", "approved.png": "pixels-v1\n"}
+    _SYMLINK_CASES = (
+        ("file link, literal glob", {"snapshots/home.png": "png-v1\n"}, {"home_link.png": "snapshots/home.png"},
+         ["home_link.png"], ["home_link.png"]),
+        ("file link, ** glob", {"snapshots/home.png": "png-v1\n"}, {"home_link.png": "snapshots/home.png"},
+         ["**/*.png"], ["home_link.png"]),
+        ("file link below a baseline dir", {"golden.png": "png-v1\n", "snapshots/keep.txt": ""},
+         {"snapshots/baseline.png": "../golden.png"}, ["snapshots/**"], ["snapshots/baseline.png"]),
+        ("dir link at concrete prefix", {"snapshots/home.png": "png-v1\n"}, {"current": "snapshots"},
+         ["current/*.png"], ["current"]),
+        ("dir link at concrete prefix, current/**", {"snapshots/home.png": "png-v1\n"}, {"current": "snapshots"},
+         ["current/**"], ["current"]),
+        ("dir link, ** prefix exposing a match", {"real/home.png": "png-v1\n"}, {"snapshots": "real"},
+         ["**/*.png"], ["snapshots"]),
+        ("root link", _GOLDEN, {"alias": "."}, ["alias/golden.png"], ["alias"]),
+        ("root link under alias/**", _GOLDEN, {"alias": "."}, ["alias/**"], ["alias"]),
+        ("repeated root link", _GOLDEN, {"alias": "."}, ["alias/alias/golden.png"], ["alias"]),
+        ("parent link", {**_GOLDEN, "sub/keep.txt": ""}, {"sub/up": ".."}, ["sub/up/golden.png"], ["sub/up"]),
+        ("mutually recursive links, **", {"dir2/golden.png": "png-v1\n", "dir1/keep.txt": ""},
+         {"dir1/a": "../dir2", "dir2/b": "../dir1"}, ["**/*.png"], ["dir1/a", "dir2/b"]),
+        ("mutually recursive links, dir1/**", {"dir2/golden.png": "png-v1\n", "dir1/keep.txt": ""},
+         {"dir1/a": "../dir2", "dir2/b": "../dir1"}, ["dir1/**/*.png"], ["dir1/a"]),
+    )
+
+    def test_committed_symlink_baselines_fail_closed_even_unchanged(self):
+        for n, (label, files, links, globs, expected) in enumerate(self._SYMLINK_CASES):
+            with self.subTest(label, globs=globs), isolated_hermes_home() as home:
+                repo = self._repo(home, f"svc{n}", files, links, self._visual(globs))
+                self.assertEqual(_git(repo, "status", "--porcelain"), "")
+                self._assert_tampered(repo, expected)
+
+    def test_unverifiable_and_escaping_symlinks_fail_closed(self):
+        from factonio.harness import _frozen_baseline_changes
+
+        with isolated_hermes_home() as home:
+            outside = home / "outside.png"
+            outside.write_text("png-v1\n", encoding="utf-8")
+            (home / "outside_snaps").mkdir()
+            (home / "outside_snaps" / "home.png").write_text("png-v1\n", encoding="utf-8")
+            cases = {
+                "external file": ({"snapshots/baseline.png": str(outside)}, ["snapshots/**"], ["snapshots/baseline.png"]),
+                "broken": ({"snapshots/baseline.png": "../missing.png"}, ["snapshots/**"], ["snapshots/baseline.png"]),
+                "self cycle": ({"snapshots/baseline.png": "baseline.png"}, ["snapshots/**"], ["snapshots/baseline.png"]),
+                "escaping dir, concrete prefix": ({"snapshots": "../outside_snaps"}, ["snapshots/**"], ["snapshots"]),
+                "escaping dir, ** prefix": ({"snapshots": "../outside_snaps"}, ["**/*.png"], ["snapshots"]),
+            }
+            for n, (label, (links, globs, expected)) in enumerate(cases.items()):
+                with self.subTest(label):
+                    repo = self._repo(home, f"svc{n}", {"assets/keep.txt": ""}, links, None)
+                    head = _git(repo, "rev-parse", "HEAD")
+                    out = _frozen_baseline_changes(repo, {"pixels": globs}, head)
+                    self.assertEqual(out[0]["changed_files"] if out else [], expected)
+
+    def test_live_symlink_at_a_concrete_glob_prefix_fails_closed(self):
+        from factonio.harness import _frozen_baseline_changes
+
+        with isolated_hermes_home() as home:
+            with self.subTest("committed directory replaced by a symlink to identical bytes"):
+                repo = self._repo(home, "svc", {"snapshots/home.png": "png-v1\n"}, {}, None)
+                head = _git(repo, "rev-parse", "HEAD")
+                (repo / "snapshots").rename(repo / "alt_snapshots")
+                os.symlink("alt_snapshots", repo / "snapshots")
+                self.assertEqual((repo / "snapshots" / "home.png").read_text(encoding="utf-8"), "png-v1\n")
+                out = _frozen_baseline_changes(repo, {"pixels": ["snapshots/**"]}, head)
+                self.assertEqual(out[0]["changed_files"], ["snapshots", "snapshots/home.png"])
+            with self.subTest("untracked symlink where no baseline exists yet"):
+                repo = self._repo(home, "fresh", {"README.md": "x\n"}, {}, None)
+                head = _git(repo, "rev-parse", "HEAD")
+                _write(repo, "evil/home.png", "png-other\n")
+                os.symlink("evil", repo / "golden")
+                for globs in (["golden/*.png"], ["golden/sub/**"]):
+                    out = _frozen_baseline_changes(repo, {"pixels": globs}, head)
+                    self.assertEqual(out[0]["changed_files"] if out else [], ["golden"])
+
+    def test_live_added_frozen_hook_fails_closed_on_committed_symlink(self):
+        from factonio.harness import check_harness
+
+        with isolated_hermes_home() as home:
+            repo = self._repo(home, "svc", {"real_snapshots/home.png": "png-v1\n"}, {"snapshots": "real_snapshots"},
+                              [{"name": "lint", "kind": "invariant", "command": "true"}])
+            TestFixRound9LiveFrozenBaselines._add_live_visual_hook(repo, "true")
+            for run_hooks in (False, True):
+                chk = check_harness(str(repo), run_hooks=run_hooks)
+                self.assertFalse(chk["valid"])
+                self.assertEqual(self._changed(chk), ["snapshots"])
+
+    # -- unrelated symlinks stay clean ------------------------------------------------------------------
+
+    def _star_repo(self, home: Path, name: str, globs: list[str], files: dict[str, str],
+                   links: dict[str, str]) -> Path:
+        return self._repo(home, name, {"snapshots/home.png": "png-v1\n", "README.md": "readme\n", **files},
+                          links, self._visual(globs))
+
+    def test_unrelated_file_links_stay_clean(self):
+        for n, (globs, link) in enumerate(((["**/*.png"], "docs/readme_link"), (["snapshots/**/*.png"], "snapshots/notes.md"))):
+            with self.subTest(globs=globs), isolated_hermes_home() as home:
+                repo = self._star_repo(home, f"svc{n}", globs, {}, {link: "../README.md"})
+                self._assert_clean(repo)
+                _write(repo, "README.md", "edited readme\n")
+                self._assert_clean(repo)
+        with self.subTest("external file link"), isolated_hermes_home() as home:
+            outside = home / "tool"
+            outside.write_text("#!/bin/sh\n", encoding="utf-8")
+            self._assert_clean(self._star_repo(home, "ext", ["**/*.png"], {}, {"docs/tool_link": str(outside)}))
+
+    def test_unrelated_directory_links_stay_clean(self):
+        for label in ("unchanged", "retargeted", "removed"):
+            with self.subTest(label), isolated_hermes_home() as home:
+                repo = self._star_repo(home, label, ["**/*.png"], {"real_docs/guide.md": "v1\n"}, {"docs": "real_docs"})
+                if label != "unchanged":
+                    (repo / "docs").unlink()
+                if label == "retargeted":
+                    _write(repo, "real_docs_v2/guide.md", "v2\n")
+                    os.symlink("real_docs_v2", repo / "docs")
+                self._assert_clean(repo)
+        with self.subTest("link to an empty directory holding a directory named like a baseline"), \
+                isolated_hermes_home() as home:
+            repo = self._star_repo(home, "empty", ["**/*.png"], {}, {"not-image": "empty"})
+            (repo / "empty" / "cache.png").mkdir(parents=True)
+            _write(repo, "empty/notes.txt", "notes\n")
+            self._assert_clean(repo)
+
+    def test_directory_link_that_starts_exposing_matches_fails_closed(self):
+        with isolated_hermes_home() as home:
+            for n, (label, mutate, extra) in enumerate((
+                ("matching file added below", lambda r: _write(r, "empty/sneaky.png", "png-other\n"), []),
+                ("matching file inside an ordinary directory",
+                 lambda r: _write(r, "empty/cache.png/real.png", "x\n"), []),
+                # the nested link is itself a live symlink exposing matches, so it is reported too
+                ("nested live symlink that can lead to matches",
+                 lambda r: os.symlink("../snapshots", r / "empty" / "sub"), ["empty/sub"]),
+                ("retargeted outside the repository", lambda r: ((r / "not-image").unlink(),
+                                                                 os.symlink("../outside_dir", r / "not-image")), []),
+                ("retargeted to matching files", lambda r: (_write(r, "evil/home.png", "png-other\n"), (r / "not-image").unlink(),
+                                                            os.symlink("evil", r / "not-image")), []),
+            )):
+                with self.subTest(label):
+                    (home / "outside_dir").mkdir(exist_ok=True)
+                    repo = self._star_repo(home, f"svc{n}", ["**/*.png"], {}, {"not-image": "empty"})
+                    (repo / "empty").mkdir()
+                    mutate(repo)
+                    self._assert_tampered(repo, sorted(["not-image", *extra]))
+
+    # -- committed regular baselines are pinned in the index, HEAD and the live disk --------------------
+
+    def _regular_repo(self, home: Path, name: str, hooks: bool = True) -> Path:
+        return self._repo(home, name, {"snapshots/home.png": "png-v1\n"}, {},
+                          self._visual(["snapshots/*.png"]) if hooks else None)
+
+    @staticmethod
+    def _untrack(repo: Path, how: str) -> None:
+        if how == "rm --cached":
+            _git(repo, "rm", "-q", "--cached", "snapshots/home.png")
+        else:
+            _git(repo, "mv", "snapshots/home.png", "archive_home.png")
+            shutil.copyfile(repo / "archive_home.png", repo / "snapshots" / "home.png")
+
+    def test_untracked_regular_baseline_fails_closed_staged_and_committed(self):
+        for n, how in enumerate(("rm --cached", "mv")):
+            with self.subTest("staged", how=how), isolated_hermes_home() as home:
+                repo = self._regular_repo(home, f"st{n}")
+                self._untrack(repo, how)
+                self._assert_tampered(repo, ["snapshots/home.png"])
+            with self.subTest("committed", how=how), isolated_hermes_home() as home:
+                repo = self._regular_repo(home, f"co{n}")
+                base = _git(repo, "rev-parse", "HEAD")
+                self._untrack(repo, how)
+                _git(repo, "commit", "-q", "-m", "untrack baseline")
+                self.assertTrue((repo / "snapshots" / "home.png").is_file())
+                self._assert_tampered_since(repo, base, ["snapshots/home.png"])
+
+    def test_live_added_frozen_hook_with_staged_untracking_fails_closed(self):
+        from factonio.harness import bootstrap_verify_harness
+
+        with isolated_hermes_home() as home:
+            repo = self._regular_repo(home, "live", hooks=False)
+            bootstrap_verify_harness(str(repo), hooks=self._visual(["snapshots/*.png"]))
+            self._untrack(repo, "rm --cached")
+            self._assert_tampered(repo, ["snapshots/home.png"])
+
+    def test_unchanged_regular_baseline_stays_clean_under_assume_unchanged(self):
+        from factonio.harness import audit_harness
+
+        with isolated_hermes_home() as home:
+            repo = self._regular_repo(home, "ok")
+            _git(repo, "update-index", "--assume-unchanged", "snapshots/home.png")
+            self.assertEqual(_git(repo, "status", "--porcelain"), "")
+            self._assert_clean(repo)
+            base = _git(repo, "rev-parse", "HEAD")
+            _write(repo, "unrelated.txt", "x\n")
+            _commit_all(repo, "unrelated")
+            self.assertEqual(audit_harness(str(repo), base_ref=base)["severity"], "clean")
+
+    # -- normalized baseline_paths ----------------------------------------------------------------------
+
+    _UNNORMALIZED = ("alias/../snapshots/home.png", "./snapshots/home.png", "snapshots//home.png",
+                     "snapshots\\home.png", "/snapshots/home.png", "snapshots/./home.png", "..", "snapshots/..//")
+
+    def test_unnormalized_baseline_paths_are_rejected(self):
+        from factonio.harness import validate_hooks
+
+        for bad in self._UNNORMALIZED:
+            with self.subTest(bad=bad), self.assertRaises(ValueError) as ctx:
+                validate_hooks([{"name": "pixels", "kind": "visual_diff", "command": "true", "baseline_paths": [bad]}])
+            self.assertIn("normalized repo-relative", str(ctx.exception))
+        for ok in ("snapshots/home.png", "snapshots/", "**/*.png", "snap shots/a?.png"):
+            with self.subTest(ok=ok):
+                hooks = validate_hooks([{"name": "pixels", "kind": "visual_diff", "command": "true",
+                                         "baseline_paths": [ok]}])
+                self.assertEqual(hooks[0]["baseline_paths"], [ok])
+
+    def test_unnormalized_committed_baseline_glob_fails_closed(self):
+        from factonio.harness import _committed_blob_mismatches, _frozen_baseline_changes
+
+        with isolated_hermes_home() as home:
+            repo = self._repo(home, "svc", {"snapshots/home.png": "png-v1\n"}, {}, None)
+            head = _git(repo, "rev-parse", "HEAD")
+            for bad in self._UNNORMALIZED:
+                with self.subTest(bad=bad):
+                    self.assertEqual(_committed_blob_mismatches(repo, head, [bad, "snapshots/home.png"]), {bad})
+                    out = _frozen_baseline_changes(repo, {"pixels": [bad]}, head)
+                    self.assertEqual(out[0]["changed_files"], [bad])
+
+    # -- glob helpers -----------------------------------------------------------------------------------
+
+    def test_prefix_match_helpers(self):
+        from factonio.harness import _concrete_prefix_match, _could_prefix_match
+
+        for link, globs in (("snapshots", ["snapshots/**"]), ("snapshots", ["snapshots/*.png"]),
+                            ("snapshots", ["snapshots/home.png"]), ("snapshots", ["**/home.png"]),
+                            ("snapshots", ["*/home.png"]), ("snapshots", ["snapshots/"]),
+                            ("snapshots/sub", ["snapshots/sub/**"]), ("snapshots/sub", ["snapshots/**/*.png"]),
+                            ("snapshots/sub", ["snapshots/sub/a.png"])):
+            with self.subTest("could", link=link, globs=globs):
+                self.assertTrue(_could_prefix_match(globs, link))
+        for link, globs in (("snapshots", ["snapshots"]), ("snapshots", ["other/**"]),
+                            ("snapshots/sub", ["snapshots/other/*.png"]), ("snapshots/sub", ["snapshots/*.png"])):
+            with self.subTest("could not", link=link, globs=globs):
+                self.assertFalse(_could_prefix_match(globs, link))
+        for rel, globs in (("snapshots", ["snapshots/**"]), ("snapshots", ["snapshots/*.png"]),
+                           ("snapshots", ["snapshots/home.png"]), ("snapshots/sub", ["snapshots/sub/**"])):
+            with self.subTest("concrete", rel=rel, globs=globs):
+                self.assertTrue(_concrete_prefix_match(globs, rel))
+        for rel, globs in (("docs/tool_link", ["**/*.png"]), ("snapshots/sub", ["snapshots/**/*.png"]),
+                           ("docs", ["snapshots/**"]), ("snapshots", ["snapshots"])):
+            with self.subTest("not concrete", rel=rel, globs=globs):
+                self.assertFalse(_concrete_prefix_match(globs, rel))
+
+    def test_live_walk_follows_nested_symlinks_but_not_directory_names(self):
+        from factonio.harness import _live_walk_exposes
+
+        with isolated_hermes_home() as home:
+            root = home / "live"
+            _write(root, "evil/home.png", "png\n")
+            (root / "fake").mkdir()
+            os.symlink("../evil", root / "fake" / "sub")
+            self.assertTrue(_live_walk_exposes(root / "fake", "docs", ["**/*.png"]))
+            (root / "fake2" / "cache.png").mkdir(parents=True)
+            self.assertFalse(_live_walk_exposes(root / "fake2", "docs2", ["**/*.png"]))
+            (root / "fake3").mkdir()
+            os.symlink("../evil/home.png", root / "fake3" / "a")
+            self.assertTrue(_live_walk_exposes(root / "fake3", "docs3", ["docs3/**"]))
+            self.assertFalse(_live_walk_exposes(root / "fake3", "docs3", ["docs3/*.png"]))
+
+
+class TestFixRound23MaxDiffDirectionAndUniformSymlinkScan(unittest.TestCase):
+    """Round 23: only unambiguous maximum-difference thresholds (`--max-diff*`, `--max-mismatch`, `MAX_DIFF*`,
+    `MAX_MISMATCH`) may be tightened by lowering them; any edit of an ambiguous `--threshold` / `--tolerance` /
+    `THRESHOLD` fails closed (a minimum similarity loosens when lowered). Every symlink at the base, at `HEAD`, in
+    the index or live on disk is held to the same regular-files-only rule, also for a frozen hook new in the PR."""
+
+    _repo = staticmethod(TestFrozenBaselinesAreRegularFiles._repo)
+    _visual = staticmethod(TestFrozenBaselinesAreRegularFiles._visual)
+    _changed = staticmethod(TestFrozenBaselinesAreRegularFiles._changed)
+    _assert_clean = TestFrozenBaselinesAreRegularFiles._assert_clean
+    _assert_tampered = TestFrozenBaselinesAreRegularFiles._assert_tampered
+    _assert_tampered_since = TestFrozenBaselinesAreRegularFiles._assert_tampered_since
+    # A minimum-similarity checker: the measured SSIM is 0.95 and the check passes when SSIM >= --threshold.
+    _SSIM_CHECK = (
+        "import argparse, sys\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('--threshold', type=float, required=True)\n"
+        "sys.exit(0 if 0.95 >= p.parse_args().threshold else 1)\n"
+    )
+
+    def test_lowered_minimum_similarity_threshold_is_gate_loosening_end_to_end(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo = self._repo(home, "svc", {"ssim.py": self._SSIM_CHECK, "snapshots/home.png": "png-v1\n"}, {},
+                              self._visual(["snapshots/*.png"], "python3 ssim.py --threshold 0.99"))
+            committed = check_harness(str(repo), run_hooks=True)
+            self.assertEqual(committed["hook_results"]["failed_required"], ["pixels"])
+            self.assertFalse(committed["gate_loosening"]["loosened"], committed["gate_loosening"])
+            TestFixRound2VisualGuardAndHarnessGaps._set_command(repo, "python3 ssim.py --threshold 0.90")
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertEqual(chk["hook_results"]["failed_required"], [])  # the edit really turns it green...
+            self.assertFalse(chk["valid"])  # ...and is reported as loosening
+            self.assertTrue(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+            self.assertTrue(any("ambiguous" in f for f in chk["gate_loosening"]["findings"]), chk["gate_loosening"])
+            self.assertEqual(audit_harness(str(repo))["severity"], "stale")
+
+    def test_ambiguous_threshold_edits_fail_closed_and_max_diff_tightening_stays_clean(self):
+        from factonio.harness import _visual_hook_loosening
+
+        def reasons(base: Any, live: Any) -> list[str]:
+            return _visual_hook_loosening({"command": base}, {"command": live})
+
+        for base, live in (("python3 ssim.py --threshold 0.99", "python3 ssim.py --threshold 0.90"),
+                           ("python3 check.py --threshold 0.05", "python3 check.py --threshold 0.01"),
+                           ("python3 check.py --threshold=0.05", "python3 check.py --threshold=0.01"),
+                           ("python3 check.py --tolerance 5", "python3 check.py --tolerance 2"),
+                           ("python3 check.py --diff-threshold 0.1", "python3 check.py --diff-threshold 0.05"),
+                           ("python3 check.py --pixel-threshold 3", "python3 check.py --pixel-threshold 1"),
+                           ("THRESHOLD=0.99 python3 check.py", "THRESHOLD=0.90 python3 check.py"),
+                           ("TOLERANCE=5 python3 check.py", "TOLERANCE=2 python3 check.py"),
+                           ("VISUAL_THRESHOLD=0.05 python3 check.py", "VISUAL_THRESHOLD=0.01 python3 check.py"),
+                           (["python3", "check.py", "--threshold", "0.05"], ["python3", "check.py", "--threshold", "0.01"]),
+                           ("python3 check.py --max-diff-pixels 10 --threshold 0.2",
+                            "python3 check.py --max-diff-pixels 5 --threshold 0.1")):
+            with self.subTest(base=base, live=live):
+                self.assertNotEqual(reasons(base, live), [])
+        for base, live in (("python3 check.py --max-diff-pixels 10", "python3 check.py --max-diff-pixels 5"),
+                           ("python3 check.py --max-diff-pixel-ratio 0.05", "python3 check.py --max-diff-pixel-ratio 0.01"),
+                           ("python3 check.py --max-diff=3", "python3 check.py --max-diff=1"),
+                           ("python3 check.py --max-mismatch 2", "python3 check.py --max-mismatch 0"),
+                           ("MAX_DIFF_PIXELS=10 python3 check.py", "MAX_DIFF_PIXELS=5 python3 check.py"),
+                           ("MAX_MISMATCH=2 python3 check.py", "MAX_MISMATCH=1 python3 check.py"),
+                           ("python3 check.py --max-diff-pixels 10 --threshold 0.2",
+                            "python3 check.py --max-diff-pixels 5 --threshold 0.2"),
+                           ("python3 ssim.py --threshold 0.99", "python3 ssim.py --threshold 0.99")):
+            with self.subTest(base=base, live=live):
+                self.assertEqual(reasons(base, live), [])
+        self.assertNotEqual(reasons("python3 check.py --max-diff-pixels 5", "python3 check.py --max-diff-pixels 10"), [])
+
+    # -- every symlink (base, HEAD, index, live disk) is held to the regular-files-only rule ---------------
+
+    def _outside(self, home: Path) -> Path:
+        out = home / "outside"
+        _write(out, "evil.png", "evil\n")
+        return out
+
+    def test_pr_added_baseline_symlink_fails_closed_in_worktree_index_and_commit(self):
+        for stage in ("worktree", "staged", "committed"):
+            with self.subTest(stage), isolated_hermes_home() as home:
+                outside = self._outside(home)
+                repo = self._repo(home, "svc", {"snapshots/home.png": "png-v1\n"}, {}, self._visual(["snapshots/*.png"]))
+                base = _git(repo, "rev-parse", "HEAD")
+                os.symlink(outside / "evil.png", repo / "snapshots" / "modal.png")
+                if stage != "worktree":
+                    _git(repo, "add", "-A")
+                if stage == "committed":
+                    _git(repo, "commit", "-q", "-m", "add modal")
+                self._assert_tampered_since(repo, base, ["snapshots/modal.png"])
+
+    def test_pr_added_directory_symlink_at_wildcard_or_double_star_prefix_fails_closed(self):
+        for n, glob in enumerate(("snapshots/*/*.png", "snapshots/**/*.png")):
+            with self.subTest(glob=glob), isolated_hermes_home() as home:
+                outside = self._outside(home)
+                repo = self._repo(home, f"svc{n}", {"snapshots/v1/home.png": "png-v1\n"}, {}, self._visual([glob]))
+                base = _git(repo, "rev-parse", "HEAD")
+                os.symlink(outside, repo / "snapshots" / "v2")
+                self._assert_tampered_since(repo, base, ["snapshots/v2"])
+                _commit_all(repo, "add v2")
+                self._assert_tampered_since(repo, base, ["snapshots/v2"])
+
+    def test_untracked_symlink_at_literal_leaf_absent_at_head_fails_closed(self):
+        with isolated_hermes_home() as home:
+            outside = self._outside(home)
+            repo = self._repo(home, "svc", {"README.md": "x\n"}, {}, self._visual(["snapshots/home.png"]))
+            _write(repo, "snapshots/.keep", "")
+            os.symlink(outside / "evil.png", repo / "snapshots" / "home.png")
+            self._assert_tampered(repo, ["snapshots/home.png"])
+
+    def test_hook_created_symlink_fails_closed_after_the_hooks_ran(self):
+        with isolated_hermes_home() as home:
+            outside = self._outside(home)
+            cmd = f"ln -sf {outside / 'evil.png'} snapshots/new.png"
+            repo = self._repo(home, "svc", {"snapshots/home.png": "png-v1\n"}, {}, self._visual(["snapshots/*.png"], cmd))
+            self._assert_tampered(repo, ["snapshots/new.png"], run_hooks=True)
+
+    def test_new_frozen_hook_with_symlink_baseline_fails_closed_regular_file_stays_clean(self):
+        from factonio.harness import audit_harness, bootstrap_verify_harness, check_harness
+
+        lint = [{"name": "lint", "kind": "invariant", "command": "true"}]
+        for kind in ("symlink", "regular"):
+            with self.subTest(kind), isolated_hermes_home() as home:
+                outside = self._outside(home)
+                repo = self._repo(home, "svc", {"README.md": "x\n"}, {}, lint)
+                base = _git(repo, "rev-parse", "HEAD")
+                if kind == "symlink":
+                    (repo / "snapshots").mkdir()
+                    os.symlink(outside / "evil.png", repo / "snapshots" / "home.png")
+                else:
+                    _write(repo, "snapshots/home.png", "png-v1\n")
+                bootstrap_verify_harness(str(repo), force=True, hooks=[*lint, *self._visual(["snapshots/*.png"])])
+                _commit_all(repo, "new visual hook")
+                if kind == "symlink":
+                    self._assert_tampered_since(repo, base, ["snapshots/home.png"])
+                else:
+                    chk = check_harness(str(repo), base_ref=base, run_hooks=True)
+                    self.assertTrue(chk["valid"], chk["errors"])
+                    self.assertEqual(chk["visual_baseline_changes"], [])
+                    audit = audit_harness(str(repo), base_ref=base)
+                    self.assertEqual(audit["visual_baseline_changes"], [])
+
+    def test_file_link_inside_a_linked_directory_stays_clean(self):
+        with isolated_hermes_home() as home:
+            repo = self._repo(home, "svc", {"README.md": "x\n", "real_docs/guide.md": "g\n"},
+                              {"real_docs/readme_link": "../README.md", "docs": "real_docs"},
+                              self._visual(["**/*.png"]))
+            self._assert_clean(repo)
+
+    def test_live_scan_past_the_limit_fails_closed(self):
+        from factonio import harness
+
+        with isolated_hermes_home() as home:
+            repo = self._repo(home, "svc", {"snapshots/home.png": "png-v1\n"}, {}, self._visual(["**/*.png"]))
+            with mock.patch.object(harness, "_MAX_LIVE_SCAN", 3):
+                self.assertIsNone(harness._live_symlinks(repo, ["**/*.png"]))
+                self.assertTrue(any("live entries" in p for p in
+                                    harness._committed_blob_mismatches(repo, "HEAD", ["**/*.png"])))
+
 
 
 if __name__ == "__main__":

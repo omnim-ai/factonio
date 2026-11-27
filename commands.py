@@ -124,6 +124,11 @@ def _print_prune(res: dict[str, Any]) -> None:
     print(f"\nReclaimed {res['reclaimed_human']} from {len(res['removed'])} worktree(s); held {len(res['held'])}.")
 
 
+def _print_visual_baseline_changes(res: dict[str, Any]) -> None:
+    for change in res.get("visual_baseline_changes") or []:
+        print(f"  visual_baseline_changes: {change['name']}: {', '.join(change.get('changed_files') or [])}")
+
+
 def _print_harness(action: str, res: dict[str, Any]) -> None:
     if action == "init":
         if res.get("refused"):
@@ -170,6 +175,10 @@ def _print_harness(action: str, res: dict[str, Any]) -> None:
             for r in (block or {}).get("results", []):
                 name = r.get("name") or r["command"]
                 print(f"  {label}: [{'OK  ' if r['ok'] else 'FAIL'}] {name} (exit {r['exit_code']})")
+        for inv in (res.get("formal_invariants") or {}).get("invariants") or []:
+            since = f" since {str(inv.get('sync_commit'))[:12]}" if inv.get("sync_commit") else ""
+            print(f"  Invariant: [{inv.get('status')}] {inv.get('name')} covers {', '.join(inv.get('covers') or [])}{since}")
+        _print_visual_baseline_changes(res)
         return
     print(f"{res['severity'].upper()}: {res['repo']} harness drift (base={str(res.get('base_commit') or '-')[:12]})")
     for key in (
@@ -178,6 +187,16 @@ def _print_harness(action: str, res: dict[str, Any]) -> None:
     ):
         if res.get(key):
             print(f"  {key}: {', '.join(res[key])}")
+    for inv in res.get("stale_invariants") or []:
+        print(
+            f"  stale_invariants: {inv['name']} ({inv.get('sync_source')} {str(inv.get('sync_commit') or '-')[:12]}): "
+            + ", ".join(inv.get("changed_files") or [])
+        )
+    for dead in res.get("dead_cover_globs") or []:
+        print(f"  dead_cover_globs: {dead['hook']}: {dead['glob']}")
+    for item in res.get("unresolved_sync_commits") or []:
+        print(f"  unresolved_sync_commits: {item['name']}: {item['sync_commit']}")
+    _print_visual_baseline_changes(res)
     classification = (res.get("drift_classification") or {}).get("classification")
     if classification and classification != "clean":
         print(f"  classification: {classification}")

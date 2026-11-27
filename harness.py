@@ -3,25 +3,30 @@
 Pure stdlib + the `git` CLI. Detects a repository's stack and black-box surfaces
 (HTTP routes, CLI commands), bootstraps a versioned Launch / Doctor / Drive /
 Evidence / Cleanup playbook, validates and shows it, runs optional repo-defined
-hooks, proves a freshly generated harness (`prove`), detects loosened gates, classifies drift
-(`doc_drift` / `harness_gap` / `product_regression`), and audits drift read-only (every git probe uses
+hooks, proves a freshly generated harness (`prove`), detects loosened gates (including regenerated or
+tampered frozen `visual_diff` baselines), tracks formal-invariant drift (`covers` / `sync_commit`), classifies
+drift (`doc_drift` / `harness_gap` / `product_regression`), and audits drift read-only (every git probe uses
 `--no-optional-locks`).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import time
+from collections import Counter
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, NamedTuple, Optional
 
 try:
     import tomllib
@@ -82,7 +87,7 @@ _WORKFLOW_RUN_RE = re.compile(r"^[ \t]*-?[ \t]*run:[ \t]*(?![|>\s])(.+?)[ \t]*$"
 # A positive allowlist prevents provisioning, package-manager, privileged, and
 # shell-boilerplate steps from leaking into generated verification plans.
 _CI_VERIFY_RE = re.compile(
-    r"^(?:(?:[A-Z_][A-Z0-9_]*=\S+\s+)|(?:env(?:\s+-u\s+\S+)*\s+))*"
+    r"\A(?:(?:[A-Z_][A-Z0-9_]*=\S+\s+)|(?:env(?:\s+-u\s+\S+)*\s+))*"
     r"(?:pytest\b|"
     r"python3?(?:\s+-W\s+\S+)*(?:\s+-m\s+(?:pytest|unittest|compileall|mypy|flake8|ruff|black|isort|pylint|doctest)\b|\s+(?:tools|scripts|tests)/)|"
     r"uv\s+run\b|uvx\b|ruff\b|mypy\b|pyright\b|flake8\b|pylint\b|black\b|isort\b|"
@@ -96,7 +101,7 @@ _CI_VERIFY_RE = re.compile(
     re.IGNORECASE,
 )
 _CI_SETUP_SUBCMD_RE = re.compile(
-    r"(?:^|\s)(?:pip\s+install|npm\s+(?:ci|install)|uv\s+sync)\b",
+    r"(?:\A|\s)(?:pip\s+install|npm\s+(?:ci|install)|uv\s+sync)\b",
     re.IGNORECASE,
 )
 
@@ -107,7 +112,7 @@ def _is_ci_verification_command(cmd: str) -> bool:
     if not text or not _CI_VERIFY_RE.match(text):
         return False
     return _CI_SETUP_SUBCMD_RE.search(text) is None
-_GITHUB_REMOTE_RE = re.compile(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
+_GITHUB_REMOTE_RE = re.compile(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?\Z")
 _H2_RE = re.compile(r"^##\s+(.+?)\s*#*\s*$", re.MULTILINE)
 _FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
 _HOOK_LINE_RE = re.compile(
@@ -274,12 +279,12 @@ def _glob_to_regex(pattern: str) -> re.Pattern[str]:
             i += 1
     if pat.endswith("/"):
         out.append(".*")
-    return re.compile("^" + "".join(out) + "$")
+    return re.compile(r"\A" + "".join(out) + r"\Z")
 
 
 def glob_matches(pattern: str, rel_path: str) -> bool:
     """True when a POSIX-relative path matches a feature-map glob (`*`, `?`, `**`)."""
-    return bool(_glob_to_regex(pattern).match(rel_path.replace(os.sep, "/")))
+    return bool(_glob_to_regex(pattern).fullmatch(rel_path.replace(os.sep, "/")))
 
 
 def _any_match(patterns: Iterable[str], rel_path: str) -> bool:
@@ -291,7 +296,7 @@ def _any_match(patterns: Iterable[str], rel_path: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _walk_files(repo_path: Path) -> tuple[list[str], bool]:
+def _walk_files(repo_path: Path, skip_dirs: frozenset[str] = SKIP_DIRS) -> tuple[list[str], bool]:
     """Bounded walk returning POSIX relative paths (skipping vendored/cache dirs)."""
     files: list[str] = []
     truncated = False
@@ -299,7 +304,7 @@ def _walk_files(repo_path: Path) -> tuple[list[str], bool]:
     for dirpath, dirnames, filenames in os.walk(repo_path):
         depth = len(Path(dirpath).parts) - root_depth
         dirnames[:] = sorted(
-            d for d in dirnames if d not in SKIP_DIRS and not d.endswith(".egg-info") and depth < MAX_DEPTH
+            d for d in dirnames if d not in skip_dirs and not d.endswith(".egg-info") and depth < MAX_DEPTH
         )
         for name in sorted(filenames):
             rel = (Path(dirpath) / name).relative_to(repo_path).as_posix()
@@ -309,7 +314,7 @@ def _walk_files(repo_path: Path) -> tuple[list[str], bool]:
     return files, truncated
 
 
-def _list_repo_files(repo_path: Path) -> tuple[list[str], bool]:
+def _list_repo_files(repo_path: Path, skip_dirs: frozenset[str] = SKIP_DIRS) -> tuple[list[str], bool]:
     """Tracked + untracked (non-ignored) files via read-only git, else a bounded walk."""
     if _is_git_repo(repo_path):
         proc = _git_ro(repo_path, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], timeout=60)
@@ -319,7 +324,7 @@ def _list_repo_files(repo_path: Path) -> tuple[list[str], bool]:
             for rel in proc.stdout.split("\0"):
                 if not rel or rel in seen:
                     continue
-                if any(part in SKIP_DIRS for part in rel.split("/")[:-1]):
+                if any(part in skip_dirs for part in rel.split("/")[:-1]):
                     continue
                 if not (repo_path / rel).exists():
                     continue
@@ -328,7 +333,16 @@ def _list_repo_files(repo_path: Path) -> tuple[list[str], bool]:
             files.sort()
             truncated = len(files) > MAX_SCAN_FILES
             return files[:MAX_SCAN_FILES], truncated
-    return _walk_files(repo_path)
+    return _walk_files(repo_path, skip_dirs)
+
+
+# Formal invariants may cover the harness's own files (e.g. `.factonio/model.cfg`), so their inventory keeps
+# `.factonio/` while every other skipped directory (`.git/`, venvs, build output) stays excluded.
+_INVARIANT_SKIP_DIRS = SKIP_DIRS - {HARNESS_DIR_NAME}
+
+
+def _invariant_files(root: Path) -> list[str]:
+    return _list_repo_files(root, _INVARIANT_SKIP_DIRS)[0]
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -479,7 +493,7 @@ def detect_repo_profile(repo_path: str | Path) -> dict[str, Any]:
         entrypoints.append("plugin.yaml")
         add_stack("hermes-plugin")
 
-    workflows = sorted(f for f in files if re.match(r"^\.github/workflows/[^/]+\.ya?ml$", f))
+    workflows = sorted(f for f in files if re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", f))
     ci_commands: list[str] = []
     for wf in workflows:
         for cmd in _WORKFLOW_RUN_RE.findall(_read_text(root / wf)):
@@ -588,9 +602,102 @@ def validate_hooks(hooks: Any) -> list[dict[str, Any]]:
             hook["timeout"] = timeout
         if raw.get("description"):
             hook["description"] = str(raw["description"])
+        hook.update(_validate_hook_metadata(raw, kind, f"hooks[{idx}] ({name})"))
         seen.add(name)
         out.append(hook)
     return out
+
+
+# Optional per-kind hook metadata: formal invariants (`covers` / `sync_commit`) and frozen visual baselines.
+INVARIANT_META_KEYS: tuple[str, ...] = ("covers", "sync_commit")
+VISUAL_META_KEYS: tuple[str, ...] = ("baseline_paths", "frozen_baseline")
+HOOK_META_KEYS: tuple[str, ...] = (*INVARIANT_META_KEYS, *VISUAL_META_KEYS)
+
+
+def _glob_list(value: Any, label: str) -> list[str]:
+    if not isinstance(value, list) or not value or not all(isinstance(v, str) and v.strip() for v in value):
+        raise ValueError(f"{label} must be a non-empty list of non-empty glob strings; got {value!r}")
+    return [v.strip() for v in value]
+
+
+def _unnormalized_baseline_glob(glob: str) -> bool:
+    """Whether a `baseline_paths` glob is not a normalized repo-relative POSIX path: a leading `/`, a
+    backslash, or an empty, `.` or `..` component (`alias/../snapshots/home.png` names no committed blob, so
+    protecting it would silently protect nothing). A single trailing `/` (directory glob) is allowed."""
+    pat = glob.strip()
+    if not pat or pat.startswith("/") or "\\" in pat:
+        return True
+    return any(part in ("", ".", "..") for part in (pat[:-1] if pat.endswith("/") else pat).split("/"))
+
+
+def _validate_hook_metadata(raw: dict[str, Any], kind: str, label: str) -> dict[str, Any]:
+    """Normalize the optional kind-specific metadata of one hook; ``ValueError`` on misuse."""
+    present = {k: raw[k] for k in HOOK_META_KEYS if raw.get(k) is not None}
+    for key in present:
+        owner = "invariant" if key in INVARIANT_META_KEYS else "visual_diff"
+        if kind != owner:
+            raise ValueError(f"{label}.{key} is only allowed on `{owner}` hooks; got kind {kind!r}")
+    meta: dict[str, Any] = {}
+    if "covers" in present:
+        meta["covers"] = _glob_list(present["covers"], f"{label}.covers")
+    if "sync_commit" in present:
+        if "covers" not in meta:
+            raise ValueError(f"{label}.sync_commit requires a non-empty `covers` glob list")
+        value = present["sync_commit"]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label}.sync_commit must be a non-empty git commit SHA or ref; got {value!r}")
+        ref = value.strip()
+        if ref.startswith("-") or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in ref):
+            raise ValueError(
+                f"{label}.sync_commit must not start with '-' or contain whitespace/control characters; got {value!r}"
+            )
+        meta["sync_commit"] = ref
+    if "baseline_paths" in present:
+        globs = _glob_list(present["baseline_paths"], f"{label}.baseline_paths")
+        bad = [g for g in globs if _unnormalized_baseline_glob(g)]
+        if bad:
+            raise ValueError(
+                f"{label}.baseline_paths must be normalized repo-relative paths/globs without a leading '/', "
+                f"backslashes, empty, '.' or '..' segments; got {bad!r}"
+            )
+        meta["baseline_paths"] = globs
+    if "frozen_baseline" in present:
+        if not isinstance(present["frozen_baseline"], bool):
+            raise ValueError(f"{label}.frozen_baseline must be a boolean")
+        meta["frozen_baseline"] = present["frozen_baseline"]
+    elif "baseline_paths" in meta:
+        meta["frozen_baseline"] = True
+    return meta
+
+
+def _hook_metadata_md(hook: dict[str, Any]) -> str:
+    """Trailing ` [covers: `a/**`; sync_commit: `abc`]` rendered after a hook's backticked command."""
+    parts: list[str] = []
+    for key in HOOK_META_KEYS:
+        value = hook.get(key)
+        if value is None:
+            continue
+        if isinstance(value, list):
+            parts.append(f"{key}: " + ", ".join(f"`{v}`" for v in value))
+        else:
+            parts.append(f"{key}: `{str(value).lower() if isinstance(value, bool) else value}`")
+    return f" [{'; '.join(parts)}]" if parts else ""
+
+
+_HOOK_META_RE = re.compile(r"\b(covers|sync_commit|baseline_paths|frozen_baseline):\s*((?:`[^`\n]*`\s*,?\s*)+)")
+
+
+def _parse_hook_metadata_md(rest: str) -> dict[str, Any]:
+    meta: dict[str, Any] = {}
+    for key, raw in _HOOK_META_RE.findall(rest):
+        values = re.findall(r"`([^`\n]*)`", raw)
+        if key in ("covers", "baseline_paths"):
+            meta[key] = values
+        elif key == "frozen_baseline":
+            meta[key] = {"true": True, "false": False}.get(values[0].strip().lower(), values[0]) if values else None
+        elif values:
+            meta[key] = values[0]
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -716,7 +823,9 @@ def render_verify_md(manifest: dict[str, Any]) -> str:
     hooks = manifest.get("hooks") or []
     for hook in hooks:
         req = "optional" if hook.get("optional") else "required"
-        lines.append(f"- **{hook['name']}** (`{hook['kind']}`, {req}): `{_fmt_cmd(hook['command'])}`")
+        lines.append(
+            f"- **{hook['name']}** (`{hook['kind']}`, {req}): `{_fmt_cmd(hook['command'])}`{_hook_metadata_md(hook)}"
+        )
     if not hooks:
         lines.append("_No hooks declared._")
     lines.append("")
@@ -1001,11 +1110,13 @@ def _section_commands(body: str) -> list[str]:
 def _parse_md_hooks(body: str) -> list[dict[str, Any]]:
     hooks: list[dict[str, Any]] = []
     for m in _HOOK_LINE_RE.finditer(body):
+        eol = body.find("\n", m.end())
         hooks.append({
             "name": m.group("name").strip(),
             "kind": m.group("kind"),
             "command": m.group("cmd").strip(),
             "optional": m.group("opt") == "optional",
+            **_parse_hook_metadata_md(body[m.end(): eol if eol >= 0 else len(body)]),
         })
     return hooks
 
@@ -1302,18 +1413,21 @@ def check_harness(
             errors.append(f"feature_map `{d['feature']}` glob `{d['glob']}` matches no files")
     elif info["present"]:
         warnings.append(f"No {HARNESS_DIR_NAME}/{HARNESS_JSON_NAME}; using hand-authored verify.md only")
-    if info["present"] and info["hooks"]:
-        try:
-            validate_hooks(info["hooks"])
-        except ValueError as exc:
-            if info["manifest"] is None:
-                errors.append(f"verify.md hooks invalid: {exc}")
+    md_hook_errors = _verify_md_hook_errors(info)
+    errors.extend(md_hook_errors)
+    formal = _check_formal_invariants(root, info)
+    errors.extend(formal["errors"])
 
     doctor = None
     hooks_res = None
     if manifest_errors and (run_doctor or run_hooks):
         warnings.append("Skipped Doctor commands and hooks: harness.json is malformed")
         run_doctor = run_hooks = False
+    # Unresolved sync_commits and malformed verify.md hooks are harness gaps too, but they must not mask a real
+    # hook failure.
+    manifest_errors = manifest_errors + md_hook_errors + formal["manifest_errors"]
+    pre_sha, pre_frozen = (_pre_execution_frozen_contract(root, gate, info["hooks"]) if run_doctor or run_hooks
+                           else (None, {}))
     if run_doctor:
         cmds = info["phases"].get("doctor") or []
         doctor = _run_doctor(root, cmds)
@@ -1329,7 +1443,15 @@ def check_harness(
             for name in hooks_res["failed_required"]:
                 errors.append(f"Required hook {name!r} failed")
         except ValueError as exc:
-            errors.append(str(exc))
+            if not md_hook_errors:
+                errors.append(str(exc))
+    if run_doctor or run_hooks:
+        # A Doctor command or hook may regenerate a frozen baseline while it runs: re-check after execution,
+        # both against the live harness and against the contract fixed before anything ran (execution may also
+        # unfreeze, remove or rewrite the hook, or move HEAD).
+        gate = _merge_gate(gate, detect_harness_gate_loosening(root, base_ref))
+        if pre_frozen and pre_sha:
+            gate = _merge_gate(gate, _frozen_contract_gate(root, pre_sha, pre_frozen, base_ref))
     if gate["loosened"]:
         errors.extend(gate["findings"])
 
@@ -1354,7 +1476,1021 @@ def check_harness(
         "doctor": doctor,
         "hook_results": hooks_res,
         "gate_loosening": gate,
+        "formal_invariants": formal,
+        "visual_baseline_changes": list(gate.get("visual_baseline_changes") or []),
     }
+
+
+def _verify_md_hook_errors(info: dict[str, Any]) -> list[str]:
+    """Schema errors of hooks sourced from verify.md (no harness.json, or one without `hooks`), which
+    `_validate_manifest` never sees."""
+    manifest = info.get("manifest")
+    if not info.get("present") or not info.get("hooks") or (manifest is not None and manifest.get("hooks") is not None):
+        return []
+    try:
+        validate_hooks(info["hooks"])
+    except ValueError as exc:
+        return [f"{VERIFY_MD_NAME} hooks invalid: {exc}"]
+    return []
+
+
+def _merge_gate(gate: dict[str, Any], later: dict[str, Any]) -> dict[str, Any]:
+    """Union of two gate-loosening results for the same base (e.g. before and after hooks ran)."""
+    if not later.get("checked"):
+        return gate
+    merged = dict(gate) if gate.get("checked") else dict(later)
+    for key in ("removed_required_hooks", "downgraded_hooks", "removed_doctor_commands", "loosened_visual_hooks",
+                "findings"):
+        merged[key] = list(dict.fromkeys([*(gate.get(key) or []), *(later.get(key) or [])]))
+    merged["visual_baseline_changes"] = _merge_baseline_changes(
+        list(gate.get("visual_baseline_changes") or []), list(later.get("visual_baseline_changes") or [])
+    )
+    merged["loosened"] = bool(merged["findings"])
+    return merged
+
+
+def _check_formal_invariants(root: Path, info: dict[str, Any]) -> dict[str, Any]:
+    """`_audit_formal_invariants` for `check_harness`: stale invariants since the harness base (warnings-free)."""
+    if not info["present"] or not _formal_invariant_hooks(info["hooks"]):
+        return _audit_formal_invariants(root, [], files=[], harness_base=None, harness_base_source=None, is_git=False)
+    is_git = _is_git_repo(root)
+    base_sha, base_source = _audit_base(root, None, info["manifest"]) if is_git else (None, None)
+    return _audit_formal_invariants(
+        root, info["hooks"], files=_invariant_files(root), harness_base=base_sha, harness_base_source=base_source,
+        is_git=is_git,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Formal invariants (`covers` / `sync_commit`) and frozen visual baselines (read-only)
+# ---------------------------------------------------------------------------
+
+
+def _safe_ref(value: Any) -> Optional[str]:
+    try:
+        return _validate_ref(value)
+    except ValueError:
+        return None
+
+
+def _formal_invariant_hooks(hooks: Iterable[Any]) -> list[dict[str, Any]]:
+    """Well-typed `invariant` hooks declaring a non-empty `covers` glob list (malformed ones are schema errors)."""
+    return [
+        h for h in hooks
+        if isinstance(h, dict) and h.get("kind") == "invariant"
+        and _is_str_list(h.get("covers"), non_empty_items=True) and h.get("covers")
+    ]
+
+
+def _audit_formal_invariants(
+    root: Path,
+    hooks: Iterable[Any],
+    *,
+    files: list[str],
+    harness_base: Optional[str],
+    harness_base_source: Optional[str],
+    is_git: bool,
+) -> dict[str, Any]:
+    """Read-only formal-invariant drift: dead `covers` globs, unresolved `sync_commit`s, and invariants whose
+    covered files changed since `sync_commit` (or the harness base when omitted). Every git probe is `_git_ro`."""
+    result: dict[str, Any] = {
+        "checked": False,
+        "invariants": [],
+        "dead_cover_globs": [],
+        "unresolved_sync_commits": [],
+        "stale_invariants": [],
+        "errors": [],
+        "manifest_errors": [],
+    }
+    invariants = _formal_invariant_hooks(hooks)
+    if not invariants:
+        return result
+    result["checked"] = True
+    changed_cache: dict[str, list[str]] = {}
+    for hook in invariants:
+        name = str(hook.get("name") or "").strip()
+        covers = [c.strip() for c in hook["covers"]]
+        raw_sync = hook.get("sync_commit")
+        declared = raw_sync.strip() if isinstance(raw_sync, str) and raw_sync.strip() else None
+        entry: dict[str, Any] = {
+            "name": name, "covers": covers, "sync_commit": declared, "sync_source": None, "base_commit": None,
+            "changed_files": [], "optional": bool(hook.get("optional", False)), "status": "unchecked",
+        }
+        result["invariants"].append(entry)
+        for glob in covers:
+            if not any(glob_matches(glob, f) for f in files):
+                result["dead_cover_globs"].append({"hook": name, "glob": glob})
+                result["errors"].append(f"Formal invariant {name!r} covers glob `{glob}` matches no files")
+        if declared is not None:
+            ref = _safe_ref(declared)
+            sha = _resolve_commit(root, ref) if is_git and ref else None
+            if not sha:
+                entry["status"] = "unresolved"
+                result["unresolved_sync_commits"].append({"name": name, "sync_commit": declared})
+                msg = f"Formal invariant {name!r} sync_commit `{declared}` does not resolve to a commit"
+                result["errors"].append(msg)
+                result["manifest_errors"].append(msg)
+                continue
+            entry.update(sync_source="sync_commit", base_commit=sha)
+        elif is_git and harness_base:
+            sha = harness_base
+            entry.update(sync_commit=harness_base, sync_source=harness_base_source, base_commit=harness_base)
+        else:
+            continue
+        if sha not in changed_cache:
+            changed_cache[sha] = _changed_files(root, sha, include_harness_dir=True)
+        hits = [p for p in changed_cache[sha] if _any_match(covers, p)]
+        entry["changed_files"] = hits
+        entry["status"] = "stale" if hits else "in_sync"
+        if hits:
+            result["stale_invariants"].append(
+                {k: entry[k] for k in ("name", "sync_commit", "sync_source", "covers", "changed_files", "optional")}
+            )
+    return result
+
+
+def _frozen_baseline_globs(hook: dict[str, Any]) -> list[str]:
+    """`baseline_paths` of a `visual_diff` hook whose baseline is frozen (the default once paths are set)."""
+    if not isinstance(hook, dict) or hook.get("kind") != "visual_diff" or hook.get("frozen_baseline") is False:
+        return []
+    paths = hook.get("baseline_paths")
+    return [p.strip() for p in paths] if _is_str_list(paths, non_empty_items=True) and paths else []
+
+
+def _changed_status(root: Path, base_sha: Optional[str]) -> dict[str, str]:
+    """path -> `A`/`M`/`D`/`T` for commits ``base_sha..HEAD`` plus the working tree (read-only probes)."""
+    out: dict[str, str] = {}
+    if base_sha:
+        proc = _git_ro(root, ["diff", "--name-status", "-z", "--no-renames", base_sha, "HEAD"], timeout=60)
+        if proc.returncode == 0:
+            parts = proc.stdout.split("\0")
+            for status, path in zip(parts[0::2], parts[1::2]):
+                if path:
+                    out[path] = status[:1]
+    proc = _git_ro(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"], timeout=60)
+    worktree: dict[str, str] = {}
+    if proc.returncode == 0:
+        for rec in proc.stdout.split("\0"):
+            if len(rec) <= 3:
+                continue
+            xy, path = rec[:2], rec[3:]
+            status = "A" if xy == "??" or "A" in xy else ("D" if "D" in xy else "M")
+            prior = worktree.get(path)
+            # A staged deletion plus an untracked/re-added file at the same path replaces an existing file.
+            worktree[path] = status if prior is None or prior == status else "M"
+    for path, status in worktree.items():
+        prior = out.get(path)
+        if prior == "A" and status == "D":
+            out.pop(path)  # added after the base and deleted again: no net change to a frozen baseline
+        elif prior == "A" or prior is None:
+            out[path] = prior or status
+        else:
+            out[path] = "M" if status == "A" else status
+    return out
+
+
+def _existed_at(root: Path, ref: str, path: str) -> bool:
+    return _git_ro(root, ["cat-file", "-e", f"{ref}:{path}"]).returncode == 0
+
+
+def _git_blob_oid(data: bytes, oid_len: int) -> str:
+    algo = hashlib.sha256 if oid_len == 64 else hashlib.sha1
+    return algo(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _committed_tree(root: Path, ref: str) -> Optional[dict[str, tuple[str, str]]]:
+    """Every committed blob at ``ref`` (path -> ``(mode, oid)``), or None when the tree cannot be read."""
+    proc = _git_ro(root, ["ls-tree", "-r", "-z", "--full-tree", ref], timeout=60)
+    if proc.returncode != 0:
+        return None
+    tree: dict[str, tuple[str, str]] = {}
+    for rec in proc.stdout.split("\0"):
+        meta, sep, rel = rec.partition("\t")
+        fields = meta.split(" ")
+        if sep and len(fields) == 3 and fields[1] == "blob":
+            tree[rel] = (fields[0], fields[2])
+    return tree
+
+
+def _live_regular_oid(root: Path, rel: str, oid_len: int) -> Optional[str]:
+    """Git blob hash of the live file at ``rel`` when every ancestor is a real directory and the leaf a real
+    regular file (`lstat`, never following a symlink); None otherwise."""
+    cur = root
+    parts = rel.split("/")
+    try:
+        for n, comp in enumerate(parts):
+            cur = cur / comp
+            mode = os.lstat(cur).st_mode
+            if not (stat.S_ISREG(mode) if n == len(parts) - 1 else stat.S_ISDIR(mode)):
+                return None
+        return _git_blob_oid(cur.read_bytes(), oid_len)
+    except OSError:
+        return None
+
+
+def _could_prefix_match(globs: Iterable[str], rel: str) -> bool:
+    """Whether some path strictly below the directory ``rel`` could match one of ``globs`` (component-wise; a
+    `**` component at or before the depth of ``rel`` may match anything below it)."""
+    parts = rel.split("/")
+    for glob in globs:
+        pat = glob.strip()
+        gparts = [*pat.split("/")[:-1], "**"] if pat.endswith("/") else pat.split("/")
+        for n, gp in enumerate(gparts):
+            if "**" in gp:
+                return True
+            if n == len(parts):
+                return True  # every component of ``rel`` matched and the glob continues below it
+            if not glob_matches(gp, parts[n]):
+                break
+    return False
+
+
+def _concrete_prefix_match(globs: Iterable[str], rel: str) -> bool:
+    """Whether ``rel`` names a directory the glob spells out before any `**` component (`snapshots` for
+    `snapshots/**` or `snapshots/*.png`, never an arbitrary `docs/tool_link` under a leading `**/*.png`)."""
+    parts = rel.split("/")
+    for glob in globs:
+        pat = glob.strip()
+        gparts = [*pat.split("/")[:-1], "**"] if pat.endswith("/") else pat.split("/")
+        if len(gparts) > len(parts) and all("**" not in gp and glob_matches(gp, part)
+                                            for gp, part in zip(gparts, parts)):
+            return True
+    return False
+
+
+_MAX_LIVE_SCAN = 20000
+
+
+def _live_walk_exposes(base: Path, vprefix: str, globs: list[str]) -> bool:
+    """Whether the live tree below the directory ``base`` (read by a checker as ``vprefix``) exposes a path
+    matching ``globs``: a file (or file symlink) matching them, or a nested symlink that matches or could lead
+    to a match below it. Ordinary directories are only descended into, never matched themselves (an empty
+    `cache.png/` is no baseline). Fails closed past `_MAX_LIVE_SCAN` entries."""
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        sub = os.path.relpath(dirpath, base).replace(os.sep, "/")
+        prefix = vprefix if sub == "." else f"{vprefix}/{sub}"
+        seen += len(dirnames) + len(filenames)
+        if seen > _MAX_LIVE_SCAN:
+            return True
+        for name in dirnames:
+            rel = f"{prefix}/{name}"
+            if os.path.islink(os.path.join(dirpath, name)) and (_any_match(globs, rel)
+                                                                 or _could_prefix_match(globs, rel)):
+                return True
+        for name in filenames:
+            rel = f"{prefix}/{name}"
+            full = os.path.join(dirpath, name)
+            # a file link to a regular file exposes nothing below it (directory links are in ``dirnames``)
+            if _any_match(globs, rel) or (os.path.islink(full) and not os.path.isfile(full)
+                                          and _could_prefix_match(globs, rel)):
+                return True
+    return False
+
+
+def _symlink_breaks_contract(root: Path, real_root: str, rel: str, globs: list[str]) -> bool:
+    """Whether the symlink at ``rel`` puts a frozen baseline behind a link: it matches ``globs``, sits at a
+    concrete glob directory prefix, or (under a `**` prefix) is a live directory link escaping the repository
+    or exposing a path matching ``globs``. Unrelated links stay clean."""
+    if _any_match(globs, rel) or _concrete_prefix_match(globs, rel):
+        return True
+    if not (_could_prefix_match(globs, rel) and os.path.isdir(root / rel)):
+        return False
+    target = os.path.realpath(root / rel)
+    return os.path.commonpath([real_root, target]) != real_root or _live_walk_exposes(root / rel, rel, globs)
+
+
+def _live_symlinks(root: Path, globs: list[str]) -> Optional[set[str]]:
+    """Every live symlink where a baseline could sit or be reached: one `os.walk` that never follows links,
+    skips `.git` and prunes real directories no glob reaches below. None past `_MAX_LIVE_SCAN` (fail closed)."""
+    found: set[str] = set()
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        sub = os.path.relpath(dirpath, root).replace(os.sep, "/")
+        prefix = "" if sub == "." else f"{sub}/"
+        seen += len(dirnames) + len(filenames)
+        if seen > _MAX_LIVE_SCAN:
+            return None
+        keep = []
+        for name in dirnames:
+            rel = prefix + name
+            if os.path.islink(os.path.join(dirpath, name)):
+                found.add(rel)
+            elif name != ".git" and _could_prefix_match(globs, rel):
+                keep.append(name)
+        dirnames[:] = keep
+        found.update(prefix + n for n in filenames if os.path.islink(os.path.join(dirpath, n)))
+    return found
+
+
+def _committed_blob_mismatches(root: Path, ref: str, globs: list[str]) -> set[str]:
+    """Frozen baselines at ``ref`` that are no longer exactly the committed regular files. Frozen baselines
+    must be regular tracked files, never symlinks or reached through one, so this is a fail-closed contract:
+    - a glob that is not a normalized repo-relative path (`_unnormalized_baseline_glob`) is reported itself;
+    - every committed regular file (`100644`/`100755`) matching ``globs`` must keep its mode and oid in the
+      live index (`ls-files --stage`, read-only; unmerged fails closed) and, when ``HEAD`` moved past ``ref``,
+      in the ``HEAD`` tree, and must be a real regular file under real directories on disk whose bytes hash
+      to the committed blob (immune to `assume-unchanged`/`skip-worktree`; Git-filtered content fails closed);
+    - every symlink at ``ref``, at ``HEAD``, in the live index or on disk (`_live_symlinks`) is checked by the
+      same rule (`_symlink_breaks_contract`), so a link added by the PR, staged, or created by a hook counts
+      exactly like a committed one, including for a frozen hook new since ``ref``."""
+    bad: set[str] = {g for g in globs if _unnormalized_baseline_glob(g)}
+    globs = [g for g in globs if g not in bad]
+    tree = _committed_tree(root, ref) if globs else None
+    if tree is None:
+        return bad
+    index = _index_entries(root)
+    head_sha = _git_ro(root, ["rev-parse", "--verify", "-q", "HEAD^{commit}"]).stdout.strip()
+    ref_sha = _git_ro(root, ["rev-parse", "--verify", "-q", f"{ref}^{{commit}}"]).stdout.strip()
+    check_head = bool(head_sha) and head_sha != ref_sha
+    head = _committed_tree(root, "HEAD") if check_head else None
+    links = {rel for entries in (tree, head or {}, index or {}) for rel, e in entries.items() if e[0] == "120000"}
+    live = _live_symlinks(root, globs)
+    if live is None:
+        bad.add(f"(more than {_MAX_LIVE_SCAN} live entries to scan for symlinks)")
+    real_root = os.path.realpath(root)
+    bad.update(rel for rel in links | (live or set()) if _symlink_breaks_contract(root, real_root, rel, globs))
+    baselines = {rel: e for rel, e in tree.items() if e[0] in ("100644", "100755") and _any_match(globs, rel)}
+    for rel, entry in baselines.items():
+        pinned = index is not None and index.get(rel) == entry \
+            and (not check_head or (head is not None and head.get(rel) == entry))
+        if not pinned or _live_regular_oid(root, rel, len(entry[1])) != entry[1]:
+            bad.add(rel)
+    return bad
+
+
+def _index_entries(root: Path) -> Optional[dict[str, tuple[str, str]]]:
+    """Live index entries (path -> ``(mode, oid)``) read with `ls-files --stage` (no refresh, no lock); a path
+    with unmerged stages maps to `("unmerged", "")`; None when the index cannot be read."""
+    proc = _git_ro(root, ["ls-files", "--stage", "-z"], timeout=60)
+    if proc.returncode != 0:
+        return None
+    out: dict[str, tuple[str, str]] = {}
+    for rec in proc.stdout.split("\0"):
+        meta, sep, rel = rec.partition("\t")
+        fields = meta.split(" ")
+        if not sep or len(fields) != 3:
+            continue
+        out[rel] = (fields[0], fields[1]) if fields[2] == "0" and rel not in out else ("unmerged", "")
+    return out
+
+
+def _frozen_baseline_changes(root: Path, frozen: dict[str, list[str]], base_sha: Optional[str]) -> list[dict[str, Any]]:
+    """Existing frozen baseline files modified or deleted since ``base_sha`` (committed or in the working tree).
+    Baseline files absent from ``base_sha`` (``HEAD`` when no base) are new surfaces, not tampering."""
+    if not frozen:
+        return []
+    status = _changed_status(root, base_sha)
+    ref = base_sha or "HEAD"
+    out: list[dict[str, Any]] = []
+    for name, globs in frozen.items():
+        hits = sorted({
+            *(p for p, st in status.items()
+              if _any_match(globs, p) and (st != "A" or _existed_at(root, ref, p))),
+            *_committed_blob_mismatches(root, ref, globs),
+        })
+        if hits:
+            out.append({"name": name, "baseline_paths": globs, "changed_files": hits})
+    return out
+
+
+def _merge_baseline_changes(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        for item in group:
+            cur = merged.setdefault(item["name"], {**item, "changed_files": []})
+            cur["changed_files"] = sorted({*cur["changed_files"], *item["changed_files"]})
+    return list(merged.values())
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed structural `visual_diff` command guard
+# ---------------------------------------------------------------------------
+# Proving that an arbitrary rewritten shell script keeps a committed threshold is undecidable, so the guard does
+# not emulate the shell. A committed command left byte-identical is always clean. An edited one is clean only as
+# a pure in-place threshold tightening: the same tokens 1-to-1 with the same raw spelling (no insertions,
+# deletions, quote or operator edits, heredocs or line continuations), the same `--flag=val` / `--flag val`
+# syntax, and each changed committed threshold a max-difference one (`_MAX_DIFF_FLAGS`/`_MAX_DIFF_ENVS`) and a
+# plain fixed-point decimal no larger than before. On top of that,
+# every byte outside the tightened threshold value spans must match the committed command verbatim
+# (`_verbatim_tightening_ok`): whitespace, comments and quoting are never normalized. Edited commands allow this
+# only under a positive grammar (`_value_spans`): one simple command (optionally wrapped once in exactly
+# `sh -c SCRIPT` / `bash -c SCRIPT`), leading `NAME=val` assignments or a bare flagless `env`, a non-denied head,
+# then only threshold flags with plain numbers and plain positionals. Any other option word fails closed, as no
+# option denylist can know which flag turns the next word into code or a filter. Everything
+# else fails closed, and every validation regex anchors with `\A...\Z` + `fullmatch` (`$` also matches before a final LF).
+
+_THRESHOLD_KEY_RE = re.compile(
+    r"threshold|toleran|max[-_]?diff|fuzz|max[-_]?pixel|diff[-_]?ratio|mismatch", re.IGNORECASE
+)
+# Only these names provably mean "maximum allowed difference" (smaller = stricter). A bare `--threshold`,
+# `--tolerance` or `THRESHOLD` may be a minimum similarity (SSIM `0.99 -> 0.90` loosens it), so any edit to
+# such a value fails closed; it stays clean only while byte-identical.
+_MAX_DIFF_FLAGS = frozenset({"--max-diff-pixels", "--max-diff-pixel-ratio", "--max-diff", "--max-mismatch"})
+_MAX_DIFF_ENVS = frozenset({"MAX_DIFF_PIXELS", "MAX_DIFF_PIXEL_RATIO", "MAX_DIFF", "MAX_MISMATCH"})
+_REGEN_FLAG_RE = re.compile(r"\A--?(?:update|regen(?:erate)?|accept(?:-snapshots)?|snapshot[-_]?update|"
+                            r"(?:force[-_]?)?update[-_]?(?:snapshots?|baselines?|goldens?)|"
+                            r"overwrite[-_]?baselines?)\Z", re.IGNORECASE)
+_REGEN_ENV_RE = re.compile(r"(?:\A|_)(?:UPDATE_?SNAPSHOTS?|SNAPSHOTS?_?UPDATE|UPDATE_?BASELINES?|UPDATE_?GOLDENS?|"
+                           r"REGENERATE)(?:_|\Z)", re.IGNORECASE)
+_DISABLED = frozenset({"", "0", "false", "no", "off", "none"})
+_ASSIGN_RE = re.compile(r"\A([A-Za-z_][A-Za-z0-9_]*)=(.*)\Z", re.DOTALL)
+_PYTHON_RE = re.compile(r"\A(?:python(?:\d+(?:\.\d+)*)?|pypy3?)\Z")
+_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "busybox"})
+# A shell word whose meaning is identical as an argv item and as unquoted shell text.
+_PLAIN_WORD_RE = re.compile(r"[A-Za-z0-9_./:=+%,@-]+", re.ASCII)
+# Plain fixed-point only: no exponent, no bare leading `.`. For two such spellings, a smaller exact value is never
+# larger under `parseInt`/integer-prefix, `parseFloat`/`Number` or `Decimal` (`parseInt("9e-2", 10)` is 9).
+_ASCII_THRESHOLD_RE = re.compile(r"\A(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\Z", re.ASCII)
+# A replaceable threshold value span: the same digits plus an optional `%`; no quote, escape or whitespace.
+_ASCII_VALUE_RE = re.compile(r"\A(?:0|[1-9][0-9]*)(?:\.[0-9]+)?%?\Z", re.ASCII)
+_MAX_SCRIPT_DEPTH = 4
+_OPERATORS = ("<<<", "&>>", "&&", "||", "|&", ";;", ">>", "<<", "<>", ">&", "<&", "&>", ">|",
+              "|", ";", "&", "(", ")", ">", "<")
+_UNVERIFIABLE = "mutates committed visual_diff command with an unverifiable shell/structural rewrite"
+
+
+class _UnsupportedEdit(ValueError):
+    """Syntax whose bytes the token comparison cannot preserve; allowed only in a byte-identical command."""
+
+
+class _Tok(NamedTuple):
+    text: str     # the word after quote removal, or the operator
+    raw: str      # the source slice
+    is_op: bool
+    quoted: bool
+    from_argv: bool = False  # an argv-list item: never seen by a shell
+    glued: bool = False      # a `(`/`)` with no whitespace before it: `((`/`$(` differ from `( (`/`$ (`
+    start: int = 0           # source offsets of ``raw`` in the command string (argv items: in the item)
+    end: int = 0
+
+    @property
+    def key(self) -> tuple[str, bool, bool, bool]:
+        """Comparison identity: the exact source spelling. No quoting is harmless in general (`'T=1'` is a
+        command, `"^FAIL"` a literal `=~` pattern, `\\!=` invalid arithmetic), so none is normalized away."""
+        return self.raw, self.is_op, self.from_argv, self.glued
+
+
+class _Slot(NamedTuple):
+    """A threshold: `--flag val` / `--flag=val` (kind `flag`, ``eq`` tells which) or `VAR=val` (kind `env`),
+    keyed by the exact unquoted spelling (dashes, case, `-` vs `_`: `--THRESHOLD` is another, unknown, flag).
+    ``raw`` is the source spelling of the value and ``text`` the word the program receives; ``value`` is its
+    exact number (`1%` -> 1 with ``percent``) or None when not strict ASCII decimal syntax."""
+    kind: str
+    key: str
+    eq: bool
+    raw: str
+    text: str
+    value: Optional[Decimal]
+    percent: bool
+
+
+def _tokenize_visual_cmd(command: Any) -> list[_Tok]:
+    """Shell words and operators of ``command`` (argv lists are literal words). An unquoted newline is a
+    separator (raw `\\n`, never equal to `;`; blank lines collapse and edge newlines are dropped), `#` at a word
+    start comments to the end of the line, and a redirection keeps its fd (`2>`). Raises ValueError on an
+    unclosed quote or a trailing lone backslash, and `_UnsupportedEdit` on a heredoc/herestring or a line
+    continuation, whose meaning depends on bytes (delimiter lines, joined words) the tokens do not keep."""
+    if isinstance(command, list):
+        return [_Tok(str(c), str(c), False, True, True, start=0, end=len(str(c))) for c in command]
+    text = str(command or "")
+    toks: list[_Tok] = []
+    word: Optional[list[str]] = None
+    i, n, start, quoted = 0, len(text), 0, False
+
+    def flush(end: int) -> None:
+        nonlocal word, quoted
+        if word is not None:
+            toks.append(_Tok("".join(word), text[start:end], False, quoted, start=start, end=end))
+        word, quoted = None, False
+
+    while i < n:
+        ch = text[i]
+        if ch in " \t\n":  # not `\r`: sh/bash keep it inside the word
+            flush(i)
+            if ch == "\n":
+                toks.append(_Tok(";", "\n", True, False, start=i, end=i + 1))
+            i += 1
+        elif word is None and ch == "#":
+            end = text.find("\n", i)
+            i = n if end < 0 else end
+        elif word is None and ch in "{}" and (i + 1 == n or text[i + 1] in " \t\n;&|()"):
+            toks.append(_Tok(ch, ch, True, False, start=i, end=i + 1))
+            i += 1
+        elif ch == "\\" and text.startswith("\n", i + 1):
+            raise _UnsupportedEdit("line continuation")
+        elif op := next((o for o in _OPERATORS if text.startswith(o, i)), None):
+            if op.startswith("<<"):
+                raise _UnsupportedEdit("heredoc/herestring")
+            op_start, i = i, i + len(op)
+            fd = "".join(word) if word is not None and not quoted else ""
+            if re.fullmatch(r"\d+|\{[A-Za-z_]\w*\}", fd) and ("<" in op or ">" in op):
+                word, op = None, fd + op  # `2>`: the fd belongs to the redirection
+            flush(op_start)
+            glued = op in "()" and op_start > 0 and text[op_start - 1] not in " \t\n"
+            toks.append(_Tok(op, op, True, False, False, glued, start=i - len(op), end=i))
+        else:
+            if word is None:
+                word, start = [], i
+            if ch == "\\":
+                if i + 1 >= n:
+                    raise ValueError("trailing backslash")
+                word.append(text[i + 1])
+                quoted, i = True, i + 2
+            elif ch == "'":
+                end = text.find("'", i + 1)
+                if end < 0:
+                    raise ValueError("unclosed single quote")
+                word.append(text[i + 1:end])
+                quoted, i = True, end + 1
+            elif ch == '"':
+                i += 1
+                while i < n and text[i] != '"':
+                    if text.startswith("\\\n", i):
+                        raise _UnsupportedEdit("line continuation")
+                    esc = text[i] == "\\" and i + 1 < n and text[i + 1] in '$`"\\'
+                    word.append(text[i + 1] if esc else text[i])
+                    i += 2 if esc else 1
+                if i >= n:
+                    raise ValueError("unclosed double quote")
+                quoted, i = True, i + 1
+            else:
+                word.append(ch)
+                i += 1
+    flush(n)
+    out: list[_Tok] = []
+    for tok in toks:
+        if not (tok.raw == "\n" and (not out or out[-1].raw == "\n")):
+            out.append(tok)
+    while out and out[-1].raw == "\n":
+        out.pop()
+    return out
+
+
+def _segments(toks: list[_Tok]) -> tuple[list[_Tok], list[list[_Tok]]]:
+    """Operator tokens and the word segments around them (always ``len(ops) + 1`` segments)."""
+    ops: list[_Tok] = []
+    segs: list[list[_Tok]] = [[]]
+    for tok in toks:
+        if tok.is_op:
+            ops.append(tok)
+            segs.append([])
+        else:
+            segs[-1].append(tok)
+    return ops, segs
+
+
+def _parse_value(raw: str) -> tuple[Optional[Decimal], bool]:
+    """Strict ASCII fixed-point decimal syntax only (Python also takes `0.0_1`, `1e-2`, `inf` and non-ASCII
+    digits, which integer-prefix, JS, Go or Rust checkers read differently, as NaN or an error), as an exact
+    `Decimal`: binary64 `float` equates adjacent integers past 2**53, and `Decimal` construction and ordering
+    never round to the context precision."""
+    pct = raw.endswith("%")
+    number = raw[:-1] if pct else raw
+    if not _ASCII_THRESHOLD_RE.fullmatch(number):
+        return None, pct
+    try:
+        value = Decimal(number)
+    except InvalidOperation:  # an exponent beyond the context's Emax/Emin
+        return None, pct
+    if not value.is_finite() or value < 0:
+        return None, pct
+    return value, pct
+
+
+def _slot_items(words: list[str], texts: Optional[list[str]] = None) -> list[Any]:
+    """``words`` (source spellings) with each threshold (`--flag val`, `--flag=val`, `VAR=val`) collapsed into one
+    `_Slot`; ``texts`` are the same words after quote removal (default: ``words``). Names are matched on the
+    source spelling, so only an unquoted `NAME=` is an assignment (`'T=0.01'`, `"T"=0.01` and `T\\=0.01` are
+    command words the shell cannot find) and only an unquoted `--flag` / `--flag=` is a threshold flag."""
+    texts = words if texts is None else texts
+
+    def value_text(k: int, prefix: str) -> str:
+        return texts[k][len(prefix):] if texts[k].startswith(prefix) else words[k][len(prefix):]
+
+    items: list[Any] = []
+    i = 0
+    while i < len(words):
+        tok = words[i]
+        m = _ASSIGN_RE.fullmatch(tok)
+        if m and _THRESHOLD_KEY_RE.search(m.group(1)):
+            text = value_text(i, m.group(1) + "=")
+            items.append(_Slot("env", m.group(1), True, m.group(2), text, *_parse_value(text)))
+        elif tok.startswith("-") and tok not in ("-", "--") and _THRESHOLD_KEY_RE.search(tok.partition("=")[0]):
+            name, eq, raw = tok.partition("=")
+            text = value_text(i, name + "=") if eq else raw
+            if not eq and i + 1 < len(words) and not words[i + 1].startswith("--"):
+                i, raw, text = i + 1, words[i + 1], texts[i + 1]
+            items.append(_Slot("flag", name, bool(eq), raw, text, *_parse_value(text)))
+        else:
+            items.append(tok)
+        i += 1
+    return items
+
+
+def _slot_ok(base: _Slot, live: _Slot) -> bool:
+    """``live`` keeps ``base``'s bar: same slot and syntax, and the same text or a comparable, no looser value."""
+    if (base.kind, base.key, base.eq) != (live.kind, live.key, live.eq):
+        return False  # `--t=v` <-> `--t v` drops the threshold for parsers that read only one form
+    if live.raw == base.raw:
+        return True
+    if base.value is None or live.value is None or not _max_diff_slot(base):
+        return False
+    if base.percent != live.percent:
+        return False  # checkers read `1%` and `0.01` differently (`Number("1%")` is NaN): keep the committed unit
+    if _integer_syntax_lost(base, live):
+        return False
+    return live.value <= base.value
+
+
+def _max_diff_slot(slot: _Slot) -> bool:
+    return slot.key in (_MAX_DIFF_FLAGS if slot.kind == "flag" else _MAX_DIFF_ENVS)
+
+
+def _integer_syntax_lost(base: _Slot, live: _Slot) -> bool:
+    """A committed integer threshold rewritten as a decimal (`5` -> `0.5`): Go/Rust/Python `int()` parsing
+    errors out, and a crashing checker is not a tightened one."""
+    def number(slot: _Slot) -> str:
+        return slot.text[:-1] if slot.percent else slot.text
+
+    return number(base).isascii() and number(base).isdigit() and not (
+        number(live).isascii() and number(live).isdigit())
+
+
+def _item_ok(base: Any, live: Any) -> bool:
+    if isinstance(base, _Slot) and isinstance(live, _Slot):
+        return _slot_ok(base, live)
+    return not isinstance(base, _Slot) and not isinstance(live, _Slot) and base == live
+
+
+def _is_regen(tok: str, prev: Optional[str]) -> bool:
+    """An active snapshot-regeneration option or environment assignment (`=false`/`=0`/... disable it)."""
+    m = _ASSIGN_RE.fullmatch(tok)
+    if m:
+        return bool(_REGEN_ENV_RE.search(m.group(1))) and m.group(2).strip().lower() not in _DISABLED
+    name, eq, value = tok.partition("=")
+    if _REGEN_FLAG_RE.fullmatch(name):
+        return not (eq and value.strip().lower() in _DISABLED)
+    word = name[1:]
+    if not name.startswith("-") or eq or not word.isalpha() or "u" not in word or len(word) > 3:
+        return False
+    prev_name = os.path.basename(prev or "")
+    exempt = bool(_PYTHON_RE.fullmatch(prev_name)) or prev_name in _SHELLS | {"set", "env", "diff"}
+    return not exempt and word.lower() not in {"run", "sub", "cpu", "out", "url", "num"}
+
+
+def _outer_expands(tok: _Tok) -> bool:
+    """Whether the outer shell expands part of ``tok`` (`$`/`` ` `` unquoted or in double quotes; globs, `~` and
+    braces unquoted), so the word a nested `sh -c` receives is not its literal text."""
+    if tok.from_argv:
+        return False
+    raw, i, dq = tok.raw, 0, False
+    while i < len(raw):
+        ch = raw[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "'" and not dq:
+            i = raw.index("'", i + 1) + 1
+            continue
+        if ch == '"':
+            dq = not dq
+        elif ch in "$`" or (not dq and ch in "*?[~{"):
+            return True
+        i += 1
+    return False
+
+
+def _sh_c_script_ok(base_toks: list[_Tok], live_toks: list[_Tok], depth: int) -> Optional[bool]:
+    """For an unchanged `sh|bash [-flags] -c SCRIPT [args]` wrapper whose only difference is SCRIPT, whether the
+    script edit is clean (checked recursively); None when the segment is not such a wrapper."""
+    base = [t.raw for t in base_toks]
+    head = next((k for k, t in enumerate(base) if not _ASSIGN_RE.fullmatch(t)), None)
+    if head is None or len(base_toks) != len(live_toks) or os.path.basename(base[head]) not in _SHELLS:
+        return None
+    diff = [k for k in range(len(base)) if base_toks[k].key != live_toks[k].key]
+    if len(diff) != 1 or diff[0] <= head + 1 or not re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", base[diff[0] - 1]):
+        return None
+    b, s = base_toks[diff[0]], live_toks[diff[0]]
+    # the outer shell expands `$T`/globs in a double-quoted or unquoted script before the child sees it, so
+    # neither side may expand, and the script keeps its committed outer quote style
+    return (not _outer_expands(b) and not _outer_expands(s)
+            and b.from_argv == s.from_argv and (b.from_argv or b.raw[:1] == s.raw[:1])
+            and all(re.fullmatch(r"[-+][A-Za-z]+", t) and "c" not in t for t in base[head + 1:diff[0] - 1])
+            and _structure_ok(b.text, s.text, depth + 1))
+
+
+def _segment_ok(base_toks: list[_Tok], live_toks: list[_Tok], depth: int) -> bool:
+    """Pure in-place tightening: the same items 1-to-1, each word with its exact spelling and each committed
+    threshold kept or tightened in place. Nothing may be inserted, deleted or moved."""
+    if [t.key for t in base_toks] == [t.key for t in live_toks]:
+        return True
+    script = _sh_c_script_ok(base_toks, live_toks, depth)
+    if script is not None:
+        return script
+    b_items = _slot_items([t.raw for t in base_toks], [t.text for t in base_toks])
+    l_items = _slot_items([t.raw for t in live_toks], [t.text for t in live_toks])
+    return len(b_items) == len(l_items) and all(map(_item_ok, b_items, l_items))
+
+
+def _structure_ok(base_cmd: Any, live_cmd: Any, depth: int = 0) -> bool:
+    """The fail-closed structural rule: identical operators (exact spelling), each segment aligned 1-to-1."""
+    if depth > _MAX_SCRIPT_DEPTH:
+        return False
+    try:
+        base, live = _tokenize_visual_cmd(base_cmd), _tokenize_visual_cmd(live_cmd)
+    except ValueError:
+        return False
+    if isinstance(base_cmd, list) != isinstance(live_cmd, list) and not all(
+            not t.is_op and _PLAIN_WORD_RE.fullmatch(t.text) for t in (*base, *live)):
+        return False  # argv list <-> shell string: only plain words mean the same thing in both
+    (b_ops, b_segs), (l_ops, l_segs) = _segments(base), _segments(live)
+    if [o.key for o in b_ops] != [o.key for o in l_ops]:
+        return False
+    return all(_segment_ok(b, s, depth) for b, s in zip(b_segs, l_segs))
+
+
+def _payload_offset(tok: _Tok) -> Optional[int]:
+    """Offset of an `sh -c` script's first character in the outer string when its characters map 1:1 to the
+    outer source (an argv item, `'...'`, or `"..."` without `\\`, `$`, `` ` ``); None otherwise."""
+    raw = tok.raw
+    if tok.from_argv:
+        return tok.start
+    if len(raw) >= 2 and raw[0] == raw[-1] == "'" and "'" not in raw[1:-1]:
+        return tok.start + 1
+    if len(raw) >= 2 and raw[0] == raw[-1] == '"' and not any(c in raw[1:-1] for c in '\\$`"'):
+        return tok.start + 1
+    return None
+
+
+def _value_span(raw: str, off: int, from_argv: bool) -> list[tuple[int, int]]:
+    """The offsets of a threshold value's bare number in the source (inside one pair of shell quotes)."""
+    if _ASCII_VALUE_RE.fullmatch(raw):
+        return [(off, off + len(raw))]
+    if (not from_argv and len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\""
+            and _ASCII_VALUE_RE.fullmatch(raw[1:-1])):
+        return [(off + 1, off + len(raw) - 1)]
+    return []
+
+
+# Command heads an edited command may never have: shell keywords/builtins, shells, test/comparison utilities,
+# text filters, expression/script interpreters whose positional argument is code, and wrappers that run another
+# command (any argument could be comparison data or code).
+_EDIT_DENIED_HEADS = frozenset({
+    "[", "[[", "test", "if", "then", "elif", "else", "fi", "while", "until", "for", "do", "done", "case", "esac",
+    "select", "time", "coproc", "!", "{", "}", "function", "echo", "printf", "grep", "egrep", "fgrep", "rg",
+    "sed", "awk", "gawk", "mawk", "tr", "cut", "cat", "head", "tail", "true", "false", "exit", "return", "eval",
+    "exec", "source", ".", "alias", "set", "unset", "declare", "typeset", "local", "readonly", "export", "let",
+    "command", "builtin", "env", "xargs", "find", "nice", "nohup", "timeout", "sudo", "doas", "stdbuf", "setsid",
+    "chroot", "ionice", "taskset", "strace", "watch", "expr", "jq", "yq", "perl", "ruby", "php", "lua", "git",
+    *_SHELLS,
+})
+_SH_C_SHELLS = frozenset({"sh", "bash"})
+# Positional words that make a runner evaluate or filter (`deno eval`, `npm exec`, `git grep`), never a file.
+_EDIT_DENIED_POSITIONALS = frozenset({"eval", "exec", "grep"})
+_FLAG_NAME_RE = re.compile(r"\A--?[A-Za-z0-9][A-Za-z0-9_-]*\Z", re.ASCII)
+
+
+def _value_spans(command: Any, depth: int = 0) -> list[tuple[int, int, int]]:
+    """``(item, start, end)`` source offsets of every editable threshold value in ``command`` (item is the argv
+    index, 0 for a string). A positive grammar, never a denylist of options: only a single simple command has
+    editable values, optionally wrapped once (top level only) in exactly `sh -c SCRIPT` / `bash -c SCRIPT` whose
+    offsets map 1:1. It is `[NAME=val ...] <cmd> ARG...` or `env [NAME=val ...] <cmd> ARG...` (a bare `env`: no
+    flags, no assignment before it), where `<cmd>` is not a denied head (shell keyword, shell, test, text filter,
+    expression interpreter, wrapper) and every ARG is either a threshold flag with a plain number
+    (`--max-diff=0.05` / `--max-diff 0.05`; only max-difference values are editable spans, any other threshold
+    value must stay verbatim) or a plain positional (no leading `-`, no `=`, not `eval`/`exec`/
+    `grep`). Any other option (`-c`, `-Bc'...'`, `-E`, `--grep`, `--`, ...) could make the next word code or a
+    filter, so it raises `_UnsupportedEdit`, as do shell operators, newlines, comments and `$`/`` ` ``/glob
+    expansion; ValueError like `_tokenize_visual_cmd`."""
+    toks = _tokenize_visual_cmd(command)
+    argv = isinstance(command, list)
+    if not argv:
+        text, pos = str(command or ""), 0
+        for tok in toks:
+            if tok.is_op or text[pos:tok.start].strip(" \t") or _outer_expands(tok):
+                raise _UnsupportedEdit("compound command")
+            pos = tok.end
+        if text[pos:].strip(" \t"):
+            raise _UnsupportedEdit("comment")  # `#` comments are the only bytes the tokenizer drops
+    spans: list[tuple[int, int, int]] = []
+
+    def env_slot(k: int) -> bool:
+        tok = toks[k]
+        m = _ASSIGN_RE.fullmatch(tok.raw)
+        if not m:
+            return False
+        if m.group(1) in _MAX_DIFF_ENVS:
+            spans.extend((k if argv else 0, s, e) for s, e in
+                         _value_span(m.group(2), tok.start + len(m.group(1)) + 1, tok.from_argv))
+        return True
+
+    k = 0
+    while not argv and k < len(toks) and env_slot(k):
+        k += 1  # an argv item `NAME=val` is a command name for execvp, never an assignment
+    if k < len(toks) and os.path.basename(toks[k].text) == "env":
+        if k:
+            raise _UnsupportedEdit("assignment before env")  # `env -i`/`-u` would clear it
+        k += 1
+        while k < len(toks) and env_slot(k):
+            k += 1
+    if k >= len(toks):
+        raise _UnsupportedEdit("no command head")
+    head = os.path.basename(toks[k].text)
+    rest = toks[k + 1:]
+    if head in _SH_C_SHELLS and depth == 0:
+        if len(rest) != 2 or rest[0].raw != "-c" or (off := _payload_offset(rest[1])) is None:
+            raise _UnsupportedEdit("shell wrapper")
+        unit = k + 2 if argv else 0
+        inner = _value_spans(rest[1].text, depth + 1)
+        return sorted([*spans, *((unit, off + s, off + e) for _, s, e in inner)])
+    if head in _EDIT_DENIED_HEADS or _ASSIGN_RE.fullmatch(toks[k].text) or toks[k].text.startswith("-"):
+        raise _UnsupportedEdit("command head")
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        unit = k + 1 + i if argv else 0
+        i += 1
+        if not tok.text.startswith("-"):
+            if "=" in tok.text or tok.text in _EDIT_DENIED_POSITIONALS:
+                raise _UnsupportedEdit("non-positional argument")
+            continue
+        name, eq, val = tok.raw.partition("=")
+        if not (_FLAG_NAME_RE.fullmatch(name) and _THRESHOLD_KEY_RE.search(name)):
+            raise _UnsupportedEdit("non-threshold option")
+        if eq:
+            found = [(unit, s, e) for s, e in _value_span(val, tok.start + len(name) + 1, tok.from_argv)]
+        else:
+            nxt = rest[i] if i < len(rest) else None
+            found = [] if nxt is None else [
+                (k + 1 + i if argv else 0, s, e) for s, e in _value_span(nxt.raw, nxt.start, nxt.from_argv)]
+            i += 1
+        if not found:
+            raise _UnsupportedEdit("threshold option without a plain number")
+        if name in _MAX_DIFF_FLAGS:
+            spans += found  # any other threshold value is outside bytes and must stay verbatim
+    return sorted(spans)
+
+
+def _verbatim_tightening_ok(base_cmd: Any, live_cmd: Any) -> bool:
+    """The verbatim invariant for an edited command: at least one committed threshold value span, every byte
+    outside those spans identical to the committed command, and each span replaced by a plain fixed-point ASCII
+    number (same `%` unit, integer stays integer) no larger than the committed one."""
+    if isinstance(base_cmd, list) != isinstance(live_cmd, list):
+        return False
+    b_units = [str(c) for c in base_cmd] if isinstance(base_cmd, list) else [str(base_cmd or "")]
+    l_units = [str(c) for c in live_cmd] if isinstance(live_cmd, list) else [str(live_cmd or "")]
+    try:
+        b_spans, l_spans = _value_spans(base_cmd), _value_spans(live_cmd)
+    except ValueError:
+        return False
+    if len(b_units) != len(l_units) or not b_spans or len(b_spans) != len(l_spans):
+        return False
+
+    def outside(units: list[str], spans: list[tuple[int, int, int]]) -> list[list[str]]:
+        parts: list[list[str]] = []
+        for u, unit in enumerate(units):
+            pos, cur = 0, []
+            for su, s, e in spans:
+                if su == u:
+                    cur.append(unit[pos:s])
+                    pos = e
+            parts.append([*cur, unit[pos:]])
+        return parts
+
+    if outside(b_units, b_spans) != outside(l_units, l_spans):
+        return False
+    for (bu, bs, be), (lu, ls, le) in zip(b_spans, l_spans):
+        b_val, l_val = b_units[bu][bs:be], l_units[lu][ls:le]
+        if not (_ASCII_VALUE_RE.fullmatch(b_val) and _ASCII_VALUE_RE.fullmatch(l_val)):
+            return False
+        if b_val.endswith("%") != l_val.endswith("%"):
+            return False
+        b_num, l_num = b_val.rstrip("%"), l_val.rstrip("%")
+        if b_num.isdigit() and not l_num.isdigit():
+            return False
+        if Decimal(l_num) > Decimal(b_num):
+            return False
+    return True
+
+
+def _flat_segments(command: Any, depth: int = 0) -> tuple[list[list[str]], int]:
+    """Word segments of ``command`` and of every nested `sh -c` script, plus its `||` count (diagnostics)."""
+    try:
+        ops, segs = _segments(_tokenize_visual_cmd(command))
+    except ValueError:
+        return [], 0
+    out, ors = [[t.text for t in s] for s in segs if s], sum(o.raw == "||" for o in ops)
+    for n, seg in enumerate(out[:]):
+        if depth < _MAX_SCRIPT_DEPTH and os.path.basename(seg[0]) in _SHELLS:
+            k = next((k for k in range(1, len(seg) - 1) if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", seg[k])), None)
+            if k is not None:
+                out[n] = seg[:k + 1] + seg[k + 2:]  # the script is code, diagnosed below, not one outer word
+                inner, inner_ors = _flat_segments(seg[k + 1], depth + 1)
+                out, ors = out + inner, ors + inner_ors
+    return out, ors
+
+
+def _slot_problem(base: _Slot, live: _Slot) -> str:
+    """Why ``live`` fails `_slot_ok` against ``base`` (same kind and key)."""
+    if live.value is None:
+        return "value"
+    if base.percent != live.percent:
+        return "unit"
+    if base.eq != live.eq:
+        return "syntax"
+    if not _max_diff_slot(base):
+        return "direction"
+    return "integer" if _integer_syntax_lost(base, live) else "loosen"
+
+
+def _threshold_reasons(base_segs: list[list[str]], live_segs: list[list[str]]) -> list[str]:
+    def slots(segs: list[list[str]]) -> dict[tuple[str, str], list[_Slot]]:
+        out: dict[tuple[str, str], list[_Slot]] = {}
+        for item in (i for seg in segs for i in _slot_items(seg) if isinstance(i, _Slot)):
+            out.setdefault((item.kind, item.key), []).append(item)
+        return out
+
+    base, live = slots(base_segs), slots(live_segs)
+    reasons: list[str] = []
+    for (kind, key), b_vals in base.items():
+        l_vals = live.get((kind, key), [])
+        label = f"`{key}`" + (" environment variable" if kind == "env" else "")
+        if not l_vals:
+            reasons.append(f"removes threshold `{key}={b_vals[0].raw}` (falls back to the tool default)")
+            continue
+        if len(l_vals) < len(b_vals):
+            reasons.append(f"removes {len(b_vals) - len(l_vals)} of {len(b_vals)} {label} threshold(s)")
+        strictest = min(b_vals, key=lambda s: Decimal("Infinity") if s.value is None else s.value)
+        pairs = [*zip(b_vals, l_vals), *((strictest, s) for s in l_vals[len(b_vals):])]
+        problems: dict[str, list[_Slot]] = {}
+        for b, s in pairs:
+            if not _slot_ok(b, s):
+                problems.setdefault(_slot_problem(b, s), []).append(s)
+        if "value" in problems:
+            reasons.append(f"sets non-finite or unparseable threshold {label} "
+                           f"({', '.join(s.raw for s in problems['value'])})")
+        if "unit" in problems:
+            reasons.append(f"changes threshold unit {label} (`%` vs plain number) from "
+                           f"{', '.join(s.raw for s in b_vals)} to {', '.join(s.raw for s in l_vals)}")
+        if "syntax" in problems:
+            reasons.append(f"changes threshold syntax {label} (`--flag=value` vs `--flag value`; checkers "
+                           "often read only one form)")
+        if "integer" in problems:
+            reasons.append(f"rewrites integer threshold {label} as a non-integer "
+                           f"({', '.join(s.raw for s in problems['integer'])}; integer parsers reject `0.5`)")
+        if "direction" in problems:
+            reasons.append(f"edits threshold {label} from {', '.join(s.raw for s in b_vals)} to "
+                           f"{', '.join(s.raw for s in l_vals)}; its direction (minimum similarity or maximum "
+                           "difference) is ambiguous, so only `max-diff`/`max-mismatch` thresholds may be tightened")
+        if "loosen" in problems:
+            reasons.append(f"loosens threshold {label} from {', '.join(s.raw for s in b_vals)} to "
+                           f"{', '.join(s.raw for s in l_vals)}")
+    for (kind, key), l_vals in live.items():
+        extra = l_vals[len(base.get((kind, key), [])):]
+        if extra:
+            reasons.append(f"adds threshold `{key}={extra[0].raw}` "
+                           "(committed thresholds may only be tightened in place)")
+    return reasons
+
+
+def _visual_hook_loosening(base_hook: dict[str, Any], live_hook: dict[str, Any]) -> list[str]:
+    """Ways ``live_hook`` weakens the committed `visual_diff` ``base_hook`` (empty when it does not)."""
+    reasons: list[str] = []
+    base_cmd, live_cmd = base_hook.get("command"), live_hook.get("command")
+    unchanged = base_cmd == live_cmd  # byte-identical: any shell construct is the committed, reviewed one
+    if not unchanged:
+        try:
+            _tokenize_visual_cmd(live_cmd)
+        except _UnsupportedEdit as exc:
+            reasons.append(f"mutates visual_diff command with a {exc} (allowed only when byte-identical to the "
+                           "committed command)")
+        except ValueError:
+            reasons.append("mutates visual_diff command with unparseable shell syntax")
+    if not unchanged and not reasons and not (_structure_ok(base_cmd, live_cmd)
+                                              and _verbatim_tightening_ok(base_cmd, live_cmd)):
+        (base_segs, base_ors), (live_segs, live_ors) = _flat_segments(base_cmd), _flat_segments(live_cmd)
+
+        def regen(segs: list[list[str]]) -> Counter[str]:
+            return Counter(t for seg in segs for k, t in enumerate(seg) if _is_regen(t, seg[k - 1] if k else None))
+
+        added = sorted((regen(live_segs) - regen(base_segs)).elements())
+        if added:
+            reasons.append("adds snapshot-regeneration flag(s) " + ", ".join(f"`{f}`" for f in added))
+        reasons.extend(_threshold_reasons(base_segs, live_segs))
+        if live_ors > base_ors:
+            reasons.append("adds shell `||` fallback to visual_diff hook (a failing check can still pass)")
+        reasons.append(_UNVERIFIABLE)
+    base_frozen = _frozen_baseline_globs(base_hook)
+    if base_frozen:
+        live_frozen = _frozen_baseline_globs(live_hook) if live_hook.get("kind") == "visual_diff" else []
+        if not live_frozen:
+            reasons.append("no longer freezes its baseline (`frozen_baseline`/`baseline_paths` removed)")
+        else:
+            dropped = [g for g in base_frozen if g not in live_frozen]
+            if dropped:
+                reasons.append("drops frozen baseline glob(s) " + ", ".join(f"`{g}`" for g in dropped))
+    return reasons
 
 
 # ---------------------------------------------------------------------------
@@ -1389,8 +2525,10 @@ def _baseline_gates(root: Path, sha: str) -> Optional[dict[str, Any]]:
 
 
 def detect_harness_gate_loosening(repo_path: str | Path, base_ref: Optional[str] = None) -> dict[str, Any]:
-    """Strictly read-only: flag required hooks removed or downgraded to optional, and dropped Doctor
-    commands, in the live `.factonio/` compared with the harness committed at ``base_ref`` (default ``HEAD``)."""
+    """Strictly read-only: flag required hooks removed or downgraded to optional, dropped Doctor commands,
+    `visual_diff` hooks mutated to regenerate baselines or loosen thresholds (or unfreeze them), and frozen
+    baseline files modified since ``base_ref`` (default ``HEAD``: working-tree edits only), comparing the live
+    `.factonio/` with the harness committed at ``base_ref``."""
     root = Path(repo_path).expanduser()
     result: dict[str, Any] = {
         "checked": False,
@@ -1401,6 +2539,8 @@ def detect_harness_gate_loosening(repo_path: str | Path, base_ref: Optional[str]
         "removed_required_hooks": [],
         "downgraded_hooks": [],
         "removed_doctor_commands": [],
+        "loosened_visual_hooks": [],
+        "visual_baseline_changes": [],
         "findings": [],
     }
     ref = _validate_ref(base_ref) if base_ref is not None else None
@@ -1417,14 +2557,19 @@ def detect_harness_gate_loosening(repo_path: str | Path, base_ref: Optional[str]
         return result
     result["base_commit"] = sha
     baseline = _baseline_gates(root, sha)
+    live = discover_harness(root)
+    live_hooks, live_doctor = live["hooks"], list(live["phases"].get("doctor") or [])
     if baseline is None:
         result["reason"] = f"no {HARNESS_DIR_NAME}/ harness committed at {sha[:12]}"
-        return result
+        # A first, not-yet-committed harness has no committed gates to compare, but its frozen baselines that
+        # already exist at ``sha`` are still protected (`baseline_source: live`).
+        if not any(_frozen_baseline_globs(h) for h in live_hooks
+                   if isinstance(h, dict) and str(h.get("name") or "").strip()):
+            return result
+        baseline = {"source": "live", "hooks": [], "doctor": []}
     result["checked"] = True
     result["baseline_source"] = baseline["source"]
 
-    live = discover_harness(root)
-    live_hooks, live_doctor = live["hooks"], list(live["phases"].get("doctor") or [])
     live_by_name = {str(h.get("name") or "").strip(): h for h in live_hooks}
     short = sha[:12]
     seen: set[str] = set()
@@ -1447,6 +2592,76 @@ def detect_harness_gate_loosening(repo_path: str | Path, base_ref: Optional[str]
         if cmd.strip() not in live_doctor_set and cmd not in result["removed_doctor_commands"]:
             result["removed_doctor_commands"].append(cmd)
             result["findings"].append(f"Gate loosening: Doctor command `{cmd}` (present at {short}) was removed")
+    frozen: dict[str, list[str]] = {}
+    for hook in baseline["hooks"]:
+        name = str(hook.get("name") or "").strip()
+        if not name or hook.get("kind") != "visual_diff":
+            continue
+        current = live_by_name.get(name)
+        reasons = _visual_hook_loosening(hook, current) if current is not None else []
+        if reasons and name not in result["loosened_visual_hooks"]:
+            result["loosened_visual_hooks"].append(name)
+            result["findings"].extend(
+                f"Gate loosening: visual_diff hook {name!r} {why} (vs {short})" for why in reasons
+            )
+    # A live hook may freeze more files than the committed one (or be new): its existing baselines count too.
+    frozen = _collect_frozen_globs(baseline["hooks"], live_hooks)
+    result["visual_baseline_changes"] = _frozen_baseline_changes(root, frozen, sha)
+    for change in result["visual_baseline_changes"]:
+        files = ", ".join(change["changed_files"][:5])
+        result["findings"].append(
+            f"Gate loosening: frozen baseline of visual_diff hook {change['name']!r} was modified since {short}: {files}"
+        )
+    result["loosened"] = bool(result["findings"])
+    return result
+
+
+def _collect_frozen_globs(committed_hooks: Iterable[Any], live_hooks: Iterable[Any]) -> dict[str, list[str]]:
+    """hook name -> frozen `baseline_paths` of the committed hooks unioned with the live ones."""
+    frozen: dict[str, list[str]] = {}
+    for hook in [*committed_hooks, *live_hooks]:
+        name = str(hook.get("name") or "").strip() if isinstance(hook, dict) else ""
+        globs = _frozen_baseline_globs(hook) if name else []
+        if globs:
+            frozen[name] = list(dict.fromkeys([*frozen.get(name, []), *globs]))
+    return frozen
+
+
+def _pre_execution_frozen_contract(root: Path, gate: dict[str, Any],
+                                   live_hooks: list[Any]) -> tuple[Optional[str], dict[str, list[str]]]:
+    """The base commit and effective frozen globs (committed union live) fixed before Doctor/hooks run."""
+    sha = gate.get("base_commit")
+    if not sha:
+        return None, {}
+    committed = _baseline_gates(root, sha)
+    return sha, _collect_frozen_globs((committed or {}).get("hooks") or [], live_hooks)
+
+
+def _frozen_contract_gate(root: Path, sha: str, frozen: dict[str, list[str]],
+                          base_ref: Optional[str]) -> dict[str, Any]:
+    """Re-check the pre-execution frozen contract after Doctor/hooks ran, whatever they did to `.factonio/`: a
+    frozen hook removed or unfrozen meanwhile is flagged, and its baselines are still compared with ``sha``."""
+    result: dict[str, Any] = {
+        "checked": True, "loosened": False, "base_ref": base_ref, "base_commit": sha,
+        "baseline_source": "pre-execution", "removed_required_hooks": [], "downgraded_hooks": [],
+        "removed_doctor_commands": [], "loosened_visual_hooks": [], "visual_baseline_changes": [], "findings": [],
+    }
+    now = _collect_frozen_globs([], discover_harness(root)["hooks"])
+    for name, globs in frozen.items():
+        dropped = [g for g in globs if g not in now.get(name, [])]
+        if dropped:
+            result["loosened_visual_hooks"].append(name)
+            result["findings"].append(
+                f"Gate loosening: frozen visual_diff hook {name!r} was removed or unfrozen while Doctor/hooks ran "
+                f"(baseline glob(s) {', '.join(f'`{g}`' for g in dropped)} no longer frozen)"
+            )
+    result["visual_baseline_changes"] = _frozen_baseline_changes(root, frozen, sha)
+    for change in result["visual_baseline_changes"]:
+        files = ", ".join(change["changed_files"][:5])
+        result["findings"].append(
+            f"Gate loosening: frozen baseline of visual_diff hook {change['name']!r} was modified since "
+            f"{sha[:12]}: {files}"
+        )
     result["loosened"] = bool(result["findings"])
     return result
 
@@ -1475,7 +2690,7 @@ def _audit_base(root: Path, base_ref: Optional[str], manifest: Optional[dict[str
     return None, "none"
 
 
-def _changed_files(root: Path, base_sha: Optional[str]) -> list[str]:
+def _changed_files(root: Path, base_sha: Optional[str], *, include_harness_dir: bool = False) -> list[str]:
     changed: set[str] = set()
     if base_sha:
         proc = _git_ro(root, ["diff", "--name-only", "-z", "--no-renames", base_sha, "HEAD"], timeout=60)
@@ -1486,6 +2701,8 @@ def _changed_files(root: Path, base_sha: Optional[str]) -> list[str]:
         for rec in proc.stdout.split("\0"):
             if len(rec) > 3:
                 changed.add(rec[3:])
+    if include_harness_dir:
+        return sorted(changed)
     return sorted(p for p in changed if not (p == HARNESS_DIR_NAME or p.startswith(HARNESS_DIR_NAME + "/")))
 
 
@@ -1514,6 +2731,10 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
         "removed_routes": [],
         "new_cli_commands": [],
         "removed_cli_commands": [],
+        "stale_invariants": [],
+        "dead_cover_globs": [],
+        "unresolved_sync_commits": [],
+        "visual_baseline_changes": [],
         "warnings": [],
         "manifest_errors": [],
         "recommendations": [],
@@ -1528,7 +2749,13 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
         if gate["loosened"]:
             result["warnings"].extend(gate["findings"])
             recs.append(_GATE_LOOSENING_RECOMMENDATION)
-        result.update(drifted=True, severity="missing", recommendations=recs, gate_loosening=gate)
+        result.update(
+            drifted=True,
+            severity="missing",
+            recommendations=recs,
+            gate_loosening=gate,
+            visual_baseline_changes=list(gate.get("visual_baseline_changes") or []),
+        )
         result["drift_classification"] = classify_harness_drift(result)
         return result
 
@@ -1537,6 +2764,7 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
         result["manifest_errors"] = [info["manifest_error"]]
     elif manifest is not None:
         result["manifest_errors"] = _validate_manifest(manifest)
+    result["manifest_errors"].extend(_verify_md_hook_errors(info))
     result["warnings"].extend(result["manifest_errors"])
     is_git = _is_git_repo(root)
     if not is_git:
@@ -1590,6 +2818,17 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
     else:
         result["warnings"].append("No harness.json discovered_surfaces baseline: route/CLI drift not computed")
 
+    formal = _audit_formal_invariants(
+        root, info["hooks"], files=_invariant_files(root), harness_base=base_sha, harness_base_source=base_source,
+        is_git=is_git,
+    )
+    result["formal_invariants"] = formal
+    for key in ("stale_invariants", "dead_cover_globs", "unresolved_sync_commits"):
+        result[key] = formal[key]
+    if formal["manifest_errors"]:
+        result["manifest_errors"].extend(formal["manifest_errors"])
+        result["warnings"].extend(formal["manifest_errors"])
+
     recs: list[str] = result["recommendations"]
     if result["uncovered_changed_files"]:
         recs.append(
@@ -1612,11 +2851,28 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
             "Update Drive CLI checks (new: " + (", ".join(result["new_cli_commands"]) or "-")
             + "; removed: " + (", ".join(result["removed_cli_commands"]) or "-") + ")"
         )
+    if result["stale_invariants"]:
+        recs.append(
+            "Re-prove formal invariant(s) "
+            + ", ".join(i["name"] for i in result["stale_invariants"])
+            + " against their changed covered files, then bump `sync_commit` to the re-proven commit."
+        )
+    if result["dead_cover_globs"]:
+        recs.append(
+            "Fix or remove dead formal-invariant `covers` globs: "
+            + ", ".join(f"{d['hook']}:{d['glob']}" for d in result["dead_cover_globs"])
+        )
+    if result["unresolved_sync_commits"]:
+        recs.append(
+            "Point `sync_commit` at a commit reachable in this checkout (squash merges rewrite SHAs): "
+            + ", ".join(u["name"] for u in result["unresolved_sync_commits"])
+        )
     doc_drifted = any(
         result[k]
         for k in (
             "uncovered_changed_files", "stale_features", "orphaned_globs",
             "new_routes", "removed_routes", "new_cli_commands", "removed_cli_commands",
+            "stale_invariants", "dead_cover_globs",
         )
     )
     if doc_drifted:
@@ -1625,20 +2881,48 @@ def audit_harness(repo_spec: str, *, base_ref: Optional[str] = None) -> dict[str
             "or edit .factonio/ by hand, then commit it so the audit baseline moves forward."
         )
     gate = detect_harness_gate_loosening(root, base_sha) if base_sha else _unchecked_gate(base_ref)
-    head = result["head_commit"]
-    if not gate["checked"] and head and head != base_sha:
-        # The audit base often predates the harness (generated base_commit); gate against the committed one.
-        gate = detect_harness_gate_loosening(root, head)
+    tried = {base_sha}
+    live_gate: Optional[dict[str, Any]] = None  # a `baseline_source: live` result compares no committed gates
+
+    def committed(g: dict[str, Any]) -> bool:
+        return bool(g["checked"]) and g.get("baseline_source") != "live"
+
+    # A generated `base_commit` usually predates `.factonio/` itself: gate against the last committed harness,
+    # but only then, so a pinned approved harness stays the bar for later commits that loosen it.
+    for step in ("fallback", "head"):
+        if committed(gate):
+            break
+        if gate["checked"] and live_gate is None:
+            live_gate = gate
+        if step == "fallback":
+            nxt = _frozen_baseline_base(root, base_ref, base_sha) if is_git else None
+        else:
+            nxt = result["head_commit"]
+        if nxt and nxt not in tried:
+            tried.add(nxt)
+            gate = detect_harness_gate_loosening(root, nxt)
+    if live_gate is not None and live_gate is not gate:
+        gate = _merge_gate(gate, live_gate) if gate["checked"] else live_gate
     result["gate_loosening"] = gate
     if gate["loosened"]:
         result["warnings"].extend(gate["findings"])
         recs.append(_GATE_LOOSENING_RECOMMENDATION)
+    if is_git:
+        frozen = {str(h.get("name")): _frozen_baseline_globs(h) for h in info["hooks"] if _frozen_baseline_globs(h)}
+        result["visual_baseline_changes"] = _merge_baseline_changes(
+            list(gate.get("visual_baseline_changes") or []),
+            _frozen_baseline_changes(root, frozen, _frozen_baseline_base(root, base_ref, base_sha)),
+        )
+    if result["visual_baseline_changes"]:
+        recs.append(_FROZEN_BASELINE_RECOMMENDATION)
     if result["manifest_errors"]:
         recs.append(
-            f"Repair the malformed {HARNESS_DIR_NAME}/{HARNESS_JSON_NAME} ({len(result['manifest_errors'])} "
+            f"Repair the malformed {HARNESS_DIR_NAME}/ manifest or hooks ({len(result['manifest_errors'])} "
             f"error(s)); `hermes factonio harness check {target['repo']}` lists them."
         )
-    drifted = doc_drifted or gate["loosened"] or bool(result["manifest_errors"])
+    drifted = (
+        doc_drifted or gate["loosened"] or bool(result["manifest_errors"]) or bool(result["visual_baseline_changes"])
+    )
     result["drifted"] = drifted
     result["severity"] = "stale" if drifted else "clean"
     classification = classify_harness_drift(result)
@@ -1672,10 +2956,27 @@ _GATE_LOOSENING_RECOMMENDATION = (
 )
 
 
+_FROZEN_BASELINE_RECOMMENDATION = (
+    "Restore the modified frozen visual baselines; regenerating a frozen baseline (or loosening a visual threshold) "
+    "to turn a failing visual_diff green needs explicit spec/design approval and a `factonio_log_decision` countersign."
+)
+
+
+def _frozen_baseline_base(root: Path, base_ref: Optional[str], base_sha: Optional[str]) -> Optional[str]:
+    """Audit baseline for frozen files: ``base_ref`` when given, else the last commit touching `.factonio/`
+    (baselines committed together with the harness are the frozen bar), else the audit base."""
+    if base_ref:
+        return base_sha
+    proc = _git_ro(root, ["log", "-1", "--format=%H", "--", HARNESS_DIR_NAME])
+    sha = proc.stdout.strip()
+    return sha if proc.returncode == 0 and sha else base_sha
+
+
 def _unchecked_gate(base_ref: Optional[str]) -> dict[str, Any]:
     return {
         "checked": False, "loosened": False, "base_ref": base_ref, "base_commit": None, "baseline_source": None,
-        "removed_required_hooks": [], "downgraded_hooks": [], "removed_doctor_commands": [], "findings": [],
+        "removed_required_hooks": [], "downgraded_hooks": [], "removed_doctor_commands": [],
+        "loosened_visual_hooks": [], "visual_baseline_changes": [], "findings": [],
     }
 
 
@@ -1685,9 +2986,9 @@ def classify_harness_drift(
     """Classify audit/check findings as `clean`, `doc_drift`, `harness_gap`, or `product_regression`.
 
     `doc_drift`: `.factonio/` no longer describes the repo (missing/stale harness, section errors, dead globs,
-    loosened gates). `harness_gap`: the harness itself is broken or a gate could not run (malformed
-    harness.json: invalid JSON or schema/`schema_version` errors; Doctor failure, hook timeout or
-    command-not-found). `product_regression`: a required hook ran and failed. Priority:
+    stale formal invariants, loosened gates or tampered frozen baselines). `harness_gap`: the harness itself is
+    broken or a gate could not run (malformed harness.json: invalid JSON, schema/`schema_version` errors or an
+    unresolved `sync_commit`; Doctor failure, hook timeout or command-not-found). `product_regression`: a required hook ran and failed. Priority:
     product_regression > harness_gap > doc_drift > clean.
     """
     audit = audit_result if isinstance(audit_result, dict) else {}
@@ -1701,7 +3002,10 @@ def classify_harness_drift(
     manifest_errors.extend(
         e for e in _str_list(check.get("errors")) if e.startswith(f"{HARNESS_JSON_NAME} ") and e not in manifest_errors
     )
-    reasons["harness_gap"].extend(f"Malformed {HARNESS_DIR_NAME}/{HARNESS_JSON_NAME}: {e}" for e in manifest_errors)
+    reasons["harness_gap"].extend(
+        f"Malformed {HARNESS_DIR_NAME}/{VERIFY_MD_NAME if e.startswith(VERIFY_MD_NAME + ' ') else HARNESS_JSON_NAME}: {e}"
+        for e in manifest_errors
+    )
 
     severity = audit.get("severity")
     if severity == "missing" or (check and check.get("present") is False):
@@ -1718,6 +3022,15 @@ def classify_harness_drift(
         items = _str_list(audit.get(key))
         if items:
             reasons["doc_drift"].append(f"{len(items)} {label}: " + ", ".join(items[:5]))
+    for key, label in (
+        ("stale_invariants", "formal invariants whose covered files changed since their sync_commit"),
+        ("dead_cover_globs", "formal-invariant covers globs matching no files"),
+        ("visual_baseline_changes", "frozen visual_diff baselines modified"),
+    ):
+        items = [i for i in audit.get(key) or [] if isinstance(i, dict)]
+        if items:
+            names = sorted({str(i.get("name") or i.get("hook")) for i in items})
+            reasons["doc_drift"].append(f"{len(items)} {label}: " + ", ".join(names[:5]))
     gate_findings: list[str] = []
     for source in (audit, check):
         gate = _as_dict(source.get("gate_loosening"))
