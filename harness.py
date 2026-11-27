@@ -22,7 +22,7 @@ import stat
 import subprocess
 import tempfile
 import time
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -1678,63 +1678,127 @@ def _live_blob_matches(root: Path, rel: str, entry: Optional[tuple[str, str]]) -
     return data is not None and _git_blob_oid(data, len(oid)) == oid
 
 
-def _real_dirs(root: Path, parts: list[str]) -> bool:
-    """Whether every prefix of ``parts`` under ``root`` is a real directory on disk, never a symlink."""
-    try:
-        return all(stat.S_ISDIR(os.lstat(root.joinpath(*parts[:n + 1])).st_mode) for n in range(len(parts)))
-    except OSError:
-        return False
+def _committed_dirs(tree: dict[str, tuple[str, str]]) -> set[str]:
+    """Every directory that holds a committed blob in ``tree`` (all parent prefixes, never the root)."""
+    dirs: set[str] = set()
+    for rel in tree:
+        parts = rel.split("/")[:-1]
+        dirs.update("/".join(parts[:n + 1]) for n in range(len(parts)))
+    return dirs
 
 
-def _frozen_path_intact(root: Path, rel: str, tree: dict[str, tuple[str, str]]) -> bool:
-    """Whether the bytes a checker reads through the frozen baseline ``rel`` are the committed ones: every parent
-    directory is real (no symlinked ancestor), and a symlink baseline's whole chain is followed inside the repo,
-    each hop a committed, unchanged link, to a committed regular file with unchanged bytes. An absolute or
-    escaping target, a symlinked intermediate directory, a missing, cyclic, too deep or non-regular end fails."""
-    cur = rel
-    visited = {rel}
-    if not _real_dirs(root, rel.split("/")[:-1]):
-        return False
-    for _ in range(_MAX_SYMLINK_HOPS + 1):
+def _resolve_pinned(root: Path, rel: str, tree: dict[str, tuple[str, str]], tree_dirs: set[str],
+                    want_dir: bool = False) -> Optional[str]:
+    """Resolve ``rel`` component by component exactly as the kernel does, pinning every step to the committed
+    ``tree`` and the live disk at once: a symlink component must be a committed `120000` link on both sides with
+    unchanged link text (relative, non-empty; its components replace it, so `..` pops the link's parent), an
+    intermediate component a committed directory that is a real directory on disk, and the end a committed
+    regular file with unchanged bytes (or a committed real directory when ``want_dir``). Returns the resolved
+    repo-relative path, or None when any step escapes the root, differs, is missing, cyclic or too deep."""
+    resolved: list[str] = []
+    pending = deque(rel.split("/"))
+    hops = 0
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    while pending:
+        comp = pending.popleft()
+        if comp in ("", "."):
+            continue
+        if comp == "..":
+            if not resolved:
+                return None  # escapes the repository
+            resolved.pop()
+            continue
+        cur = "/".join([*resolved, comp])
         entry = tree.get(cur)
-        if not _live_blob_matches(root, cur, entry):
-            return False
-        if entry is None or entry[0] != "120000":
-            return True
         try:
-            target = os.readlink(root / cur)
+            st = os.lstat(root / cur)
+            target = os.readlink(root / cur) if stat.S_ISLNK(st.st_mode) else None
         except OSError:
-            return False
-        if not target or target.startswith("/"):
-            return False
-        parts = cur.split("/")[:-1]
-        comps = [c for c in target.split("/") if c not in ("", ".")]
-        for n, comp in enumerate(comps):
-            if comp == "..":
-                if not parts:
-                    return False  # escapes the repository
-                parts.pop()  # every part is a verified real directory, so `..` is its lexical parent
-            else:
-                parts.append(comp)
-                if n + 1 < len(comps) and not _real_dirs(root, parts):
-                    return False
-        cur = "/".join(parts)
-        if not cur or cur in visited:
-            return False
-        visited.add(cur)
+            return None
+        if target is not None or (entry is not None and entry[0] == "120000"):
+            if entry is None or entry[0] != "120000" or not _live_blob_matches(root, cur, entry):
+                return None
+            hops += 1
+            state = (cur, tuple(pending))
+            if not target or target.startswith("/") or hops > _MAX_SYMLINK_HOPS or state in seen:
+                return None
+            seen.add(state)
+            pending.extendleft(reversed(target.split("/")))
+        elif pending or want_dir:
+            if cur not in tree_dirs or not stat.S_ISDIR(st.st_mode):
+                return None
+            resolved.append(comp)
+        else:
+            return cur if entry is not None and entry[0] in ("100644", "100755") \
+                and _live_blob_matches(root, cur, entry) else None
+    return "/".join(resolved) if want_dir and resolved else None
+
+
+def _could_prefix_match(globs: Iterable[str], rel: str) -> bool:
+    """Whether some path strictly below the directory ``rel`` could match one of ``globs`` (component-wise; a
+    `**` component at or before the depth of ``rel`` may match anything below it)."""
+    parts = rel.split("/")
+    for glob in globs:
+        pat = glob.strip()
+        pat = pat[2:] if pat.startswith("./") else pat
+        gparts = [*pat.split("/")[:-1], "**"] if pat.endswith("/") else pat.split("/")
+        for n, gp in enumerate(gparts):
+            if "**" in gp:
+                return True
+            if n == len(parts):
+                return True  # every component of ``rel`` matched and the glob continues below it
+            if not glob_matches(gp, parts[n]):
+                break
     return False
 
 
 def _committed_blob_mismatches(root: Path, ref: str, globs: list[str]) -> set[str]:
-    """Committed blobs at ``ref`` matching ``globs`` whose live file is missing, of another type or has other
-    bytes, sits under a symlinked directory, or (a symlink) no longer resolves to the committed bytes of its
-    committed in-repo referent (`_frozen_path_intact`). Files are hashed directly, so Git index flags
-    (`assume-unchanged`, `skip-worktree`) and stat-cache tricks that hide a mutation from `git status` cannot,
-    for the baseline or for a referent outside ``globs``. Filtered content (LFS, `autocrlf`) fails closed."""
+    """Frozen baselines at ``ref`` whose bytes, as a checker reads them, are no longer the committed ones.
+    Every committed blob matching ``globs`` is resolved with `_resolve_pinned` against the live disk (files
+    hashed directly, so `assume-unchanged`/`skip-worktree` and stat-cache tricks cannot hide a change, for the
+    baseline or a referent outside ``globs``; filtered content such as LFS or `autocrlf` fails closed). A
+    committed directory symlink at, inside or above a glob prefix (`snapshots -> real_snapshots`) is expanded:
+    each committed file below its committed target becomes the virtual path the checker opens
+    (`snapshots/home.png`) and is verified the same way, while a link that no longer resolves to its committed
+    directory (retargeted, replaced, absolute, escaping, broken, cyclic) is reported itself."""
     tree = _committed_tree(root, ref)
     if tree is None:
         return set()
-    return {rel for rel in tree if _any_match(globs, rel) and not _frozen_path_intact(root, rel, tree)}
+    tree_dirs = _committed_dirs(tree)
+    bad: set[str] = set()
+    baselines: set[str] = set()
+    links: deque[tuple[str, tuple[str, ...]]] = deque((rel, ()) for rel, (mode, _) in tree.items()
+                  if mode == "120000" and (_any_match(globs, rel) or _could_prefix_match(globs, rel)))
+    for rel, (mode, _) in tree.items():
+        if mode != "120000" and _any_match(globs, rel):
+            baselines.add(rel)
+    expanded: set[str] = set()
+    while links:
+        link, chain = links.popleft()
+        if link in expanded:
+            continue
+        expanded.add(link)
+        if _any_match(globs, link) and _resolve_pinned(root, link, tree, tree_dirs) is not None:
+            continue  # a pinned file symlink baseline
+        target = _resolve_pinned(root, link, tree, tree_dirs, want_dir=True)
+        if target is None:
+            if _any_match(globs, link) or _resolve_pinned(root, link, tree, tree_dirs) is None:
+                bad.add(link)  # an unpinned directory link, unless it is a pinned file link below no glob
+            continue
+        if target in chain or len(chain) >= _MAX_SYMLINK_HOPS:
+            bad.add(link)  # a directory link back into a directory it is already expanding never ends
+            continue
+        for sub, (mode, _) in tree.items():
+            if not sub.startswith(target + "/"):
+                continue
+            vpath = f"{link}/{sub[len(target) + 1:]}"
+            if mode == "120000":
+                if _any_match(globs, vpath) or _could_prefix_match(globs, vpath):
+                    links.append((vpath, (*chain, target)))
+            elif _any_match(globs, vpath):
+                baselines.add(vpath)
+    bad.update(rel for rel in baselines if _resolve_pinned(root, rel, tree, tree_dirs) is None)
+    return bad
 
 
 def _frozen_baseline_changes(root: Path, frozen: dict[str, list[str]], base_sha: Optional[str]) -> list[dict[str, Any]]:
