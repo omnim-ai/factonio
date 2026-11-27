@@ -1442,7 +1442,8 @@ class TestPublishPrApi(unittest.TestCase):
                 r = client.post(f"{_CP}/publish-pr", json=self.OK)
             self.assertEqual(r.status_code, 409, r.text)
             detail = r.json()["detail"]
-            self.assertTrue(detail["refused"])
+            self.assertEqual({k: detail[k] for k in ("ok", "published", "pushed", "created", "refused")},
+                             {"ok": False, "published": False, "pushed": False, "created": False, "refused": True})
             self.assertFalse(detail["verification"]["verified"])
             rows = _trail_rows("publish_pr")
             self.assertEqual(len(rows), 1)
@@ -1503,6 +1504,8 @@ class TestPublishPrApi(unittest.TestCase):
             self.assertEqual(r.status_code, 409, r.text)
             self.assertIn("drift", r.json()["detail"]["error"].lower())
             self.assertFalse(r.json()["detail"]["pushed"])
+            self.assertIs(r.json()["detail"]["ok"], False)
+            self.assertIs(r.json()["detail"]["refused"], True)
             row = _trail_rows("publish_pr")[0]
             self.assertEqual((row["actor"], row["result"]), ("human", "refused"))
 
@@ -1577,6 +1580,100 @@ class TestInvestigationReportApi(unittest.TestCase):
                     self.assertNotIn("ESCAPED", r.text)
 
 
+    def test_symlinked_ancestors_and_mid_walk_swap_fail_closed(self):
+        import os as _os
+        import shutil
+        from unittest import mock
+
+        with isolated_hermes_home() as home:
+            client = _cp_client("factonio_test_cp_report_dirfd")
+            outside = home / "outside"
+            (outside / "ws-a").mkdir(parents=True)
+            (outside / "ws-a" / "investigation.md").write_text("OUTSIDE SECRET\n", encoding="utf-8")
+            runs = self._runs(home)
+            runs.parent.mkdir(parents=True)
+            runs.symlink_to(outside, target_is_directory=True)
+            r = client.get(f"{_CP}/workstreams/ws-a/report")
+            self.assertEqual(r.status_code, 403, r.text)
+            self.assertNotIn("SECRET", r.text)
+            runs.unlink()
+            fdata = home / "plugin-data" / "factonio"
+            shutil.move(str(fdata), str(home / "fdata"))
+            fdata.symlink_to(home / "fdata", target_is_directory=True)
+            (home / "fdata" / "runs").symlink_to(outside, target_is_directory=True)
+            self.assertEqual(client.get(f"{_CP}/workstreams/ws-a/report").status_code, 403)
+            fdata.unlink()
+            runs.mkdir(parents=True)
+            self.assertEqual(client.get(f"{_CP}/workstreams/ws-a/report").json()["exists"], False)
+            (runs / "ws-a").symlink_to(outside / "ws-a", target_is_directory=True)
+            r = client.get(f"{_CP}/workstreams/ws-a/report")
+            self.assertEqual(r.status_code, 403, r.text)
+            self.assertNotIn("SECRET", r.text)
+            (runs / "ws-a").unlink()
+            (runs / "ws-a").mkdir()
+            (runs / "ws-a" / "investigation.md").write_text("inside\n", encoding="utf-8")
+            self.assertEqual(client.get(f"{_CP}/workstreams/ws-a/report").json()["content"], "inside\n")
+
+            mod = _load_plugin_api("factonio_test_cp_report_swap")
+            real_open = _os.open
+
+            def swapping_open(path, flags, *args, **kwargs):
+                if path == "investigation.md":
+                    _os.rename(runs / "ws-a", runs / "ws-a.old")
+                    (runs / "ws-a").symlink_to(outside / "ws-a", target_is_directory=True)
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(mod.os, "open", side_effect=swapping_open):
+                r = _client(mod).get(f"{_CP}/workstreams/ws-a/report")
+            self.assertEqual(r.status_code, 403, r.text)
+            self.assertNotIn("SECRET", r.text)
+            self.assertNotIn("inside", r.text)
+
+    def test_utf8_cap_path_redaction_and_post_redaction_cap(self):
+        cap = 256 * 1024
+        with isolated_hermes_home() as home:
+            client = _cp_client("factonio_test_cp_report_utf8")
+            run = self._runs(home) / "ws-u"
+            run.mkdir(parents=True)
+            report = run / "investigation.md"
+            for ch in ("\u00e9", "\u65e5", "\U0001F680"):
+                for pad in range(1, len(ch.encode("utf-8"))):
+                    with self.subTest(ch=ch, pad=pad):
+                        report.write_text("a" * (cap - pad) + ch * 3, encoding="utf-8")
+                        body = client.get(f"{_CP}/workstreams/ws-u/report").json()
+                        self.assertTrue(body["truncated"])
+                        self.assertLessEqual(len(body["content"].encode("utf-8")), cap)
+                        self.assertNotIn("\ufffd", body["content"])
+                        self.assertEqual(body["content"], "a" * (cap - pad))
+            report.write_text("\u65e5\u672c" * 60000, encoding="utf-8")
+            body = client.get(f"{_CP}/workstreams/ws-u/report").json()
+            self.assertEqual((body["truncated"], len(body["content"].encode("utf-8"))), (True, cap - 1))
+            self.assertNotIn("\ufffd", body["content"])
+
+            report.write_text("holdout\n" * 45000, encoding="utf-8")
+            body = client.get(f"{_CP}/workstreams/ws-u/report").json()
+            self.assertEqual((body["truncated"], body["redacted"]), (True, True))
+            self.assertLessEqual(len(body["content"].encode("utf-8")), cap)
+            self.assertNotIn("holdout", body["content"])
+
+            report.write_text("/tmp/x\n" * 50000, encoding="utf-8")
+            body = client.get(f"{_CP}/workstreams/ws-u/report").json()
+            self.assertEqual((body["truncated"], body["redacted"]), (True, True))
+            self.assertLessEqual(len(body["content"].encode("utf-8")), cap)
+
+            text = ("See /home/alice/private/case.md and `src/app.py`, dashboard/plugin_api.py,\n"
+                    "https://github.com/a/b, (/var/log/x.log) C:\\Users\\bob\\notes.txt and /Users/c/d.\n")
+            report.write_text(text, encoding="utf-8")
+            body = client.get(f"{_CP}/workstreams/ws-u/report").json()
+            self.assertTrue(body["redacted"])
+            for gone in ("/home/alice", "/var/log", "C:\\Users", "/Users/c"):
+                self.assertNotIn(gone, body["content"])
+            for kept in ("src/app.py", "dashboard/plugin_api.py", "https://github.com/a/b"):
+                self.assertIn(kept, body["content"])
+            self.assertEqual(body["content"].count("[REDACTED]"), 4)
+            report.write_text("plain src/app.py https://github.com/a/b\n", encoding="utf-8")
+            self.assertFalse(client.get(f"{_CP}/workstreams/ws-u/report").json()["redacted"])
+
 class TestHarnessAuditApi(unittest.TestCase):
     def test_validation_status_codes_and_read_only_audit(self):
         from factonio.config import get_repo
@@ -1605,7 +1702,10 @@ class TestHarnessAuditApi(unittest.TestCase):
             self.assertNotIn("repo_path", body)
             self.assertNotIn(str(repo), r.text)
             self.assertEqual(client.post(f"{_CP}/repos/acme-svc/harness/audit", json={"base_ref": "HEAD"}).status_code, 200)
-            self.assertEqual(client.post(f"{_CP}/repos/acme-svc/harness/audit", json={"base_ref": "nope"}).status_code, 422)
+            bad_ref = client.post(f"{_CP}/repos/acme-svc/harness/audit", json={"base_ref": "nope"})
+            self.assertEqual(bad_ref.status_code, 422)
+            self.assertNotIn(str(repo), bad_ref.text)
+            self.assertNotIn(str(repo.resolve()), bad_ref.text)
             self.assertEqual(_index_fingerprint(repo), index_before)
             self.assertEqual(sorted(p.name for p in repo.rglob("*") if ".git" not in p.parts), files_before)
             rows = _trail_rows("harness_audit")
@@ -1708,6 +1808,26 @@ class TestPanelAndArenaEvaluateApi(unittest.TestCase):
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 2)
             self.assertEqual(_trail_rows("spawn_arena_judge"), [])
 
+
+    def test_arena_evaluate_malformed_candidates_is_404_not_500(self):
+        with isolated_hermes_home() as home:
+            client = _cp_client("factonio_test_cp_arena_malformed")
+            url = f"{_CP}/arenas/evaluate"
+            for i, bad in enumerate((123, True, "c1", {"slot": "c1"})):
+                aid = f"ar_{i + 2}{i + 2}{i + 2}{i + 2}222222"
+                with self.subTest(candidates=bad):
+                    _write_arena_manifest(home, "ws-c", aid, {"arena_id": aid, "tenant": "ws-c", "candidates": bad,
+                                                               "created_at_ns": 10 + i})
+                    r = client.post(url, json={"arena_id": aid, "tenant": "ws-c"})
+                    self.assertEqual(r.status_code, 404, r.text)
+                    self.assertEqual(client.post(url, json={"tenant": "ws-c"}).status_code, 404)
+                    cards = client.get(f"{_CP}/cards")
+                    self.assertEqual(cards.status_code, 200, cards.text)
+            good = "ar_9999999999"
+            _write_arena_manifest(home, "ws-c", good, {"arena_id": good, "tenant": "ws-c", "candidates": [],
+                                                        "created_at_ns": 1})
+            self.assertEqual(client.post(url, json={"arena_id": good}).status_code, 200)
+            self.assertEqual(client.post(url, json={"tenant": "ws-c"}).status_code, 404, "newest manifest is corrupt")
 
 if __name__ == "__main__":
     unittest.main()

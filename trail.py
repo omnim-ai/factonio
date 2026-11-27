@@ -606,9 +606,14 @@ def _validate_trail_filters(
         raise ValueError(f"include_superseded must be a boolean; got {type(include_superseded).__name__}")
 
 
-def _like_pattern(text: str) -> str:
-    escaped = text.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    return f"%{escaped}%"
+def _routine_sql(a: str) -> str:
+    """Routine machine tick (`pr_gate` / `bootstrap_verify` polls): never human, superseding or failing."""
+    return (
+        f"(lower(trim({a}decision)) IN ({_sql_list(_ROUTINE_DECISIONS)})"
+        f" AND lower(trim({a}actor)) != 'human' AND {a}supersedes_id IS NULL"
+        f" AND lower(trim({a}phase)) NOT IN ({_sql_list(_KEY_EXEMPT_PHASES)})"
+        f" AND lower(trim({a}result)) NOT IN ({_sql_list(_KEY_EXEMPT_RESULTS)}))"
+    )
 
 
 def _filter_sql(
@@ -623,7 +628,7 @@ def _filter_sql(
     q: Optional[str] = None,
     signal: Optional[str] = None,
     include_superseded: Optional[bool] = None,
-    attention_ids: Optional[list[str]] = None,
+    attention_ids: Optional[tuple[list[str], list[str]]] = None,
 ) -> tuple[str, list[Any]]:
     a = f"{alias}." if alias else ""
     # Correlated subqueries need the outer table spelled out: a bare `id` would bind to the inner alias.
@@ -650,33 +655,25 @@ def _filter_sql(
     if actor and actor.strip():
         where.append(f"{a}actor = ?")
         params.append(actor.strip())
-    needle = q.strip() if isinstance(q, str) else ""
-    if needle:
-        if contains_holdout_reference(needle):
-            # Barrier oracle guard: a search naming holdout must not reveal which rows were redacted.
-            where.append("0")
-        else:
-            where.append(
-                "(" + " OR ".join(f"lower({a}{col}) LIKE ? ESCAPE '\\'" for col in _SEARCH_COLUMNS) + ")"
-            )
-            params.extend([_like_pattern(needle)] * len(_SEARCH_COLUMNS))
+    if isinstance(q, str) and contains_holdout_reference(q.strip()):
+        # Barrier oracle guard: a search naming holdout must not reveal which rows were redacted.
+        # Every other `q` is matched in Python on decoded public text (`_public_match`), never via SQL LIKE.
+        where.append("0")
     active = f"NOT EXISTS (SELECT 1 FROM decisions s_ WHERE s_.supersedes_id = {outer}.id)"
     if include_superseded is False:
         where.append(active)
     if signal == "key":
-        where.append(
-            f"NOT (lower(trim({a}decision)) IN ({_sql_list(_ROUTINE_DECISIONS)})"
-            f" AND lower(trim({a}actor)) != 'human' AND {a}supersedes_id IS NULL"
-            f" AND lower(trim({a}phase)) NOT IN ({_sql_list(_KEY_EXEMPT_PHASES)})"
-            f" AND lower(trim({a}result)) NOT IN ({_sql_list(_KEY_EXEMPT_RESULTS)}))"
-        )
+        where.append(f"NOT {_routine_sql(a)}")
     elif signal == "attention":
+        # Evidence findings always surface; routine polls never bury real escalations, escapes and failures.
+        evidence_ids, escalation_ids = attention_ids or ([], [])
         where.append(
             f"({active} AND ({a}id IN (SELECT value FROM json_each(?))"
+            f" OR (NOT {_routine_sql(a)} AND ({a}id IN (SELECT value FROM json_each(?))"
             f" OR lower(trim({a}phase)) IN ({_sql_list(_ATTENTION_PHASES)})"
-            f" OR lower(trim({a}result)) IN ({_sql_list(_ATTENTION_RESULTS)})))"
+            f" OR lower(trim({a}result)) IN ({_sql_list(_ATTENTION_RESULTS)})))))"
         )
-        params.append(json.dumps(sorted(set(attention_ids or []))))
+        params.extend([json.dumps(evidence_ids), json.dumps(escalation_ids)])
     return (" WHERE " + " AND ".join(where)) if where else "", params
 
 
@@ -696,28 +693,49 @@ def scrub_public(value: Any) -> Any:
     return value
 
 
+def _public_texts(value: Any) -> Iterator[str]:
+    """Every decoded key and scalar of a scrubbed value, as plain text (no JSON escaping)."""
+    if isinstance(value, Mapping):
+        for k, v in value.items():
+            yield str(k)
+            yield from _public_texts(v)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            yield from _public_texts(v)
+    elif value is not None:
+        yield str(value)
+
+
 def _public_match(row: sqlite3.Row, needle: str) -> bool:
-    """``needle`` occurs in the row's public (scrubbed) text, so redacted content is never searchable."""
+    """Case-folded ``needle`` occurs in the row's decoded public (scrubbed) text; redacted content never matches."""
     for col in _SEARCH_COLUMNS:
         raw = row[col]
         if col == "evidence_json":
             try:
-                evidence = json.loads(raw or "{}")
+                value: Any = json.loads(raw or "{}")
             except ValueError:
-                evidence = {}
-            text = json.dumps(scrub_public(evidence), sort_keys=True, default=str)
+                value = {}
         else:
-            text = scrub_public(str(raw or ""))
-        if needle in text.lower():
+            value = str(raw or "")
+        if any(needle in text.casefold() for text in _public_texts(scrub_public(value))):
             return True
     return False
 
 
 def _attention_ids(
     *, tenant: Optional[str], repo: Optional[str], phase: Optional[str], card_id: Optional[str], path: Path
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
+    """Audit-flagged row ids: ``(evidence findings, unclosed escalations)``.
+
+    Unclosed escalations stay separate because a routine poll's ``blocked`` is a wait, not an escalation.
+    """
     audit = audit_trail_evidence(tenant=tenant, repo=repo, phase=phase, card_id=card_id, db_path=path)
-    return [str(f["decision_id"]) for f in audit.get("findings") or [] if f.get("decision_id")]
+    evidence: set[str] = set()
+    escalations: set[str] = set()
+    for f in audit.get("findings") or []:
+        if f.get("decision_id"):
+            (escalations if f.get("kind") == "unclosed_escalation" else evidence).add(str(f["decision_id"]))
+    return sorted(evidence), sorted(escalations)
 
 
 def _query_trail_ro(path: Path) -> sqlite3.Connection:
@@ -763,7 +781,7 @@ def query_decisions(
         include_superseded=include_superseded, attention_ids=ids,
     )
     cap = _clamp_limit(limit)
-    needle = q.strip().lower() if isinstance(q, str) else ""
+    needle = q.strip().casefold() if isinstance(q, str) else ""
     with closing(_query_trail_ro(path)) as conn:
         if not needle:
             rows = conn.execute(
@@ -825,7 +843,7 @@ def summarize_trail(
         tenant=tenant, repo=repo, phase=phase, card_id=card_id, since=since, alias="d", actor=actor, q=q,
         signal=signal, include_superseded=include_superseded, attention_ids=ids,
     )
-    needle = q.strip().lower() if isinstance(q, str) else ""
+    needle = q.strip().casefold() if isinstance(q, str) else ""
     with closing(_query_trail_ro(path)) as conn:
         rows = conn.execute(
             f"""

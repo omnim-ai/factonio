@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import importlib
 import json
 import os
@@ -444,20 +445,73 @@ def log_human_decision(payload: Any = Body(None), profile: Optional[str] = Query
 
 _REPORT_NAME = "investigation.md"
 _REPORT_MAX_BYTES = 256 * 1024
+# Absolute OS paths (POSIX system roots, Windows drive paths); relative repo paths and URLs never match.
+_ABS_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_:/])(?:/(?:home|Users|root|tmp|var|etc|opt|srv|mnt|private|Volumes|proc|sys|dev|run|usr)"
+    r"/[^\s`'\"<>)\]]+|[A-Za-z]:\\[^\s`'\"<>)\]]+)"
+)
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+_FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
 
 
-def _runs_root() -> Path:
-    return _config.get_root_hermes_home_path() / "plugin-data" / _config.PLUGIN_ID / "runs"
+def _trim_utf8_bytes(value: str | bytes, max_bytes: int = _REPORT_MAX_BYTES) -> tuple[str, bool]:
+    """Cut to at most ``max_bytes`` of UTF-8 on a character boundary; returns ``(text, trimmed)``.
+
+    A multi-byte sequence split by the cut is dropped, never turned into U+FFFD.
+    """
+    raw = value.encode("utf-8") if isinstance(value, str) else value
+    trimmed = len(raw) > max_bytes
+    text = codecs.getincrementaldecoder("utf-8")("replace").decode(raw[:max_bytes], final=not trimmed)
+    return text, trimmed
 
 
 def _redact_report(text: str) -> tuple[str, bool]:
-    """Withhold every line naming holdout; if a reference still spans lines, withhold the whole report."""
+    """Withhold every line naming holdout (the whole report if a reference spans lines), then absolute paths."""
     lines = text.split("\n")
     kept = ["[redacted]" if _trail.contains_holdout_reference(line) else line for line in lines]
     out = "\n".join(kept)
     if _trail.contains_holdout_reference(out):
         return "[redacted]", True
-    return out, kept != lines
+    out, paths = _ABS_PATH_RE.subn("[REDACTED]", out)
+    return out, kept != lines or paths > 0
+
+
+def _read_confined_report(tenant_dir: str) -> Optional[tuple[bytes, os.stat_result]]:
+    """Read ``<hermes_home>/plugin-data/factonio/runs/<tenant>/investigation.md`` through pinned dir fds.
+
+    No component below the Hermes home may be a symlink or change identity mid-walk (``403``); a
+    missing component returns ``None``. Every descriptor is closed before returning.
+    """
+    forbidden = HTTPException(status_code=403, detail="The investigation report is not a regular file.")
+    parts = ("plugin-data", _config.PLUGIN_ID, "runs", tenant_dir)
+    fds: list[int] = []
+    try:
+        try:
+            fds.append(os.open(_config.get_root_hermes_home_path(), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)))
+            for name in parts:
+                fds.append(os.open(name, _DIR_FLAGS, dir_fd=fds[-1]))
+            fds.append(os.open(_REPORT_NAME, _FILE_FLAGS, dir_fd=fds[-1]))
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise forbidden from exc
+        st = os.fstat(fds[-1])
+        if not stat.S_ISREG(st.st_mode):
+            raise forbidden
+        # Re-check every pinned component still names the opened inode (no swap during the walk).
+        for parent, name, fd in zip(fds, (*parts, _REPORT_NAME), fds[1:]):
+            try:
+                now = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except OSError as exc:
+                raise forbidden from exc
+            pinned = os.fstat(fd)
+            if (now.st_dev, now.st_ino) != (pinned.st_dev, pinned.st_ino):
+                raise forbidden
+        with os.fdopen(fds.pop(), "rb") as fh:
+            return fh.read(_REPORT_MAX_BYTES + 1), st
+    finally:
+        for fd in fds:
+            os.close(fd)
 
 
 @router.get("/workstreams/{tenant}/report")
@@ -468,39 +522,23 @@ def workstream_report(tenant: str, profile: Optional[str] = Query(None)):
         "ok": True, "exists": False, "tenant": tenant, "filename": _REPORT_NAME, "content": None,
         "updated_at": None, "size_bytes": 0, "truncated": False, "redacted": False,
     }
-    run_dir = _runs_root() / safe
-    report = run_dir / _REPORT_NAME
-    forbidden = HTTPException(status_code=403, detail="The investigation report is not a regular file.")
-    for path, want_dir in ((run_dir, True), (report, False)):
-        try:
-            st = os.lstat(path)
-        except FileNotFoundError:
-            return result
-        except OSError as exc:
-            raise forbidden from exc
-        if stat.S_ISLNK(st.st_mode) or not (stat.S_ISDIR(st.st_mode) if want_dir else stat.S_ISREG(st.st_mode)):
-            raise forbidden
-    try:
-        fd = os.open(report, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
-    except FileNotFoundError:
+    read = _read_confined_report(safe)
+    if read is None:
         return result
-    except OSError as exc:
-        raise forbidden from exc
-    with os.fdopen(fd, "rb") as fh:
-        st = os.fstat(fh.fileno())
-        if not stat.S_ISREG(st.st_mode):
-            raise forbidden
-        data = fh.read(_REPORT_MAX_BYTES + 1)
+    data, st = read
     if b"\x00" in data:
         raise _unprocessable("The investigation report contains binary (NUL) data.")
-    truncated = len(data) > _REPORT_MAX_BYTES
-    content, redacted = _redact_report(data[:_REPORT_MAX_BYTES].decode("utf-8", errors="replace"))
+    text, truncated = _trim_utf8_bytes(data)
+    content, redacted = _redact_report(text)
+    content, trimmed = _trim_utf8_bytes(content)
+    if trimmed and _trail.contains_holdout_reference(content):
+        content = "[redacted]"
     result.update(
         exists=True,
         content=content,
         updated_at=datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z"),
         size_bytes=int(st.st_size),
-        truncated=truncated,
+        truncated=truncated or trimmed,
         redacted=redacted,
     )
     return result
@@ -527,7 +565,11 @@ def audit_repo_harness(slug: str, payload: Any = Body(None), profile: Optional[s
     try:
         audit = _harness.audit_harness(repo_slug, base_ref=base_ref)
     except ValueError as exc:
-        raise _unprocessable(_scrub_public(str(exc).replace(str(path), "<checkout>"))) from exc
+        message = str(exc)
+        aliases = {path, str(Path(path).expanduser()), str(Path(path).expanduser().resolve())}
+        for alias in sorted(aliases, key=len, reverse=True):
+            message = message.replace(alias, "<checkout>")
+        raise _unprocessable(_scrub_public(message)) from exc
     out = {k: v for k, v in audit.items() if k != "repo_path"}
     classification = out.get("drift_classification") or {}
     _trail.record_transition(
@@ -606,7 +648,11 @@ def publish_pr_route(payload: Any = Body(None), profile: Optional[str] = Query(N
             result="refused",
         )
         raise HTTPException(
-            status_code=409, detail=_scrub_public({"error": refusal, "refused": True, "verification": verification})
+            status_code=409,
+            detail=_scrub_public({
+                "ok": False, "published": False, "pushed": False, "created": False, "refused": True,
+                "error": refusal, "verification": verification,
+            }),
         )
     res = _repos.publish_pr(
         full_repo, str(branch), expected_head_sha=sha, title=str(title), body=pr_body,

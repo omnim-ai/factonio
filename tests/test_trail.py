@@ -1329,6 +1329,55 @@ class TestTrailSignalFilters(unittest.TestCase):
                     self.assertNotIn("holdout", r.text.lower())
             self.assertEqual(search("c1"), [rows["secret"]["id"]], "unredacted evidence stays searchable")
 
+    def test_attention_is_not_drowned_by_routine_gate_polls(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            escape = trail.log_decision("escape", tenant="w", phase="escape", card_id="t_e", why="bug escaped",
+                                        evidence={"pr_number": 3}, result="escalated")
+            weak = trail.log_decision("verify_verdict", tenant="w", phase="verify", card_id="t_v", why="looked fine",
+                                      evidence={"note": "eyeballed"}, result="pass")
+            blocked = trail.log_decision("spawn_implement", tenant="w", phase="implement", card_id="t_b",
+                                         why="needs creds", evidence={"pr_number": 4}, result="blocked")
+            for i in range(60):
+                trail.log_decision("pr_gate", tenant="w", phase="gate", why=f"CI pending {i}",
+                                   evidence={"pr_number": 7, "poll": i}, result="blocked")
+            client = _trail_api("factonio_test_trail_attention_drown")
+            body = client.get("/api/plugins/factonio/trail?signal=attention&limit=50").json()
+            got = [d["id"] for d in body["decisions"]]
+            self.assertEqual(set(got), {escape["id"], weak["id"], blocked["id"]})
+            self.assertEqual(body["summary"]["total"], 3)
+            self.assertFalse([d for d in body["decisions"] if d["decision"] == "pr_gate"])
+            key = client.get("/api/plugins/factonio/trail?signal=key&limit=50").json()
+            self.assertEqual(key["summary"]["total"], 3)
+
+    def test_keyword_search_is_unicode_casefolded_on_decoded_evidence(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            upper = trail.log_decision("note", tenant="w", phase="define", why="CAF\u00c9 opened", evidence={"k": 1})
+            cafe = trail.log_decision("note", tenant="w", phase="define", why="x", evidence={"note": "caf\u00e9"})
+            quoted = trail.log_decision("note", tenant="w", phase="define", why="y",
+                                        evidence={"note": 'alpha"beta', "path": "a\\b", "nested": [{"Stra\u00dfe": True}]})
+            trail.log_decision("note", tenant="w", phase="define", why="z", evidence={"holdout_note": "zebra-secret",
+                                                                                     "x": "see holdout/s.md quokka"})
+            client = _trail_api("factonio_test_trail_unicode_q")
+
+            def search(q: str) -> tuple[set[str], int]:
+                r = client.get("/api/plugins/factonio/trail", params={"q": q})
+                self.assertEqual(r.status_code, 200, r.text)
+                return {d["id"] for d in r.json()["decisions"]}, r.json()["summary"]["total"]
+
+            self.assertEqual(search("caf\u00e9"), ({upper["id"], cafe["id"]}, 2))
+            self.assertEqual(search("CAF\u00c9"), ({upper["id"], cafe["id"]}, 2))
+            self.assertEqual(search('alpha"beta'), ({quoted["id"]}, 1))
+            self.assertEqual(search("a\\b"), ({quoted["id"]}, 1))
+            self.assertEqual(search("strasse"), ({quoted["id"]}, 1), "casefold matches decoded evidence keys")
+            self.assertEqual(search("\\u00e9"), (set(), 0), "raw JSON escapes are not searchable text")
+            for probe in ("zebra-secret", "quokka", "holdout_note"):
+                with self.subTest(probe=probe):
+                    self.assertEqual(search(probe), (set(), 0))
+
     def test_non_finite_evidence_is_json_safe(self):
         from factonio import trail
 
