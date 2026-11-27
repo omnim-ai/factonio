@@ -822,7 +822,7 @@ def _copy_tracked_checkout(src: Path, dest: Path) -> Path:
 class TestRepoDogfoodHarness(unittest.TestCase):
     """The committed `.factonio/` harness for this repository stays valid, complete, and drift-free."""
 
-    REQUIRED_HOOKS = ("compileall", "ruff-static", "desktop-syntax", "repo-integrity")
+    REQUIRED_HOOKS = ("compileall", "ruff-static", "desktop-syntax", "repo-integrity", "skill-bloat")
 
     def _manifest(self) -> dict[str, Any]:
         path = PLUGIN_ROOT / ".factonio" / "harness.json"
@@ -841,6 +841,8 @@ class TestRepoDogfoodHarness(unittest.TestCase):
         for name in self.REQUIRED_HOOKS:
             self.assertEqual(hooks[name]["kind"], "invariant")
             self.assertFalse(hooks[name]["optional"])
+        self.assertEqual(hooks["skill-bloat"]["command"], "python3 tools/eval_skills.py bloat skills --fail-on-over-budget")
+        self.assertEqual(hooks["skill-bloat"]["covers"], ["skills/*/SKILL.md"])
         drive = "\n".join(manifest["phases"]["drive"])
         for needle in ("mktemp -d", 'ln -s "$PWD" "$d/factonio"', "env -u HERMES_DELEGATED_CHILD_CONTEXT",
                        "python3 -m unittest discover -s tests"):

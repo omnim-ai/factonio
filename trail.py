@@ -244,7 +244,7 @@ def trail_db_path() -> Path:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return _iso(datetime.now(timezone.utc))
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -1175,7 +1175,12 @@ _SNAPSHOT_TEXT_MAX = 200
 
 
 def _iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    # Explicit padding: strftime("%Y") drops leading zeros for years < 1000 on some platforms.
+    utc = dt.astimezone(timezone.utc)
+    return (
+        f"{utc.year:04d}-{utc.month:02d}-{utc.day:02d}"
+        f"T{utc.hour:02d}:{utc.minute:02d}:{utc.second:02d}.{utc.microsecond:06d}Z"
+    )
 
 
 def _parse_iso(value: str) -> datetime:

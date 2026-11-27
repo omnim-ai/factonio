@@ -293,6 +293,7 @@ def _judge_body(
         )
         canonical = f"`{canonical_spec}` (and the merged hidden scenarios under `{canonical_holdout}`, never referenced or quoted inside `spec.md`)"
         skill = "factonio:define"
+        switcher = ""
         barrier = ""
         canonical_path = str(canonical_spec)
     else:
@@ -300,7 +301,13 @@ def _judge_body(
             f"- Spec: `{canonical_spec}`\n- Canonical design output directory: `{canonical_design}`\n"
             f"- Design provider: `hermes` (pure-Hermes synthesis on this judge's own model)\n"
         )
-        canonical = f"`{canonical_design}/DESIGN.md` plus the grafted static HTML previews and screenshots under `{canonical_design}`"
+        canonical = f"`{canonical_design}/DESIGN.md` (with rendered screenshots under `{canonical_design}`)"
+        switcher = (
+            f"   - Emit `{canonical_design}/preview.html` as ONE self-contained zero-build static HTML variant switcher "
+            f"(pure HTML/CSS with inline vanilla JS; no external assets, CDN, or build step) that lets the reviewer "
+            f"toggle between every competing candidate (Candidate A / Candidate B / ..., labeled by slot and vendor), "
+            f"the grafted Synthesis, and a side-by-side comparison in one view, alongside `DESIGN.md`.\n"
+        )
         skill = "factonio:design"
         barrier = (
             f"## Information Barrier\n"
@@ -327,6 +334,7 @@ def _judge_body(
         f"reconcile conflicts explicitly instead of averaging them.\n"
         f"4. Write {canonical}, ending with an `## Arena Synthesis` section that lists each candidate's strengths "
         f"and risks and which candidate every grafted section came from.\n"
+        f"{switcher}"
         f"5. Log the outcome with `factonio_log_decision` (decision `arena_synthesis`, phase `{target}`, tenant "
         f"`{tenant}`, result `synthesized`, evidence: `arena_id`, `candidates`, `grafted_from`, `strengths`, "
         f"`risks`, `canonical_path`).\n"

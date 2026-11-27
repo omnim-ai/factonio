@@ -506,6 +506,71 @@ class TestBundledSkillRigorAndAttribution(unittest.TestCase):
             "OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.",
         ), "THIRD_PARTY_NOTICES.md")
 
+    def test_agents_md_rule_to_enforcer_ledger(self):
+        from factonio import RETRO_BLUEPRINT_PROMPT
+
+        header = "| Rule | Enforcer | Rung | Occurrences | Last seen |"
+        # The retro blueprint reads exactly these columns.
+        self.assertIn(header.strip("| "), RETRO_BLUEPRINT_PROMPT)
+        text = self._read("AGENTS.md")
+        ledger = text.split("## Rule-to-Enforcer Ledger", 1)[1].split("\n## ", 1)[0]
+        self.assertIn(header, ledger)
+        rows = {}
+        for line in ledger.splitlines():
+            if not line.startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if len(cells) == 5 and cells[0] not in ("Rule", "---"):
+                rows[cells[0]] = cells[1:]
+        self.assertEqual(len(rows), 7, rows)
+
+        def row(prefix: str) -> list[str]:
+            return next(v for k, v in rows.items() if k.startswith(prefix))
+
+        self.assertTrue(any(k.startswith("Zero-build ESM") and "`desktop/plugin.js`" in k for k in rows))
+        self.assertIn("node --check desktop/plugin.js", row("Zero-build ESM")[0])
+        self.assertIn("README media freshness", row("README media freshness")[0])
+        self.assertIn("`tools/check_repo_integrity.py`", row("`plugin.yaml`")[0])
+        self.assertIn("Architecture", row("`holdout/`")[1])
+        self.assertIn("isolated_hermes_home()", row("Isolated `HERMES_HOME`")[0])
+        self.assertEqual(row("Bundled skill bloat budget")[1], "Harness")
+        self.assertIn("`skill-bloat`", row("Bundled skill bloat budget")[0])
+        self.assertEqual(row("Wave 5 simplicity rule")[1:], ["Prose", "1", "2026-11-26"])
+
+    def test_orchestrator_skill_within_bloat_budget_with_reference_offload(self):
+        from factonio.eval_skills import measure_skill_bloat
+
+        res = measure_skill_bloat(PLUGIN_ROOT / "skills" / "orchestrator" / "SKILL.md")
+        self.assertLess(res["estimated_tokens"], 4500)
+        self.assertNotEqual(res["status"], "over_budget")
+        text = self._read("skills/orchestrator/SKILL.md")
+        self.assertIn('skill_view(name="factonio:orchestrator", file_path="references/workflow-reference.md")', text)
+        self.assertTrue((PLUGIN_ROOT / "skills" / "orchestrator" / "references" / "workflow-reference.md").is_file())
+
+    def test_design_skill_arena_judge_multi_variant_switcher(self):
+        from factonio.eval_skills import measure_skill_bloat
+
+        text = self._read("skills/design/SKILL.md")
+        heading = "### 2b. Arena Judge Mode (Multi-Variant HTML Switcher)"
+        self.assertLess(text.index("### 2. Run the Configured Design Provider"), text.index(heading))
+        self.assertLess(text.index(heading), text.index("### 3. Verify Rendered Output"))
+        section = text.split(heading, 1)[1].split("\n### ", 1)[0]
+        self._assert_all_in(section, (
+            "`role=judge`, `target=design`",
+            "without `holdout/` access",
+            "`<design_dir>/DESIGN.md`",
+            "`## Arena Synthesis`",
+            "self-contained zero-build static `<design_dir>/preview.html` multi-variant switcher",
+            "no external CDN",
+            "Candidate A / Candidate B / ... / Synthesis",
+            "side-by-side comparison",
+            "`browser_exec` + `vision_analyze`",
+        ), "design arena judge mode")
+        self.assertNotIn("/holdout", section)
+        self.assertIn("Never search for, open, or reference any `holdout/` directory", text)
+        res = measure_skill_bloat(PLUGIN_ROOT / "skills" / "design" / "SKILL.md")
+        self.assertLess(res["estimated_tokens"], 3000)
+
 
 if __name__ == "__main__":
     unittest.main()

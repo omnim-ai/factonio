@@ -1167,5 +1167,39 @@ class TestAttribution(unittest.TestCase):
             self.assertIn(clause, notices)
 
 
+class TestIsoFormatting(unittest.TestCase):
+    """`_iso` pads years to 4 digits on every Python/platform (strftime("%Y") does not)."""
+
+    def test_iso_pads_sub_1000_years_and_converts_offsets(self):
+        from datetime import datetime, timedelta, timezone
+
+        from factonio import trail
+
+        cases = [
+            (datetime(1, 1, 1, 5, 30, 0, 123, tzinfo=timezone(timedelta(hours=2))), "0001-01-01T03:30:00.000123Z"),
+            (datetime(42, 7, 4, 12, 34, 56, 789, tzinfo=timezone.utc), "0042-07-04T12:34:56.000789Z"),
+            (datetime(999, 12, 31, 23, 59, 59, 999999, tzinfo=timezone.utc), "0999-12-31T23:59:59.999999Z"),
+            (datetime(2026, 11, 26, 23, 30, tzinfo=timezone(timedelta(hours=-5))), "2026-11-27T04:30:00.000000Z"),
+        ]
+        for dt, expected in cases:
+            self.assertEqual(trail._iso(dt), expected)
+            self.assertEqual(trail.resolve_since(expected), expected)
+
+    def test_resolve_since_normalizes_sub_1000_year_inputs(self):
+        from factonio import trail
+
+        self.assertEqual(trail.resolve_since("0042-07-04T14:34:56.000789+02:00"), "0042-07-04T12:34:56.000789Z")
+        self.assertEqual(trail.resolve_since("0999-12-31"), "0999-12-31T00:00:00.000000Z")
+
+    def test_now_iso_is_4_digit_utc_microseconds(self):
+        import re
+
+        from factonio import trail
+
+        stamp = trail._now_iso()
+        self.assertRegex(stamp, re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$"))
+        self.assertEqual(trail._iso(trail._parse_iso(stamp)), stamp)
+
+
 if __name__ == "__main__":
     unittest.main()
