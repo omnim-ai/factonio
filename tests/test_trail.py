@@ -652,7 +652,7 @@ class TestTrailCliAndApi(unittest.TestCase):
             scoped = client.get("/api/plugins/factonio/metrics?tenant=other-i1").json()["trail"]
             self.assertEqual((scoped["decision_count"], scoped["by_tenant"]), (1, {"other-i1": 1}))
             cards = client.get("/api/plugins/factonio/cards").json()
-            self.assertEqual(set(cards), {"cards", "counts"})
+            self.assertEqual(set(cards), {"cards", "counts", "workstreams", "arenas"})
 
     def test_unreadable_trail_db_does_not_break_metrics(self):
         from factonio import trail

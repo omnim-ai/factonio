@@ -33,7 +33,7 @@ try:
 except ImportError:  # non-POSIX: fall back to the in-process lock plus retry
     fcntl = None  # type: ignore[assignment]
 
-from .config import PLUGIN_ID, get_root_hermes_home_path
+from .config import PLUGIN_ID, WORKSTREAM_KINDS, get_root_hermes_home_path
 
 logger = logging.getLogger("factonio.trail")
 
@@ -899,6 +899,42 @@ def _open_trail_ro(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=_BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def workstream_modes_from_trail(tenants: Iterable[str], *, db_path: Optional[Path] = None) -> dict[str, dict[str, Any]]:
+    """``{tenant: {kind, read_only}}`` from each tenant's newest valid ``start_workstream`` row.
+
+    Strictly read-only: an absent, non-regular or unreadable `trail.db` yields ``{}`` and is never
+    created or migrated. Rows whose evidence ``kind`` is not a known workstream kind are skipped.
+    """
+    wanted = sorted({str(t) for t in tenants if t})
+    path = Path(db_path) if db_path is not None else trail_db_path()
+    if not wanted or not path.is_file():
+        return {}
+    modes: dict[str, dict[str, Any]] = {}
+    try:
+        with closing(_open_trail_ro(path)) as conn:
+            rows = conn.execute(
+                "SELECT tenant, evidence_json FROM decisions WHERE decision = 'start_workstream' "
+                f"AND tenant IN ({','.join('?' for _ in wanted)}) ORDER BY ts DESC, rowid DESC",
+                wanted,
+            ).fetchall()
+    except (sqlite3.Error, OSError):
+        return {}
+    for row in rows:
+        tenant = str(row["tenant"])
+        if tenant in modes:
+            continue
+        try:
+            ev = json.loads(row["evidence_json"] or "{}")
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        kind = str(ev.get("kind") or "").strip().lower()
+        if kind in WORKSTREAM_KINDS:
+            modes[tenant] = {"kind": kind, "read_only": bool(ev.get("read_only")) or kind == "investigate"}
+    return modes
 
 
 def audit_trail_evidence(

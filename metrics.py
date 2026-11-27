@@ -13,13 +13,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-from .config import WORKER_PROFILE, get_root_hermes_home_path
+from .config import PLUGIN_ID, WORKER_PROFILE, WORKSTREAM_KINDS, get_root_hermes_home_path
 from .trail import (
     BEST_EFFORT_BUDGET_S,
     best_effort,
+    contains_holdout_reference,
     record_metric_snapshot,
     summarize_metric_snapshots,
     summarize_trail,
+    workstream_modes_from_trail,
 )
 
 logger = logging.getLogger("factonio.metrics")
@@ -45,6 +47,21 @@ _VERIFY_PHASES = frozenset({"verify-diff", "verify-blackbox"})
 _PANEL_TAG_RE = re.compile(r"Verification panel: `(vp_[a-z0-9]+)` \(rigor=`([^`\n]+)`, vendor=`([^`\n]+)`")
 _PANEL_MODEL_RE = re.compile(r", model=`([^\n]*)`\)")
 _PASS_VERDICTS = frozenset({"pass"})
+# Arena identity is parsed independently of the free-form `model=` tail (see `_PANEL_TAG_RE`).
+_ARENA_TAG_RE = re.compile(
+    r"- Arena: `(ar_[0-9a-f]{6,32})` \(role=`([^`\n]+)`, target=`([^`\n]+)`(?:, slot=`([^`\n]+)`)?, vendor=`([^`\n]+)`"
+)
+_ARENA_ROLES: tuple[str, ...] = ("candidate", "judge")
+_MODE_LINE_RE = re.compile(r"^- Mode: `([a-z]+)`$", re.MULTILINE)
+_REPORT_LINE_RE = re.compile(r"^- Investigation report path: `([^`\n]+)`$", re.MULTILINE)
+# Mode contract headings stamped by `orchestrator.mode_contract_section` (incl. skip_define cards).
+_MODE_HEADINGS: tuple[tuple[str, str], ...] = (
+    ("## Investigation Contract (read-only)", "investigate"),
+    ("## Refactor Contract (behavior preservation)", "refactor"),
+    ("## Behavior-Preservation Contract (refactor)", "refactor"),
+    ("## Performance Contract (benchmark-checklist)", "perf"),
+)
+_SAFE_TENANT_RE = re.compile(r"[^a-z0-9-]+")
 # Orchestrator-written stamp of an unpublished local-branch verification target (spawn_verification_pair).
 _LOCAL_TARGET_RE = re.compile(
     r"^- Local branch target: `([^`\n]+)` \(base=`([^`\n]+)`, head=`([0-9a-f]{40}|[0-9a-f]{64})`\)$", re.MULTILINE
@@ -204,6 +221,87 @@ def parse_panel_tag(body: Any) -> Optional[dict[str, str]]:
         "vendor": m.group(3),
         "model": model.group(1) if model else None,
     }
+
+
+def parse_arena_tag(body: Any) -> Optional[dict[str, Optional[str]]]:
+    """Parse the ``- Arena: `ar_...` (role=..., target=..., [slot=...,] vendor=..., model=...)`` card stamp."""
+    text = str(body or "")
+    m = _ARENA_TAG_RE.search(text)
+    if not m:
+        return None
+    from .arena import ARENA_TARGETS  # lazy: arena imports orchestrator, which imports this module
+
+    model = _PANEL_MODEL_RE.match(text, m.end())
+    tag = {
+        "arena_id": m.group(1),
+        "role": m.group(2) if m.group(2) in _ARENA_ROLES else None,
+        "target": m.group(3) if m.group(3) in ARENA_TARGETS else None,
+        "slot": m.group(4),
+        "vendor": m.group(5),
+        "model": model.group(1) if model else None,
+    }
+    # Card bodies are free text: fail closed on any stamp field that names holdout.
+    return {k: None if v is None or contains_holdout_reference(v) else v for k, v in tag.items()}
+
+
+def parse_workstream_mode(task: Mapping[str, Any], runs: Optional[list[dict[str, Any]]] = None) -> Optional[dict[str, Any]]:
+    """``{kind, report_path}`` stamped on a workstream card, or ``None`` for cards without mode data.
+
+    Sources, in order: the ``- Mode:`` header line, the ``[define] [investigate]`` title tag, then a
+    mode contract heading. ``report_path`` is only set for ``investigate``: the
+    ``- Investigation report path:`` line, else the latest run's ``metadata.report_path``.
+    """
+    body = str(task.get("body") or "")
+    kind: Optional[str] = None
+    m = _MODE_LINE_RE.search(body)
+    if m and m.group(1) in WORKSTREAM_KINDS:
+        kind = m.group(1)
+    elif "[define] [investigate]" in str(task.get("title") or "").lower():
+        kind = "investigate"
+    else:
+        lines = {line.rstrip() for line in body.splitlines()}
+        kind = next((k for heading, k in _MODE_HEADINGS if heading in lines), None)
+    if kind is None:
+        return None
+    report_path: Optional[str] = None
+    if kind == "investigate":
+        rm = _REPORT_LINE_RE.search(body)
+        if rm:
+            report_path = rm.group(1).strip()
+        elif runs:
+            meta_path = _parse_json_dict(runs[-1].get("metadata")).get("report_path")
+            report_path = meta_path.strip() if isinstance(meta_path, str) and meta_path.strip() else None
+    return {"kind": kind, "report_path": report_path}
+
+
+def _report_exists(path: str) -> bool:
+    try:
+        p = Path(path)
+        return p.is_file() and p.stat().st_size > 0
+    except (OSError, ValueError):
+        return False
+
+
+def _resolve_workstreams(
+    tenants: list[str], card_modes: Mapping[str, dict[str, Any]], *, trail_db: Optional[Path] = None
+) -> dict[str, dict[str, Any]]:
+    """``{tenant: {kind, read_only, report_path, report_exists}}``; strictly read-only (never mkdir)."""
+    trail_modes = workstream_modes_from_trail(tenants, db_path=trail_db)
+    runs_root = get_root_hermes_home_path() / "plugin-data" / PLUGIN_ID / "runs"
+    out: dict[str, dict[str, Any]] = {}
+    for tenant in tenants:
+        card = card_modes.get(tenant) or {}
+        kind = (trail_modes.get(tenant) or {}).get("kind") or card.get("kind")
+        entry: dict[str, Any] = {"kind": kind, "read_only": False, "report_path": None, "report_exists": False}
+        if kind == "investigate":
+            safe = _SAFE_TENANT_RE.sub("-", tenant.lower()).strip("-") or "default"
+            path = card.get("report_path") or str(runs_root / safe / "investigation.md")
+            entry["read_only"] = True
+            if not contains_holdout_reference(path):
+                entry["report_path"] = path
+                entry["report_exists"] = _report_exists(path)
+        out[tenant] = entry
+    return out
 
 
 def _known_vendor(vendor: Any) -> Optional[str]:
@@ -965,11 +1063,47 @@ def thread_cards(
     tenant: Optional[str] = None,
     assignee: str = WORKER_PROFILE,
     limit: int = 100,
+    trail_db: Optional[Path] = None,
 ) -> dict[str, Any]:
-    """Return Factonio Kanban cards for a chat session (or all active cards if omitted)."""
+    """Return Factonio Kanban cards for a chat session (or all active cards if omitted).
+
+    Additive read-only context: ``workstreams`` (mode per in-scope tenant, plus an explicitly queried
+    ``tenant``) and ``arenas`` (Dashboard-safe `/arena` summaries for the same tenants, newest first).
+    """
+    result, card_modes = _thread_card_rows(db_path, session_id=session_id, tenant=tenant, assignee=assignee, limit=limit)
+    tenants = sorted({str(c["tenant"]) for c in result["cards"] if c.get("tenant")} | ({tenant} if tenant else set()))
+    workstreams = _resolve_workstreams(tenants, card_modes, trail_db=trail_db)
+    for card in result["cards"]:
+        card["workstream_kind"] = (workstreams.get(str(card.get("tenant") or "")) or {}).get("kind")
+    result["workstreams"] = workstreams
+    result["arenas"] = _arena_summaries(tenants, db_path)
+    return result
+
+
+def _arena_summaries(tenants: list[str], db_path: Path) -> list[dict[str, Any]]:
+    if not tenants:
+        return []
+    from .arena import list_arena_summaries  # lazy: arena imports orchestrator, which imports this module
+
+    try:
+        return list_arena_summaries(tenants=tenants, db_path=db_path)
+    except (sqlite3.Error, OSError, ValueError):
+        return []
+
+
+def _thread_card_rows(
+    db_path: Path,
+    *,
+    session_id: Optional[str],
+    tenant: Optional[str],
+    assignee: str,
+    limit: int,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """``({cards, counts}, {tenant: card-stamped mode})`` from a read-only `kanban.db` connection."""
+    empty: tuple[dict[str, Any], dict[str, dict[str, Any]]] = ({"cards": [], "counts": _empty_counts()}, {})
     conn = _open_ro(db_path)
     if conn is None:
-        return {"cards": [], "counts": _empty_counts()}
+        return empty
 
     try:
         with closing(conn):
@@ -1060,7 +1194,15 @@ def thread_cards(
 
             counts = _empty_counts()
             cards: list[dict[str, Any]] = []
+            card_modes: dict[str, dict[str, Any]] = {}
             now_ts = time.time()
+            # Oldest first, so a workstream's root card stamps its mode before any follow-up card.
+            for r in reversed(rows):
+                mode = parse_workstream_mode(r, runs_by_task.get(r["id"], [])) if r.get("tenant") else None
+                if mode is not None:
+                    tenant_modes = card_modes.setdefault(str(r["tenant"]), {"kind": mode["kind"], "report_path": None})
+                    if tenant_modes["kind"] == mode["kind"] and not tenant_modes["report_path"]:
+                        tenant_modes["report_path"] = mode["report_path"]
             for r in rows:
                 st = str(r.get("status") or "")
                 if st in counts:
@@ -1075,6 +1217,7 @@ def thread_cards(
                 phase = classify_phase(r)
                 verdict = _card_verdict(phase, st, runs)
                 panel_tag = parse_panel_tag(r.get("body")) if phase in _VERIFY_PHASES else None
+                arena_tag = parse_arena_tag(r.get("body"))
                 pr_ref, local_target = _card_targets(r, runs)
                 if verdict in _REJECT_VERDICTS:
                     counts["rejected"] += 1
@@ -1106,11 +1249,16 @@ def thread_cards(
                     "last_error": _card_last_error(r, st, runs),
                     "panel_id": (panel_tag or {}).get("panel_id"),
                     "panel_vendor": (panel_tag or {}).get("vendor"),
+                    "arena_id": (arena_tag or {}).get("arena_id"),
+                    "arena_role": (arena_tag or {}).get("role"),
+                    "arena_slot": (arena_tag or {}).get("slot"),
+                    "arena_vendor": (arena_tag or {}).get("vendor"),
+                    "arena_target": (arena_tag or {}).get("target"),
                 })
             counts["attention"] = (
                 counts["blocked"] + counts["triage"] + counts["rejected"] + counts["inconclusive"]
             )
             counts["total"] = len(cards)
-            return {"cards": cards, "counts": counts}
+            return {"cards": cards, "counts": counts}, card_modes
     except sqlite3.Error:
-        return {"cards": [], "counts": _empty_counts()}
+        return empty

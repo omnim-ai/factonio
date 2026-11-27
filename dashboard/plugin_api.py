@@ -30,6 +30,7 @@ if _PKG_NAME not in sys.modules:
     # Do not call register(); only bind package namespace so submodules import cleanly.
 
 _config = importlib.import_module(f"{_PKG_NAME}.config")
+_harness = importlib.import_module(f"{_PKG_NAME}.harness")
 _metrics = importlib.import_module(f"{_PKG_NAME}.metrics")
 _profile_setup = importlib.import_module(f"{_PKG_NAME}.profile_setup")
 _repos = importlib.import_module(f"{_PKG_NAME}.repos")
@@ -124,6 +125,7 @@ def _serialize_repo(slug: str, info: dict[str, Any], settings: dict[str, Any]) -
         "effective_default_rigor": _safe_rigor(slug),
         "has_required_checks": bool(info.get("has_required_checks")),
         "models": _config.resolve_all_phase_models(repo_slug=slug),
+        "harness": _harness.summarize_harness_readonly(info.get("path")),
     }
 
 
@@ -226,6 +228,20 @@ def cards(
     return _metrics.thread_cards(_kanban_db(), session_id=session_id, tenant=tenant, limit=limit)
 
 
+def _scrub_public(value: Any) -> Any:
+    """Public trail serializer: drop holdout-named keys and redact any string that references holdout.
+
+    Strings without a holdout reference pass through byte-for-byte, so ordinary rows are unchanged.
+    """
+    if isinstance(value, str):
+        return "[redacted]" if _trail.contains_holdout_reference(value) else value
+    if isinstance(value, dict):
+        return {k: _scrub_public(v) for k, v in value.items() if not _trail.contains_holdout_reference(str(k))}
+    if isinstance(value, (list, tuple)):
+        return [_scrub_public(v) for v in value]
+    return value
+
+
 @router.get("/trail")
 def trail(
     tenant: Optional[str] = Query(None),
@@ -236,7 +252,7 @@ def trail(
     profile: Optional[str] = Query(None),
 ):
     """Append-only decision trail from `trail.db`: `{decisions, summary, filters}`."""
-    return _trail.trail_payload(tenant=tenant, repo=repo, phase=phase, card_id=card_id, limit=limit)
+    return _scrub_public(_trail.trail_payload(tenant=tenant, repo=repo, phase=phase, card_id=card_id, limit=limit))
 
 
 @router.get("/trail/{decision_id}")
@@ -245,7 +261,7 @@ def trail_decision(decision_id: str, profile: Optional[str] = Query(None)):
     row = _trail.get_decision(decision_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"Decision {decision_id!r} not found.")
-    return {"decision": row}
+    return {"decision": _scrub_public(row)}
 
 
 @router.get("/doctor")

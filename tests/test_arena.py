@@ -677,6 +677,163 @@ class TestArenaFixRound2(unittest.TestCase):
                 self.assertEqual(ev["status"], "needs_attention")
 
 
+def _summary_view(ev: dict[str, Any]) -> dict[str, Any]:
+    """The Dashboard-safe projection of an `evaluate_arena` result."""
+    return {
+        "status": ev["status"],
+        "ready_for_synthesis": ev["ready_for_synthesis"],
+        "synthesized": ev["synthesized"],
+        "canonical_artifact_exists": ev["canonical_artifact_exists"],
+        "judge": ev["judge"],
+        "candidates": [{k: c[k] for k in ("slot", "vendor", "model", "task_id", "status", "artifact_ready")}
+                       for c in ev["candidates"]],
+    }
+
+
+def _assert_barrier(case: unittest.TestCase, payload: Any, home: Path) -> None:
+    text = json.dumps(payload)
+    case.assertNotIn("holdout", text.lower())
+    case.assertNotIn(str(home), text)
+    for key in ("holdout_files", "holdout_dir", "manifest_path", "artifact", "canonical_artifact", "path"):
+        case.assertNotIn(f'"{key}"', text)
+
+
+class TestArenaDashboardSummaries(unittest.TestCase):
+    def test_summaries_share_evaluate_state_machine_and_are_read_only(self):
+        from factonio.arena import evaluate_arena, list_arena_summaries
+        from factonio.metrics import thread_cards
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            res = _spawn()
+            tenant, aid = res["tenant"], res["arena_id"]
+            c1, c2 = res["candidates"]
+            (Path(c1["holdout_dir"]) / "scenario-secret.md").write_text("hidden", encoding="utf-8")
+            manifest_before = Path(res["manifest_path"]).read_bytes()
+
+            def check(expected_status: str) -> dict[str, Any]:
+                before = (_db_fingerprint(home), _task_count())
+                summaries = list_arena_summaries(tenants=[tenant], db_path=home / "kanban.db")
+                cards = thread_cards(home / "kanban.db", tenant=tenant)
+                self.assertEqual((_db_fingerprint(home), _task_count()), before)
+                self.assertEqual(Path(res["manifest_path"]).read_bytes(), manifest_before)
+                self.assertEqual(len(summaries), 1)
+                summary = summaries[0]
+                self.assertEqual(cards["arenas"], summaries)
+                ev = evaluate_arena(arena_id=aid)
+                self.assertEqual(summary["status"], expected_status)
+                self.assertEqual({k: summary[k] for k in _summary_view(ev)}, _summary_view(ev))
+                self.assertEqual(
+                    {k: summary[k] for k in ("arena_id", "tenant", "repo", "target", "title")},
+                    {"arena_id": aid, "tenant": tenant, "repo": "acme/svc", "target": "define", "title": "Retry policy"},
+                )
+                self.assertIsInstance(summary["created_at"], int)
+                _assert_barrier(self, cards["arenas"], home)
+                return cards
+
+            cards = check("candidates_in_progress")
+            by_id = {c["id"]: c for c in cards["cards"]}
+            self.assertEqual(
+                {k: by_id[c1["task_id"]][k] for k in ("arena_id", "arena_role", "arena_slot", "arena_vendor", "arena_target")},
+                {"arena_id": aid, "arena_role": "candidate", "arena_slot": "c1-anthropic", "arena_vendor": "anthropic",
+                 "arena_target": "define"},
+            )
+            judge = by_id[res["judge_task_id"]]
+            self.assertEqual((judge["arena_role"], judge["arena_slot"], judge["arena_vendor"]), ("judge", None, "google"))
+
+            Path(c1["spec_path"]).write_text("# A\n", encoding="utf-8")
+            _complete(c1["task_id"], None)
+            _complete(c2["task_id"], None)
+            summary = check("needs_attention")["arenas"][0]
+            self.assertTrue(any("c2-openai" in a and "missing or empty" in a for a in summary["advisories"]))
+            Path(c2["spec_path"]).write_text("# B\n", encoding="utf-8")
+            check("judging")
+            _complete(res["judge_task_id"], None)
+            summary = check("needs_attention")["arenas"][0]
+            self.assertTrue(any("canonical artifact is missing" in a for a in summary["advisories"]))
+            Path(res["canonical"]["spec_path"]).write_text("# Canonical\n", encoding="utf-8")
+            summary = check("synthesized")["arenas"][0]
+            self.assertTrue(summary["synthesized"] and summary["canonical_artifact_exists"])
+
+    def test_single_ro_query_newest_first_and_corrupt_manifests_skipped(self):
+        import sqlite3 as sqlite_mod
+        from unittest import mock
+
+        from factonio import arena
+        from factonio.arena import list_arena_summaries
+
+        with isolated_hermes_home() as home:
+            _register(home)
+            first = _spawn(target="define")
+            second = _spawn(target="design")
+            arena_root = _arena_root(home) / "acme-svc-arena" / "arena"
+            (arena_root / "ar_deadbeef00").mkdir()
+            (arena_root / "ar_deadbeef00" / "manifest.json").write_text("{not json", encoding="utf-8")
+            (arena_root / "ar_abcdef1234").mkdir()
+            (arena_root / "ar_abcdef1234" / "manifest.json").write_text(json.dumps({"arena_id": "ar_0000000000"}),
+                                                                        encoding="utf-8")
+            (arena_root / "ar_aaaaaaaaaa").mkdir()
+            (arena_root / "ar_aaaaaaaaaa" / "manifest.json").write_text(
+                json.dumps({"arena_id": "ar_aaaaaaaaaa", "candidates": 5, "judge": 7}), encoding="utf-8")
+            (arena_root / "not-an-arena").mkdir()
+
+            real_connect = sqlite_mod.connect
+            calls: list[str] = []
+
+            def counting(target: Any, *a: Any, **k: Any):
+                calls.append(str(target))
+                return real_connect(target, *a, **k)
+
+            with mock.patch.object(arena.sqlite3, "connect", counting):
+                out = list_arena_summaries(tenants=["acme-svc-arena", "acme-svc-arena", "", "nobody"],
+                                           db_path=home / "kanban.db")
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0].endswith("?mode=ro"))
+            ids = [s["arena_id"] for s in out]
+            self.assertEqual(ids[:2], [second["arena_id"], first["arena_id"]])
+            self.assertNotIn("ar_deadbeef00", ids)
+            self.assertNotIn("ar_abcdef1234", ids)
+            self.assertNotIn("ar_0000000000", ids)
+            self.assertEqual(out[0]["target"], "design")
+            _assert_barrier(self, out, home)
+
+            self.assertEqual(list_arena_summaries(tenants=[]), [])
+            self.assertEqual(list_arena_summaries(tenants=["nobody"]), [])
+            self.assertFalse((_arena_root(home) / "nobody").exists())
+
+    def test_missing_kanban_db_and_holdout_strings_fail_closed(self):
+        from factonio.arena import list_arena_summaries
+
+        with isolated_hermes_home() as home:
+            arena_dir = _arena_root(home) / "ws-h" / "arena" / "ar_1234567890"
+            arena_dir.mkdir(parents=True)
+            (arena_dir / "manifest.json").write_text(json.dumps({
+                "arena_id": "ar_1234567890",
+                "tenant": "ws-h",
+                "target": "define",
+                "title": "Copy holdout/scenario-1.md into spec",
+                "created_at_ns": 1,
+                "candidates": [
+                    {"slot": "c1-holdout-reader", "vendor": "anthropic", "task_id": "t_gone",
+                     "spec_path": str(arena_dir / "candidates" / "c1" / "spec.md"),
+                     "holdout_dir": str(arena_dir / "candidates" / "c1" / "holdout")},
+                    {"slot": "c2-openai", "vendor": "openai", "task_id": "t_gone2"},
+                ],
+                "judge": {"task_id": "t_judge", "vendor": "google"},
+            }), encoding="utf-8")
+            missing = home / "elsewhere" / "kanban.db"
+            out = list_arena_summaries(tenants=["ws-h"], db_path=missing)
+            self.assertFalse(missing.parent.exists())
+            self.assertEqual(len(out), 1)
+            self.assertEqual(out[0]["status"], "degraded")
+            self.assertIsNone(out[0]["title"])
+            self.assertIn("kanban.db not found", out[0]["advisories"])
+            self.assertTrue(any("c2-openai" in a for a in out[0]["advisories"]))
+            self.assertFalse(any("c1-holdout" in a for a in out[0]["advisories"]))
+            self.assertIsNone(out[0]["candidates"][0]["slot"])
+            _assert_barrier(self, out, home)
+
+
 class TestArenaToolsAndCli(unittest.TestCase):
     def test_tools(self):
         with isolated_hermes_home() as home:

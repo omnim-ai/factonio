@@ -717,5 +717,559 @@ class TestTriStateVerdicts(unittest.TestCase):
             self.assertEqual(r.json()["counts"]["attention"], 5)
 
 
+
+def _load_plugin_api(name: str):
+    spec = importlib.util.spec_from_file_location(name, PLUGIN_ROOT / "dashboard" / "plugin_api.py")
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _client(mod):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    app = FastAPI()
+    app.include_router(mod.router, prefix="/api/plugins/factonio")
+    return TestClient(app)
+
+
+def _seed_mode_cards(db_path: Path, now_ts: float, report: Path) -> None:
+    """Workstream cards stamped the way `orchestrator.start_workstream` stamps them."""
+    from hermes_cli.kanban_db_connect import connect_closing
+
+    from factonio.orchestrator import mode_contract_section
+
+    def task(conn, tid, title, tenant, skill, created, body, status="done"):
+        conn.execute(
+            "INSERT INTO tasks (id, title, assignee, status, tenant, session_id, skills, created_at, body)"
+            " VALUES (?, ?, 'factonio', ?, ?, 'sess_m', ?, ?, ?)",
+            (tid, title, status, tenant, json.dumps([skill]), created, body),
+        )
+
+    with connect_closing(db_path=db_path) as conn:
+        task(conn, "t_legacy", "[define] Old work", "ws-legacy", "factonio:define", now_ts - 900,
+             "## Factonio Definition Card\n- Workstream tenant: `ws-legacy`\n")
+        task(conn, "t_legacy_impl", "[implement] Old impl", "ws-legacy", "factonio:implement", now_ts - 800, "body")
+        task(conn, "t_inv", "[define] [investigate] Why slow", "ws-inv", "factonio:define", now_ts - 700,
+             f"- Mode: `investigate`\n- Investigation report path: `{report}`\n\n" + mode_contract_section(
+                 "investigate", report_path=report))
+        task(conn, "t_inv_tag", "[define] [investigate] Title only", "ws-inv-tag", "factonio:define", now_ts - 650,
+             "No header lines here.\n")
+        task(conn, "t_inv_hold", "[define] [investigate] Leak", "ws-inv-hold", "factonio:define", now_ts - 640,
+             "- Mode: `investigate`\n- Investigation report path: `/runs/x/holdout/secret.md`\n")
+        task(conn, "t_feat", "[define] Feature", "ws-feat", "factonio:define", now_ts - 600,
+             "- Mode: `feature`\n- Investigation report path: `/tmp/should-not-leak.md`\n")
+        task(conn, "t_refactor", "[implement] Tidy", "ws-refactor", "factonio:implement", now_ts - 500,
+             "## Factonio Implementation Card\n\n" + mode_contract_section("refactor"))
+        task(conn, "t_perf", "[implement] Speed", "ws-perf", "factonio:implement", now_ts - 400,
+             "## Factonio Implementation Card\n\n" + mode_contract_section("perf"))
+        task(conn, "t_trail", "[define] Trail wins", "ws-trail", "factonio:define", now_ts - 300, "- Mode: `feature`\n")
+        conn.commit()
+
+
+_LEGACY_MODE = {"kind": None, "read_only": False, "report_path": None, "report_exists": False}
+
+
+class TestWorkstreamModes(unittest.TestCase):
+    def test_parse_workstream_mode_sources_and_fallbacks(self):
+        from factonio.metrics import parse_workstream_mode
+        from factonio.orchestrator import mode_contract_section
+
+        self.assertEqual(parse_workstream_mode({"body": "- Mode: `bug`\n"}), {"kind": "bug", "report_path": None})
+        self.assertIsNone(parse_workstream_mode({"body": "- Mode: `chaos`\n", "title": "[define] x"}))
+        self.assertIsNone(parse_workstream_mode({"body": "plain", "title": "[implement] x"}))
+        self.assertEqual(parse_workstream_mode({"title": "[define] [investigate] X", "body": ""}),
+                         {"kind": "investigate", "report_path": None})
+        runs = [{"metadata": json.dumps({"report_path": "/r/investigation.md"})}]
+        self.assertEqual(parse_workstream_mode({"title": "[define] [investigate] X", "body": ""}, runs)["report_path"],
+                         "/r/investigation.md")
+        self.assertEqual(parse_workstream_mode({"body": mode_contract_section("refactor")})["kind"], "refactor")
+        self.assertEqual(parse_workstream_mode({"body": "## Behavior-Preservation Contract (refactor)\nx"})["kind"], "refactor")
+        self.assertEqual(parse_workstream_mode({"body": mode_contract_section("perf")})["kind"], "perf")
+        # A heading quoted mid-line is not a contract section.
+        self.assertIsNone(parse_workstream_mode({"body": "see `## Performance Contract (benchmark-checklist)` docs"}))
+        # report_path is only ever parsed for investigate.
+        self.assertIsNone(parse_workstream_mode({"body": "- Mode: `feature`\n- Investigation report path: `/x`\n"},
+                                                runs)["report_path"])
+
+    def test_workstream_kinds_shared_constant(self):
+        from factonio import config, orchestrator
+
+        self.assertIs(orchestrator.WORKSTREAM_KINDS, config.WORKSTREAM_KINDS)
+        self.assertEqual(config.WORKSTREAM_KINDS, ("feature", "bug", "quick", "refactor", "perf", "investigate"))
+
+    def test_trail_modes_newest_valid_row_and_read_only(self):
+        from factonio import trail
+
+        with isolated_hermes_home() as home:
+            db = trail.trail_db_path()
+            self.assertEqual(trail.workstream_modes_from_trail(["ws"]), {})
+            self.assertFalse(db.exists())
+            trail.log_decision("start_workstream", tenant="ws", evidence={"kind": "perf"})
+            trail.log_decision("start_workstream", tenant="ws", evidence={"kind": "bogus"})
+            trail.log_decision("start_workstream", tenant="ws-inv", evidence={"kind": "investigate"})
+            trail.log_decision("start_workstream", tenant="ws-old", evidence={"kind": "feature"})
+            trail.log_decision("start_workstream", tenant="ws-old", evidence={"kind": "refactor", "read_only": True})
+            trail.log_decision("merge", tenant="ws-x", evidence={"kind": "bug"})
+            before = db.read_bytes()
+            modes = trail.workstream_modes_from_trail(["ws", "ws-inv", "ws-old", "ws-x", "", "ws-none"])
+            self.assertEqual(modes, {
+                "ws": {"kind": "perf", "read_only": False},
+                "ws-inv": {"kind": "investigate", "read_only": True},
+                "ws-old": {"kind": "refactor", "read_only": True},
+            })
+            self.assertEqual(db.read_bytes(), before)
+            self.assertEqual(trail.workstream_modes_from_trail([]), {})
+
+            corrupt = home / "corrupt.db"
+            corrupt.write_bytes(b"not sqlite" * 50)
+            self.assertEqual(trail.workstream_modes_from_trail(["ws"], db_path=corrupt), {})
+            self.assertEqual(trail.workstream_modes_from_trail(["ws"], db_path=home), {})
+            missing = home / "nope" / "trail.db"
+            self.assertEqual(trail.workstream_modes_from_trail(["ws"], db_path=missing), {})
+            self.assertFalse(missing.parent.exists())
+
+    def test_thread_cards_workstreams_resolution(self):
+        from factonio import metrics, trail
+
+        with isolated_hermes_home() as home:
+            now_ts = time.time()
+            report = home / "reports" / "investigation.md"
+            report.parent.mkdir()
+            report.write_text("# Root cause\n", encoding="utf-8")
+            _seed_mode_cards(home / "kanban.db", now_ts, report)
+            trail.log_decision("start_workstream", tenant="ws-trail", evidence={"kind": "perf", "read_only": False})
+            runs_dir = home / "plugin-data" / "factonio" / "runs"
+
+            data = metrics.thread_cards(home / "kanban.db", session_id="sess_m")
+            ws = data["workstreams"]
+            self.assertEqual(set(ws), {"ws-legacy", "ws-inv", "ws-inv-tag", "ws-inv-hold", "ws-feat", "ws-refactor",
+                                       "ws-perf", "ws-trail"})
+            self.assertEqual(ws["ws-legacy"], _LEGACY_MODE)
+            self.assertEqual(ws["ws-inv"], {"kind": "investigate", "read_only": True, "report_path": str(report),
+                                            "report_exists": True})
+            fallback = runs_dir / "ws-inv-tag" / "investigation.md"
+            self.assertEqual(ws["ws-inv-tag"], {"kind": "investigate", "read_only": True, "report_path": str(fallback),
+                                                "report_exists": False})
+            self.assertEqual(ws["ws-inv-hold"], {"kind": "investigate", "read_only": True, "report_path": None,
+                                                 "report_exists": False})
+            self.assertEqual(ws["ws-feat"], {"kind": "feature", "read_only": False, "report_path": None,
+                                             "report_exists": False})
+            self.assertEqual(ws["ws-refactor"]["kind"], "refactor")
+            self.assertEqual(ws["ws-perf"]["kind"], "perf")
+            self.assertEqual(ws["ws-trail"]["kind"], "perf")  # trail.db wins over the card header
+            for t in ("ws-refactor", "ws-perf", "ws-trail"):
+                self.assertEqual({k: ws[t][k] for k in ("read_only", "report_path", "report_exists")},
+                                 {"read_only": False, "report_path": None, "report_exists": False})
+            by_id = {c["id"]: c for c in data["cards"]}
+            self.assertIsNone(by_id["t_legacy"]["workstream_kind"])
+            self.assertIsNone(by_id["t_legacy_impl"]["workstream_kind"])
+            self.assertEqual(by_id["t_inv"]["workstream_kind"], "investigate")
+            self.assertEqual(by_id["t_trail"]["workstream_kind"], "perf")
+            self.assertNotIn("holdout", json.dumps(data).lower())
+            self.assertNotIn("should-not-leak", json.dumps(data))
+            # Read-only: the fallback report path is computed, never created.
+            self.assertFalse(runs_dir.exists())
+
+            # An empty (but present) report is not ready.
+            fallback.parent.mkdir(parents=True)
+            fallback.write_text("", encoding="utf-8")
+            self.assertFalse(metrics.thread_cards(home / "kanban.db", tenant="ws-inv-tag")["workstreams"]["ws-inv-tag"]
+                             ["report_exists"])
+            fallback.write_text("# Findings\n", encoding="utf-8")
+            self.assertTrue(metrics.thread_cards(home / "kanban.db", tenant="ws-inv-tag")["workstreams"]["ws-inv-tag"]
+                            ["report_exists"])
+
+            # An explicitly queried tenant with no cards still gets a (legacy) entry.
+            only = metrics.thread_cards(home / "kanban.db", tenant="ws-empty")
+            self.assertEqual((only["cards"], only["workstreams"], only["arenas"]), ([], {"ws-empty": _LEGACY_MODE}, []))
+
+    def test_cards_never_create_kanban_trail_or_runs(self):
+        from factonio import metrics
+
+        with isolated_hermes_home() as home:
+            data_dir = home / "plugin-data"
+            mod = _load_plugin_api("factonio_test_plugin_api_ro")
+            client = _client(mod)
+            for url in ("/api/plugins/factonio/cards", "/api/plugins/factonio/cards?tenant=ws-x",
+                        "/api/plugins/factonio/cards?session_id=s1"):
+                r = client.get(url)
+                self.assertEqual(r.status_code, 200, r.text)
+            body = client.get("/api/plugins/factonio/cards?tenant=ws-x").json()
+            self.assertEqual(body["workstreams"], {"ws-x": _LEGACY_MODE})
+            self.assertEqual(body["arenas"], [])
+            direct = metrics.thread_cards(home / "kanban.db", tenant="ws-y")
+            self.assertEqual(direct["workstreams"], {"ws-y": _LEGACY_MODE})
+            self.assertFalse((home / "kanban.db").exists())
+            self.assertFalse(data_dir.exists())
+
+    def test_cards_api_exposes_workstreams_and_card_kinds(self):
+        from factonio import trail
+
+        with isolated_hermes_home() as home:
+            now_ts = time.time()
+            _seed_mode_cards(home / "kanban.db", now_ts, home / "nowhere.md")
+            trail.log_decision("start_workstream", tenant="ws-legacy", evidence={"kind": "quick"})
+            client = _client(_load_plugin_api("factonio_test_plugin_api_modes"))
+            body = client.get("/api/plugins/factonio/cards?tenant=ws-legacy").json()
+            self.assertEqual(body["workstreams"], {"ws-legacy": {"kind": "quick", "read_only": False, "report_path": None,
+                                                                 "report_exists": False}})
+            self.assertEqual({c["workstream_kind"] for c in body["cards"]}, {"quick"})
+            inv = client.get("/api/plugins/factonio/cards?tenant=ws-inv").json()["workstreams"]["ws-inv"]
+            self.assertEqual((inv["kind"], inv["report_exists"]), ("investigate", False))
+            self.assertFalse((home / "plugin-data" / "factonio" / "runs").exists())
+
+
+def _write_harness(repo: Path, manifest: object, *, raw: str | None = None) -> None:
+    hdir = repo / ".factonio"
+    hdir.mkdir(parents=True, exist_ok=True)
+    (hdir / "verify.md").write_text("# Verify\n\n## Launch\n## Doctor\n## Drive\n## Evidence\n## Cleanup\n",
+                                    encoding="utf-8")
+    (hdir / "harness.json").write_text(raw if raw is not None else json.dumps(manifest), encoding="utf-8")
+
+
+_HOOKS = [
+    {"name": "unit", "kind": "custom", "command": "true"},
+    {"name": "lint", "kind": "custom", "command": "true", "optional": True},
+    {"name": "inv", "kind": "invariant", "command": "true", "covers": ["src/**"]},
+    {"name": "shots", "kind": "visual_diff", "command": "true", "baseline_paths": ["docs/images/*.png"]},
+    {"name": "loose", "kind": "visual_diff", "command": "true", "optional": True, "baseline_paths": ["a.png"],
+     "frozen_baseline": False},
+    {"name": "nobase", "kind": "visual_diff", "command": "true"},
+]
+
+
+class TestHarnessSummary(unittest.TestCase):
+    _ABSENT = {"present": False, "mode": "absent", "required_hooks": 0, "optional_hooks": 0, "invariant_hooks": 0,
+               "visual_diff_hooks": 0, "frozen_visual_hooks": 0, "has_manifest_error": False}
+
+    def test_summary_shapes_and_malformed_manifests(self):
+        from factonio.harness import summarize_harness_readonly
+
+        with isolated_hermes_home() as home:
+            for bad in (None, "", "   ", str(home / "missing"), home / "file.txt"):
+                if isinstance(bad, Path):
+                    bad.write_text("x", encoding="utf-8")
+                with self.subTest(path=bad):
+                    self.assertEqual(summarize_harness_readonly(bad), self._ABSENT)
+            bare = home / "bare"
+            bare.mkdir()
+            self.assertEqual(summarize_harness_readonly(bare), self._ABSENT)
+
+            repo = home / "repo"
+            _write_harness(repo, {"schema_version": 1, "hooks": _HOOKS})
+            self.assertEqual(summarize_harness_readonly(repo), {
+                "present": True, "mode": "full", "required_hooks": 4, "optional_hooks": 2, "invariant_hooks": 1,
+                "visual_diff_hooks": 3, "frozen_visual_hooks": 1, "has_manifest_error": False,
+            })
+            for label, manifest, raw in (
+                ("invalid json", None, "{not json"),
+                ("non-object", ["x"], None),
+                ("schema_version", {"schema_version": 2, "hooks": []}, None),
+                ("bool schema", {"schema_version": True, "hooks": []}, None),
+                ("hooks not list", {"schema_version": 1, "hooks": "x"}, None),
+                ("hooks null", {"schema_version": 1, "hooks": None}, None),
+                ("hook not object", {"schema_version": 1, "hooks": [1, _HOOKS[0]]}, None),
+            ):
+                with self.subTest(label=label):
+                    _write_harness(repo, manifest, raw=raw)
+                    out = summarize_harness_readonly(repo)
+                    self.assertTrue(out["has_manifest_error"])
+                    self.assertEqual(set(out), set(self._ABSENT))
+            _write_harness(repo, {"schema_version": 1})
+            self.assertEqual(summarize_harness_readonly(repo)["has_manifest_error"], False)
+            _write_harness(repo, {"schema_version": 1, "hooks": [_HOOKS[1]]})
+            out = summarize_harness_readonly(repo)
+            self.assertEqual((out["required_hooks"], out["optional_hooks"], out["has_manifest_error"]), (0, 1, False))
+
+            only_md = home / "only-md"
+            (only_md / ".factonio").mkdir(parents=True)
+            (only_md / ".factonio" / "verify.md").write_text("# Verify\n", encoding="utf-8")
+            self.assertEqual(summarize_harness_readonly(only_md)["mode"], "verify_md_only")
+
+    def test_summary_runs_no_subprocess_and_touches_no_git_index(self):
+        import subprocess
+        from unittest import mock
+
+        from factonio.harness import summarize_harness_readonly
+
+        def boom(*a, **k):
+            raise AssertionError("subprocess spawned")
+
+        with isolated_hermes_home() as home:
+            repo = home / "repo"
+            (repo / ".git").mkdir(parents=True)
+            _write_harness(repo, {"schema_version": 1, "hooks": _HOOKS})
+            with mock.patch.object(subprocess, "run", boom), mock.patch.object(subprocess, "Popen", boom), \
+                    mock.patch.object(subprocess, "check_output", boom):
+                self.assertTrue(summarize_harness_readonly(repo)["present"])
+                self.assertTrue(summarize_harness_readonly(PLUGIN_ROOT)["present"])
+            self.assertEqual(sorted(p.name for p in (repo / ".git").iterdir()), [])
+
+    def test_repo_own_harness_is_summarized(self):
+        from factonio.harness import summarize_harness_readonly
+
+        out = summarize_harness_readonly(PLUGIN_ROOT)
+        self.assertEqual((out["present"], out["mode"], out["has_manifest_error"]), (True, "full", False))
+        self.assertGreaterEqual(out["required_hooks"], 1)
+
+    def test_repos_api_exposes_harness_and_patch_rejects_it(self):
+        import subprocess
+        from unittest import mock
+
+        from factonio.repos import add_repo
+
+        def boom(*a, **k):
+            raise AssertionError("subprocess spawned")
+
+        with isolated_hermes_home() as home:
+            good = home / "dev" / "good"
+            (good / ".git").mkdir(parents=True)
+            _write_harness(good, {"schema_version": 1, "hooks": _HOOKS})
+            bad = home / "dev" / "bad"
+            (bad / ".git").mkdir(parents=True)
+            _write_harness(bad, None, raw="{oops")
+            plain = home / "dev" / "plain"
+            (plain / ".git").mkdir(parents=True)
+            nullhooks = home / "dev" / "nullhooks"
+            (nullhooks / ".git").mkdir(parents=True)
+            _write_harness(nullhooks, {"schema_version": 1, "hooks": None})
+            for spec, path in (("acme/good", good), ("acme/bad", bad), ("acme/plain", plain),
+                               ("acme/nullhooks", nullhooks)):
+                add_repo(spec, local_path=str(path), clone=False, inspect_remote=False)
+            api = _load_plugin_api("factonio_test_plugin_api_harness")
+            client = _client(api)
+            base = "/api/plugins/factonio"
+            no_claude = {"claude_bin": None, "has_credentials": False, "available": False}
+            mod = api._config
+            with mock.patch.object(mod, "detect_claude_design_support", return_value=no_claude), \
+                    mock.patch.object(subprocess, "run", boom), mock.patch.object(subprocess, "Popen", boom):
+                r = client.get(f"{base}/repos")
+                self.assertEqual(r.status_code, 200, r.text)
+                by_slug = {item["slug"]: item["harness"] for item in r.json()["repos"]}
+            self.assertEqual(by_slug["acme-good"]["frozen_visual_hooks"], 1)
+            self.assertEqual(by_slug["acme-good"]["required_hooks"], 4)
+            self.assertTrue(by_slug["acme-bad"]["has_manifest_error"])
+            self.assertEqual((by_slug["acme-nullhooks"]["present"], by_slug["acme-nullhooks"]["has_manifest_error"]),
+                             (True, True))
+            self.assertEqual(by_slug["acme-plain"], TestHarnessSummary._ABSENT)
+            for repo in (good, bad, plain):
+                self.assertEqual(list((repo / ".git").iterdir()), [])
+
+            store = home / "plugin-data" / "factonio" / "repos.json"
+            before = store.read_bytes()
+            for payload in ({"harness": {"present": True}}, {"merge_policy": "ask", "harness": None}):
+                r = client.patch(f"{base}/repos/acme-good", json=payload)
+                self.assertEqual(r.status_code, 422, r.text)
+            self.assertEqual(store.read_bytes(), before)
+            with mock.patch.object(mod, "detect_claude_design_support", return_value=no_claude):
+                r = client.patch(f"{base}/repos/acme-good", json={"merge_policy": "ask"})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json()["repo"]["harness"]["required_hooks"], 4)
+
+
+def _seed_arena_cards(db_path: Path, now_ts: float, bodies: dict[str, str], tenant: str = "ws-arena") -> None:
+    from hermes_cli.kanban_db_connect import connect_closing
+
+    with connect_closing(db_path=db_path) as conn:
+        for i, (tid, body) in enumerate(bodies.items()):
+            conn.execute(
+                "INSERT INTO tasks (id, title, assignee, status, tenant, session_id, skills, created_at, body)"
+                " VALUES (?, ?, 'factonio', 'running', ?, 'sess_a', ?, ?, ?)",
+                (tid, f"[define] Arena card {i}", tenant, json.dumps(["factonio:define"]), now_ts - 100 + i, body),
+            )
+        conn.commit()
+
+
+def _write_arena_manifest(home: Path, tenant: str, arena_id: str, manifest: object, *, raw: str | None = None) -> None:
+    adir = home / "plugin-data" / "factonio" / "runs" / tenant / "arena" / arena_id
+    adir.mkdir(parents=True, exist_ok=True)
+    (adir / "manifest.json").write_text(raw if raw is not None else json.dumps(manifest), encoding="utf-8")
+
+
+def _arena_stamp(aid: str, role: str, target: str, vendor: str, slot: str | None = None) -> str:
+    slot_part = f", slot=`{slot}`" if slot else ""
+    return f"## Card\n- Arena: `{aid}` (role=`{role}`, target=`{target}`{slot_part}, vendor=`{vendor}`)\n"
+
+
+class TestArenaInformationBarrierApi(unittest.TestCase):
+    def test_cards_never_leak_holdout_in_any_arena_field(self):
+        with isolated_hermes_home() as home:
+            aid = "ar_1111111111"
+            _seed_arena_cards(home / "kanban.db", time.time(), {
+                "t_a1": _arena_stamp(aid, "candidate", "define", "holdout-vendor", slot="c1-holdout-slot"),
+                "t_a2": _arena_stamp(aid, "candidate", "define", "openai", slot="c2-openai"),
+                "t_a3": _arena_stamp(aid, "judge", "define", "google/holdout/v"),
+                "t_a4": _arena_stamp("ar_2222222222", "holdout", "holdout/x", "openai"),
+                "t_a5": _arena_stamp("ar_2222222222", "reviewer", "build", "openai"),
+            })
+            _write_arena_manifest(home, "ws-arena", aid, {
+                "arena_id": aid, "tenant": "ws-arena", "repo": "acme/holdout/repo", "target": "define",
+                "title": "Copy holdout/scenario-1.md", "created_at_ns": 2,
+                "candidates": [
+                    {"slot": "c1-holdout-slot", "vendor": "holdout-vendor", "model": "holdout/model", "task_id": "t_a1"},
+                    {"slot": "c2-openai", "vendor": "openai", "model": "gpt", "task_id": "t_a2"},
+                    {"slot": "c3", "vendor": "x", "task_id": "t_holdout_gone"},
+                ],
+                "judge": {"task_id": "t_a3", "vendor": "holdout-judge", "model": "holdout/judge-model"},
+            })
+            for bad_id, manifest in (
+                ("ar_3333333333", {"tenant": "holdout/ws", "target": "define"}),
+                ("ar_4444444444", {"tenant": "other-ws", "target": "define"}),
+                ("ar_5555555555", {"tenant": "ws-arena", "target": "holdout"}),
+                ("ar_6666666666", {"tenant": "ws-arena", "target": "build"}),
+            ):
+                _write_arena_manifest(home, "ws-arena", bad_id, {"arena_id": bad_id, "created_at_ns": 1, **manifest})
+
+            r = _client(_load_plugin_api("factonio_test_plugin_api_arena_barrier")).get(
+                "/api/plugins/factonio/cards?tenant=ws-arena")
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertNotIn("holdout", r.text.lower())
+            body = r.json()
+            self.assertEqual([a["arena_id"] for a in body["arenas"]], [aid])
+            arena = body["arenas"][0]
+            self.assertEqual((arena["tenant"], arena["repo"], arena["target"], arena["title"]),
+                             ("ws-arena", None, "define", None))
+            self.assertEqual([{k: c[k] for k in ("slot", "vendor", "model", "task_id")} for c in arena["candidates"]], [
+                {"slot": None, "vendor": None, "model": None, "task_id": "t_a1"},
+                {"slot": "c2-openai", "vendor": "openai", "model": "gpt", "task_id": "t_a2"},
+                {"slot": "c3", "vendor": "x", "model": None, "task_id": None},
+            ])
+            self.assertEqual((arena["judge"]["task_id"], arena["judge"]["vendor"], arena["judge"]["model"]),
+                             ("t_a3", None, None))
+            keys = ("arena_id", "arena_role", "arena_slot", "arena_vendor", "arena_target")
+            by_id = {c["id"]: {k: c[k] for k in keys} for c in body["cards"]}
+            self.assertEqual(by_id, {
+                "t_a1": {"arena_id": aid, "arena_role": "candidate", "arena_slot": None, "arena_vendor": None,
+                         "arena_target": "define"},
+                "t_a2": {"arena_id": aid, "arena_role": "candidate", "arena_slot": "c2-openai", "arena_vendor": "openai",
+                         "arena_target": "define"},
+                "t_a3": {"arena_id": aid, "arena_role": "judge", "arena_slot": None, "arena_vendor": None,
+                         "arena_target": "define"},
+                "t_a4": {"arena_id": "ar_2222222222", "arena_role": None, "arena_slot": None, "arena_vendor": "openai",
+                         "arena_target": None},
+                "t_a5": {"arena_id": "ar_2222222222", "arena_role": None, "arena_slot": None, "arena_vendor": "openai",
+                         "arena_target": None},
+            })
+
+    def test_cards_skip_non_finite_arena_timestamp_and_keep_valid_sibling(self):
+        from factonio.arena import _created_ns
+
+        self.assertEqual(_created_ns({"created_at_ns": float("inf")}), 0)
+        self.assertEqual(_created_ns({"created_at_ns": float("nan"), "created_at": 3}), 3_000_000_000)
+        self.assertEqual(_created_ns({"created_at_ns": True}), 0)
+        with isolated_hermes_home() as home:
+            _seed_arena_cards(home / "kanban.db", time.time(), {"t_c1": "plain body"})
+            good = {"arena_id": "ar_aaaaaaaaaa", "tenant": "ws-arena", "target": "define", "title": "Good",
+                    "created_at_ns": 5_000_000_000, "candidates": []}
+            _write_arena_manifest(home, "ws-arena", "ar_aaaaaaaaaa", good)
+            _write_arena_manifest(home, "ws-arena", "ar_bbbbbbbbbb", None, raw=(
+                '{"arena_id": "ar_bbbbbbbbbb", "tenant": "ws-arena", "target": "define", "created_at_ns": 1e309}'))
+            _write_arena_manifest(home, "ws-arena", "ar_cccccccccc", None, raw=(
+                '{"arena_id": "ar_cccccccccc", "tenant": "ws-arena", "target": "define", "created_at": -1e309}'))
+            r = _client(_load_plugin_api("factonio_test_plugin_api_arena_inf")).get(
+                "/api/plugins/factonio/cards?tenant=ws-arena")
+            self.assertEqual(r.status_code, 200, r.text)
+            arenas = r.json()["arenas"]
+            self.assertEqual([(a["arena_id"], a["title"], a["created_at"]) for a in arenas], [("ar_aaaaaaaaaa", "Good", 5)])
+
+    def test_cards_judge_cross_vendor_is_strict_bool_or_null(self):
+        cases = (
+            ('"/runs/probe-ws/holdout/private-scenario.md"', None),
+            ('{"nested": "holdout/secret.md"}', None),
+            ('["holdout/a.md"]', None),
+            ("1e309", None),
+            ("1", None),
+            ('"true"', None),
+            ("true", True),
+            ("false", False),
+            ("null", None),
+        )
+        for raw_cv, expected in cases:
+            with self.subTest(cross_vendor=raw_cv), isolated_hermes_home() as home:
+                aid = "ar_dddddddddd"
+                _seed_arena_cards(home / "kanban.db", time.time(), {
+                    "t_j1": _arena_stamp(aid, "judge", "define", "google"),
+                }, tenant="ws-cv")
+                _write_arena_manifest(home, "ws-cv", aid, None, raw=(
+                    '{"arena_id": "ar_dddddddddd", "tenant": "ws-cv", "target": "define", "created_at_ns": 7,'
+                    ' "candidates": [], "judge": {"task_id": "t_j1", "vendor": "google", "model": "gemini",'
+                    f' "cross_vendor": {raw_cv}}}}}'))
+                r = _client(_load_plugin_api("factonio_test_plugin_api_arena_cv")).get(
+                    "/api/plugins/factonio/cards?tenant=ws-cv")
+                self.assertEqual(r.status_code, 200, r.text)
+                self.assertNotIn("holdout", r.text.lower())
+                judge = r.json()["arenas"][0]["judge"]
+                self.assertEqual(judge, {"task_id": "t_j1", "status": "running", "vendor": "google",
+                                         "model": "gemini", "cross_vendor": expected})
+                self.assertIs(type(judge["cross_vendor"]), type(expected))
+
+    def test_cards_arena_fields_reject_non_string_manifest_values(self):
+        with isolated_hermes_home() as home:
+            aid = "ar_eeeeeeeeee"
+            _seed_arena_cards(home / "kanban.db", time.time(), {
+                "t_c1": _arena_stamp(aid, "candidate", "define", "openai", slot="c1"),
+                "t_j1": _arena_stamp(aid, "judge", "define", "google"),
+            }, tenant="ws-typed")
+            _write_arena_manifest(home, "ws-typed", aid, None, raw=(
+                '{"arena_id": "ar_eeeeeeeeee", "tenant": "ws-typed", "target": "define", "created_at_ns": 9e9,'
+                ' "repo": {"p": "holdout/r"}, "title": 1e309,'
+                ' "candidates": [{"slot": ["holdout"], "vendor": 1e309, "model": {"x": "holdout/m"}, "task_id": "t_c1"}],'
+                ' "judge": {"task_id": "t_j1", "vendor": ["holdout/v"], "label": 1e309, "cross_vendor": true}}'))
+            r = _client(_load_plugin_api("factonio_test_plugin_api_arena_typed")).get(
+                "/api/plugins/factonio/cards?tenant=ws-typed")
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertNotIn("holdout", r.text.lower())
+            arena = r.json()["arenas"][0]
+            self.assertEqual((arena["repo"], arena["title"], arena["created_at"]), (None, None, 9))
+            self.assertEqual(arena["candidates"], [{"slot": None, "vendor": None, "model": None, "task_id": "t_c1",
+                                                    "status": "running", "artifact_ready": False}])
+            self.assertEqual(arena["judge"], {"task_id": "t_j1", "status": "running", "vendor": None, "model": None,
+                                              "cross_vendor": True})
+            for key in ("ready_for_synthesis", "synthesized", "canonical_artifact_exists"):
+                self.assertIs(type(arena[key]), bool)
+            self.assertTrue(all(isinstance(a, str) for a in arena["advisories"]))
+
+
+class TestTrailInformationBarrierApi(unittest.TestCase):
+    def test_trail_list_and_detail_scrub_holdout_keys_paths_counts_and_text(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            leak = trail.log_decision(
+                "arena_synthesis", tenant="ws-t", phase="define", actor="judge",
+                why="Judge read holdout/scenario-1.md before synthesis",
+                result="merged spec; see runs/ws-t/holdout/",
+                evidence={
+                    "holdout_path": "/runs/ws-t/holdout", "holdout_files": 3, "HoldOut_Count": 2,
+                    "kind": "define", "winner": "c1",
+                    "nested": {"note": "copied holdout/b.md", "items": ["ok", "x/holdout/b", 7],
+                               "holdout_dir": "/x"},
+                },
+            )
+            normal = trail.log_decision("merge", tenant="ws-t", phase="merge", actor="orchestrator", why="CI green",
+                                        evidence={"pr": 7, "checks": ["unit", "lint"]})
+            client = _client(_load_plugin_api("factonio_test_plugin_api_trail_barrier"))
+            base = "/api/plugins/factonio"
+            listing = client.get(f"{base}/trail?tenant=ws-t")
+            detail = client.get(f"{base}/trail/{leak['id']}")
+            for r in (listing, detail):
+                self.assertEqual(r.status_code, 200, r.text)
+                self.assertNotIn("holdout", r.text.lower())
+                self.assertNotIn("scenario-1", r.text)
+            row = detail.json()["decision"]
+            self.assertEqual(row["evidence"], {"kind": "define", "winner": "c1",
+                                               "nested": {"note": "[redacted]", "items": ["ok", "[redacted]", 7]}})
+            self.assertEqual((row["why"], row["result"], row["decision"], row["tenant"]),
+                             ("[redacted]", "[redacted]", "arena_synthesis", "ws-t"))
+            by_id = {d["id"]: d for d in listing.json()["decisions"]}
+            self.assertEqual(by_id[leak["id"]], row)
+            self.assertEqual(by_id[normal["id"]], trail.get_decision(normal["id"]))
+            self.assertEqual(client.get(f"{base}/trail/{normal['id']}").json()["decision"],
+                             trail.get_decision(normal["id"]))
+
+
 if __name__ == "__main__":
     unittest.main()
