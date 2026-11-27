@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-27T19:40:00Z",
+  "generated_at": "2026-11-27T21:00:00Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -180,7 +180,8 @@
         "`--spawn-judge` creates a missing judge exactly once, reusing the saved judge model and persisted strict_cross_vendor and reporting its real Kanban status; a failure on any arena card rolls back every card and the arena directory; a deferred judge whose manifest write fails is rolled back (zero judge card, unchanged manifest, CLI JSON error + exit 1) and a retry succeeds",
         "`list_arena_summaries` (GET /cards `arenas`) shares evaluate_arena's status machine, reads kanban.db with one `?mode=ro` query, skips corrupt or mismatched manifests, sorts newest first, never creates directories, kanban.db or manifests, and never emits paths, manifest_path, holdout_dir, holdout_files or holdout-referencing titles/labels/advisories",
         "`list_arena_summaries` skips (per manifest, never failing GET /cards) a manifest with a non-finite created_at_ns / created_at (`1e309`), an unknown target, or an arena_id / tenant that does not match its runs/<tenant>/arena/<arena_id>/ directory, keeps valid sibling arenas, and nulls repo, title and every candidate / judge slot, vendor, model and task_id that references holdout",
-        "`list_arena_summaries` emits a strictly typed projection: string fields (repo, title, candidate / judge slot, vendor, model, task_id, status, advisories) are a real `str` without a holdout reference or null, `judge.cross_vendor` is `true` / `false` / null (a string, number, `1e309`, list or object reads null), and artifact_ready / ready_for_synthesis / synthesized / canonical_artifact_exists are bools, so a malformed manifest can neither leak nor make GET /cards HTTP 500"
+        "`list_arena_summaries` emits a strictly typed projection: string fields (repo, title, candidate / judge slot, vendor, model, task_id, status, advisories) are a real `str` without a holdout reference or null, `judge.cross_vendor` is `true` / `false` / null (a string, number, `1e309`, list or object reads null), and artifact_ready / ready_for_synthesis / synthesized / canonical_artifact_exists are bools, so a malformed manifest can neither leak nor make GET /cards HTTP 500",
+        "The design judge card (only) tells the judge to emit `<canonical design>/preview.html` as a self-contained zero-build static HTML variant switcher toggling every candidate, the Synthesis and a side-by-side comparison alongside `DESIGN.md`; define judge cards never mention it"
       ]
     },
     {
@@ -267,7 +268,7 @@
         "A candidate that reads holdout/ (implement/design/verify-diff) or runs git diff / reads source (verify-blackbox) is disqualified, including `cat -v`, `execute_code` `read_file` / `open` / `Path.read_text`, `python3 -c` / `node -e` one-liners, `tool_call` wrappers and `.factonio/../src` traversal; quoted prohibitions and quoted JSON in user/system/tool messages are ignored; `rg 'app.py' README.md` is not a source read",
         "`eval ab --strict-vendor` exits 1 before judging when any candidate or judge vendor is unknown or the judge shares a candidate's vendor family (provider-only vendors resolve); `--record-trail` logs skill_eval (phase eval) to trail.db and `--dry-run` never writes it (`dry_run: true`, `trail_decision_id: null`)",
         "Top-level `verdict` / `scenarios_run` / `findings` beside `messages` are kept in the packet and scored by the rubric",
-        "`eval audit` exits 1 on barrier leaks; `eval bloat` accepts files or skill directories (`eval bloat skills` reports all 6 SKILL.md files) and exits 0 when measurement succeeds (budgets soft 3000 / hard 4500; `orchestrator` reported `over_budget`), exiting 1 on over_budget only with `--strict` / `--fail-on-over-budget`",
+        "`eval audit` exits 1 on barrier leaks; `eval bloat` accepts files or skill directories (`eval bloat skills` reports all 6 SKILL.md files) and exits 0 when measurement succeeds (budgets soft 3000 / hard 4500; every bundled skill, including `orchestrator`, is within budget), exiting 1 on over_budget only with `--strict` / `--fail-on-over-budget`",
         "`python3 -S tools/eval_skills.py {ab|audit|bloat}` runs standalone without Hermes or site-packages",
         "Barrier audit fix round 2: user/system/tool envelopes suppress nested assistant calls inside `messages` / `events` / `transcript`; `print(\"Never read holdout/case.md\")` and `print(\"Never run git diff\")` are clean while `open(\"holdout/case.md\")` and `subprocess.run(\"git diff\")` are flagged; `deno eval \"Deno.readTextFileSync('src/auth.py')\"`, `rg secret`, `grep -R password .` and `sort < src/app.py` are source_read in verify-blackbox, while `rg 'app.py' README.md`, `rg foo .factonio/`, `cat < .factonio/verify.md` and `echo hi > out.py` stay clean",
         "Barrier audit fix round 3: `search_files(pattern=\"SECRET\", target=\"content\")` with an omitted path, `path=\".\"` or `path=\"/home/alice/dev/repo/src\"` (structured or inside execute_code) is source_read and disqualified in A/B while `target=\"files\"` and `path=\".factonio\"` stay clean; Python code is audited from `ast.parse` call nodes so `print(\"Never run subprocess.run('git diff')\")` and `python3 -c 'print(\"open(\\\"holdout/case.md\\\")\")'` are clean while `subprocess.run([\"git\", \"diff\"])` and `read_file(\"holdout/case.md\")` are flagged; `cat <<'EOF'` heredoc bodies are passive data while `python3 - <<'EOF'` bodies are audited as programs",
@@ -275,7 +276,8 @@
         "Fix round 5: `cmd = ['git', 'diff']; subprocess.run(cmd)` (also tuples, `['cat', p]`, `+=`, `append` / `extend` / `insert`, aliases, `os.execvp('git', cmd)`) in execute_code is diff_inspection or source_read with `eval audit` exit 1 and A/B disqualification, while `cmd = ['git', 'diff']; cmd = ['echo', 'ok']; subprocess.run(cmd)` stays clean and `paths = [...]; for p in paths: open(p)` binds every element; `open('probe.py', 'w')`, `mode='wb'`, `io.open(p, 'a')` and `Path(p).open('x')` are clean and never disqualify, while omitted, `r`, `r+`, `w+` and dynamic modes stay source_read",
         "Fix round 6: `bash -lc \"git diff\"`, `bash -ec \"git diff\"`, `sh -ec \"cat src/app.py\"` (verify-blackbox) and `bash -lc \"cat holdout/synthetic.md\"` (implement) exit 1 from `eval audit` and disqualify the candidate in A/B, while `bash -lc \"echo never run git diff\"` stays clean; `eval ab A.json B.json` without label metadata redacts newline-separated `Option A` / `candidate_a` / `Candidate B` / `B:` headings; `search_files(**{'pattern': 'foo', 'target': 'content', 'path': '.factonio'})`, `search_files(**{'pattern': '*.py', 'target': 'files'})` and `opts = {...}; search_files(**opts)` stay clean while `path: 'src'` and `**unknown_kwargs` stay source_read",
         "Fix round 7: in execute_code `opts = {'path': 'README.md'}; opts['path'] = 'src/auth.py'; read_file(**opts)`, `opts.update({'path': 'holdout/secret.md'})`, `read_file(**unknown)` and `open(**opts).read()` fail closed (source_read for verify-blackbox, holdout_access for implement / design / verify-diff) with `eval audit` exit 1 and A/B disqualification, while literal `read_file(**{'path': '.factonio/verify.md'})` and `open(**{'file': '/tmp/out.txt', 'mode': 'w'})` stay clean; `echo \"$(cat src/a.py)\"`, `printf \"%s\" \"$(cat src/a.py)\"` and `echo \"`git diff`\"` (verify-blackbox) and `echo \"$(cat holdout/synthetic.txt)\"` (implement) are flagged while `echo '$(cat src/a.py)'` and `echo \"never run git diff\"` stay clean; `Path(\"design\", \"/src/a.py\").read_text()`, `os.path.join`, `/` and `joinpath` reset on the absolute component while `Path(\"design\", \"mock.html\")` stays clean; an `except` handler sees `p = 'src/a.py'` set before a mid-try `raise` or raising call; `gh --repo owner/repo pr diff 31`, `gh -R owner/repo pr diff 31`, `gh --repo=owner/repo pr diff 31` and `gh pr --repo owner/repo diff 31` are diff_inspection while `gh --repo owner/repo pr view 31 --json state` stays clean",
-        "Fix round 8: `git show HEAD:holdout/synthetic.md`, `git show HEAD:./holdout/synthetic.md`, `git cat-file -p HEAD:holdout/synthetic.md` and `git show :0:holdout/synthetic.md` are holdout_access in implement / design / verify-diff with `eval audit` exit 1 and A/B disqualification, while `git show HEAD:README.md` and `echo 'never run git show HEAD:holdout/synthetic.md'` stay clean; `git cat-file -p HEAD:src/app.py` is source_read in verify-blackbox while `git cat-file -p HEAD:holdout/synthetic.md` stays clean"
+        "Fix round 8: `git show HEAD:holdout/synthetic.md`, `git show HEAD:./holdout/synthetic.md`, `git cat-file -p HEAD:holdout/synthetic.md` and `git show :0:holdout/synthetic.md` are holdout_access in implement / design / verify-diff with `eval audit` exit 1 and A/B disqualification, while `git show HEAD:README.md` and `echo 'never run git show HEAD:holdout/synthetic.md'` stay clean; `git cat-file -p HEAD:src/app.py` is source_read in verify-blackbox while `git cat-file -p HEAD:holdout/synthetic.md` stays clean",
+        "`python3 tools/eval_skills.py bloat skills --fail-on-over-budget --json` exits 0 with `over_budget: false` (enforced by the required `skill-bloat` hook)"
       ]
     },
     {
@@ -305,7 +307,8 @@
         "`recall_decisions` fails closed on the whole field: any emitted string or evidence value referencing holdout becomes exactly [redacted] (no trailing words or path suffix), while prose such as \"hold out for review\" is left untouched",
         "`contains_holdout_reference` strips complete ANSI CSI/OSC/DCS/C1 escape sequences before matching and also matches the byte-deleted reading, so escape sequences can neither split nor swallow the holdout marker",
         "metrics `_card_targets` surfaces additive `local_target` (repo, branch, base_branch, head_sha) on panel lanes, panel summaries and thread cards from the orchestrator `Local branch target:` stamp (stamped cards never yield a phantom PR ref) or a PR-less full-SHA completion handoff on non-verification cards (a newer PR-publishing run hides earlier local handoffs; a structured local handoff beats `- GitHub Issue:` / `- Stack parent PR:` body refs, which are only a fallback; PR-target lanes never match `branch` filters)",
-        "`workstream_modes_from_trail` returns each tenant's newest valid start_workstream kind read-only (`{}` for an absent, directory or corrupt trail.db, never created); `thread_cards` adds `workstreams` `{kind, read_only, report_path, report_exists}` (trail first, then `- Mode:` / `[define] [investigate]` / mode contract headings, else legacy null; only investigate exposes a report path, computed without mkdir and null when it references holdout), per-card workstream_kind and arena_id / arena_role / arena_slot / arena_vendor / arena_target"
+        "`workstream_modes_from_trail` returns each tenant's newest valid start_workstream kind read-only (`{}` for an absent, directory or corrupt trail.db, never created); `thread_cards` adds `workstreams` `{kind, read_only, report_path, report_exists}` (trail first, then `- Mode:` / `[define] [investigate]` / mode contract headings, else legacy null; only investigate exposes a report path, computed without mkdir and null when it references holdout), per-card workstream_kind and arena_id / arena_role / arena_slot / arena_vendor / arena_target",
+        "`trail._iso` / `_now_iso` format UTC timestamps with explicit 4-digit zero-padded years (`0001`, `0042`, `0999`) and microseconds on every Python 3.11+ platform, converting non-UTC offsets"
       ]
     },
     {
@@ -375,7 +378,8 @@
         "define §1c, verify-diff checklist item 11 and orchestrator §1.4 document the refactor, perf and read-only investigate modes",
         "orchestrator section 5 caps trunk-drift rebases (escalate before a 3rd rebase of the same PR) and runs merge-result caller checks on disjoint drift",
         "define Core Principles add Build the Lever / Idempotency / Minimize Reader Load / \"No is an acceptable answer\" plus a §1 recall step; implement §1b Crash-Pickup Protocol; orchestrator §1 pushback rule, Decision Trail pre-workstream recall and Error Handling crash pickup (outside §5)",
-        "publish_policy: ask workflow: orchestrator §4b local-branch factonio_spawn_verify (incl. rigor=high + factonio_evaluate_panel branch filter), bounded local fix rounds, publish handoff and factonio_publish_pr only on explicit approval; implement §2d local-only delivery (no git push / gh pr create); verify-diff and verify-blackbox local unpublished branch modes keep their barriers"
+        "publish_policy: ask workflow: orchestrator §4b local-branch factonio_spawn_verify (incl. rigor=high + factonio_evaluate_panel branch filter), bounded local fix rounds, publish handoff and factonio_publish_pr only on explicit approval; implement §2d local-only delivery (no git push / gh pr create); verify-diff and verify-blackbox local unpublished branch modes keep their barriers",
+        "orchestrator SKILL.md stays under the 4,500-token hard budget by offloading CLI equivalents, resolution chains and the worked example to `skills/orchestrator/references/workflow-reference.md` (not counted as a skill) while keeping every section contract; design §2b Arena Judge Mode emits one self-contained zero-build `preview.html` multi-variant switcher (Candidate A / B / ... / Synthesis + side-by-side) with no holdout/ access and the design skill stays under 3,000 tokens"
       ]
     },
     {
@@ -399,7 +403,8 @@
         "CHANGELOG Unreleased and docs/architecture.md document whole-field fail-closed recall redaction",
         "CHANGELOG Unreleased and docs/architecture.md document ANSI escape-sequence stripping in recall redaction",
         "README.md, SECURITY.md, docs/architecture.md and CHANGELOG Unreleased document publish_policy / default_publish_policy, the exact-SHA fail-closed publish_pr gate, `hermes factonio publish-pr`, and `publish` / `published` in trail --audit",
-        "README.md keeps the `## Setting this up for your team` consulting section (mailto:tony@omnim.ai and LinkedIn links, no omnim.ai site link) immediately before `## Affiliation and trademarks`"
+        "README.md keeps the `## Setting this up for your team` consulting section (mailto:tony@omnim.ai and LinkedIn links, no omnim.ai site link) immediately before `## Affiliation and trademarks`",
+        "AGENTS.md carries the 7-row `## Rule-to-Enforcer Ledger` (`| Rule | Enforcer | Rung | Occurrences | Last seen |`) read by the retro blueprint; CHANGELOG Unreleased and docs/architecture.md document the skill-bloat hook, design arena preview switcher and trail year padding"
       ]
     },
     {
@@ -427,7 +432,8 @@
         "spaced and tab-interleaved holdout recall paths are covered end to end (log_decision -> trail --recall --json/--markdown -> Definition card) in tests.test_recall_and_principles",
         "ANSI CSI, OSC, DCS and C1 escape sequences inside holdout recall paths are covered end to end (log_decision -> trail --recall --json/--markdown -> Definition card) in tests.test_recall_and_principles",
         "publish_policy prompt, skill, docs and plugin.yaml contracts are covered in tests.test_plugin_registration",
-        "Malformed GraphQL open-PR and closing-reference nodes (inline and follow-up pages) fail closed across triage, CLI and tool entrypoints in tests.test_issue_intake.TestMalformedGraphqlNodes"
+        "Malformed GraphQL open-PR and closing-reference nodes (inline and follow-up pages) fail closed across triage, CLI and tool entrypoints in tests.test_issue_intake.TestMalformedGraphqlNodes",
+        "Rule-to-Enforcer ledger, orchestrator/design skill budgets and the design arena switcher contract are covered in tests.test_plugin_registration and tests.test_arena; sub-1000-year `_iso` / `resolve_since` / `_now_iso` formatting in tests.test_trail; the required `skill-bloat` hook in tests.test_verify_harness"
       ]
     }
   ],
@@ -462,6 +468,16 @@
       "command": "uv run --with pyyaml python tools/check_repo_integrity.py",
       "optional": false,
       "description": "plugin.yaml, dashboard manifest, skill frontmatter and doc links are consistent (PyYAML via uv, as in CI)."
+    },
+    {
+      "name": "skill-bloat",
+      "kind": "invariant",
+      "command": "python3 tools/eval_skills.py bloat skills --fail-on-over-budget",
+      "optional": false,
+      "description": "Every bundled skill stays within the 4,500-token hard bloat budget.",
+      "covers": [
+        "skills/*/SKILL.md"
+      ]
     }
   ],
   "discovered_surfaces": {
