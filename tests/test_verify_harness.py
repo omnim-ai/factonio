@@ -2711,6 +2711,7 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
         "inf": ("python3 check.py --threshold 0.01", "python3 check.py --threshold=inf"),
         "% loosened": ("python3 check.py --threshold 1%", "python3 check.py --threshold 0.05"),
         "ratio to %": ("python3 check.py --threshold 0.05", "python3 check.py --threshold 10%"),
+        "% to ratio": ("python3 check.py --threshold 5%", "python3 check.py --threshold 0.01"),
         "% vs pixels": ("python3 check.py --threshold 1%", "python3 check.py --threshold 5"),
         "swapped thresholds": ("a --threshold 0.01 && b --threshold 0.05", "a --threshold 0.05 && b --threshold 0.01"),
         "prefix loosened": ("THRESHOLD=0.05 python3 check.py", "THRESHOLD=0.5 python3 check.py"),
@@ -2748,7 +2749,7 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
     )
     _CLEAN = {
         "--threshold tightened": ("python3 check.py --threshold 0.05", "python3 check.py --threshold 0.01"),
-        "% tightened to ratio": ("python3 check.py --threshold 5%", "python3 check.py --threshold 0.01"),
+        "% tightened": ("python3 check.py --threshold 5%", "python3 check.py --threshold 1%"),
         "--flag val -> --flag=val": ("python3 check.py --threshold 0.05", "python3 check.py --threshold=0.01"),
         "prefix tightened": ("THRESHOLD=0.05 python3 check.py", "THRESHOLD=0.01 python3 check.py"),
         "export tightened": ("export THRESHOLD=0.05; python3 check.py", _EXPORTED),
@@ -2834,8 +2835,10 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
         self.assertTrue(any("adds threshold `threshold=0.01`" in r for r in renamed), renamed)
         self.assertIn("loosens threshold `--threshold` from 0.01 to 0.5",
                       reasons("python3 check.py --threshold 0.01", "python3 check.py --threshold 0.5"))
-        self.assertIn("loosens threshold `--threshold` from 1% to 0.05",
+        self.assertIn("changes threshold unit `--threshold` (`%` vs plain number) from 1% to 0.05",
                       reasons("python3 check.py --threshold 1%", "python3 check.py --threshold 0.05"))
+        self.assertIn("loosens threshold `--threshold` from 1% to 5%",
+                      reasons("python3 check.py --threshold 1%", "python3 check.py --threshold 5%"))
         self.assertTrue(any(r.startswith("sets non-finite or unparseable threshold `--threshold`")
                             for r in reasons("x --threshold 0.01", "x --threshold nan")))
         self.assertTrue(any(r.startswith("adds threshold `--threshold=0.5`")
@@ -3089,7 +3092,7 @@ class TestFixRound13StructuralGuardHardening(unittest.TestCase):
         pairs += [("node check.js --threshold 5%", f"node check.js --threshold {v}") for v in ("0_1%", "\uff11%")]
         self._assert_executed_bypasses_rejected(pairs)
         self._assert_clean({v: ("node check.js --threshold 0.05", f"node check.js --threshold {v}")
-                            for v in ("0.01", ".01", "1%", "1e-2")})
+                            for v in ("0.01", ".01", "1e-2")})
         self._assert_clean({"unchanged odd literal": ("node check.js --threshold 0.0_1",
                                                       "node check.js --threshold 0.0_1")})
 
@@ -3131,6 +3134,159 @@ class TestFixRound13StructuralGuardHardening(unittest.TestCase):
                          ["echo", "$T", ";", "x", "2>", "err"])
         self.assertTrue(all(t.from_argv for t in _tokenize_visual_cmd(["a", "$T"])))
         self.assertFalse(any(t.from_argv for t in _tokenize_visual_cmd("a $T")))
+
+
+class TestFixRound14ShellWordsQuotingUnitsAndWrappers(unittest.TestCase):
+    """Round 14: `\\r` stays inside a shell word, `sh -c` outer quoting is preserved in both directions, a
+    threshold keeps its committed unit (`%` vs plain), and Python `-u` needs a real interpreter/wrapper head."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    # A repo-relative executable that "regenerates" (exits 0) on `-u`, as `vitest -u` / `jest -u` would.
+    # Visual diff 0.80 against a bare `Number(raw)` threshold (no `%` support): NaN passes the check.
+    _PLAIN_JS_CHECK = (
+        "const args = process.argv.slice(2);\n"
+        "let raw = '1';\n"
+        "for (let i = 0; i < args.length; i++) {\n"
+        "  if (args[i] === '--threshold') raw = args[i + 1];\n"
+        "  else if (args[i].startsWith('--threshold=')) raw = args[i].slice(12);\n"
+        "}\n"
+        "process.exit(0.80 > Number(raw) ? 1 : 0);\n"
+    )
+    _REGEN_EXE = '#!/bin/sh\nfor a in "$@"; do [ "$a" = -u ] && exit 0; done\nexit 1\n'
+
+    def _repo(self, home: Path, name: str, command: Any) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "check.py", TestFixRound13StructuralGuardHardening._PY_CHECK)
+        _write(repo, "check.js", TestFixRound13StructuralGuardHardening._JS_CHECK)
+        _write(repo, "plain.js", self._PLAIN_JS_CHECK)
+        for rel in ("vitest", "tests/python3"):
+            _write(repo, rel, self._REGEN_EXE)
+            (repo / rel).chmod(0o755)
+        _commit_all(repo, "visual checks + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def test_carriage_return_is_part_of_the_shell_word(self):
+        from factonio.harness import _tokenize_visual_cmd
+
+        self.assertEqual([t.text for t in _tokenize_visual_cmd("a --threshold\r 0.01\r#c")],
+                         ["a", "--threshold\r", "0.01\r#c"])
+        self._assert_rejected({
+            "python flag": ("python3 check.py --threshold 0.01", "python3 check.py --threshold\r 0.01"),
+            "value + comment": ("node check.js --threshold 0.01", "node check.js --threshold 0.01\r#comment"),
+            "bash -c flag": ("bash -c 'python3 check.py --threshold 0.01'",
+                             "bash -c 'python3 check.py --threshold\r 0.01'"),
+        })
+        pairs: list[tuple[Any, Any]] = [
+            ("python3 check.py --threshold 0.01", "python3 check.py --threshold\r 0.01"),
+            ("bash -c 'python3 check.py --threshold 0.01'", "bash -c 'python3 check.py --threshold\r 0.01'"),
+        ]
+        if shutil.which("node"):  # Node's `Number("0.01\r#comment")` / `Number("1%\r")` is NaN
+            pairs += [
+                ("node check.js --threshold 0.01", "node check.js --threshold\r 0.01"),
+                ("node check.js --threshold 0.01", "node check.js --threshold 0.01\r#comment"),
+                ("node check.js --threshold=1% --color=never", "node check.js --threshold=1%\r --color=never"),
+            ]
+        self._assert_executed_bypasses_rejected(pairs)
+
+    def test_sh_c_outer_quoting_is_preserved_in_both_directions(self):
+        flips = {
+            "${T:-...} double -> single": ('T=0.01; bash -c "python3 check.py --threshold ${T:-0.99}"',
+                                           "T=0.01; bash -c 'python3 check.py --threshold ${T:-0.99}'"),
+            "export $T double -> single": ('T=0.01; bash -c "export THRESHOLD=$T; python3 check.py"',
+                                           "T=0.01; bash -c 'export THRESHOLD=$T; python3 check.py'"),
+            "sh -c": ('T=0.01; sh -c "python3 check.py --threshold ${T:-0.99}"',
+                      "T=0.01; sh -c 'python3 check.py --threshold ${T:-0.99}'"),
+            "bash -ec": ('T=0.01; bash -ec "python3 check.py --threshold ${T:-0.99}"',
+                         "T=0.01; bash -ec 'python3 check.py --threshold ${T:-0.99}'"),
+            "$(...)": ('T=0.01; bash -c "python3 check.py --threshold $(echo ${T:-0.99})"',
+                       "T=0.01; bash -c 'python3 check.py --threshold $(echo ${T:-0.99})'"),
+            "backticks": ('T=0.01; bash -c "python3 check.py --threshold `echo ${T:-0.99}`"',
+                          "T=0.01; bash -c 'python3 check.py --threshold `echo ${T:-0.99}`'"),
+            "unquoted -> single": ("T=0.01; bash -c python3\\ check.py\\ --threshold\\ ${T:-0.99}",
+                                   "T=0.01; bash -c 'python3 check.py --threshold ${T:-0.99}'"),
+            "nested sh -c bash -c": ('T=0.01; sh -c "bash -c \'python3 check.py --threshold ${T:-0.99}\'"',
+                                     "T=0.01; sh -c 'bash -c \"python3 check.py --threshold ${T:-0.99}\"'"),
+        }
+        self._assert_rejected(flips)
+        self._assert_rejected({
+            "positional after an earlier -c": ("bash -c 'python3 check.py' -c 'x --threshold 0.05'",
+                                               "bash -c 'python3 check.py' -c 'x --threshold 0.01'"),
+            "option with a value": ("bash -o pipefail -c 'python3 check.py --threshold 0.05'",
+                                    "bash -o pipefail -c 'python3 check.py --threshold 0.01'"),
+        })
+        self._assert_clean({
+            "single-quoted tightening": ("bash -c 'python3 check.py --threshold 0.05'",
+                                         "bash -c 'python3 check.py --threshold 0.01'"),
+            "bash -e -c tightening": ("bash -e -c 'python3 check.py --threshold 0.05'",
+                                      "bash -e -c 'python3 check.py --threshold 0.01'"),
+            "unchanged expanding script": (flips["sh -c"][0], flips["sh -c"][0]),
+        })
+        self._assert_executed_bypasses_rejected(list(flips.values()))
+
+    def test_threshold_keeps_its_committed_unit(self):
+        self._assert_rejected({
+            "plain -> %": ("node check.js --threshold 0.05", "node check.js --threshold 1%"),
+            "% -> plain": ("node check.js --threshold 5%", "node check.js --threshold 0.01"),
+            "env plain -> %": ("THRESHOLD=0.05 node check.js", "THRESHOLD=1% node check.js"),
+        })
+        self._assert_clean({
+            "plain tightened": ("node check.js --threshold 0.05", "node check.js --threshold 0.01"),
+            "% tightened": ("node check.js --threshold 5%", "node check.js --threshold 1%"),
+        })
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
+    def test_unit_change_that_is_nan_in_node_fails_end_to_end(self):
+        """`plain.js` reads `Number(raw)`: `Number("1%")` is NaN and `0.80 > NaN` is false, so the check passes."""
+        from factonio.harness import audit_harness, check_harness
+
+        self._assert_executed_bypasses_rejected([
+            ("node plain.js --threshold 0.05", "node plain.js --threshold 1%"),
+            ("node plain.js --threshold=0.05", "node plain.js --threshold=1%"),
+        ])
+        with isolated_hermes_home() as home:
+            for n, (base, live, loosened) in enumerate((
+                    ("node plain.js --threshold 5%", "node plain.js --threshold 0.01", True),
+                    ("node plain.js --threshold 0.05", "node plain.js --threshold 0.01", False),
+                    ("node check.js --threshold=5%", "node check.js --threshold=1%", False))):
+                with self.subTest(base=base, live=live):
+                    repo = self._repo(home, f"svc{n}", base)
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(chk["hook_results"]["failed_required"], ["pixels"])  # 0.80 > 0.01 either way
+                    self.assertEqual(chk["gate_loosening"]["loosened"], loosened, chk["gate_loosening"])
+                    audit = audit_harness(str(repo))
+                    self.assertEqual(audit["gate_loosening"]["loosened"], loosened)
+                    self.assertEqual(audit["severity"], "stale" if loosened else "clean")
+
+    def test_python_u_needs_a_real_interpreter_or_wrapper_head(self):
+        bypasses = [
+            ("./vitest run tests/python3 tests/visual.test.ts", "./vitest run tests/python3 -u tests/visual.test.ts"),
+            ("./vitest -t python3 tests/visual.test.ts", "./vitest -t python3 -u tests/visual.test.ts"),
+            ("timeout 30 tests/python3 check.py", "timeout 30 tests/python3 -u check.py"),
+        ]
+        self._assert_rejected({live: (base, live) for base, live in bypasses})
+        self._assert_rejected({
+            "relative wrapper": ("tests/timeout 30 python3 check.py", "tests/timeout 30 python3 -u check.py"),
+            "uv without run": ("uv tool python3 check.py", "uv tool python3 -u check.py"),
+        })
+        self._assert_clean({
+            "python3 -u": ("python3 check.py", "python3 -u check.py"),
+            "/usr/bin/python3 -u": ("/usr/bin/python3 check.py", "/usr/bin/python3 -u check.py"),
+            "timeout python3 -u": ("timeout 30 python3 check.py", "timeout 30 python3 -u check.py"),
+            "uv run python3 -u": ("uv run python3 check.py", "uv run python3 -u check.py"),
+            "nice -n 5 python3 -u": ("nice -n 5 python3 check.py", "nice -n 5 python3 -u check.py"),
+        })
+        self._assert_executed_bypasses_rejected(bypasses)
 
 
 if __name__ == "__main__":

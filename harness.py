@@ -1701,6 +1701,8 @@ _LAUNCHER_VERBS = frozenset({"run", "exec", "dlx", "x"})
 # A shell word whose meaning is identical as an argv item and as unquoted shell text.
 _PLAIN_WORD_RE = re.compile(r"[A-Za-z0-9_./:=+%,@-]+", re.ASCII)
 _ASCII_THRESHOLD_RE = re.compile(r"^(?:(?:0|[1-9][0-9]*)(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$", re.ASCII)
+# Command-launching wrappers that may sit between a segment head and a Python interpreter given `-u`.
+_PY_WRAPPERS = frozenset({"timeout", "nice", "nohup", "time", "uv", "uvx", "stdbuf", "ionice", "xvfb-run"})
 _WRAPPER_ARG_RE = re.compile(r"^(?:run|-.*|\d+(?:\.\d+)?[smhd]?)$")  # `timeout 30`, `uv run`, `nice -n 5`
 _MAX_SCRIPT_DEPTH = 4
 _OPERATORS = ("<<<", "&>>", "&&", "||", "|&", ";;", ">>", "<<", "<>", ">&", "<&", "&>", ">|",
@@ -1752,7 +1754,7 @@ def _tokenize_visual_cmd(command: Any) -> list[_Tok]:
 
     while i < n:
         ch = text[i]
-        if ch in " \t\r\n":
+        if ch in " \t\n":  # not `\r`: sh/bash keep it inside the word
             flush(i)
             if ch == "\n":
                 toks.append(_Tok(";", "\n", True, False))
@@ -1760,7 +1762,7 @@ def _tokenize_visual_cmd(command: Any) -> list[_Tok]:
         elif word is None and ch == "#":
             end = text.find("\n", i)
             i = n if end < 0 else end
-        elif word is None and ch in "{}" and (i + 1 == n or text[i + 1] in " \t\r\n;&|()"):
+        elif word is None and ch in "{}" and (i + 1 == n or text[i + 1] in " \t\n;&|()"):
             toks.append(_Tok(ch, ch, True, False))
             i += 1
         elif ch == "\\" and text.startswith("\n", i + 1):
@@ -1862,8 +1864,8 @@ def _slot_ok(base: _Slot, live: _Slot) -> bool:
         return True
     if base.value is None or live.value is None:
         return False
-    if base.percent != live.percent and (base.value if live.percent else live.value) > 1.0:
-        return False  # `%` against a plain number above 1 (pixels?) cannot be ordered
+    if base.percent != live.percent:
+        return False  # checkers read `1%` and `0.01` differently (`Number("1%")` is NaN): keep the committed unit
     return live.value <= base.value
 
 
@@ -1926,11 +1928,25 @@ def _insert_ok(live: list[Any], j: int, head: int, trailing_from: int, matched: 
         if _REGEN_FLAG_RE.match(name):
             return value.lower() in _DISABLED
         return value in _INERT_EQ_OPTIONS.get(name, ())
-    if item == "-u" and {j - 1, j + 1} <= matched and _PYTHON_RE.match(os.path.basename(live[j - 1])):
-        return all(isinstance(w, str) and _WRAPPER_ARG_RE.match(w) for w in live[head + 1:j - 1])
+    if item == "-u" and {j - 1, j + 1} <= matched and _is_python_exe(live[j - 1]):
+        if j - 1 == head:
+            return True
+        wrapper = live[head]
+        return (_is_bare_or_absolute(wrapper) and os.path.basename(wrapper) in _PY_WRAPPERS
+                and (os.path.basename(wrapper) != "uv" or live[head + 1] == "run")
+                and all(isinstance(w, str) and _WRAPPER_ARG_RE.match(w) for w in live[head + 1:j - 1]))
     if j < trailing_from:
         return False
     return item in _INERT_TRAILING_FLAGS or item in _RUNNER_SHORT_FLAGS.get(_runner(live, head) or "", ())
+
+
+def _is_bare_or_absolute(word: Any) -> bool:
+    """A command resolved via PATH (`python3`) or an absolute path, never a repo-relative script (`tests/python3`)."""
+    return isinstance(word, str) and ("/" not in word or word.startswith("/"))
+
+
+def _is_python_exe(word: Any) -> bool:
+    return _is_bare_or_absolute(word) and bool(_PYTHON_RE.match(os.path.basename(word)))
 
 
 def _outer_expands(tok: _Tok) -> bool:
@@ -1966,8 +1982,10 @@ def _segment_ok(base_toks: list[_Tok], live_toks: list[_Tok], depth: int, sealed
         # an unchanged `sh|bash ... -c SCRIPT [args]` wrapper: only the script may differ, checked recursively
         diff = [k for k in range(len(base)) if base[k] != live[k]]
         if len(diff) == 1 and diff[0] > head + 1 and re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", base[diff[0] - 1]):
-            # `bash -c '...$T...'` -> `bash -c "...$T..."`: the outer shell would expand the script first
-            return (not _outer_expands(live_toks[diff[0]])
+            # the outer shell expands `$T`/globs in a double-quoted or unquoted script before the child sees it, so
+            # neither side may expand: any quoting flip that changes what the child shell receives fails closed
+            return (not _outer_expands(base_toks[diff[0]]) and not _outer_expands(live_toks[diff[0]])
+                    and all(re.fullmatch(r"[-+][A-Za-z]+", t) and "c" not in t for t in base[head + 1:diff[0] - 1])
                     and _structure_ok(base_toks[diff[0]].text, live_toks[diff[0]].text, depth + 1))
     if sealed or head is None or name in _SEALED_HEADS:
         return len(b_items) == len(l_items) and all(map(_item_ok, b_items, l_items))
@@ -2046,12 +2064,15 @@ def _threshold_reasons(base_segs: list[list[str]], live_segs: list[list[str]]) -
         if len(l_vals) < len(b_vals):
             reasons.append(f"removes {len(b_vals) - len(l_vals)} of {len(b_vals)} {label} threshold(s)")
         strictest = min(b_vals, key=lambda s: math.inf if s.value is None else s.value)
-        bad = [s for b, s in [*zip(b_vals, l_vals), *((strictest, s) for s in l_vals[len(b_vals):])]
-               if not _slot_ok(b, s)]
-        if any(s.value is None for s in bad):
+        pairs = [*zip(b_vals, l_vals), *((strictest, s) for s in l_vals[len(b_vals):])]
+        bad = [(b, s) for b, s in pairs if not _slot_ok(b, s)]
+        if any(s.value is None for _, s in bad):
             reasons.append(f"sets non-finite or unparseable threshold {label} "
-                           f"({', '.join(s.raw for s in bad if s.value is None)})")
-        if any(s.value is not None for s in bad):
+                           f"({', '.join(s.raw for _, s in bad if s.value is None)})")
+        if any(s.value is not None and s.percent != b.percent for b, s in bad):
+            reasons.append(f"changes threshold unit {label} (`%` vs plain number) from "
+                           f"{', '.join(s.raw for s in b_vals)} to {', '.join(s.raw for s in l_vals)}")
+        if any(s.value is not None and s.percent == b.percent for b, s in bad):
             reasons.append(f"loosens threshold {label} from {', '.join(s.raw for s in b_vals)} to "
                            f"{', '.join(s.raw for s in l_vals)}")
     for (kind, key), l_vals in live.items():
