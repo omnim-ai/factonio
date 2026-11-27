@@ -729,6 +729,7 @@ export function initialReposState() {
         effective_default_rigor: 'standard',
         has_required_checks: true,
         models: {},
+        harness: { present: true, mode: 'full', required_hooks: 4, optional_hooks: 0, invariant_hooks: 1, visual_diff_hooks: 0, frozen_visual_hooks: 0, has_manifest_error: false },
       },
       {
         slug: 'acme-payments-api',
@@ -748,6 +749,7 @@ export function initialReposState() {
         effective_default_rigor: 'high',
         has_required_checks: true,
         models: {},
+        harness: { present: false, mode: 'absent', required_hooks: 0, optional_hooks: 0, invariant_hooks: 0, visual_diff_hooks: 0, frozen_visual_hooks: 0, has_manifest_error: false },
       },
       {
         slug: 'acme-web-console',
@@ -767,6 +769,7 @@ export function initialReposState() {
         effective_default_rigor: 'standard',
         has_required_checks: true,
         models: {},
+        harness: { present: true, mode: 'full', required_hooks: 4, optional_hooks: 1, invariant_hooks: 1, visual_diff_hooks: 2, frozen_visual_hooks: 2, has_manifest_error: false },
       },
     ],
   };
@@ -811,7 +814,13 @@ export function trailPayload(list, path = '') {
 const W2 = 'omnim-ai-factonio-wave-2-watchdog-liveness';
 const ACME = 'acme-payments-api-rate-limit-i42';
 const d = trailDecision;
+const W5 = 'omnim-ai-factonio-wave-5-desktop-ui';
 export const DASHBOARD_TRAIL = [
+  d({ id: 'd_e5a10c7b3f01', ts: trailIso(4), tenant: W5, repo_slug: 'omnim-ai-factonio', phase: 'eval', actor: 'eval', decision: 'skill_eval', why: 'Blind A/B (define, judge): define-v3 beat define-v2 on 6 of 8 fixtures; no barrier leaks.', evidence: { eval_phase: 'define', winner: 'B', winner_label: 'define-v3', verdict: 'B', decided_by: 'judge', disqualified: [] }, result: 'decided' }),
+  d({ id: 'd_e5a10c7b3f02', ts: trailIso(6), tenant: W5, repo_slug: 'omnim-ai-factonio', phase: 'intake', decision: 'issue_intake_triage', why: 'Read-only issue intake triage of 3 issue(s): 0 stop-the-line, 2 actionable.', evidence: { repo: 'omnim-ai/factonio', issue_numbers: [51, 52, 54], counts: { actionable: 2, no_action: 1 }, stop_the_line: [], actionable: [51, 54] }, result: 'actionable' }),
+  d({ id: 'd_e5a10c7b3f03', ts: trailIso(8), tenant: W5, repo_slug: 'omnim-ai-factonio', phase: 'harness', decision: 'harness_audit', why: 'Read-only drift audit of .factonio/: feature_map and hooks match the tree.', evidence: { drifted: false, hooks: 4 }, result: 'clean' }),
+  d({ id: 'd_e5a10c7b3f04', ts: trailIso(9), tenant: W5, repo_slug: 'omnim-ai-factonio', phase: 'design', decision: 'arena_synthesis', why: 'Synthesized the sidebar layout from the anthropic and openai candidates; judge google.', evidence: { arena_id: 'ar_7f2c9a10', target: 'design', candidates: [{ vendor: 'anthropic' }, { vendor: 'openai' }], judge_vendor: 'google' }, result: 'synthesized' }),
+  d({ id: 'd_e5a10c7b3f05', ts: trailIso(10), tenant: W5, repo_slug: 'omnim-ai-factonio', phase: 'define', decision: 'start_workstream', why: 'Wave 5 desktop UI parity, benchmark checklist contract.', evidence: { kind: 'perf', read_only: false }, result: 'spawned' }),
   d({ id: 'd_f012c8a47b99', ts: trailIso(12), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'merge', card_id: 't_bcf5502a', decision: 'pr_merged', why: 'Squash-merged PR #12 after the GraphQL readback confirmed all four gate tiers green on the exact head.', evidence: { pr_number: 12, head_sha: '5d178304e1', tests_passed: 114 }, result: 'merged' }),
   d({ id: 'd_3c5e7a9b1d20', ts: trailIso(16), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'publish', card_id: 't_bcf5502a', actor: 'human', decision: 'publish_pr', why: 'Approved publication: pushed the exact verified head for PR #12.', evidence: { pr_number: 12, head_sha: '5d178304e1', branch: 'feat/watchdog-liveness', base_branch: 'main', draft: false }, result: 'published', supersedes_id: 'd_3c5e7a9b1d1f' }),
   d({ id: 'd_3c5e7a9b1d1f', ts: trailIso(21), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'publish', card_id: 't_bcf5502a', decision: 'publish_pr', why: 'publish_policy is ask: kept the verified branch local and waited for approval.', evidence: { head_sha: '5d178304e1', branch: 'feat/watchdog-liveness', base_branch: 'main' }, result: 'refused' }),
@@ -1032,6 +1041,7 @@ SIDEBAR_HTML = f"""<!doctype html>
     const SIDEBAR = 'omnim-ai-factonio-docked-sidebar-tab';
     const META = 'omnim-ai-factonio-enrich-cards-metadata';
     const PILL = 'omnim-ai-factonio-statusbar-pill-counts';
+    const INV = 'omnim-ai-factonio-cache-miss-spike';
     const PR44 = {{ repo: 'omnim-ai/factonio', number: 44, url: 'https://github.com/omnim-ai/factonio/pull/44' }};
     const PR42 = {{ repo: 'omnim-ai/factonio', number: 42, url: 'https://github.com/omnim-ai/factonio/pull/42' }};
     const PR39 = {{ repo: 'omnim-ai/factonio', number: 39, url: 'https://github.com/omnim-ai/factonio/pull/39' }};
@@ -1043,7 +1053,9 @@ SIDEBAR_HTML = f"""<!doctype html>
     const c = o => ({{ ...base, ...o }});
     const CARDS = [
       c({{ id: 't_4ab36a09', tenant: SIDEBAR, session_id: 'sess_demo', phase: 'define', status: 'done', title: '[define] Spec: docked Factonio sidebar tab', model: 'claude-opus-4-1', created_at: T(9000), started_at: T(8980), completed_at: T(8420), elapsed_seconds: 560, active_duration_seconds: 318, summary: 'Acceptance criteria & private holdout/ checks authored.' }}),
-      c({{ id: 't_4ab36a0b', tenant: SIDEBAR, session_id: 'sess_demo', phase: 'design', status: 'done', title: '[design] Phase 1b sidebar previews', parents: ['t_4ab36a09'], created_at: T(8400), started_at: T(8390), completed_at: T(7100), elapsed_seconds: 1290, active_duration_seconds: 744 }}),
+      c({{ id: 't_4ab36a0a', tenant: SIDEBAR, session_id: 'sess_demo', phase: 'design', status: 'done', title: '[design] Candidate: docked tab previews', model: 'claude-opus-4-1', arena_id: 'ar_7f2c9a10', arena_role: 'candidate', arena_slot: 'c1-anthropic', arena_vendor: 'anthropic', arena_target: 'design', parents: ['t_4ab36a09'], created_at: T(8410), started_at: T(8400), completed_at: T(7700), elapsed_seconds: 700, active_duration_seconds: 512 }}),
+      c({{ id: 't_4ab36a0c', tenant: SIDEBAR, session_id: 'sess_demo', phase: 'design', status: 'done', title: '[design] Candidate: docked tab previews', model: 'gpt-5', provider: 'openai', arena_id: 'ar_7f2c9a10', arena_role: 'candidate', arena_slot: 'c2-openai', arena_vendor: 'openai', arena_target: 'design', parents: ['t_4ab36a09'], created_at: T(8410), started_at: T(8395), completed_at: T(7650), elapsed_seconds: 745, active_duration_seconds: 540 }}),
+      c({{ id: 't_4ab36a0b', tenant: SIDEBAR, session_id: 'sess_demo', phase: 'design', status: 'done', title: '[design] Judge arena candidates: sidebar previews', model: 'gemini-2.5-pro', provider: 'google', arena_id: 'ar_7f2c9a10', arena_role: 'judge', arena_vendor: 'google', arena_target: 'design', parents: ['t_4ab36a0a', 't_4ab36a0c'], created_at: T(7600), started_at: T(7590), completed_at: T(7100), elapsed_seconds: 490, active_duration_seconds: 302 }}),
       c({{ id: 't_4ab36a0d', tenant: SIDEBAR, session_id: 'sess_demo', phase: 'implement', status: 'done', title: '[implement] Tabbed sidebar pane with filters', parents: ['t_4ab36a0b'], pr: PR44, created_at: T(7000), started_at: T(6990), completed_at: T(4600), elapsed_seconds: 2390, active_duration_seconds: 1505 }}),
       c({{ id: 't_4ab36a10', tenant: SIDEBAR, session_id: 'sess_demo', phase: 'verify-diff', status: 'done', verdict: 'pass', title: '[verify-diff] Review PR #44 against spec.md', model: 'gpt-5', provider: 'openai', parents: ['t_4ab36a0d'], pr: PR44, created_at: T(4500), started_at: T(4490), completed_at: T(4010), elapsed_seconds: 480, active_duration_seconds: 402 }}),
       c({{ id: 't_4ab36a11', tenant: SIDEBAR, session_id: 'sess_demo', phase: 'verify-blackbox', status: 'done', verdict: 'reject', last_outcome: 'changes_requested', title: '[verify-blackbox] Keyboard and theme acceptance run', model: 'gpt-5', provider: 'openai', panel_id: 'vp_9a4c1e', panel_vendor: 'openai', parents: ['t_4ab36a0d'], pr: PR44, created_at: T(4500), started_at: T(4480), completed_at: T(3300), elapsed_seconds: 1180, active_duration_seconds: 960, summary: 'Collapsed workstream header is skipped by Tab key.' }}),
@@ -1057,11 +1069,30 @@ SIDEBAR_HTML = f"""<!doctype html>
       c({{ id: 't_39c1aa03', tenant: PILL, session_id: 'sess_demo', phase: 'implement', status: 'done', pr: PR39, title: '[implement] Running/blocked counts in status bar', created_at: T(88900), started_at: T(88890), completed_at: T(87000), elapsed_seconds: 1890, active_duration_seconds: 1220 }}),
       c({{ id: 't_39c1aa04', tenant: PILL, session_id: 'sess_demo', phase: 'verify-diff', status: 'done', verdict: 'pass', pr: PR39, title: '[verify-diff] Review PR #39', created_at: T(86900), started_at: T(86890), completed_at: T(86500), elapsed_seconds: 390, active_duration_seconds: 330 }}),
       c({{ id: 't_39c1aa05', tenant: PILL, session_id: 'sess_demo', phase: 'verify-blackbox', status: 'done', verdict: 'pass', pr: PR39, title: '[verify-blackbox] Acceptance run for PR #39', created_at: T(86900), started_at: T(86880), completed_at: T(86100), elapsed_seconds: 780, active_duration_seconds: 640 }}),
+      c({{ id: 't_c4e11a01', tenant: INV, session_id: 'sess_demo', phase: 'define', status: 'running', title: '[define] [investigate] Why do /cards cache misses spike after 0.3.0?', created_at: T(640), started_at: T(630), elapsed_seconds: 630, active_duration_seconds: 402 }}),
+    ];
+    // GET /cards additive Wave 5 context: per-workstream modes and Dashboard-safe /arena summaries.
+    const WORKSTREAMS = {{
+      [SIDEBAR]: {{ kind: 'perf', read_only: false, report_path: null, report_exists: false }},
+      [META]: {{ kind: 'feature', read_only: false, report_path: null, report_exists: false }},
+      [PILL]: {{ kind: 'refactor', read_only: false, report_path: null, report_exists: false }},
+      [INV]: {{ kind: 'investigate', read_only: true, report_path: '~/.hermes/plugin-data/factonio/runs/omnim-ai-factonio-cache-miss-spike/investigation.md', report_exists: false }},
+    }};
+    const ARENAS = [
+      {{
+        arena_id: 'ar_7f2c9a10', tenant: SIDEBAR, repo: 'omnim-ai/factonio', target: 'design', title: 'Docked tab previews', status: 'synthesized', created_at: T(8410),
+        candidates: [
+          {{ slot: 'c1-anthropic', vendor: 'anthropic', model: 'anthropic/claude-opus-4-1', task_id: 't_4ab36a0a', status: 'done', artifact_ready: true }},
+          {{ slot: 'c2-openai', vendor: 'openai', model: 'openai/gpt-5', task_id: 't_4ab36a0c', status: 'done', artifact_ready: true }},
+        ],
+        judge: {{ task_id: 't_4ab36a0b', status: 'done', vendor: 'google', model: 'google/gemini-2.5-pro', cross_vendor: true }},
+        ready_for_synthesis: true, synthesized: true, canonical_artifact_exists: true, advisories: [],
+      }},
     ];
 
     window.__fcMock = {{ sessionId: 'sess_demo', visible: true, __version: 1 }};
     const {{ regs }} = await bootPlugin((path) => {{
-      if (path.startsWith('/cards')) return {{ cards: CARDS, counts: {{ running: 2, blocked: 1, triage: 0, rejected: 1, attention: 2, done: 12, total: 15 }} }};
+      if (path.startsWith('/cards')) return {{ cards: CARDS, counts: {{ running: 3, blocked: 1, triage: 0, rejected: 1, attention: 2, done: 14, total: 18 }}, workstreams: WORKSTREAMS, arenas: ARENAS }};
       if (path.startsWith('/trail')) return trailPayload(SIDEBAR_TRAIL, path);
       return {{}};
     }});
@@ -1072,9 +1103,9 @@ SIDEBAR_HTML = f"""<!doctype html>
     const cardBtn = document.querySelector('article[data-id="t_4ab36a11"] button[data-action="toggle-card"]');
     if (cardBtn) cardBtn.click();
     await new Promise(r => setTimeout(r, 60));
-    // Scroll so the workstream's verification panel strip and the opened lane's drawer share the frame.
+    // Scroll so the workstream header (mode pill), its /arena + verification panel strips and the opened lane's drawer share the frame.
     const sbBody = document.querySelector('.fc-sb-body');
-    const panelStrip = document.querySelector(`section[data-tenant="${{SIDEBAR}}"] .fc-sb-pipe`);
+    const panelStrip = document.querySelector(`section[data-tenant="${{SIDEBAR}}"]`);
     if (sbBody && panelStrip) {{
       sbBody.scrollTop = Math.max(0, panelStrip.getBoundingClientRect().top - sbBody.getBoundingClientRect().top + sbBody.scrollTop - 6);
     }}
@@ -1826,7 +1857,7 @@ def capture_selected(out_dir: Path, targets: list[str], qa_dir: Path | None = No
             print(f"Wrote {dest} ({dest.stat().st_size} bytes)")
         if "sidebar" in targets:
             dest = out_dir / "sidebar.png"
-            capture_url(chrome, f"{base}/__harness/sidebar.html", dest, 1100, 1040, scale=2)
+            capture_url(chrome, f"{base}/__harness/sidebar.html", dest, 1100, 1160, scale=2)
             print(f"Wrote {dest} ({dest.stat().st_size} bytes)")
         if "settings" in targets:
             dest = out_dir / "settings.png"

@@ -2001,6 +2001,369 @@ async function runPolishScenarios(report) {
   globalThis.__fcReposState = undefined
   globalThis.__fcQueryClient = undefined
 }
+// ---------------------------------------------------------------------------
+// Wave 5: workstream modes, /arena strip + drawer, 12-phase trail, harness badge
+// ---------------------------------------------------------------------------
+const ICON_SIG = [
+  ['attention', 'M6 1.6 10.8 10H1.2z'], ['check', 'M2.5 6.3 5 8.7l4.5-5.2'], ['x', 'M3.5 3.5l5 5M8.5 3.5l-5 5'],
+  ['queued', 'M6 3.6V6l1.6 1.1'], ['trend', 'M1.8 8.6l2.7-2.7 1.9 1.9 3.8-3.8'], ['retry', 'M9.6 5.2A3.8 3.8 0 1 0 9 8'],
+  ['eye', 'M1.2 6S3 2.8 6 2.8 10.8 6 10.8 6 9 9.2 6 9.2 1.2 6 1.2 6z'], ['arena', 'M1.8 2.6 5 6 1.8 9.4'],
+  ['shieldOk', 'M4.4 6.1 5.5 7.2 7.6 4.9'], ['shield', 'M6 1.5 9.8 3v3c0 2.2-1.6 3.8-3.8 4.5C3.8 9.8 2.2 8.2 2.2 6V3z']
+]
+function iconOf(node) {
+  const svg = node && node.type === 'svg' ? node : find(node, n => n.type === 'svg')?.node
+  if (!svg) return null
+  const kids = (Array.isArray(svg.props.children) ? svg.props.children : [svg.props.children]).filter(Boolean)
+  const ds = kids.map(k => k.props.d).filter(Boolean)
+  for (const [name, d] of ICON_SIG) if (ds.includes(d)) return name
+  const circle = kids.find(k => k.type === 'circle')
+  if (circle && circle.props.strokeDasharray === '15 11') return 'spin'
+  if (circle && kids.length === 1 && circle.props.r === 4.2) return 'pending'
+  return 'other'
+}
+// Every string reachable in a rendered tree: text and every string prop (titles, aria labels, hrefs).
+function allStrings(node, out = []) {
+  if (node == null || typeof node === 'boolean') return out
+  if (typeof node === 'string' || typeof node === 'number') { out.push(String(node)); return out }
+  if (Array.isArray(node)) { node.forEach(n => allStrings(n, out)); return out }
+  if (typeof node !== 'object') return out
+  for (const [k, v] of Object.entries(node.props || {})) {
+    if (k === 'children') continue
+    if (typeof v === 'string') out.push(v)
+    else if (v && typeof v === 'object' && !Array.isArray(v) && k !== 'style') out.push(JSON.stringify(v))
+  }
+  allStrings(node.props && node.props.children, out)
+  return out
+}
+const classOf = n => String(n.props.className || '')
+const hasCls = c => n => classOf(n).split(/\s+/).includes(c)
+
+async function runWave5Scenarios(report) {
+  const W = report.wave5 = {}
+  const J = v => JSON.parse(JSON.stringify(v))
+
+  // --- pure helpers ---------------------------------------------------------
+  const TN = 'omnim-ai-factonio-wave-5-ui'
+  const startRow = (tenant, kind, readOnly, ts) => ({ id: `d_sw_${kind}`, ts, tenant, decision: 'start_workstream', phase: 'define', evidence: { kind, read_only: readOnly } })
+  W.mode = {
+    perfApi: mod.workstreamMode(TN, { [TN]: { kind: 'perf', read_only: false, report_path: null, report_exists: false } }, [], []),
+    investigateReady: mod.workstreamMode(TN, { [TN]: { kind: 'investigate', read_only: true, report_path: '/home/u/.hermes/plugin-data/factonio/runs/x/investigation.md', report_exists: true } }, [], []),
+    investigateWinPath: mod.workstreamMode(TN, { [TN]: { kind: 'investigate', read_only: true, report_path: 'C:\\runs\\x\\report.md', report_exists: false } }, [], []),
+    investigateHoldoutPath: mod.workstreamMode(TN, { [TN]: { kind: 'investigate', read_only: true, report_path: '/runs/x/holdout/investigation.md', report_exists: true } }, [], []),
+    refactorWithPath: mod.workstreamMode(TN, { [TN]: { kind: 'refactor', read_only: false, report_path: '/runs/x/investigation.md', report_exists: true } }, [], []),
+    legacyNull: mod.workstreamMode(TN, { [TN]: { kind: null, read_only: false, report_path: null, report_exists: false } }, [{ id: 't1', workstream_kind: 'refactor', created_at: 5 }], []),
+    cardFallback: mod.workstreamMode(TN, undefined, [{ id: 't1', workstream_kind: 'bug', created_at: 1 }, { id: 't2', workstream_kind: 'perf', created_at: 9 }, { id: 't3', created_at: 20 }], []),
+    trailFallback: mod.workstreamMode(TN, undefined, [{ id: 't1', created_at: 1 }], [startRow(TN, 'refactor', false, '2026-11-01T10:00:00Z'), startRow(TN, 'investigate', false, '2026-11-02T10:00:00Z')]),
+    trailOtherTenant: mod.workstreamMode(TN, undefined, [], [startRow('other-tenant', 'perf', false, '2026-11-01T10:00:00Z')]),
+    unknownKind: mod.workstreamMode(TN, { [TN]: { kind: 'chaos' } }, [{ id: 't', workstream_kind: 'zzz' }], []),
+    none: mod.workstreamMode(TN, undefined, undefined, undefined),
+    emptyTenant: mod.workstreamMode('', { '': { kind: 'perf' } }, [], [])
+  }
+
+  const cand = (slot, vendor, status, ready) => ({ slot, vendor, model: `${vendor}/m`, task_id: `t_${slot}`, status, artifact_ready: ready })
+  const arena = (o) => ({ arena_id: 'ar_7f2c9a10', tenant: TN, repo: 'omnim-ai/factonio', target: 'design', title: 'Sidebar layout', status: 'judging', created_at: 100,
+    candidates: [cand('c1-anthropic', 'anthropic', 'done', true), cand('c2-openai', 'openai', 'done', true)],
+    judge: { task_id: 't_judge', status: 'running', vendor: 'google', model: 'google/gemini', cross_vendor: true },
+    ready_for_synthesis: true, synthesized: false, canonical_artifact_exists: false, advisories: [], ...o })
+  const tagged = (id, role, extra) => ({ id, tenant: TN, status: 'done', created_at: 10, arena_id: 'ar_legacy01', arena_role: role, arena_target: 'define', ...extra })
+  W.arenas = {
+    api: J(mod.computeWorkstreamArenas(TN, [], [arena({ arena_id: 'ar_new', created_at: 200 }), arena({ arena_id: 'ar_other', tenant: 'someone-else' }), arena({ arena_id: 'ar_old', created_at: 100 })])),
+    apiEmptyIgnoresTags: J(mod.computeWorkstreamArenas(TN, [tagged('t_a', 'candidate', { arena_vendor: 'openai' })], [])),
+    sanitized: J(mod.computeWorkstreamArenas(TN, [], [arena({
+      title: 'Read holdout/s1.md', advisories: ['see holdout/s2.md', 'Judge waiting on c2-openai'],
+      candidates: [{ slot: 'c1', vendor: 'anthropic', model: { nested: true }, task_id: 7, status: 'done', artifact_ready: 'yes', holdout_files: 3 }],
+      judge: { task_id: 't_j', status: 'running', vendor: 'HOLDOUT-vendor', model: null, cross_vendor: 'true' }
+    }), arena({ arena_id: 'ar_holdout_x' }), { tenant: TN }, null, 'junk'])),
+    legacy: J(mod.computeWorkstreamArenas(TN, [
+      tagged('t_c1', 'candidate', { arena_slot: 'c1-anthropic', arena_vendor: 'anthropic', status: 'done', created_at: 10 }),
+      tagged('t_c2', 'candidate', { arena_slot: 'c2-openai', arena_vendor: 'openai', status: 'running', created_at: 11 }),
+      tagged('t_j', 'judge', { arena_vendor: 'google', status: 'todo', created_at: 12 }),
+      { id: 't_plain', tenant: TN, status: 'done', created_at: 13 }
+    ], undefined)),
+    noTenant: J(mod.computeWorkstreamArenas('', [], [arena({ tenant: '' })]))
+  }
+
+  const pills = (decision, evidence, gh = 'omnim-ai/factonio') => J(mod.evidencePills({ decision, evidence }, gh)).map(p => ({ key: p.key, label: p.label || null, text: p.text, tone: p.tone || null, href: p.href || null, title: p.title }))
+  const ESC = String.fromCharCode(27)
+  W.pills = {
+    start: pills('start_workstream', { kind: 'investigate', read_only: true, skill: 'factonio:define', skip_define: false }),
+    startRw: pills('start_workstream', { kind: 'perf', read_only: false }),
+    spawnArena: pills('spawn_arena', { arena_id: 'ar_7f2c9a10', target: 'define', candidates: [{ slot: 'c1', vendor: 'anthropic' }, { slot: 'c2', vendor: 'openai' }], judge_task_id: 't_j' }),
+    arenaMany: pills('arena_synthesis', { arena_id: 'ar_1', candidates: ['a', 'b', 'c', 'd'], judge_vendor: 'google' }),
+    triage: pills('issue_intake_triage', { repo: 'omnim-ai/factonio', issue_numbers: [412, 413, 414], counts: { stop_the_line: 1, actionable: 1, no_action: 1 }, stop_the_line: [412], actionable: [413], verify_existing_fix: [] }),
+    verifyFix: pills('issue_intake_verify_fix', { pr_number: 44, head_sha: 'abcdef1234', issue_number: 412, verdict: 'verified_fix' }),
+    verifyFixNoGh: pills('issue_intake_verify_fix', { issue_number: 412, verdict: 'fix_incomplete' }, null),
+    skillEval: pills('skill_eval', { pair_id: 'p1', eval_phase: 'define', winner: 'B', winner_label: 'define-v3', verdict: 'B', decided_by: 'judge', disqualified: ['A'], scores: { A: 1 } }),
+    otherKind: pills('spawn_verify', { kind: 'diff', verdict: 'pass' }),
+    holdout: pills('arena_synthesis', {
+      holdout_files: 3, path: '/runs/x/holdout/a.md', note: 'HOLDOUT scenario 2', list: ['ok', 'holdout'], nested: { deep: ['x', { p: 'holdout' }] },
+      wide: 'ｈｏｌｄｏｕｔ', ansi: `hold${ESC}[31mout`, zw: 'hold\u200bout', ctrl: 'hold\u0007out', ['hold\u200dout_key']: 1
+    }),
+    holdoutKeyOnly: pills('start_workstream', { holdout_dir: 'x' }),
+    holdoutValueOnly: pills('start_workstream', { kind: 'see holdout/' })
+  }
+  W.pills.noWinner = pills('skill_eval', { winner: 'none', disqualified: ['A', 'B'] })
+  W.pills.tie = pills('skill_eval', { winner: 'tie' })
+
+  const hb = h => J(mod.summarizeHarnessBadge(h))
+  const full = { present: true, mode: 'full', required_hooks: 4, optional_hooks: 1, invariant_hooks: 2, visual_diff_hooks: 2, frozen_visual_hooks: 1, has_manifest_error: false }
+  W.harness = {
+    full: hb(full),
+    oneHook: hb({ ...full, required_hooks: 1, optional_hooks: 0, frozen_visual_hooks: 0, visual_diff_hooks: 0 }),
+    mdOnly: hb({ ...full, mode: 'verify_md_only', required_hooks: 0, optional_hooks: 0 }),
+    error: hb({ ...full, has_manifest_error: true }),
+    absent: hb({ present: false, mode: 'absent', required_hooks: 0, optional_hooks: 0, invariant_hooks: 0, visual_diff_hooks: 0, frozen_visual_hooks: 0, has_manifest_error: false }),
+    garbageCounts: hb({ present: true, mode: '<b>', required_hooks: -1, optional_hooks: 'x', frozen_visual_hooks: 1.5 }),
+    legacy: hb(undefined),
+    nullish: hb(null)
+  }
+
+  // --- sidebar render ---------------------------------------------------------
+  const PERF = 'omnim-ai-factonio-wave-5-desktop-ui'
+  const INV = 'omnim-ai-factonio-cache-miss-spike'
+  const REF = 'omnim-ai-factonio-split-orchestrator'
+  const BUG = 'omnim-ai-factonio-fix-login'
+  const PR = { repo: 'omnim-ai/factonio', number: 141, url: 'https://github.com/omnim-ai/factonio/pull/141' }
+  const wcard = o => card({ status: 'done', created_at: 100, ...o })
+  const W5_CARDS = [
+    wcard({ id: 't_p_def', tenant: PERF, phase: 'define', title: '[define] Spec', created_at: 100, workstream_kind: 'perf' }),
+    wcard({ id: 't_p_c1', tenant: PERF, phase: 'design', title: '[design] Candidate: sidebar layout', created_at: 110, workstream_kind: 'perf', model: 'claude-opus-4-1', arena_id: 'ar_7f2c9a10', arena_role: 'candidate', arena_slot: 'c1-anthropic', arena_vendor: 'anthropic', arena_target: 'design' }),
+    wcard({ id: 't_p_c2', tenant: PERF, phase: 'design', title: '[design] Candidate: sidebar layout', created_at: 111, workstream_kind: 'perf', arena_id: 'ar_7f2c9a10', arena_role: 'candidate', arena_slot: 'c2-openai', arena_vendor: 'openai', arena_target: 'design', panel_vendor: 'openai' }),
+    wcard({ id: 't_p_j', tenant: PERF, phase: 'design', status: 'running', title: '[design] Judge arena candidates', created_at: 120, workstream_kind: 'perf', arena_id: 'ar_7f2c9a10', arena_role: 'judge', arena_vendor: 'google', arena_target: 'design' }),
+    wcard({ id: 't_p_v1', tenant: PERF, phase: 'verify-diff', status: 'running', title: '[verify:diff] panel', created_at: 130, workstream_kind: 'perf', panel_id: 'vp_3e91a7', panel_vendor: 'openai', pr: PR }),
+    wcard({ id: 't_i_def', tenant: INV, phase: 'define', status: 'running', title: '[define] [investigate] Why do /cards cache misses spike?', created_at: 200, workstream_kind: 'investigate' }),
+    wcard({ id: 't_r_imp', tenant: REF, phase: 'implement', status: 'running', title: '[implement] Extract scheduler', created_at: 300, workstream_kind: 'refactor' }),
+    wcard({ id: 't_b_imp', tenant: BUG, phase: 'implement', status: 'running', title: '[implement] Fix login', created_at: 400, workstream_kind: 'bug' })
+  ]
+  const W5_WS = {
+    [PERF]: { kind: 'perf', read_only: false, report_path: null, report_exists: false },
+    [INV]: { kind: 'investigate', read_only: true, report_path: '/home/u/.hermes/plugin-data/factonio/runs/x/investigation.md', report_exists: false },
+    [REF]: { kind: 'refactor', read_only: false, report_path: null, report_exists: false },
+    [BUG]: { kind: 'bug', read_only: false, report_path: null, report_exists: false }
+  }
+  const W5_ARENAS = [arena({ tenant: PERF, candidates: [cand('c1-anthropic', 'anthropic', 'done', true), cand('c2-openai', 'openai', 'done', false)], judge: { task_id: 't_p_j', status: 'running', vendor: 'google', model: 'google/gemini-3-pro', cross_vendor: true } })]
+  W5_ARENAS[0].candidates[0].task_id = 't_p_c1'
+  W5_ARENAS[0].candidates[1].task_id = 't_p_c2'
+
+  const readArena = s => {
+    if (!s) return null
+    const top = find(s.node, hasCls('fc-sb-panel-top')).node
+    const co = find(s.node, hasCls('fc-sb-callout'))
+    return {
+      label: s.node.props['aria-label'],
+      role: s.node.props.role,
+      status: s.node.props['data-status'],
+      lead: { title: find(top, hasCls('fc-sb-arena-k')).node.props.title, word: norm(find(top, hasCls('fc-sb-arena-word')).node), icon: iconOf(find(top, hasCls('fc-sb-arena-k')).node) },
+      target: (() => { const t = find(top, hasCls('fc-sb-arena-target')); return t ? norm(t.node) : null })(),
+      tag: (() => { const t = find(top, hasCls('fc-sb-tag')).node; return { text: norm(t), tone: t.props['data-tone'] ?? null, title: t.props.title } })(),
+      id: norm(find(top, hasCls('fc-sb-panel-id')).node),
+      count: (() => { const c = find(top, hasCls('fc-sb-panel-lanes')).node; return { text: norm(c), title: c.props.title } })(),
+      topOrder: top.props.children.filter(Boolean).map(n => classOf(n)),
+      chips: findAll(find(s.node, hasCls('fc-sb-vendors')).node, hasCls('fc-sb-vendor')).map(h => ({ text: norm(h.node), run: h.node.props['data-run'] ?? null, role: h.node.props['data-role'] ?? null, cross: h.node.props['data-cross'] ?? null, icon: iconOf(h.node), title: h.node.props.title })),
+      callout: co ? { kind: co.node.props['data-kind'], tone: co.node.props['data-tone'] ?? null, role: co.node.props.role, text: norm(co.node), title: find(co.node, hasCls('fc-sb-callout-body')).node.props.title } : null
+    }
+  }
+  const readSection = h => {
+    const sec = h.node
+    const mode = find(sec, hasCls('fc-sb-mode'))
+    const rep = find(sec, hasCls('fc-sb-report'))
+    const body = find(sec, n => typeof n.props.id === 'string' && n.props.id.startsWith('fc-sb-ws-'))
+    return {
+      tenant: sec.props['data-tenant'],
+      label: sec.props['aria-label'],
+      dataMode: sec.props['data-mode'] ?? null,
+      labelRow: (() => { const r = find(sec, hasCls('fc-sb-ws-labelrow')); return r ? r.node.props.children.filter(Boolean).map(n => classOf(n)) : null })(),
+      mode: mode ? { kind: mode.node.props['data-mode'], text: norm(mode.node), title: mode.node.props.title, icon: iconOf(mode.node), ro: !!find(mode.node, hasCls('fc-sb-mode-ro')) } : null,
+      report: rep ? { ready: rep.node.props['data-ready'], text: norm(rep.node), title: rep.node.props.title, icon: iconOf(rep.node) } : null,
+      meta: norm(find(sec, hasCls('fc-sb-ws-meta')).node),
+      bodyOrder: body ? body.node.props.children.filter(Boolean).map(n => classOf(n).split(' ').filter(c => c !== 'fc-sb-panel').join(' ') || classOf(n)) : null,
+      arena: readArena(find(sec, hasCls('fc-sb-arena'))),
+      cards: Object.fromEntries(findAll(sec, n => n.type === 'article').map(a => {
+        const tag = find(a.node, hasCls('fc-sb-arena-tag'))
+        return [a.node.props['data-id'], {
+          arenaTag: tag ? { text: norm(tag.node), title: tag.node.props.title, role: tag.node.props['data-arena-role'] } : null,
+          panelChip: !!find(a.node, n => n.props['data-panel-vendor'] != null),
+          topOrder: find(a.node, hasCls('fc-sb-card-top')).node.props.children.filter(Boolean).map(n => classOf(n).split(' ')[classOf(n).split(' ').length - 1])
+        }]
+      }))
+    }
+  }
+  const readDrawer = (tree, id) => {
+    const art = find(tree, n => n.type === 'article' && n.props['data-id'] === id)
+    const dl = art && find(art.node, n => n.type === 'dl')
+    if (!dl) return null
+    const dds = findAll(dl.node, n => n.type === 'dd')
+    return {
+      order: dds.map(h => h.node.props['data-field']),
+      labels: findAll(dl.node, n => n.type === 'dt').map(h => norm(h.node)),
+      fields: Object.fromEntries(dds.map(h => [h.node.props['data-field'], norm(h.node)])),
+      tags: Object.fromEntries(dds.map(h => [h.node.props['data-field'], findAll(h.node, hasCls('fc-sb-tag')).map(t => ({ text: norm(t.node), tone: t.node.props['data-tone'] ?? null }))])),
+      chips: Object.fromEntries(dds.map(h => [h.node.props['data-field'], findAll(h.node, hasCls('fc-sb-vendor')).map(t => ({ text: norm(t.node), run: t.node.props['data-run'] ?? null, cross: t.node.props['data-cross'] ?? null, icon: iconOf(t.node) }))])),
+      modePill: (() => { const p = find(dl.node, hasCls('fc-sb-mode')); return p ? { kind: p.node.props['data-mode'], ro: !!find(p.node, hasCls('fc-sb-mode-ro')) } : null })(),
+      reportTitle: (() => { const d = dds.find(h => h.node.props['data-field'] === 'report'); const m = d && find(d.node, hasCls('fc-sb-mono')); return m ? m.node.props.title : null })()
+    }
+  }
+  let m5Render = null
+  const renderPane = async (data, trail, openIds = []) => {
+    cardsState = { data, isLoading: false, isError: false }
+    trailState = trail
+    const m = mountPane({ focused: null })
+    m5Render = m.render
+    let tree = m.render()
+    for (const d of findAll(tree, n => n.props.className === 'fc-sb-done-toggle' && n.props['aria-expanded'] === 'false')) {
+      const ws = d.anc.find(a => a.type === 'section')
+      fire(find(find(tree, n => n.type === 'section' && n.props['data-tenant'] === ws.props['data-tenant']).node, n => n.props.className === 'fc-sb-done-toggle'))
+      tree = m.render()
+    }
+    for (const id of openIds) {
+      const art = find(tree, n => n.type === 'article' && n.props['data-id'] === id)
+      if (!art) continue
+      fire(find(art.node, byAttr('data-action', 'toggle-card')))
+      tree = m.render()
+    }
+    return tree
+  }
+  const TRAIL_READY = { data: { decisions: [], summary: {} }, isLoading: false, isError: false }
+  const SB = W.sidebar = {}
+  try {
+    cardsQueries.length = 0; trailQueries.length = 0; otherQueries.length = 0
+    let tree = await renderPane({ cards: W5_CARDS, counts: {}, workstreams: W5_WS, arenas: W5_ARENAS }, TRAIL_READY, ['t_p_c1', 't_p_j', 't_i_def', 't_b_imp', 't_p_v1'])
+    SB.sections = Object.fromEntries(findAll(tree, n => n.type === 'section').map(h => [h.node.props['data-tenant'], readSection(h)]))
+    SB.drawers = Object.fromEntries(['t_p_c1', 't_p_j', 't_i_def', 't_b_imp', 't_p_v1'].map(id => [id, readDrawer(tree, id)]))
+    SB.queries = { cards: [...new Set(cardsQueries.map(q => q.key.join('/')))], trail: [...new Set(trailQueries.map(q => q.key.join('/')))], other: [...otherQueries] }
+
+    // Report ready + all 7 arena statuses (one workstream per status) + legacy-only workstream.
+    const STATUSES = ['candidates_in_progress', 'ready_for_synthesis', 'judging', 'synthesized', 'needs_attention', 'degraded', 'blocked']
+    const statusCards = STATUSES.map((s, i) => wcard({ id: `t_s_${i}`, tenant: `acme-api-arena-${s}`, phase: 'design', status: 'running', title: '[design] x', created_at: 500 + i }))
+    const statusArenas = STATUSES.map(s => arena({
+      tenant: `acme-api-arena-${s}`, status: s, arena_id: `ar_${s}`,
+      candidates: s === 'candidates_in_progress'
+        ? [cand('c1-anthropic', 'anthropic', 'running', false), cand('c2-openai', 'openai', 'todo', false)]
+        : s === 'needs_attention'
+          ? [cand('c1-anthropic', 'anthropic', 'done', false), cand('c2-openai', 'openai', 'blocked', false)]
+          : [cand('c1-anthropic', 'anthropic', 'done', true), cand('c2-openai', 'openai', 'done', true)],
+      judge: s === 'candidates_in_progress' || s === 'blocked' ? null
+        : { task_id: 't_judge', status: s === 'synthesized' ? 'done' : 'running', vendor: s === 'degraded' ? 'openai' : 'google', model: 'm', cross_vendor: s !== 'degraded' },
+      advisories: s === 'judging' ? ['Judge waiting on canonical artifact'] : []
+    }))
+    tree = await renderPane({
+      cards: [...statusCards, wcard({ id: 't_inv2', tenant: INV, phase: 'define', status: 'running', title: '[define] [investigate] q', created_at: 900 })],
+      counts: {},
+      workstreams: { [INV]: { kind: 'investigate', read_only: true, report_path: '/x/runs/inv/investigation.md', report_exists: true } },
+      arenas: statusArenas
+    }, TRAIL_READY)
+    SB.statuses = Object.fromEntries(findAll(tree, n => n.type === 'section').filter(h => h.node.props['data-tenant'].startsWith('acme-api-arena-')).map(h => [h.node.props['data-tenant'].slice('acme-api-arena-'.length), readArena(find(h.node, hasCls('fc-sb-arena')))]))
+    SB.reportReady = readSection(find(tree, n => n.type === 'section' && n.props['data-tenant'] === INV))
+
+    // Older backend: no `workstreams` / `arenas` keys; card tags + start_workstream rows drive the UI.
+    const LEG = 'omnim-ai-factonio-legacy-arena'
+    const LEG2 = 'omnim-ai-factonio-legacy-trail'
+    const legacyCards = [
+      wcard({ id: 't_l_c1', tenant: LEG, phase: 'define', status: 'done', title: '[define] cand', created_at: 10, workstream_kind: 'refactor', arena_id: 'ar_legacy01', arena_role: 'candidate', arena_slot: 'c1-anthropic', arena_vendor: 'anthropic', arena_target: 'define' }),
+      wcard({ id: 't_l_c2', tenant: LEG, phase: 'define', status: 'running', title: '[define] cand', created_at: 11, arena_id: 'ar_legacy01', arena_role: 'candidate', arena_slot: 'c2-openai', arena_vendor: 'openai', arena_target: 'define' }),
+      wcard({ id: 't_l_t', tenant: LEG2, phase: 'define', status: 'running', title: '[define] x', created_at: 12 })
+    ]
+    tree = await renderPane({ cards: legacyCards, counts: {} }, { data: { decisions: [{ id: 'd_l1', ts: '2026-11-27T10:00:00Z', tenant: LEG2, decision: 'start_workstream', phase: 'define', evidence: { kind: 'investigate', read_only: true } }], summary: {} }, isLoading: false, isError: false }, ['t_l_c1'])
+    SB.legacy = Object.fromEntries(findAll(tree, n => n.type === 'section').map(h => [h.node.props['data-tenant'], readSection(h)]))
+    SB.legacyDrawer = readDrawer(tree, 't_l_c1')
+
+    // Pre-Wave-5 cards (no mode/arena fields at all) render exactly as before.
+    tree = await renderPane({ cards: [wcard({ id: 't_old', tenant: 'acme-api-old', phase: 'implement', status: 'running', title: '[implement] old' })], counts: {} }, TRAIL_READY, ['t_old'])
+    SB.plain = { section: readSection(find(tree, n => n.type === 'section')), drawer: readDrawer(tree, 't_old') }
+
+    // Barrier: holdout strings in every Wave 5 input never reach the rendered sidebar.
+    const HT = 'omnim-ai-factonio-barrier'
+    tree = await renderPane({
+      cards: [wcard({ id: 't_h1', tenant: HT, phase: 'define', status: 'running', title: '[define] x', created_at: 10, arena_id: 'ar_bar01', arena_role: 'candidate', arena_slot: 'holdout-slot', arena_vendor: 'holdout', arena_target: 'define' })],
+      counts: {},
+      workstreams: { [HT]: { kind: 'investigate', read_only: true, report_path: '/runs/holdout/investigation.md', report_exists: true } },
+      arenas: [arena({ tenant: HT, arena_id: 'ar_bar01', title: 'holdout title', advisories: ['Read holdout/scenario-1.md'], candidates: [cand('holdout-c1', 'anthropic', 'done', true)], judge: { task_id: 't_j', status: 'running', vendor: 'holdout', model: 'holdout/m', cross_vendor: true } })]
+    }, { data: { decisions: [{ id: 'd_h1', ts: '2026-11-27T10:00:00Z', tenant: HT, decision: 'arena_synthesis', phase: 'define', result: 'synthesized', evidence: { arena_id: 'ar_bar01', holdout_files: 4, note: 'holdout/x' } }], summary: {} }, isLoading: false, isError: false }, ['t_h1'])
+    const trailToggle = find(tree, byAttr('data-action', 'toggle-trail'))
+    if (trailToggle) { fire(trailToggle) }
+    SB.barrierStrings = allStrings(tree).filter(s => /holdout/i.test(s))
+    SB.barrierSection = readSection(find(tree, n => n.type === 'section'))
+
+    // Sidebar trail strip chips reuse evidencePills, including the warn/info tones.
+    const ST = 'omnim-ai-factonio-strip-chips'
+    tree = await renderPane({ cards: [wcard({ id: 't_st', tenant: ST, phase: 'define', status: 'running', title: '[define] x' })], counts: {} }, {
+      data: { decisions: [{ id: 'd_st1', ts: '2026-11-27T10:00:00Z', tenant: ST, decision: 'start_workstream', phase: 'define', result: 'spawned', evidence: { kind: 'investigate', read_only: true, holdout_dir: '/x' } }], summary: {} }, isLoading: false, isError: false
+    })
+    fire(find(tree, byAttr('data-action', 'toggle-trail')))
+    tree = m5Render()
+    SB.stripChips = findAll(tree, n => n.props.className === 'fc-sb-chip').map(h => ({ ev: h.node.props['data-ev'], text: norm(h.node), tone: h.node.props['data-tone'] ?? null }))
+  } catch (e) { SB.error = String(e && e.stack || e) }
+
+  // --- dashboard: harness badges + 12-phase Wave 5 trail ------------------------
+  const D = W.dashboard = {}
+  try {
+    const client = { invalidateQueries: () => Promise.resolve() }
+    const repos = [
+      { ...REPOS[0], slug: 'omnim-ai-factonio', repo: 'omnim-ai/factonio', harness: full },
+      { ...REPOS[1], slug: 'acme-api', repo: 'acme/api', harness: { ...full, mode: 'verify_md_only', required_hooks: 0, optional_hooks: 0, frozen_visual_hooks: 0 } },
+      { ...REPOS[0], slug: 'acme-web', repo: 'acme/web', harness: { ...full, has_manifest_error: true } },
+      { ...REPOS[1], slug: 'acme-cli', repo: 'acme/cli', harness: { present: false, mode: 'absent', required_hooks: 0, optional_hooks: 0, invariant_hooks: 0, visual_diff_hooks: 0, frozen_visual_hooks: 0, has_manifest_error: false } },
+      { ...REPOS[0], slug: 'acme-old', repo: 'acme/old' }
+    ]
+    const TW = 'omnim-ai-factonio-wave-5-desktop-ui'
+    const TI = 'omnim-ai-factonio-cache-miss-spike'
+    const row = (id, ts, o) => ({ id, ts, actor: 'orchestrator', repo_slug: 'omnim-ai-factonio', why: '', result: 'recorded', is_superseded: false, superseded_by: [], supersedes_id: null, card_id: null, ...o })
+    const decisions = [
+      row('d_w01', '2026-11-27T10:00:00.000000+00:00', { tenant: TW, decision: 'start_workstream', phase: 'define', result: 'spawned', evidence: { kind: 'perf', read_only: false } }),
+      row('d_w02', '2026-11-27T10:05:00.000000+00:00', { tenant: TI, decision: 'start_workstream', phase: 'define', result: 'spawned', evidence: { kind: 'investigate', read_only: true } }),
+      row('d_w03', '2026-11-27T10:10:00.000000+00:00', { tenant: TW, decision: 'arena_synthesis', phase: 'design', result: 'synthesized', evidence: { arena_id: 'ar_7f2c9a10', target: 'design', candidates: [{ vendor: 'anthropic' }, { vendor: 'openai' }], judge_vendor: 'google', holdout_files: 3 } }),
+      row('d_w04', '2026-11-27T10:15:00.000000+00:00', { tenant: TW, decision: 'issue_intake_triage', phase: 'intake', result: 'stop_the_line', evidence: { repo: 'omnim-ai/factonio', issue_numbers: [412, 413], counts: { stop_the_line: 1 }, stop_the_line: [412], actionable: [] } }),
+      row('d_w05', '2026-11-27T10:20:00.000000+00:00', { tenant: TW, decision: 'issue_intake_verify_fix', phase: 'intake', result: 'verified_fix', evidence: { issue_number: 412, verdict: 'verified_fix', note: 'see holdout/s1' } }),
+      row('d_w06', '2026-11-27T10:25:00.000000+00:00', { tenant: TW, decision: 'harness_audit', phase: 'harness', result: 'doc_drift', evidence: { drifted: true } }),
+      row('d_w07', '2026-11-27T10:30:00.000000+00:00', { tenant: TW, decision: 'skill_eval', phase: 'eval', actor: 'eval', result: 'decided', evidence: { eval_phase: 'define', winner: 'B', winner_label: 'define-v3', verdict: 'B', decided_by: 'judge', disqualified: [] } }),
+      row('d_w08', '2026-11-27T10:35:00.000000+00:00', { tenant: TW, decision: 'skill_eval', phase: 'eval', actor: 'eval', result: 'no_winner', evidence: { eval_phase: 'verify', winner: 'none', disqualified: ['A', 'B'] } }),
+      row('d_w09', '2026-11-27T10:40:00.000000+00:00', { tenant: TI, decision: 'spawn_implement', phase: 'implement', result: 'flaky', evidence: {} })
+    ]
+    trailState = { data: { decisions, summary: { total: decisions.length, active: decisions.length, superseded: 0, by_tenant: { [TW]: 7, [TI]: 2 } } }, isLoading: false, isError: false }
+    const m = mountRepos({ data: { repos, defaults: REPO_DEFAULTS }, client })
+    let tree = m.render()
+    const tbl = reposSec(tree).node
+    D.colgroup = findAll(tbl, n => n.type === 'col').length
+    D.headers = findAll(tbl, n => n.type === 'th').length
+    D.repos = Object.fromEntries(findAll(tbl, n => n.type === 'tr' && n.props['data-slug']).map(h => {
+      const tds = h.node.props.children.filter(Boolean)
+      const b = find(tds[0], hasCls('fc-harness'))
+      return [h.node.props['data-slug'], {
+        cells: tds.length,
+        firstCell: tds[0].props.children.filter(Boolean).map(n => classOf(n)),
+        badge: b ? { state: b.node.props['data-state'], text: norm(find(b.node, hasCls('fc-harness-t')).node), key: (() => { const k = find(b.node, hasCls('fc-harness-k')); return k ? norm(k.node) : null })(), title: b.node.props.title, sr: norm(find(b.node, hasCls('fc-sr')).node), icon: iconOf(b.node) } : null
+      }]
+    }))
+    const t = readTrail(tree)
+    D.trail = { phases: t.bar.phases, tenantOptions: t.bar.selects.tenant.options, rows: Object.fromEntries(t.rows.map(r => [r.id, r])) }
+    const bar = find(tree, n => n.props.className === 'fc-trail-phases').node
+    D.phaseBar = bar.props.children.flat(Infinity).filter(Boolean).map(n => n.type === 'span' ? 'sep' : `${n.props['data-phase']}${n.props['data-empty'] ? '·empty' : ''}`)
+    D.sepHidden = find(bar, hasCls('fc-trail-phase-sep'))?.node.props['aria-hidden'] ?? null
+    // Phase filter "eval" then rows show the ws pill with its mode annotation.
+    trailPhase(tree, 'eval'); tree = m.render()
+    const te = readTrail(tree)
+    D.evalRows = te.rows.map(r => r.id)
+    D.evalWsPills = te.rows.map(r => r.pills.find(p => p.ev === 'tenant')?.text ?? null)
+    trailPhase(tree, 'define'); tree = m.render()
+    D.defineWsPills = Object.fromEntries(readTrail(tree).rows.map(r => [r.id, r.pills.find(p => p.ev === 'tenant')?.text ?? null]))
+    // Workstream filter + an empty phase -> the "No decisions match" chips carry the mode.
+    trailSelect(tree, 'tenant', TI); tree = m.render()
+    trailPhase(tree, 'eval'); tree = m.render()
+    D.noMatch = readTrail(tree).box
+    D.barrierStrings = allStrings(tree).filter(s => /holdout/i.test(s))
+    trailAction(tree, 'clear'); tree = m.render()
+    D.barrierStringsAll = allStrings(tree).filter(s => /holdout/i.test(s))
+
+    const TONE_CODES = ['synthesized', 'verified_fix', 'decided', 'clean', 'stop_the_line', 'fix_incomplete', 'no_winner', 'proof_failed', 'product_regression', 'flaky', 'not_reproduced', 'tie', 'harness_gap', 'doc_drift', 'actionable', 'no_action']
+    trailState = { data: { decisions: TONE_CODES.map((r, i) => row(`d_t${i}`, `2026-11-26T10:${String(i).padStart(2, '0')}:00Z`, { tenant: TW, decision: 'wave5_result', phase: 'eval', result: r, evidence: {} })), summary: {} }, isLoading: false, isError: false }
+    D.tones = Object.fromEntries(readTrail(mountRepos({ data: { repos, defaults: REPO_DEFAULTS }, client }).render()).rows.map(r => [r.result, r.tone]))
+  } catch (e) { D.error = String(e && e.stack || e) }
+  trailState = { data: undefined, isLoading: true, isError: false }
+  cardsState = { data: undefined, isLoading: true, isError: false }
+  globalThis.__fcReposState = undefined
+  globalThis.__fcQueryClient = undefined
+}
+
 const mod = await import(process.env.FC_PLUGIN_URL)
 const plugin = mod.default
 const report = { id: plugin.id, name: plugin.name }
@@ -2101,6 +2464,7 @@ await runTrailLineageScenarios(report)
 }
 
 await runPolishScenarios(report)
+await runWave5Scenarios(report)
 
 process.stdout.write(JSON.stringify(report))
 """
@@ -2680,7 +3044,7 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual(t["bar"]["disabled"], "true")
         self.assertTrue(all(s["disabled"] for s in t["bar"]["selects"].values()))
         self.assertTrue(all(p["disabled"] for p in t["bar"]["phases"]))
-        self.assertEqual([p["phase"] for p in t["bar"]["phases"]][1:], ["define", "design", "implement", "verify", "publish", "gate", "merge", "escape", "watchdog"])
+        self.assertEqual([p["phase"] for p in t["bar"]["phases"]][1:], ["define", "design", "implement", "verify", "publish", "gate", "merge", "intake", "harness", "eval", "escape", "watchdog"])
         self.assertEqual(t["rows"], [])
         self.assertIsNone(t["alert"])
 
@@ -2696,7 +3060,7 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertFalse(t["bar"]["clear"])
         self.assertEqual(
             [p["text"] for p in t["bar"]["phases"]],
-            ["All", "define 1", "design 1", "implement 1", "verify 2", "merge 1", "escape 1", "watchdog 1"],
+            ["All", "define 1", "design 1", "implement 1", "verify 2", "publish 0", "gate 0", "merge 1", "intake 0", "harness 0", "eval 0", "escape 1", "watchdog 1"],
         )
         self.assertEqual(t["bar"]["selects"]["repo"]["options"][0], ["", "All repos"])
         self.assertIn(["omnim-ai-factonio-wave-2-watchdog-liveness", "wave-2-watchdog-liveness"], t["bar"]["selects"]["tenant"]["options"])
@@ -3426,7 +3790,7 @@ class TestDesktopPlugin(unittest.TestCase):
     def test_trail_publish_phase_tone_and_branch_pill(self):
         t = self.report["trail"]["dashboard"]["publish"]
         # publish sits between verify and gate/merge in the phase filter.
-        self.assertEqual([p["text"] for p in t["bar"]["phases"]], ["All", "verify 1", "publish 4", "merge 1"])
+        self.assertEqual([p["text"] for p in t["bar"]["phases"] if not p["text"].endswith(" 0")], ["All", "verify 1", "publish 4", "merge 1"])
         rows = {r["id"]: r for r in t["rows"]}
         pub = rows["dec_9a8c4f10b2"]
         self.assertEqual((pub["phase"], pub["result"], pub["tone"], pub["title"]), ("publish", "published", "ok", "Publish PR"))
@@ -3878,6 +4242,301 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual(sum(int(c) for c in cols), 100)
         for imp in re.findall(r"^import .* from '([^']+)'", source, re.M):
             self.assertIn(imp, ("@hermes/plugin-sdk", "react", "react/jsx-runtime"))
+
+    # --- Wave 5: workstream modes, /arena, 12-phase trail, harness badge ---------
+    def test_workstream_mode_resolution_and_fallbacks(self):
+        m = self.report["wave5"]["mode"]
+        self.assertEqual(m["perfApi"], {"kind": "perf", "readOnly": False, "reportName": None, "reportExists": False})
+        # report_path renders as its basename only (POSIX or Windows separators).
+        self.assertEqual(m["investigateReady"], {"kind": "investigate", "readOnly": True, "reportName": "investigation.md", "reportExists": True})
+        self.assertEqual(m["investigateWinPath"]["reportName"], "report.md")
+        self.assertIsNone(m["investigateHoldoutPath"]["reportName"])
+        # Only investigate workstreams expose a report.
+        self.assertEqual((m["refactorWithPath"]["reportName"], m["refactorWithPath"]["reportExists"]), (None, False))
+        # Fallbacks: API kind null -> newest card workstream_kind -> newest start_workstream row.
+        self.assertEqual(m["legacyNull"]["kind"], "refactor")
+        self.assertEqual(m["cardFallback"]["kind"], "perf")
+        self.assertEqual((m["trailFallback"]["kind"], m["trailFallback"]["readOnly"]), ("investigate", True))
+        for key in ("trailOtherTenant", "unknownKind", "none", "emptyTenant"):
+            self.assertEqual(m[key], {"kind": None, "readOnly": False, "reportName": None, "reportExists": False}, key)
+
+    def test_compute_workstream_arenas_api_legacy_and_sanitized(self):
+        a = self.report["wave5"]["arenas"]
+        self.assertEqual([x["arena_id"] for x in a["api"]], ["ar_new", "ar_old"])  # tenant-scoped, API order kept
+        self.assertFalse(a["api"][0]["legacy"])
+        # An explicit (even empty) API list wins over card tags.
+        self.assertEqual(a["apiEmptyIgnoresTags"], [])
+        self.assertEqual(a["noTenant"], [])
+        san = a["sanitized"]
+        self.assertEqual([x["arena_id"] for x in san], ["ar_7f2c9a10"])  # holdout id and junk entries dropped
+        self.assertIsNone(san[0]["title"])
+        self.assertEqual(san[0]["advisories"], ["Judge waiting on c2-openai"])
+        self.assertEqual(san[0]["candidates"], [{"slot": "c1", "vendor": "anthropic", "model": None, "task_id": None, "status": "done", "artifact_ready": None}])
+        self.assertEqual(san[0]["judge"]["cross_vendor"], None)  # "true" string is not a bool
+        self.assertIsNone(san[0]["judge"]["vendor"])
+        self.assertNotIn("holdout", json.dumps(san).lower())
+        leg = a["legacy"]
+        self.assertEqual(len(leg), 1)
+        self.assertEqual((leg[0]["arena_id"], leg[0]["target"], leg[0]["status"], leg[0]["legacy"]), ("ar_legacy01", "define", None, True))
+        self.assertEqual([(c["slot"], c["vendor"], c["status"]) for c in leg[0]["candidates"]], [("c1-anthropic", "anthropic", "done"), ("c2-openai", "openai", "running")])
+        self.assertEqual((leg[0]["judge"]["task_id"], leg[0]["judge"]["vendor"], leg[0]["judge"]["cross_vendor"]), ("t_j", "google", None))
+
+    def test_evidence_pills_wave5_decisions(self):
+        p = self.report["wave5"]["pills"]
+
+        def brief(ps):
+            return [(x["key"], x["label"], x["text"], x["tone"]) for x in ps]
+
+        self.assertEqual(brief(p["start"])[:2], [("kind", "mode", "investigate", "info"), ("read_only", None, "read-only", "warn")])
+        self.assertEqual(brief(p["startRw"]), [("kind", "mode", "perf", "info")])  # read_only false -> no pill
+        self.assertEqual(brief(p["spawnArena"])[:3], [("arena_id", "arena", "ar_7f2c9a10", None), ("target", "target", "define", None), ("candidates", "candidates", "anthropic · openai", None)])
+        self.assertEqual(brief(p["arenaMany"]), [("arena_id", "arena", "ar_1", None), ("candidates", "candidates", "4", None), ("judge_vendor", "judge", "google", None)])
+        tri = brief(p["triage"])
+        self.assertEqual(tri[:3], [("stop_the_line", None, "stop the line 1", "bad"), ("actionable", None, "actionable 1", "info"), ("issue_numbers", "issues", "3", None)])
+        self.assertNotIn("counts", [x[0] for x in tri])
+        vf = {x["key"]: x for x in p["verifyFix"]}
+        self.assertEqual(vf["issue_number"]["href"], "https://github.com/omnim-ai/factonio/issues/412")
+        self.assertEqual(vf["issue_number"]["text"], "#412")
+        self.assertEqual(vf["verdict"]["tone"], "ok")
+        self.assertEqual(vf["pr_number"]["href"], "https://github.com/omnim-ai/factonio/pull/44")
+        no_gh = {x["key"]: x for x in p["verifyFixNoGh"]}
+        self.assertEqual((no_gh["issue_number"]["href"], no_gh["issue_number"]["label"], no_gh["issue_number"]["text"]), (None, "issue", "#412"))
+        self.assertEqual(no_gh["verdict"]["tone"], "bad")
+        self.assertEqual(brief(p["skillEval"])[:4], [("winner_label", "winner", "define-v3", "ok"), ("disqualified", "disqualified", "A", "bad"), ("eval_phase", "eval phase", "define", None), ("decided_by", "decided by", "judge", None)])
+        self.assertNotIn("verdict", [x["key"] for x in p["skillEval"]])  # duplicate of winner
+        self.assertEqual(brief(p["noWinner"]), [("disqualified", "disqualified", "A, B", "bad")])
+        self.assertEqual(brief(p["tie"]), [("winner", "winner", "tie", "warn")])
+        # Keys outside their decision family still render through the generic loop.
+        self.assertEqual(brief(p["otherKind"]), [("kind", "kind", "diff", None), ("verdict", "verdict", "pass", None)])
+
+    def test_evidence_pills_drop_every_holdout_reference(self):
+        p = self.report["wave5"]["pills"]
+        # Keys, values, arrays, nested objects, fullwidth, ANSI-split, zero-width and control-char spellings.
+        self.assertEqual(p["holdout"], [])
+        self.assertEqual(p["holdoutKeyOnly"], [])
+        self.assertEqual(p["holdoutValueOnly"], [])
+
+    def test_summarize_harness_badge_states(self):
+        h = self.report["wave5"]["harness"]
+        self.assertEqual((h["full"]["state"], h["full"]["key"], h["full"]["text"]), ("ok", "harness", "5 hooks · 1 frozen"))
+        self.assertEqual(h["full"]["title"].split("\n"), ["Harness · full mode", "4 required + 1 optional hooks", "2 invariant · 2 visual_diff (1 frozen baseline)", "Read from .factonio/harness.json"])
+        self.assertEqual(h["oneHook"]["text"], "1 hook")
+        self.assertEqual((h["mdOnly"]["state"], h["mdOnly"]["text"]), ("ok", "md only"))
+        self.assertEqual((h["error"]["state"], h["error"]["text"]), ("error", "error"))  # error wins over present
+        self.assertIn("Run: hermes factonio harness check", h["error"]["title"])
+        self.assertEqual((h["absent"]["state"], h["absent"]["key"], h["absent"]["text"]), ("absent", None, "no harness"))
+        self.assertEqual(h["garbageCounts"]["text"], "0 hooks")
+        self.assertIn("Harness · unknown mode", h["garbageCounts"]["title"])
+        self.assertIsNone(h["legacy"])
+        self.assertIsNone(h["nullish"])
+        for state in ("full", "mdOnly", "error", "absent"):
+            self.assertTrue(h[state]["sr"], state)
+
+    def test_sidebar_workstream_mode_badges_and_report_indicator(self):
+        sb = self.report["wave5"]["sidebar"]
+        self.assertNotIn("error", sb)
+        s = sb["sections"]
+        perf = s["omnim-ai-factonio-wave-5-desktop-ui"]
+        self.assertEqual(perf["labelRow"], ["fc-sb-ws-label", "fc-sb-mode"])
+        self.assertEqual(perf["mode"], {"kind": "perf", "text": "perf", "title": "Performance mode: benchmark checklist contract", "icon": "trend", "ro": False})
+        self.assertEqual(perf["label"], "wave-5-desktop-ui workstream, active, perf mode")
+        ref = s["omnim-ai-factonio-split-orchestrator"]
+        self.assertEqual((ref["mode"]["text"], ref["mode"]["icon"]), ("refactor", "retry"))
+        inv = s["omnim-ai-factonio-cache-miss-spike"]
+        self.assertEqual((inv["mode"]["text"], inv["mode"]["icon"], inv["mode"]["ro"]), ("investigate · read-only", "eye", True))
+        self.assertEqual(inv["report"], {"ready": "false", "text": "report pending", "title": "investigation.md not written yet", "icon": "queued"})
+        self.assertTrue(inv["meta"].endswith("· report pending"))
+        self.assertEqual(inv["label"], "cache-miss-spike workstream, active, investigate mode, read-only, report pending")
+        ready = sb["reportReady"]
+        self.assertEqual((ready["report"]["ready"], ready["report"]["text"], ready["report"]["icon"]), ("true", "report ready", "check"))
+        # bug / feature / quick / legacy stay unbadged.
+        bug = s["omnim-ai-factonio-fix-login"]
+        self.assertEqual((bug["mode"], bug["report"], bug["dataMode"], bug["labelRow"]), (None, None, None, ["fc-sb-ws-label"]))
+        self.assertEqual(bug["label"], "fix-login workstream, active")
+        plain = sb["plain"]["section"]
+        self.assertEqual((plain["mode"], plain["arena"], plain["label"]), (None, None, "acme-api-old workstream, active"))
+        # No new polling: the pane still only queries /cards and /trail.
+        self.assertEqual(sb["queries"], {"cards": ["factonio/cards/all"], "trail": ["factonio/trail/200"], "other": []})
+
+    def test_sidebar_arena_strip_anatomy_and_placement(self):
+        perf = self.report["wave5"]["sidebar"]["sections"]["omnim-ai-factonio-wave-5-desktop-ui"]
+        self.assertEqual(perf["bodyOrder"], ["fc-sb-pipe", "fc-sb-arena", "fc-sb-panel", "fc-sb-ws-cards"])
+        a = perf["arena"]
+        self.assertEqual(a["role"], "group")
+        self.assertEqual(a["label"], "Arena ar_7f2c9a10 on design: judging. 1 of 2 candidate artifacts ready. Judge google running, cross-vendor.")
+        self.assertEqual(a["topOrder"], ["fc-sb-arena-k", "fc-sb-arena-target", "fc-sb-tag", "fc-sb-panel-id fc-sb-mono", "fc-sb-panel-lanes"])
+        self.assertEqual(a["lead"], {"title": "Arena · Sidebar layout", "word": "arena", "icon": "arena"})
+        self.assertEqual((a["target"], a["tag"]["text"], a["tag"]["tone"], a["id"]), ("design", "judging", "info", "ar_7f2c9a10"))
+        self.assertEqual(a["count"], {"text": "1/2 ready", "title": "1 of 2 candidate artifacts ready"})
+        self.assertEqual([(c["text"], c["run"], c["icon"]) for c in a["chips"]], [("anthropic", "ready", "check"), ("openai", "no-artifact", "attention"), ("judge · google", "running", "spin")])
+        self.assertEqual((a["chips"][2]["role"], a["chips"][2]["cross"]), ("judge", "true"))
+        self.assertEqual(a["chips"][0]["title"], "c1-anthropic · anthropic/m: done, artifact ready")
+        self.assertIsNone(a["callout"])
+
+    def test_sidebar_arena_strip_all_statuses_and_callouts(self):
+        st = self.report["wave5"]["sidebar"]["statuses"]
+        expected = {
+            "candidates_in_progress": ("in progress", "info", None),
+            "ready_for_synthesis": ("ready", "info", None),
+            "judging": ("judging", "info", ("advisory", "warn")),
+            "synthesized": ("synthesized", "pass", None),
+            "needs_attention": ("attention", "warn", ("advisory", "warn")),
+            "degraded": ("degraded", "warn", ("degraded", "warn")),
+            "blocked": ("blocked", "reject", ("blocked", None)),
+        }
+        self.assertEqual(set(st), set(expected))
+        for status, (label, tone, callout) in expected.items():
+            a = st[status]
+            self.assertEqual((a["tag"]["text"], a["tag"]["tone"], a["tag"]["title"]), (label, tone, f"Status: {status}"), status)
+            self.assertEqual(a["status"], status)
+            self.assertEqual((a["callout"]["kind"], a["callout"]["tone"]) if a["callout"] else None, callout, status)
+            if a["callout"]:
+                self.assertEqual(a["callout"]["role"], "note")
+        self.assertIn("Judge waiting on canonical artifact", st["judging"]["callout"]["text"])
+        self.assertIn("A candidate needs attention before the judge can run.", st["needs_attention"]["callout"]["text"])
+        self.assertIn("The arena cannot reach a judge.", st["blocked"]["callout"]["text"])
+        # A same-vendor judge never relies on hue alone: attention glyph + data-cross="false".
+        judge = st["degraded"]["chips"][-1]
+        self.assertEqual((judge["cross"], judge["icon"], judge["text"]), ("false", "attention", "judge · openai"))
+        self.assertIn("same vendor as a candidate", st["degraded"]["label"])
+        self.assertEqual([(c["run"], c["icon"]) for c in st["needs_attention"]["chips"][:2]], [("no-artifact", "attention"), ("failed", "x")])
+        self.assertEqual([(c["run"], c["icon"]) for c in st["candidates_in_progress"]["chips"]], [("running", "spin"), (None, "queued"), (None, "pending")])
+        self.assertTrue(st["blocked"]["label"].endswith("No judge yet."))
+
+    def test_sidebar_arena_card_tags_and_drawer_rows(self):
+        sb = self.report["wave5"]["sidebar"]
+        cards = sb["sections"]["omnim-ai-factonio-wave-5-desktop-ui"]["cards"]
+        self.assertEqual(cards["t_p_c1"]["arenaTag"], {"text": "arena:anthropic", "title": "Arena candidate c1-anthropic · ar_7f2c9a10", "role": "candidate"})
+        self.assertEqual(cards["t_p_j"]["arenaTag"], {"text": "arena:judge", "title": "Arena judge · ar_7f2c9a10", "role": "judge"})
+        self.assertEqual(cards["t_p_c1"]["topOrder"], ["fc-sb-dot", "fc-sb-tag", "fc-sb-arena-tag", "fc-sb-dur"])
+        # The arena tag wins over a panel chip on the same card; plain panel lanes keep theirs.
+        self.assertEqual((cards["t_p_c2"]["arenaTag"]["text"], cards["t_p_c2"]["panelChip"]), ("arena:openai", False))
+        self.assertEqual((cards["t_p_v1"]["arenaTag"], cards["t_p_v1"]["panelChip"]), (None, True))
+        d = sb["drawers"]["t_p_c1"]
+        self.assertEqual(d["order"][:6], ["mode", "model", "arena", "role", "candidates", "judge"])
+        self.assertEqual(d["labels"][:6], ["Mode", "Model", "Arena", "Role", "Candidates", "Judge"])
+        self.assertEqual(d["fields"]["arena"], "ar_7f2c9a10 design judging")
+        self.assertEqual(d["tags"]["arena"], [{"text": "judging", "tone": "info"}])
+        self.assertEqual(d["fields"]["role"], "candidate · c1-anthropic")
+        self.assertEqual([c["text"] for c in d["chips"]["candidates"]], ["anthropic", "openai"])
+        self.assertEqual(d["chips"]["judge"], [{"text": "judge · google", "run": "running", "cross": "true", "icon": "spin"}])
+        self.assertEqual(sb["drawers"]["t_p_j"]["fields"]["role"], "judge")
+        # Panel lanes keep their panel rows after Mode/Model; no arena rows.
+        self.assertEqual(sb["drawers"]["t_p_v1"]["order"][:4], ["mode", "model", "panel", "vendor"])
+
+    def test_sidebar_card_drawer_mode_and_report_rows(self):
+        dr = self.report["wave5"]["sidebar"]["drawers"]
+        inv = dr["t_i_def"]
+        self.assertEqual(inv["order"][:3], ["mode", "report", "model"])
+        self.assertEqual(inv["modePill"], {"kind": "investigate", "ro": False})  # no suffix in the drawer pill
+        self.assertEqual(inv["tags"]["mode"], [{"text": "read-only", "tone": "warn"}])
+        self.assertEqual(inv["tags"]["report"], [{"text": "pending", "tone": None}])
+        self.assertEqual(inv["fields"]["report"], "pending investigation.md")  # basename only, never a directory
+        self.assertEqual(inv["reportTitle"], "investigation.md")
+        self.assertEqual(dr["t_p_c1"]["modePill"], {"kind": "perf", "ro": False})
+        bug = dr["t_b_imp"]
+        self.assertEqual((bug["fields"]["mode"], bug["modePill"]), ("bug", None))  # unbadged kinds: plain mono text
+        self.assertNotIn("report", bug["order"])
+        self.assertNotIn("mode", self.report["wave5"]["sidebar"]["plain"]["drawer"]["order"])  # legacy: row omitted
+
+    def test_sidebar_older_backend_without_workstreams_or_arenas(self):
+        sb = self.report["wave5"]["sidebar"]
+        leg = sb["legacy"]
+        arena_ws = leg["omnim-ai-factonio-legacy-arena"]
+        self.assertEqual(arena_ws["mode"]["kind"], "refactor")  # from card workstream_kind
+        self.assertEqual(arena_ws["bodyOrder"], ["fc-sb-pipe", "fc-sb-arena", "fc-sb-ws-cards"])
+        a = arena_ws["arena"]
+        self.assertEqual((a["status"], a["tag"]["text"], a["tag"]["tone"]), ("legacy", "from cards", None))
+        self.assertEqual(a["tag"]["title"], "Older backend: rebuilt from card tags; arena status and artifact readiness unknown")
+        self.assertEqual(a["count"]["text"], "1/2 done")
+        self.assertIsNone(a["callout"])
+        trail_ws = leg["omnim-ai-factonio-legacy-trail"]
+        self.assertEqual((trail_ws["mode"]["kind"], trail_ws["report"]["ready"]), ("investigate", "false"))  # from start_workstream
+        d = sb["legacyDrawer"]
+        self.assertEqual(d["order"][:4], ["mode", "model", "arena", "role"])
+        self.assertNotIn("candidates", d["order"])
+        self.assertEqual(d["fields"]["arena"], "ar_legacy01 define")
+
+    def test_sidebar_never_renders_holdout_text(self):
+        sb = self.report["wave5"]["sidebar"]
+        self.assertEqual(sb["barrierStrings"], [])
+        bar = sb["barrierSection"]
+        self.assertEqual((bar["report"]["ready"], bar["arena"]["callout"]), ("true", None))
+        self.assertEqual(bar["cards"]["t_h1"]["arenaTag"], {"text": "arena:unknown", "title": "Arena candidate · ar_bar01", "role": "candidate"})
+        self.assertEqual(sb["stripChips"], [{"ev": "kind", "text": "mode investigate", "tone": "info"}, {"ev": "read_only", "text": "read-only", "tone": "warn"}])
+
+    def test_dashboard_repo_harness_badge_in_repository_cell(self):
+        d = self.report["wave5"]["dashboard"]
+        self.assertNotIn("error", d)
+        self.assertEqual((d["colgroup"], d["headers"]), (9, 9))
+        r = d["repos"]
+        for slug, row in r.items():
+            self.assertEqual(row["cells"], 9, slug)
+        self.assertEqual(r["omnim-ai-factonio"]["firstCell"], ["fc-trunc fc-repo-name", "fc-trunc fc-repo-path", "fc-harness"])
+        b = r["omnim-ai-factonio"]["badge"]
+        self.assertEqual((b["state"], b["key"], b["text"], b["icon"]), ("ok", "harness", "5 hooks · 1 frozen", "shieldOk"))
+        self.assertEqual((r["acme-api"]["badge"]["text"], r["acme-api"]["badge"]["icon"]), ("md only", "shieldOk"))
+        self.assertEqual((r["acme-web"]["badge"]["state"], r["acme-web"]["badge"]["icon"]), ("error", "attention"))
+        self.assertEqual((r["acme-cli"]["badge"]["state"], r["acme-cli"]["badge"]["key"], r["acme-cli"]["badge"]["icon"]), ("absent", None, "shield"))
+        self.assertIsNone(r["acme-old"]["badge"])  # legacy backend: nothing rendered
+        self.assertEqual(r["acme-old"]["firstCell"], ["fc-trunc fc-repo-name", "fc-trunc fc-repo-path"])
+
+    def test_dashboard_trail_twelve_phase_bar_tones_and_modes(self):
+        d = self.report["wave5"]["dashboard"]
+        self.assertEqual(
+            d["phaseBar"],
+            ["", "define", "design", "implement", "verify·empty", "publish·empty", "gate·empty", "merge·empty", "sep", "intake", "harness", "eval", "sep", "escape·empty", "watchdog·empty"],
+        )
+        self.assertEqual(d["sepHidden"], "true")
+        self.assertEqual([p["text"] for p in d["trail"]["phases"]][8:11], ["intake 2", "harness 1", "eval 2"])
+        self.assertEqual(d["trail"]["tenantOptions"][1:], [["omnim-ai-factonio-cache-miss-spike", "cache-miss-spike · investigate · read-only"], ["omnim-ai-factonio-wave-5-desktop-ui", "wave-5-desktop-ui · perf"]])
+        self.assertEqual(d["evalRows"], ["d_w08", "d_w07"])
+        self.assertEqual(d["evalWsPills"], ["ws wave-5-desktop-ui perf", "ws wave-5-desktop-ui perf"])
+        # start_workstream rows already carry a mode pill, so the ws pill omits it.
+        self.assertEqual(d["defineWsPills"], {"d_w02": "ws cache-miss-spike", "d_w01": "ws wave-5-desktop-ui"})
+        self.assertEqual(d["noMatch"]["chips"], ["workstream cache-miss-spike investigate", "phase eval"])
+        rows = d["trail"]["rows"]
+        self.assertEqual(rows["d_w07"]["actor"], "eval")
+        self.assertEqual(rows["d_w05"]["pills"][0]["href"], "https://github.com/omnim-ai/factonio/issues/412")
+        self.assertEqual([p["ev"] for p in rows["d_w03"]["pills"]], ["arena_id", "target", "candidates", "judge_vendor"])
+        self.assertEqual(
+            d["tones"],
+            {
+                "synthesized": "ok", "verified_fix": "ok", "decided": "ok", "clean": "ok",
+                "stop_the_line": "bad", "fix_incomplete": "bad", "no_winner": "bad", "proof_failed": "bad", "product_regression": "bad",
+                "flaky": "warn", "not_reproduced": "warn", "tie": "warn", "harness_gap": "warn", "doc_drift": "warn",
+                "actionable": "info", "no_action": "info",
+            },
+        )
+        self.assertEqual(d["barrierStrings"], [])
+        self.assertEqual(d["barrierStringsAll"], [])
+
+    def test_wave5_styles_tokens_only_and_responsive_rules(self):
+        source = PLUGIN_JS.read_text(encoding="utf-8")
+        start = source.index("const STYLES = `")
+        styles = source[start : source.index("`", start + len("const STYLES = `"))]
+        block = styles[styles.index("/* v0.4.0 Wave 5") :]
+        self.assertNotRegex(block, r"#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(")
+        self.assertNotIn(".pv-", block)  # preview scaffolding is never ported
+        for needed in (
+            "@container (max-width: 230px) { .fc-sb-mode-ro { display: none; } }",
+            "@container (max-width: 270px) { .fc-sb-arena-word { display: none; } }",
+            "@container (max-width: 760px) { .fc-trail-phase-sep { display: none; } }",
+            "@container (max-width: 640px) {",
+            ".fc-sb-arena .fc-sb-panel-top { flex-wrap: nowrap; }",
+            '.fc-sb-vendor[data-role="judge"][data-cross="false"]',
+            '.fc-sb-arena .fc-sb-callout[data-kind="blocked"] { color: color-mix(in srgb, var(--dt-destructive) 48%, var(--ui-text-primary)); }',
+            '.fc-sb-drawer dd[data-field="arena"] { flex-wrap: wrap;',
+            ".fc-trail-phases { order: 1; flex: 1 1 100%; align-items: center; }",
+            '.fc-harness[data-state="error"]',
+            '.fc-harness[data-state="absent"] { border-style: dashed;',
+        ):
+            self.assertIn(needed, block)
+        # The full STYLES sheet stays free of colour literals too.
+        self.assertNotRegex(styles, r"rgba?\(|hsla?\(")
+        self.assertEqual(source.count("setInterval("), 0)
+        for name in ("arena", "eye", "shield", "shieldOk"):
+            self.assertRegex(source, rf"\n  {name}: \[\[")
 
 if __name__ == "__main__":
     unittest.main()

@@ -62,7 +62,7 @@ Factonio ships a zero-build Hermes Desktop UI (`desktop/plugin.js`) using only p
 
 Track workstream throughput, Diff vs Black-Box pass rates, rework rate, post-merge escape rate, high-rigor verification panel outcomes (with disagreements highlighted), a Trends strip of long-term `trail.db` snapshots (inline-SVG sparklines for pass rate, escape rate and throughput), per-phase median/P90 durations, the append-only Decision Trail (filterable by repository, workstream and phase, with evidence pills and superseded ↔ superseding links), phase model assignments with the configured verify panel's readiness and vendor diversity, and registered repositories in one place:
 
-![Factonio Dashboard showing KPI cards including Verification Panels, the Trends strip, Phase Durations, the Decision Trail ledger with evidence pills and supersede lineage, and Phase Model Configuration](docs/images/dashboard.png)
+![Factonio Dashboard showing KPI cards including Verification Panels, the Trends strip, Phase Durations, the 12-phase Decision Trail ledger with Wave 5 eval, intake and harness evidence pills and supersede lineage, and Phase Model Configuration](docs/images/dashboard.png)
 
 ### Inline Repository Settings Editor
 
@@ -72,11 +72,11 @@ Edit any registered repository's `default_branch`, `merge_policy`, `publish_poli
 
 ### Docked Right-Sidebar Tab & Settings
 
-Monitor active workstreams beside your chat transcript in the hideable **Factonio** tab docked next to **Files** — with live 4-stage pipeline bars, scope/status/phase filters, attention callouts, PR shortcuts, high-rigor verification panel strips (consensus, vendor lanes and a disagreement callout), and expandable card detail drawers:
+Monitor active workstreams beside your chat transcript in the hideable **Factonio** tab docked next to **Files** — with live 4-stage pipeline bars, scope/status/phase filters, attention callouts, PR shortcuts, workstream mode badges (`refactor`, `perf`, `investigate · read-only`), opt-in `/arena` strips (candidate and judge vendors), high-rigor verification panel strips (consensus, vendor lanes and a disagreement callout), and expandable card detail drawers:
 
 | Docked Factonio Sidebar Tab | Settings → Plugins → Factonio |
 |:---:|:---:|
-| ![Factonio Right Sidebar tab beside Files with workstream pipeline, a verification panel strip with a disagreement callout, an open card drawer listing its panel lane and decisions, and per-workstream decision counts](docs/images/sidebar.png) | ![Settings Plugins Factonio landing page showing Phase Models and Agent settings](docs/images/settings.png) |
+| ![Factonio Right Sidebar tab beside Files with a perf mode badge, workstream pipeline, a synthesized arena strip above a verification panel strip with a disagreement callout, an open card drawer listing its panel lane and decisions, and per-workstream decision counts](docs/images/sidebar.png) | ![Settings Plugins Factonio landing page showing Phase Models and Agent settings](docs/images/settings.png) |
 
 ## Quick start
 
