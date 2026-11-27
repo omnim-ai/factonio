@@ -1731,7 +1731,7 @@ def _resolve_pinned(root: Path, rel: str, tree: dict[str, tuple[str, str]], tree
         else:
             return cur if entry is not None and entry[0] in ("100644", "100755") \
                 and _live_blob_matches(root, cur, entry) else None
-    return "/".join(resolved) if want_dir and resolved else None
+    return "/".join(resolved) if want_dir else None  # "" is the repository root itself
 
 
 def _could_prefix_match(globs: Iterable[str], rel: str) -> bool:
@@ -1752,51 +1752,163 @@ def _could_prefix_match(globs: Iterable[str], rel: str) -> bool:
     return False
 
 
+def _concrete_prefix_match(globs: Iterable[str], rel: str) -> bool:
+    """Whether ``rel`` names a directory the glob spells out before any `**` component (`snapshots` for
+    `snapshots/**` or `snapshots/*.png`, never an arbitrary `docs/tool_link` under a leading `**/*.png`)."""
+    parts = rel.split("/")
+    for glob in globs:
+        pat = glob.strip()
+        pat = pat[2:] if pat.startswith("./") else pat
+        gparts = [*pat.split("/")[:-1], "**"] if pat.endswith("/") else pat.split("/")
+        if len(gparts) > len(parts) and all("**" not in gp and glob_matches(gp, part)
+                                            for gp, part in zip(gparts, parts)):
+            return True
+    return False
+
+
+def _committed_link_targets(root: Path, tree: dict[str, tuple[str, str]]) -> dict[str, Optional[str]]:
+    """Committed link text of every `120000` blob in ``tree`` (oid -> text), read once in one read-only
+    `cat-file --batch`; an oid that cannot be read maps to None."""
+    oids = sorted({oid for mode, oid in tree.values() if mode == "120000"})
+    out: dict[str, Optional[str]] = dict.fromkeys(oids)
+    if not oids:
+        return out
+    try:
+        proc = subprocess.run(["git", "--no-optional-locks", "cat-file", "--batch"], cwd=str(root),
+                              input="".join(f"{oid}\n" for oid in oids).encode(), capture_output=True,
+                              timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return out
+    data, pos = proc.stdout, 0
+    for oid in oids:
+        nl = data.find(b"\n", pos)
+        if nl < 0:
+            break
+        header = data[pos:nl].split(b" ")
+        pos = nl + 1
+        if len(header) != 3 or header[1] != b"blob":
+            continue
+        size = int(header[2])
+        out[oid] = os.fsdecode(data[pos:pos + size])
+        pos += size + 1
+    return out
+
+
+def _resolve_committed_symlink(tree: dict[str, tuple[str, str]], tree_dirs: set[str], link_path: str,
+                               link_targets: dict[str, Optional[str]]) -> tuple[str, str]:
+    """Resolve ``link_path`` purely inside the committed ``tree`` (no live disk), component by component like
+    the kernel. Returns `("file", path)` for a committed regular file, `("dir", path)` for a committed directory
+    (`""` is the repository root), or `("invalid", reason)` for an absolute, escaping, broken or cyclic link."""
+    resolved: list[str] = []
+    pending = deque(link_path.split("/"))
+    hops = 0
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    while pending:
+        comp = pending.popleft()
+        if comp in ("", "."):
+            continue
+        if comp == "..":
+            if not resolved:
+                return ("invalid", "escapes the repository")
+            resolved.pop()
+            continue
+        cur = "/".join([*resolved, comp])
+        entry = tree.get(cur)
+        if entry is not None and entry[0] == "120000":
+            target = link_targets.get(entry[1])
+            hops += 1
+            state = (cur, tuple(pending))
+            if not target or target.startswith("/"):
+                return ("invalid", "absolute or unreadable link")
+            if hops > _MAX_SYMLINK_HOPS or state in seen:
+                return ("invalid", "cyclic link")
+            seen.add(state)
+            pending.extendleft(reversed(target.split("/")))
+        elif cur in tree_dirs:
+            resolved.append(comp)
+        elif entry is not None and not pending:
+            return ("file", cur)
+        else:
+            return ("invalid", "broken link")
+    return ("dir", "/".join(resolved))
+
+
+_MAX_LIVE_SCAN = 10000
+
+
+def _live_matches_below(root: Path, rel: str, globs: list[str]) -> bool:
+    """Whether the live directory at ``rel`` holds a file a checker would open as a path matching ``globs``
+    (fails closed past `_MAX_LIVE_SCAN` entries)."""
+    base = root / rel
+    if not base.is_dir():
+        return False
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(base):
+        sub = os.path.relpath(dirpath, base).replace(os.sep, "/")
+        prefix = rel if sub == "." else f"{rel}/{sub}"
+        seen += len(dirnames) + len(filenames)
+        if seen > _MAX_LIVE_SCAN or any(_any_match(globs, f"{prefix}/{name}") for name in filenames):
+            return True
+    return False
+
+
 def _committed_blob_mismatches(root: Path, ref: str, globs: list[str]) -> set[str]:
     """Frozen baselines at ``ref`` whose bytes, as a checker reads them, are no longer the committed ones.
-    Every committed blob matching ``globs`` is resolved with `_resolve_pinned` against the live disk (files
-    hashed directly, so `assume-unchanged`/`skip-worktree` and stat-cache tricks cannot hide a change, for the
+    Discovery runs on the committed tree first: every committed symlink at or above a glob prefix is resolved
+    inside the tree at ``ref`` (`_resolve_committed_symlink`). A file link counts only when it matches
+    ``globs`` itself; a directory link (`snapshots -> real_snapshots`, `alias -> .`) expands to the virtual
+    paths a checker opens (`snapshots/home.png`) that match ``globs``; an absolute, escaping, broken or cyclic
+    link fails closed when it matches, points at a live directory, or is a concrete glob directory prefix.
+    Every discovered baseline is then resolved with `_resolve_pinned` against the live disk (files hashed
+    directly, so `assume-unchanged`/`skip-worktree` and stat-cache tricks cannot hide a change, for the
     baseline or a referent outside ``globs``; filtered content such as LFS or `autocrlf` fails closed). A
-    committed directory symlink at, inside or above a glob prefix (`snapshots -> real_snapshots`) is expanded:
-    each committed file below its committed target becomes the virtual path the checker opens
-    (`snapshots/home.png`) and is verified the same way, while a link that no longer resolves to its committed
-    directory (retargeted, replaced, absolute, escaping, broken, cyclic) is reported itself."""
+    directory link that no longer resolves to its committed directory is reported itself when it had matching
+    baselines or now exposes live files matching ``globs``; unrelated links never are."""
     tree = _committed_tree(root, ref)
     if tree is None:
         return set()
     tree_dirs = _committed_dirs(tree)
     bad: set[str] = set()
-    baselines: set[str] = set()
-    links: deque[tuple[str, tuple[str, ...]]] = deque((rel, ()) for rel, (mode, _) in tree.items()
-                  if mode == "120000" and (_any_match(globs, rel) or _could_prefix_match(globs, rel)))
-    for rel, (mode, _) in tree.items():
-        if mode != "120000" and _any_match(globs, rel):
-            baselines.add(rel)
-    expanded: set[str] = set()
-    while links:
-        link, chain = links.popleft()
-        if link in expanded:
-            continue
-        expanded.add(link)
-        if _any_match(globs, link) and _resolve_pinned(root, link, tree, tree_dirs) is not None:
-            continue  # a pinned file symlink baseline
-        target = _resolve_pinned(root, link, tree, tree_dirs, want_dir=True)
-        if target is None:
-            if _any_match(globs, link) or _resolve_pinned(root, link, tree, tree_dirs) is None:
-                bad.add(link)  # an unpinned directory link, unless it is a pinned file link below no glob
-            continue
-        if target in chain or len(chain) >= _MAX_SYMLINK_HOPS:
-            bad.add(link)  # a directory link back into a directory it is already expanding never ends
-            continue
-        for sub, (mode, _) in tree.items():
-            if not sub.startswith(target + "/"):
+    baselines = {rel for rel, (mode, _) in tree.items() if mode != "120000" and _any_match(globs, rel)}
+    link_targets: Optional[dict[str, Optional[str]]] = None
+
+    def visit(vpath: str, real: str, chain: tuple[str, ...]) -> tuple[set[str], set[str]]:
+        """Baselines and failures below the committed link ``real`` as a checker reaches it at ``vpath``."""
+        kind, target = _resolve_committed_symlink(tree, tree_dirs, real, link_targets or {})
+        if kind == "file":
+            return ({vpath} if _any_match(globs, vpath) else set()), set()
+        if kind == "invalid":
+            fail = (_any_match(globs, vpath) or os.path.isdir(root / vpath)
+                    or _concrete_prefix_match(globs, vpath))
+            return set(), ({vpath} if fail else set())
+        found: set[str] = set()
+        failed: set[str] = set()
+        # A loop back into a directory already being expanded (`alias -> .`) reaches no new committed files.
+        for sub, (mode, _) in () if target in chain or len(chain) >= _MAX_SYMLINK_HOPS else tree.items():
+            if target and not sub.startswith(target + "/"):
                 continue
-            vpath = f"{link}/{sub[len(target) + 1:]}"
-            if mode == "120000":
-                if _any_match(globs, vpath) or _could_prefix_match(globs, vpath):
-                    links.append((vpath, (*chain, target)))
-            elif _any_match(globs, vpath):
-                baselines.add(vpath)
+            child = f"{vpath}/{sub[len(target) + 1:] if target else sub}"
+            if mode != "120000":
+                if _any_match(globs, child):
+                    found.add(child)
+            elif _any_match(globs, child) or _could_prefix_match(globs, child):
+                sub_found, sub_failed = visit(child, sub, (*chain, target))
+                found |= sub_found
+                failed |= sub_failed
+        if _resolve_pinned(root, vpath, tree, tree_dirs, want_dir=True) is not None:
+            return found, failed
+        if found or failed or _live_matches_below(root, vpath, globs):
+            return set(), {vpath}  # retargeted, replaced or removed: the link itself no longer pins them
+        return set(), set()
+
+    for rel, (mode, _) in tree.items():
+        if mode != "120000" or not (_any_match(globs, rel) or _could_prefix_match(globs, rel)):
+            continue
+        if link_targets is None:
+            link_targets = _committed_link_targets(root, tree)
+        found, failed = visit(rel, rel, ())
+        baselines |= found
+        bad |= failed
     bad.update(rel for rel in baselines if _resolve_pinned(root, rel, tree, tree_dirs) is None)
     return bad
 
