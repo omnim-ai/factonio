@@ -1706,8 +1706,10 @@ def _merge_baseline_changes(*groups: list[dict[str, Any]]) -> list[dict[str, Any
 # deletions, quote or operator edits, heredocs or line continuations), the same `--flag=val` / `--flag val`
 # syntax, and each changed committed threshold a plain fixed-point decimal no larger than before. On top of that,
 # every byte outside the tightened threshold value spans must match the committed command verbatim
-# (`_verbatim_tightening_ok`): whitespace, comments and quoting are never normalized. Everything else fails
-# closed, and every validation regex anchors with `\A...\Z` + `fullmatch` (`$` also matches before a final LF).
+# (`_verbatim_tightening_ok`): whitespace, comments and quoting are never normalized. Edited commands allow this
+# only on a single simple command (or `sh -c`/`bash -c` wrapping one) with `env` slots in leading assignment
+# position and `flag` slots before `--` (`_value_spans`), so comparison data is never a threshold. Everything
+# else fails closed, and every validation regex anchors with `\A...\Z` + `fullmatch` (`$` also matches before a final LF).
 
 _THRESHOLD_KEY_RE = re.compile(
     r"threshold|toleran|max[-_]?diff|fuzz|max[-_]?pixel|diff[-_]?ratio|mismatch", re.IGNORECASE
@@ -2053,73 +2055,107 @@ def _value_span(raw: str, off: int, from_argv: bool) -> list[tuple[int, int]]:
     return []
 
 
+# Command heads an edited command may never have: shell keywords/builtins, shells, test/comparison utilities,
+# text filters and wrappers that run another command (any argument could be comparison data or code).
+_EDIT_DENIED_HEADS = frozenset({
+    "[", "[[", "test", "if", "then", "elif", "else", "fi", "while", "until", "for", "do", "done", "case", "esac",
+    "select", "time", "coproc", "!", "{", "}", "function", "echo", "printf", "grep", "egrep", "fgrep", "rg",
+    "sed", "awk", "gawk", "mawk", "tr", "cut", "cat", "head", "tail", "true", "false", "exit", "return", "eval",
+    "exec", "source", ".", "alias", "set", "unset", "declare", "typeset", "local", "readonly", "export", "let",
+    "command", "builtin", "env", "xargs", "nice", "nohup", "timeout", "sudo", "doas", "stdbuf", "setsid",
+    "chroot", "ionice", "taskset", "strace", "watch", "expr", *_SHELLS,
+})
+_SH_C_SHELLS = frozenset({"sh", "bash"})
+
+
+def _inline_code_option(text: str) -> bool:
+    """`-c`/`-e`/`-p` (alone, in a short cluster like `-Bc`, or with attached code) or `--eval`/`--print`/...:
+    the following word is code or printed data, never an argument the checker reads as a threshold."""
+    if text.startswith("--"):
+        return bool(re.fullmatch(r"--(?:eval|print|command|execute)(?:=.*)?", text, re.DOTALL))
+    if not text.startswith("-") or len(text) < 2:
+        return False
+    if text[1] in "cep":
+        return True
+    m = re.match(r"-[A-Za-z]{1,3}(?![A-Za-z])", text)
+    return bool(m) and any(c in m.group(0) for c in "cep")
+
+
 def _value_spans(command: Any, depth: int = 0) -> list[tuple[int, int, int]]:
     """``(item, start, end)`` source offsets of every editable threshold value in ``command`` (item is the argv
-    index, 0 for a string), nested `sh -c` scripts included when their offsets map 1:1. Words inside bash
-    `[[ ... ]]` or `(( ... ))` are never thresholds. Raises ValueError like `_tokenize_visual_cmd`."""
+    index, 0 for a string). Only a single simple command has editable values (or `sh -c`/`bash -c` wrapping
+    one, recursively, when the script's offsets map 1:1): `env` slots only as leading `NAME=val` assignments
+    (directly, or after a leading `env` and `-i`) before a real command head, `flag` slots only after that head
+    and before `--`. Raises `_UnsupportedEdit` for anything else: shell operators, newlines, comments, `$`/``
+    ` ``/glob expansion, a missing or denied head (shell keyword, test, text filter, wrapper) or an inline-code
+    option; and ValueError like `_tokenize_visual_cmd`."""
+    if depth > _MAX_SCRIPT_DEPTH:
+        raise _UnsupportedEdit("nesting too deep")
     toks = _tokenize_visual_cmd(command)
     argv = isinstance(command, list)
-    segs: list[list[Optional[tuple[int, _Tok]]]] = [[]]
-    parens: list[bool] = []  # one entry per open `(`: True inside arithmetic `((`
-    in_test = False
-    for k, tok in enumerate(toks):
-        unit = k if argv else 0
-        if tok.is_op:
-            if tok.raw == "(":
-                nxt = toks[k + 1] if k + 1 < len(toks) else None
-                parens.append(any(parens) or (nxt is not None and nxt.is_op and nxt.raw == "("
-                                              and nxt.start == tok.end))
-            elif tok.raw == ")" and parens:
-                parens.pop()
-            segs.append([])
-            continue
-        if not argv and tok.raw in ("[[", "]]"):
-            in_test = tok.raw == "[["
-            segs[-1].append(None)
-        elif in_test or any(parens):
-            segs[-1].append(None)
-        else:
-            segs[-1].append((unit, tok))
+    if not argv:
+        text, pos = str(command or ""), 0
+        for tok in toks:
+            if tok.is_op or text[pos:tok.start].strip(" \t") or _outer_expands(tok):
+                raise _UnsupportedEdit("compound command")
+            pos = tok.end
+        if text[pos:].strip(" \t"):
+            raise _UnsupportedEdit("comment")  # `#` comments are the only bytes the tokenizer drops
     spans: list[tuple[int, int, int]] = []
-    for seg in segs:
-        head = next((k for k, w in enumerate(seg) if w is None or not _ASSIGN_RE.fullmatch(w[1].raw)), None)
-        if (head is not None and seg[head] is not None and depth < _MAX_SCRIPT_DEPTH
-                and os.path.basename(seg[head][1].raw) in _SHELLS):
-            k = head + 1
-            while k < len(seg) and seg[k] is not None and re.fullmatch(r"[-+][A-Za-z]+", seg[k][1].raw) \
-                    and "c" not in seg[k][1].raw:
-                k += 1
-            if (k + 1 < len(seg) and seg[k] is not None and seg[k + 1] is not None
-                    and re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", seg[k][1].raw)):
-                unit, script = seg[k + 1]
-                off = _payload_offset(script)
-                if off is not None:
-                    spans += [(unit, off + s, off + e) for _, s, e in _value_spans(script.text, depth + 1)]
-                seg[k + 1] = None  # the script is code, never one threshold word
-        i = 0
-        while i < len(seg):
-            item = seg[i]
+
+    def env_slot(k: int) -> bool:
+        tok = toks[k]
+        m = _ASSIGN_RE.fullmatch(tok.raw)
+        if not m:
+            return False
+        if _THRESHOLD_KEY_RE.search(m.group(1)):
+            spans.extend((k if argv else 0, s, e) for s, e in
+                         _value_span(m.group(2), tok.start + len(m.group(1)) + 1, tok.from_argv))
+        return True
+
+    k = 0
+    while not argv and k < len(toks) and env_slot(k):
+        k += 1  # an argv item `NAME=val` is a command name for execvp, never an assignment
+    if k < len(toks) and os.path.basename(toks[k].text) == "env":
+        k += 1
+        while k < len(toks) and toks[k].text in ("-", "-i", "--ignore-environment"):
+            k += 1
+        while k < len(toks) and env_slot(k):
+            k += 1
+    if k >= len(toks):
+        raise _UnsupportedEdit("no command head")
+    head = os.path.basename(toks[k].text)
+    rest = toks[k + 1:]
+    if head in _SH_C_SHELLS:
+        j = 0
+        while j < len(rest) and re.fullmatch(r"[-+][A-Za-z]+", rest[j].raw) and "c" not in rest[j].raw:
+            j += 1
+        if (len(rest) != j + 2 or not re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", rest[j].raw)
+                or (off := _payload_offset(rest[j + 1])) is None):
+            raise _UnsupportedEdit("shell wrapper")
+        unit = k + 1 + j + 1 if argv else 0
+        inner = _value_spans(rest[j + 1].text, depth + 1)
+        return sorted([*spans, *((unit, off + s, off + e) for _, s, e in inner)])
+    if head in _EDIT_DENIED_HEADS or _ASSIGN_RE.fullmatch(toks[k].text) or toks[k].text.startswith("-"):
+        raise _UnsupportedEdit("command head")
+    end = next((j for j, t in enumerate(rest) if t.text == "--"), len(rest))
+    if any(_inline_code_option(t.text) for t in rest[:end]):
+        raise _UnsupportedEdit("inline code option")
+    i = 0
+    while i < end:
+        tok = rest[i]
+        i += 1
+        raw = tok.raw
+        if not (raw.startswith("-") and raw not in ("-", "--") and _THRESHOLD_KEY_RE.search(raw.partition("=")[0])):
+            continue
+        unit = k + i if argv else 0
+        name, eq, val = raw.partition("=")
+        if eq:
+            spans += [(unit, s, e) for s, e in _value_span(val, tok.start + len(name) + 1, tok.from_argv)]
+        elif i < end and not rest[i].raw.startswith("--"):
+            nxt = rest[i]
             i += 1
-            if item is None:
-                continue
-            unit, tok = item
-            raw = tok.raw
-            m = _ASSIGN_RE.fullmatch(raw)
-            if m and _THRESHOLD_KEY_RE.search(m.group(1)):
-                found = _value_span(m.group(2), tok.start + len(m.group(1)) + 1, tok.from_argv)
-            elif raw.startswith("-") and raw not in ("-", "--") and _THRESHOLD_KEY_RE.search(raw.partition("=")[0]):
-                name, eq, val = raw.partition("=")
-                nxt_item = seg[i] if i < len(seg) else None
-                found = []
-                if eq:
-                    found = _value_span(val, tok.start + len(name) + 1, tok.from_argv)
-                elif nxt_item is not None and not nxt_item[1].raw.startswith("--"):
-                    unit, nxt = nxt_item  # the value word: its own argv index
-                    i += 1
-                    found = _value_span(nxt.raw, nxt.start, nxt.from_argv)
-            else:
-                found = []
-            spans += [(unit, s, e) for s, e in found]
+            spans += [(k + i if argv else 0, s, e) for s, e in _value_span(nxt.raw, nxt.start, nxt.from_argv)]
     return sorted(spans)
 
 

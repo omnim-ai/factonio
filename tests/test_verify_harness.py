@@ -2780,11 +2780,10 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
         "% tightened": ("python3 check.py --threshold 5%", "python3 check.py --threshold 1%"),
         "prefix tightened": ("THRESHOLD=0.05 python3 check.py", "THRESHOLD=0.01 python3 check.py"),
         "quoted prefix tightened": ("THRESHOLD='0.05' python3 check.py", "THRESHOLD='0.01' python3 check.py"),
-        "export tightened": ("export THRESHOLD=0.05; python3 check.py", _EXPORTED),
-        "sh -c tightened": ("bash -c 'export THRESHOLD=0.05; python3 check.py'", "bash -c '" + _EXPORTED + "'"),
+        "env tightened": ("env THRESHOLD=0.05 python3 check.py", "env THRESHOLD=0.01 python3 check.py"),
+        "sh -c prefix tightened": ("bash -c 'THRESHOLD=0.05 python3 check.py'", "bash -c 'THRESHOLD=0.01 python3 check.py'"),
         "sh -c pixels tightened": ("sh -c 'node check.js --max-diff-pixels=5'",
                                    "sh -c 'node check.js --max-diff-pixels=1'"),
-        "compound tightened": ("a --threshold 0.05 && b --threshold 0.02", "a --threshold 0.01 && b --threshold 0.01"),
         "committed --reporter=list tightened": ("npx playwright test --reporter=list --threshold 0.05",
                                                 "npx playwright test --reporter=list --threshold 0.01"),
         "committed UPDATE_SNAPSHOTS=0 tightened": ("UPDATE_SNAPSHOTS=0 THRESHOLD=0.05 npx playwright test",
@@ -2892,7 +2891,7 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
 
         self._assert_clean(self._CLEAN)
         with isolated_hermes_home() as home:
-            for n, label in enumerate(("export tightened", "sh -c tightened", "committed --reporter=list tightened",
+            for n, label in enumerate(("env tightened", "sh -c prefix tightened", "committed --reporter=list tightened",
                                        "quoted prefix tightened", "committed UPDATE_SNAPSHOTS=0 tightened")):
                 base, live = self._CLEAN[label]
                 with self.subTest(label):
@@ -3151,12 +3150,14 @@ class TestFixRound13StructuralGuardHardening(unittest.TestCase):
             "argv list -> plain string": (["python3", "check.py", "--threshold", "0.05"],
                                           "python3 check.py --threshold 0.01"),
         })
-        # `T` is not a threshold name, so `T=0.05` -> `T=0.01` is an unverifiable edit; a threshold-named
-        # variable is tightened in place inside the single-quoted script.
+        # Round 21: an edited script must be one simple command, so even a threshold-named variable in a
+        # compound script is never editable; a leading assignment inside the single-quoted script is.
+        compound = "bash -c 'T_THRESHOLD=0.05; export THRESHOLD=$T_THRESHOLD; python3 check.py'"
+        self._assert_rejected({"compound script tightened": (compound, compound.replace("0.05", "0.01"))})
         self._assert_clean({
-            "single-quoted tightening": (
-                "bash -c 'T_THRESHOLD=0.05; export THRESHOLD=$T_THRESHOLD; python3 check.py'",
-                "bash -c 'T_THRESHOLD=0.01; export THRESHOLD=$T_THRESHOLD; python3 check.py'"),
+            "single-quoted tightening": ("bash -c 'THRESHOLD=0.05 python3 check.py'",
+                                         "bash -c 'THRESHOLD=0.01 python3 check.py'"),
+            "unchanged compound script": (compound, compound),
             "argv list tightened": (["python3", "check.py", "--threshold", "0.05"],
                                     ["python3", "check.py", "--threshold", "0.01"]),
             "unchanged double-quoted": (double, double),
@@ -4169,8 +4170,12 @@ class TestFixRound20VerbatimOutsideThresholdValueSpans(unittest.TestCase):
         self.assertEqual(spans("sh -c 'node c.js --max-diff-pixels=5'"), ["5"])
         self.assertEqual(spans(["bash", "-c", "node c.js --threshold 0.05"]), ["0.05"])
         self.assertEqual(spans('a --threshold "0.01\n"'), [])
-        self.assertEqual(spans("[[ $x =~ --threshold=0.05 ]] && (( --threshold=5 )) && $((--threshold=5))"), [])
-        self.assertEqual(spans('sh -c "node c.js --threshold=\\"0.05\\""'), [])  # escapes: offsets do not map 1:1
+        for compound in ("[[ $x =~ --threshold=0.05 ]] && (( --threshold=5 )) && $((--threshold=5))",
+                         "a --threshold=0.05 # c"):
+            with self.assertRaises(ValueError):
+                spans(compound)
+        with self.assertRaises(ValueError):  # escapes: offsets do not map 1:1
+            spans('sh -c "node c.js --threshold=\\"0.05\\""')
 
     def test_any_edit_outside_a_value_span_is_rejected(self):
         exported = "export THRESHOLD=0.01; python3 check.py"
@@ -4187,6 +4192,7 @@ class TestFixRound20VerbatimOutsideThresholdValueSpans(unittest.TestCase):
             "escaped double-quoted script": ('sh -c "node c.js --threshold=\\"0.05\\""',
                                              'sh -c "node c.js --threshold=\\"0.01\\""'),
             "loosened": ("python3 check.py --threshold=0.05", "python3 check.py --threshold=0.06"),
+            "comment kept": ("a  --threshold=5%  # c", "a  --threshold=1%  # c"),
             "integer to decimal": ("sh -c 'node check.js --max-diff-pixels=5'",
                                    "sh -c 'node check.js --max-diff-pixels=0.5'"),
             "unit dropped": ("a --threshold=5%", "a --threshold=1"),
@@ -4199,7 +4205,7 @@ class TestFixRound20VerbatimOutsideThresholdValueSpans(unittest.TestCase):
             **{f"unchanged {cmd!r}": (cmd, cmd) for cmd in self._UNCHANGED},
             "double-quoted script": ('sh -c "node c.js --threshold 0.05"', 'sh -c "node c.js --threshold 0.01"'),
             "argv tightened": (["bash", "-c", "node c.js --threshold 0.05"], ["bash", "-c", "node c.js --threshold 0.01"]),
-            "comment and spacing kept": ("a  --threshold=5%  # c", "a  --threshold=1%  # c"),
+            "spacing kept": ("a  --threshold=5%  ", "a  --threshold=1%  "),
         })
 
     def test_trailing_newline_thresholds_are_rejected_end_to_end(self):
@@ -4224,6 +4230,132 @@ class TestFixRound20VerbatimOutsideThresholdValueSpans(unittest.TestCase):
                     self._set_command(repo, live)
                     chk = check_harness(str(repo), run_hooks=True)
                     self.assertEqual(chk["hook_results"]["failed_required"], ["pixels"])  # the bar still holds
+                    self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+                    audit = audit_harness(str(repo))
+                    self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("clean", False))
+
+
+class TestFixRound21SingleSimpleCommandTightening(unittest.TestCase):
+    """Round 21: an edited committed command may tighten a threshold in place only on a single simple command
+    (or `sh -c`/`bash -c` wrapping one), with `env` slots only as leading assignments before a real command
+    head and `flag` slots only after that head and before `--`. A `NAME=val` word anywhere else is data."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    _repo = TestFixRound20VerbatimOutsideThresholdValueSpans._repo
+    # Fails (exit 1) while its argv still holds the committed literal: an edited literal turns it green.
+    _ARGV_CHECK = "import sys\nsys.exit(1 if {!r} in sys.argv[1:] else 0)\n"
+    _STRICT = TestFixRound20VerbatimOutsideThresholdValueSpans._STRICT
+    _EXECUTED = (
+        # OpenAI Diff t_19be3775: a POSIX `[` comparison literal is not an environment threshold
+        ('out=THRESHOLD=0.05; if [ "$out" = THRESHOLD=0.05 ]; then exit 1; fi',
+         'out=THRESHOLD=0.05; if [ "$out" = THRESHOLD=0.01 ]; then exit 1; fi'),
+        ('out=--threshold=0.05; if [ "$out" = --threshold=0.05 ]; then exit 1; fi',
+         'out=--threshold=0.05; if [ "$out" = --threshold=0.01 ]; then exit 1; fi'),
+        ("python3 check.py THRESHOLD=0.05", "python3 check.py THRESHOLD=0.01"),            # positional, not leading
+        ("python3 check.py -- --threshold=0.05", "python3 check.py -- --threshold=0.01"),  # after `--`
+        ("python3 -c 'import sys; sys.exit(\"--threshold=0.05\" in sys.argv)' --threshold=0.05",
+         "python3 -c 'import sys; sys.exit(\"--threshold=0.05\" in sys.argv)' --threshold=0.01"),  # inline code
+    )
+    _CHECKS = {
+        "python3 check.py THRESHOLD=0.05": _ARGV_CHECK.format("THRESHOLD=0.05"),
+        "python3 check.py -- --threshold=0.05": _ARGV_CHECK.format("--threshold=0.05"),
+        "THRESHOLD=0.05 python3 check.py": _STRICT,
+        "env THRESHOLD=0.05 python3 check.py": _STRICT,
+        "python3 check.py --threshold=0.05": _STRICT,
+        "python3 check.py --threshold 0.05": _STRICT,
+        "sh -c 'python3 check.py --threshold=0.05'": _STRICT,
+    }
+    _REJECTED = {
+        "node -e": ("node -e 'process.exit(process.argv.includes(\"--threshold=0.05\") ? 1 : 0)' --threshold=0.05",
+                    "node -e 'process.exit(process.argv.includes(\"--threshold=0.05\") ? 1 : 0)' --threshold=0.01"),
+        "[ ] head": ("[ x = --threshold=0.05 ]", "[ x = --threshold=0.01 ]"),
+        "test head": ("test x = THRESHOLD=0.05", "test x = THRESHOLD=0.01"),
+        "assignment only": ("THRESHOLD=0.05", "THRESHOLD=0.01"),
+        "env without head": ("env THRESHOLD=0.05", "env THRESHOLD=0.01"),
+        "env -S": ("env -S 'node check.js' THRESHOLD=0.05 node c.js", "env -S 'node check.js' THRESHOLD=0.01 node c.js"),
+        "env -S split string": ("env -S 'node c.js' --threshold=0.05", "env -S 'node c.js' --threshold=0.01"),
+        "env -u": ("env -u X node c.js --threshold=0.05", "env -u X node c.js --threshold=0.01"),
+        "echo head": ("echo --threshold=0.05", "echo --threshold=0.01"),
+        "grep head": ("grep -q --threshold=0.05 report.txt", "grep -q --threshold=0.01 report.txt"),
+        "wrapper head": ("timeout 60 test x = --threshold=0.05", "timeout 60 test x = --threshold=0.01"),
+        "export head": ("export THRESHOLD=0.05", "export THRESHOLD=0.01"),
+        "export then run": ("export THRESHOLD=0.05; python3 check.py", "export THRESHOLD=0.01; python3 check.py"),
+        "assign; export; run": ("THRESHOLD=0.05; export THRESHOLD; node check.js",
+                                "THRESHOLD=0.01; export THRESHOLD; node check.js"),
+        "export &&": ("export THRESHOLD=0.05 && node check.js", "export THRESHOLD=0.01 && node check.js"),
+        "compound &&": ("a --threshold 0.05 && b --threshold 0.02", "a --threshold 0.01 && b --threshold 0.01"),
+        "pipeline": ("node check.js --threshold=0.05 | cat", "node check.js --threshold=0.01 | cat"),
+        "sh -c compound": ("bash -c 'export THRESHOLD=0.05; python3 check.py'",
+                           "bash -c 'export THRESHOLD=0.01; python3 check.py'"),
+        "sh -c test": ("sh -c '[ x = --threshold=0.05 ]'", "sh -c '[ x = --threshold=0.01 ]'"),
+        "sh -c extra args": ("sh -c 'node c.js --threshold=0.05' x", "sh -c 'node c.js --threshold=0.01' x"),
+        "$ expansion": ('node check.js "$X" --threshold=0.05', 'node check.js "$X" --threshold=0.01'),
+        "comment": ("node check.js --threshold=0.05 # c", "node check.js --threshold=0.01 # c"),
+        "argv positional": (["python3", "check.py", "THRESHOLD=0.05"], ["python3", "check.py", "THRESHOLD=0.01"]),
+        "argv after --": (["python3", "check.py", "--", "--threshold=0.05"],
+                          ["python3", "check.py", "--", "--threshold=0.01"]),
+        "argv test": (["test", "x", "=", "--threshold=0.05"], ["test", "x", "=", "--threshold=0.01"]),
+        "-pe cluster": ("perl -pe 1 --threshold=0.05", "perl -pe 1 --threshold=0.01"),
+        "--eval=": ("deno --eval=1 --threshold=0.05", "deno --eval=1 --threshold=0.01"),
+    }
+    _CLEAN = {
+        "leading assignment": ("THRESHOLD=0.05 node check.js", "THRESHOLD=0.01 node check.js"),
+        "env assignment": ("env THRESHOLD=0.05 node check.js", "env THRESHOLD=0.01 node check.js"),
+        "env -i assignment": ("env -i THRESHOLD=0.05 node check.js", "env -i THRESHOLD=0.01 node check.js"),
+        "--flag=": ("node check.js --threshold=0.05", "node check.js --threshold=0.01"),
+        "--flag value": ("node check.js --threshold 0.05", "node check.js --threshold 0.01"),
+        "playwright": ("npx playwright test --max-diff-pixel-ratio=0.05", "npx playwright test --max-diff-pixel-ratio=0.01"),
+        "sh -c pixels": ("sh -c 'node check.js --max-diff-pixels=5'", "sh -c 'node check.js --max-diff-pixels=1'"),
+        "flag before --": ("npx jest --threshold=0.05 -- x", "npx jest --threshold=0.01 -- x"),
+        "argv env": (["env", "THRESHOLD=0.05", "node", "check.js"], ["env", "THRESHOLD=0.01", "node", "check.js"]),
+        "argv flag": (["node", "check.js", "--threshold=0.05"], ["node", "check.js", "--threshold=0.01"]),
+    }
+    _UNCHANGED = (
+        *(base for base, _ in _EXECUTED), *(base for base, _ in _REJECTED.values()),
+        "if [ -f a ]; then node check.js; fi | tee log\nnode -e 1 -c --eval=2 # done",
+        "cat <<EOF >/dev/null\nTHRESHOLD=0.05\nEOF\nnode check.js",
+    )
+
+    def test_non_simple_or_non_slot_edits_are_rejected(self):
+        self._assert_rejected({**{live: (base, live) for base, live in self._EXECUTED}, **self._REJECTED})
+
+    def test_single_simple_command_tightening_and_unchanged_commands_stay_clean(self):
+        self._assert_clean({**self._CLEAN, **{f"unchanged {cmd!r}": (cmd, cmd) for cmd in self._UNCHANGED}})
+
+    def test_comparison_positional_and_inline_code_edits_are_rejected_end_to_end(self):
+        """Each committed command fails; each edited literal really turns it green, yet check and audit flag it."""
+        self._assert_executed_bypasses_rejected(list(self._EXECUTED))
+
+    def test_value_spans_ignore_non_slot_positions(self):
+        from factonio.harness import _value_spans
+
+        def spans(cmd: Any) -> list[str]:
+            items = cmd if isinstance(cmd, list) else [cmd]
+            return [items[u][s:e] for u, s, e in _value_spans(cmd)]
+
+        self.assertEqual(spans("A=1 THRESHOLD=0.05 env -i MAX_DIFF=2 node c.js THRESHOLD=3 --threshold 4 -- "
+                               "--threshold=5"), ["0.05", "2", "4"])
+        self.assertEqual(spans(["env", "THRESHOLD=1", "node", "--threshold", "2", "--", "--threshold=3"]), ["1", "2"])
+        for cmd in ('[ "$out" = THRESHOLD=0.05 ]', "THRESHOLD=0.05", "x=1; node c.js --threshold=1",
+                    "node -e 1 --threshold=1", "bash -c 'a; b --threshold=1'", "test 1 --threshold=1"):
+            with self.subTest(cmd=cmd), self.assertRaises(ValueError):
+                spans(cmd)
+
+    def test_single_command_tightening_still_fails_the_hook_and_stays_clean(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            for n, base in enumerate(cmd for cmd, src in self._CHECKS.items() if src == self._STRICT):
+                live = base.replace("0.05", "0.01")
+                with self.subTest(live=live):
+                    repo = self._repo(home, f"svc{n}", base)
+                    self._set_command(repo, live)
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(chk["hook_results"]["failed_required"], ["pixels"])  # the bar still holds
+                    self.assertEqual(chk["errors"], ["Required hook 'pixels' failed"])  # no gate finding
                     self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
                     audit = audit_harness(str(repo))
                     self.assertEqual((audit["severity"], audit["gate_loosening"]["loosened"]), ("clean", False))
