@@ -51,6 +51,7 @@ _PASS_VERDICTS = frozenset({"pass"})
 _ARENA_TAG_RE = re.compile(
     r"- Arena: `(ar_[0-9a-f]{6,32})` \(role=`([^`\n]+)`, target=`([^`\n]+)`(?:, slot=`([^`\n]+)`)?, vendor=`([^`\n]+)`"
 )
+_ARENA_ROLES: tuple[str, ...] = ("candidate", "judge")
 _MODE_LINE_RE = re.compile(r"^- Mode: `([a-z]+)`$", re.MULTILINE)
 _REPORT_LINE_RE = re.compile(r"^- Investigation report path: `([^`\n]+)`$", re.MULTILINE)
 # Mode contract headings stamped by `orchestrator.mode_contract_section` (incl. skip_define cards).
@@ -228,15 +229,19 @@ def parse_arena_tag(body: Any) -> Optional[dict[str, Optional[str]]]:
     m = _ARENA_TAG_RE.search(text)
     if not m:
         return None
+    from .arena import ARENA_TARGETS  # lazy: arena imports orchestrator, which imports this module
+
     model = _PANEL_MODEL_RE.match(text, m.end())
-    return {
+    tag = {
         "arena_id": m.group(1),
-        "role": m.group(2),
-        "target": m.group(3),
+        "role": m.group(2) if m.group(2) in _ARENA_ROLES else None,
+        "target": m.group(3) if m.group(3) in ARENA_TARGETS else None,
         "slot": m.group(4),
         "vendor": m.group(5),
         "model": model.group(1) if model else None,
     }
+    # Card bodies are free text: fail closed on any stamp field that names holdout.
+    return {k: None if v is None or contains_holdout_reference(v) else v for k, v in tag.items()}
 
 
 def parse_workstream_mode(task: Mapping[str, Any], runs: Optional[list[dict[str, Any]]] = None) -> Optional[dict[str, Any]]:

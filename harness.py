@@ -1207,13 +1207,15 @@ def summarize_harness_readonly(repo_path: Optional[str | Path]) -> dict[str, Any
     except (OSError, ValueError):
         return {**summary, "has_manifest_error": True}
     manifest = info.get("manifest")
-    raw_hooks = manifest.get("hooks") if isinstance(manifest, dict) else None
+    # An omitted "hooks" key is valid; an explicit null (or any non-list) is a schema error.
+    raw_hooks = manifest.get("hooks", []) if isinstance(manifest, dict) else []
     error = bool(info.get("manifest_error")) or (
         isinstance(manifest, dict)
         and (
             type(manifest.get("schema_version")) is not int
             or manifest.get("schema_version") != HARNESS_SCHEMA_VERSION
-            or (raw_hooks is not None and (not isinstance(raw_hooks, list) or not all(isinstance(h, dict) for h in raw_hooks)))
+            or not isinstance(raw_hooks, list)
+            or not all(isinstance(h, dict) for h in raw_hooks)
         )
     )
     hooks = [h for h in info.get("hooks") or [] if isinstance(h, dict)]

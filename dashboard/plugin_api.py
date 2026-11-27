@@ -228,6 +228,20 @@ def cards(
     return _metrics.thread_cards(_kanban_db(), session_id=session_id, tenant=tenant, limit=limit)
 
 
+def _scrub_public(value: Any) -> Any:
+    """Public trail serializer: drop holdout-named keys and redact any string that references holdout.
+
+    Strings without a holdout reference pass through byte-for-byte, so ordinary rows are unchanged.
+    """
+    if isinstance(value, str):
+        return "[redacted]" if _trail.contains_holdout_reference(value) else value
+    if isinstance(value, dict):
+        return {k: _scrub_public(v) for k, v in value.items() if not _trail.contains_holdout_reference(str(k))}
+    if isinstance(value, (list, tuple)):
+        return [_scrub_public(v) for v in value]
+    return value
+
+
 @router.get("/trail")
 def trail(
     tenant: Optional[str] = Query(None),
@@ -238,7 +252,7 @@ def trail(
     profile: Optional[str] = Query(None),
 ):
     """Append-only decision trail from `trail.db`: `{decisions, summary, filters}`."""
-    return _trail.trail_payload(tenant=tenant, repo=repo, phase=phase, card_id=card_id, limit=limit)
+    return _scrub_public(_trail.trail_payload(tenant=tenant, repo=repo, phase=phase, card_id=card_id, limit=limit))
 
 
 @router.get("/trail/{decision_id}")
@@ -247,7 +261,7 @@ def trail_decision(decision_id: str, profile: Optional[str] = Query(None)):
     row = _trail.get_decision(decision_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"Decision {decision_id!r} not found.")
-    return {"decision": row}
+    return {"decision": _scrub_public(row)}
 
 
 @router.get("/doctor")

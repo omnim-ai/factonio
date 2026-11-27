@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -688,9 +689,12 @@ def _find_manifest(arena_id: Optional[str], tenant: Optional[str]) -> tuple[Opti
 
 def _created_ns(manifest: dict[str, Any]) -> int:
     for key, scale in (("created_at_ns", 1), ("created_at", 1_000_000_000)):
+        raw = manifest.get(key)
+        if isinstance(raw, bool) or (isinstance(raw, float) and not math.isfinite(raw)):
+            continue
         try:
-            value = int(manifest.get(key) or 0)
-        except (TypeError, ValueError):
+            value = int(raw or 0)
+        except (TypeError, ValueError, OverflowError):
             continue
         if value > 0:
             return value * scale
@@ -1110,8 +1114,27 @@ def _scrub(text: Any) -> Optional[str]:
 
 
 def _scrub_labels(entry: dict[str, Any]) -> dict[str, Any]:
-    """Fail closed on manifest-sourced free text (slot, vendor, model) that references holdout."""
-    return {**entry, **{k: _scrub(entry.get(k)) for k in ("slot", "vendor", "model") if k in entry}}
+    """Fail closed on manifest-sourced strings (slot, vendor, model, task_id) that reference holdout."""
+    return {**entry, **{k: _scrub(entry.get(k)) for k in ("slot", "vendor", "model", "task_id") if k in entry}}
+
+
+# Per-manifest failures: corrupt JSON shapes, non-finite numbers, unreadable files.
+_MANIFEST_ERRORS = (TypeError, ValueError, KeyError, AttributeError, OSError, OverflowError)
+
+
+def _public_manifest_ok(manifest: dict[str, Any], tenant: str, arena_id: str) -> bool:
+    """Only manifests whose identity matches their ``<tenant>/arena/<arena_id>`` directory reach Dashboard payloads."""
+    raw_tenant = manifest.get("tenant")
+    return (
+        str(manifest.get("arena_id")) == arena_id
+        and isinstance(raw_tenant, str)
+        and bool(raw_tenant)
+        and _safe_tenant(raw_tenant) == tenant
+        and (manifest.get("target") or "define") in ARENA_TARGETS
+        and not any(isinstance(manifest.get(k), float) and not math.isfinite(manifest[k]) for k in ("created_at_ns", "created_at"))
+        and not contains_holdout_reference(raw_tenant)
+        and not contains_holdout_reference(arena_id)
+    )
 
 
 def list_arena_summaries(
@@ -1138,13 +1161,12 @@ def list_arena_summaries(
                 continue
             path = entry / MANIFEST_NAME
             manifest = _load_manifest(path)
-            if manifest is None or str(manifest.get("arena_id")) != entry.name:
-                continue
             try:
-                mtime_ns = int(path.stat().st_mtime_ns)
-            except OSError:
+                if manifest is None or not _public_manifest_ok(manifest, name, entry.name):
+                    continue
+                found.append(((_created_ns(manifest), int(path.stat().st_mtime_ns), entry.name), manifest))
+            except _MANIFEST_ERRORS:
                 continue
-            found.append(((_created_ns(manifest), mtime_ns, entry.name), manifest))
     if not found:
         return []
     found.sort(key=lambda item: item[0], reverse=True)
@@ -1164,21 +1186,21 @@ def list_arena_summaries(
         aid = str(manifest["arena_id"])
         try:
             state = _evaluate_manifest_state(manifest, tasks, judges.get(aid, []), db_error, include_paths=False)
-        except (TypeError, ValueError, KeyError, AttributeError, OSError):
+            summaries.append({
+                "arena_id": aid,
+                "tenant": str(manifest["tenant"]),
+                "repo": _scrub(manifest.get("repo")),
+                "target": manifest.get("target") or "define",
+                "title": _scrub(manifest.get("title")),
+                "status": state["status"],
+                "created_at": _created_ns(manifest) // 1_000_000_000 or None,
+                "candidates": [_scrub_labels(c) for c in state["candidates"]],
+                "judge": _scrub_labels(state["judge"]) if state["judge"] else None,
+                "ready_for_synthesis": state["ready_for_synthesis"],
+                "synthesized": state["synthesized"],
+                "canonical_artifact_exists": state["canonical_artifact_exists"],
+                "advisories": [str(a) for a in state["advisories"] if not contains_holdout_reference(a)],
+            })
+        except _MANIFEST_ERRORS:
             continue
-        summaries.append({
-            "arena_id": aid,
-            "tenant": manifest.get("tenant"),
-            "repo": manifest.get("repo"),
-            "target": manifest.get("target") or "define",
-            "title": _scrub(manifest.get("title")),
-            "status": state["status"],
-            "created_at": _created_ns(manifest) // 1_000_000_000 or None,
-            "candidates": [_scrub_labels(c) for c in state["candidates"]],
-            "judge": _scrub_labels(state["judge"]) if state["judge"] else None,
-            "ready_for_synthesis": state["ready_for_synthesis"],
-            "synthesized": state["synthesized"],
-            "canonical_artifact_exists": state["canonical_artifact_exists"],
-            "advisories": [a for a in state["advisories"] if not contains_holdout_reference(a)],
-        })
     return summaries

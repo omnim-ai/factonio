@@ -970,6 +970,7 @@ class TestHarnessSummary(unittest.TestCase):
                 ("schema_version", {"schema_version": 2, "hooks": []}, None),
                 ("bool schema", {"schema_version": True, "hooks": []}, None),
                 ("hooks not list", {"schema_version": 1, "hooks": "x"}, None),
+                ("hooks null", {"schema_version": 1, "hooks": None}, None),
                 ("hook not object", {"schema_version": 1, "hooks": [1, _HOOKS[0]]}, None),
             ):
                 with self.subTest(label=label):
@@ -977,6 +978,8 @@ class TestHarnessSummary(unittest.TestCase):
                     out = summarize_harness_readonly(repo)
                     self.assertTrue(out["has_manifest_error"])
                     self.assertEqual(set(out), set(self._ABSENT))
+            _write_harness(repo, {"schema_version": 1})
+            self.assertEqual(summarize_harness_readonly(repo)["has_manifest_error"], False)
             _write_harness(repo, {"schema_version": 1, "hooks": [_HOOKS[1]]})
             out = summarize_harness_readonly(repo)
             self.assertEqual((out["required_hooks"], out["optional_hooks"], out["has_manifest_error"]), (0, 1, False))
@@ -1030,7 +1033,11 @@ class TestHarnessSummary(unittest.TestCase):
             _write_harness(bad, None, raw="{oops")
             plain = home / "dev" / "plain"
             (plain / ".git").mkdir(parents=True)
-            for spec, path in (("acme/good", good), ("acme/bad", bad), ("acme/plain", plain)):
+            nullhooks = home / "dev" / "nullhooks"
+            (nullhooks / ".git").mkdir(parents=True)
+            _write_harness(nullhooks, {"schema_version": 1, "hooks": None})
+            for spec, path in (("acme/good", good), ("acme/bad", bad), ("acme/plain", plain),
+                               ("acme/nullhooks", nullhooks)):
                 add_repo(spec, local_path=str(path), clone=False, inspect_remote=False)
             api = _load_plugin_api("factonio_test_plugin_api_harness")
             client = _client(api)
@@ -1045,6 +1052,8 @@ class TestHarnessSummary(unittest.TestCase):
             self.assertEqual(by_slug["acme-good"]["frozen_visual_hooks"], 1)
             self.assertEqual(by_slug["acme-good"]["required_hooks"], 4)
             self.assertTrue(by_slug["acme-bad"]["has_manifest_error"])
+            self.assertEqual((by_slug["acme-nullhooks"]["present"], by_slug["acme-nullhooks"]["has_manifest_error"]),
+                             (True, True))
             self.assertEqual(by_slug["acme-plain"], TestHarnessSummary._ABSENT)
             for repo in (good, bad, plain):
                 self.assertEqual(list((repo / ".git").iterdir()), [])
@@ -1059,6 +1068,150 @@ class TestHarnessSummary(unittest.TestCase):
                 r = client.patch(f"{base}/repos/acme-good", json={"merge_policy": "ask"})
             self.assertEqual(r.status_code, 200, r.text)
             self.assertEqual(r.json()["repo"]["harness"]["required_hooks"], 4)
+
+
+def _seed_arena_cards(db_path: Path, now_ts: float, bodies: dict[str, str], tenant: str = "ws-arena") -> None:
+    from hermes_cli.kanban_db_connect import connect_closing
+
+    with connect_closing(db_path=db_path) as conn:
+        for i, (tid, body) in enumerate(bodies.items()):
+            conn.execute(
+                "INSERT INTO tasks (id, title, assignee, status, tenant, session_id, skills, created_at, body)"
+                " VALUES (?, ?, 'factonio', 'running', ?, 'sess_a', ?, ?, ?)",
+                (tid, f"[define] Arena card {i}", tenant, json.dumps(["factonio:define"]), now_ts - 100 + i, body),
+            )
+        conn.commit()
+
+
+def _write_arena_manifest(home: Path, tenant: str, arena_id: str, manifest: object, *, raw: str | None = None) -> None:
+    adir = home / "plugin-data" / "factonio" / "runs" / tenant / "arena" / arena_id
+    adir.mkdir(parents=True, exist_ok=True)
+    (adir / "manifest.json").write_text(raw if raw is not None else json.dumps(manifest), encoding="utf-8")
+
+
+def _arena_stamp(aid: str, role: str, target: str, vendor: str, slot: str | None = None) -> str:
+    slot_part = f", slot=`{slot}`" if slot else ""
+    return f"## Card\n- Arena: `{aid}` (role=`{role}`, target=`{target}`{slot_part}, vendor=`{vendor}`)\n"
+
+
+class TestArenaInformationBarrierApi(unittest.TestCase):
+    def test_cards_never_leak_holdout_in_any_arena_field(self):
+        with isolated_hermes_home() as home:
+            aid = "ar_1111111111"
+            _seed_arena_cards(home / "kanban.db", time.time(), {
+                "t_a1": _arena_stamp(aid, "candidate", "define", "holdout-vendor", slot="c1-holdout-slot"),
+                "t_a2": _arena_stamp(aid, "candidate", "define", "openai", slot="c2-openai"),
+                "t_a3": _arena_stamp(aid, "judge", "define", "google/holdout/v"),
+                "t_a4": _arena_stamp("ar_2222222222", "holdout", "holdout/x", "openai"),
+                "t_a5": _arena_stamp("ar_2222222222", "reviewer", "build", "openai"),
+            })
+            _write_arena_manifest(home, "ws-arena", aid, {
+                "arena_id": aid, "tenant": "ws-arena", "repo": "acme/holdout/repo", "target": "define",
+                "title": "Copy holdout/scenario-1.md", "created_at_ns": 2,
+                "candidates": [
+                    {"slot": "c1-holdout-slot", "vendor": "holdout-vendor", "model": "holdout/model", "task_id": "t_a1"},
+                    {"slot": "c2-openai", "vendor": "openai", "model": "gpt", "task_id": "t_a2"},
+                    {"slot": "c3", "vendor": "x", "task_id": "t_holdout_gone"},
+                ],
+                "judge": {"task_id": "t_a3", "vendor": "holdout-judge", "model": "holdout/judge-model"},
+            })
+            for bad_id, manifest in (
+                ("ar_3333333333", {"tenant": "holdout/ws", "target": "define"}),
+                ("ar_4444444444", {"tenant": "other-ws", "target": "define"}),
+                ("ar_5555555555", {"tenant": "ws-arena", "target": "holdout"}),
+                ("ar_6666666666", {"tenant": "ws-arena", "target": "build"}),
+            ):
+                _write_arena_manifest(home, "ws-arena", bad_id, {"arena_id": bad_id, "created_at_ns": 1, **manifest})
+
+            r = _client(_load_plugin_api("factonio_test_plugin_api_arena_barrier")).get(
+                "/api/plugins/factonio/cards?tenant=ws-arena")
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertNotIn("holdout", r.text.lower())
+            body = r.json()
+            self.assertEqual([a["arena_id"] for a in body["arenas"]], [aid])
+            arena = body["arenas"][0]
+            self.assertEqual((arena["tenant"], arena["repo"], arena["target"], arena["title"]),
+                             ("ws-arena", None, "define", None))
+            self.assertEqual([{k: c[k] for k in ("slot", "vendor", "model", "task_id")} for c in arena["candidates"]], [
+                {"slot": None, "vendor": None, "model": None, "task_id": "t_a1"},
+                {"slot": "c2-openai", "vendor": "openai", "model": "gpt", "task_id": "t_a2"},
+                {"slot": "c3", "vendor": "x", "model": None, "task_id": None},
+            ])
+            self.assertEqual((arena["judge"]["task_id"], arena["judge"]["vendor"], arena["judge"]["model"]),
+                             ("t_a3", None, None))
+            keys = ("arena_id", "arena_role", "arena_slot", "arena_vendor", "arena_target")
+            by_id = {c["id"]: {k: c[k] for k in keys} for c in body["cards"]}
+            self.assertEqual(by_id, {
+                "t_a1": {"arena_id": aid, "arena_role": "candidate", "arena_slot": None, "arena_vendor": None,
+                         "arena_target": "define"},
+                "t_a2": {"arena_id": aid, "arena_role": "candidate", "arena_slot": "c2-openai", "arena_vendor": "openai",
+                         "arena_target": "define"},
+                "t_a3": {"arena_id": aid, "arena_role": "judge", "arena_slot": None, "arena_vendor": None,
+                         "arena_target": "define"},
+                "t_a4": {"arena_id": "ar_2222222222", "arena_role": None, "arena_slot": None, "arena_vendor": "openai",
+                         "arena_target": None},
+                "t_a5": {"arena_id": "ar_2222222222", "arena_role": None, "arena_slot": None, "arena_vendor": "openai",
+                         "arena_target": None},
+            })
+
+    def test_cards_skip_non_finite_arena_timestamp_and_keep_valid_sibling(self):
+        from factonio.arena import _created_ns
+
+        self.assertEqual(_created_ns({"created_at_ns": float("inf")}), 0)
+        self.assertEqual(_created_ns({"created_at_ns": float("nan"), "created_at": 3}), 3_000_000_000)
+        self.assertEqual(_created_ns({"created_at_ns": True}), 0)
+        with isolated_hermes_home() as home:
+            _seed_arena_cards(home / "kanban.db", time.time(), {"t_c1": "plain body"})
+            good = {"arena_id": "ar_aaaaaaaaaa", "tenant": "ws-arena", "target": "define", "title": "Good",
+                    "created_at_ns": 5_000_000_000, "candidates": []}
+            _write_arena_manifest(home, "ws-arena", "ar_aaaaaaaaaa", good)
+            _write_arena_manifest(home, "ws-arena", "ar_bbbbbbbbbb", None, raw=(
+                '{"arena_id": "ar_bbbbbbbbbb", "tenant": "ws-arena", "target": "define", "created_at_ns": 1e309}'))
+            _write_arena_manifest(home, "ws-arena", "ar_cccccccccc", None, raw=(
+                '{"arena_id": "ar_cccccccccc", "tenant": "ws-arena", "target": "define", "created_at": -1e309}'))
+            r = _client(_load_plugin_api("factonio_test_plugin_api_arena_inf")).get(
+                "/api/plugins/factonio/cards?tenant=ws-arena")
+            self.assertEqual(r.status_code, 200, r.text)
+            arenas = r.json()["arenas"]
+            self.assertEqual([(a["arena_id"], a["title"], a["created_at"]) for a in arenas], [("ar_aaaaaaaaaa", "Good", 5)])
+
+
+class TestTrailInformationBarrierApi(unittest.TestCase):
+    def test_trail_list_and_detail_scrub_holdout_keys_paths_counts_and_text(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            leak = trail.log_decision(
+                "arena_synthesis", tenant="ws-t", phase="define", actor="judge",
+                why="Judge read holdout/scenario-1.md before synthesis",
+                result="merged spec; see runs/ws-t/holdout/",
+                evidence={
+                    "holdout_path": "/runs/ws-t/holdout", "holdout_files": 3, "HoldOut_Count": 2,
+                    "kind": "define", "winner": "c1",
+                    "nested": {"note": "copied holdout/b.md", "items": ["ok", "x/holdout/b", 7],
+                               "holdout_dir": "/x"},
+                },
+            )
+            normal = trail.log_decision("merge", tenant="ws-t", phase="merge", actor="orchestrator", why="CI green",
+                                        evidence={"pr": 7, "checks": ["unit", "lint"]})
+            client = _client(_load_plugin_api("factonio_test_plugin_api_trail_barrier"))
+            base = "/api/plugins/factonio"
+            listing = client.get(f"{base}/trail?tenant=ws-t")
+            detail = client.get(f"{base}/trail/{leak['id']}")
+            for r in (listing, detail):
+                self.assertEqual(r.status_code, 200, r.text)
+                self.assertNotIn("holdout", r.text.lower())
+                self.assertNotIn("scenario-1", r.text)
+            row = detail.json()["decision"]
+            self.assertEqual(row["evidence"], {"kind": "define", "winner": "c1",
+                                               "nested": {"note": "[redacted]", "items": ["ok", "[redacted]", 7]}})
+            self.assertEqual((row["why"], row["result"], row["decision"], row["tenant"]),
+                             ("[redacted]", "[redacted]", "arena_synthesis", "ws-t"))
+            by_id = {d["id"]: d for d in listing.json()["decisions"]}
+            self.assertEqual(by_id[leak["id"]], row)
+            self.assertEqual(by_id[normal["id"]], trail.get_decision(normal["id"]))
+            self.assertEqual(client.get(f"{base}/trail/{normal['id']}").json()["decision"],
+                             trail.get_decision(normal["id"]))
 
 
 if __name__ == "__main__":
