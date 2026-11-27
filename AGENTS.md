@@ -13,12 +13,13 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing this repository. It defi
 ## Completing a change
 
 1. Keep changes scoped to the requested task and preserve unrelated local work.
-2. Never touch the user's real `~/.hermes` in tests — always wrap tests in `tests._env.isolated_hermes_home()`.
-3. Update affected docs and add a bullet under `## Unreleased` in [CHANGELOG.md](CHANGELOG.md) (unless the PR is internal/test-only and labeled `no-changelog`).
-4. Run all verification commands before reporting done:
+2. Prefer small, fail-closed contracts over custom mini-parsers, regex dialects, or graph engines when the spec does not require complex edge-case parsing. If a guard loops across fix rounds on adversarial corner cases, simplify and narrow the contract instead of layering exceptions.
+3. Never touch the user's real `~/.hermes` in tests — always wrap tests in `tests._env.isolated_hermes_home()`.
+4. Update affected docs and add a bullet under `## Unreleased` in [CHANGELOG.md](CHANGELOG.md) (unless the PR is internal/test-only and labeled `no-changelog`).
+5. Run all verification commands before reporting done:
    - `python3 -m unittest discover -s tests -v`
    - `python3 -W error -m compileall -q .`
    - `uvx ruff check --select E9,F .`
    - `node --check desktop/plugin.js`
    - `python3 tools/check_repo_integrity.py`
-5. Report exact commands run, outcomes, and any remaining limitations. Do not weaken assertions to make a failing test pass.
+6. Report exact commands run, outcomes, and any remaining limitations. Do not weaken assertions to make a failing test pass.
