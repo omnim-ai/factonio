@@ -1674,6 +1674,38 @@ class TestInvestigationReportApi(unittest.TestCase):
             report.write_text("plain src/app.py https://github.com/a/b\n", encoding="utf-8")
             self.assertFalse(client.get(f"{_CP}/workstreams/ws-u/report").json()["redacted"])
 
+    def test_root_independent_absolute_paths_redacted(self):
+        with isolated_hermes_home() as home:
+            client = _cp_client("factonio_test_cp_report_roots")
+            run = self._runs(home) / "ws-r"
+            run.mkdir(parents=True)
+            report = run / "investigation.md"
+            leaks = {
+                "See /data/customer/private.txt now.": "/data/customer",
+                "Open /workspace/project/secrets.txt.": "/workspace/project",
+                "[key](/srv2/app/key.pem)": "/srv2/app",
+                "Log at C:/Users/alice/private.txt": "C:/Users",
+                "Log at D:/builds/log.txt": "D:/builds",
+                "Notes C:\\Users\\alice\\private.txt": "C:\\Users",
+                "Share \\\\fileserver\\share\\secret.txt": "fileserver",
+                "Share //fileserver/share/secret.txt": "fileserver",
+                "Link file:///data/secret.md here": "/data/secret",
+                "Link FILE://host/share/x.md here": "host/share",
+            }
+            for text, gone in leaks.items():
+                with self.subTest(text=text):
+                    report.write_text(text + "\n", encoding="utf-8")
+                    body = client.get(f"{_CP}/workstreams/ws-r/report").json()
+                    self.assertTrue(body["redacted"])
+                    self.assertNotIn(gone, body["content"])
+                    self.assertIn("[REDACTED]", body["content"])
+            kept = ("Edit src/app.py and dashboard/plugin_api.py; see https://github.com/omnim-ai/factonio/pull/47,\n"
+                    "http://localhost:8000/api/plugins/factonio/cards, foo/bar prose, v1/v2 and the /factonio page.\n"
+                    "# Heading\n`code` [link](https://example.com/a/b)\n")
+            report.write_text(kept, encoding="utf-8")
+            body = client.get(f"{_CP}/workstreams/ws-r/report").json()
+            self.assertEqual((body["content"], body["redacted"]), (kept, False))
+
 class TestHarnessAuditApi(unittest.TestCase):
     def test_validation_status_codes_and_read_only_audit(self):
         from factonio.config import get_repo

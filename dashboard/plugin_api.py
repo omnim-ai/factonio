@@ -445,11 +445,31 @@ def log_human_decision(payload: Any = Body(None), profile: Optional[str] = Query
 
 _REPORT_NAME = "investigation.md"
 _REPORT_MAX_BYTES = 256 * 1024
-# Absolute OS paths (POSIX system roots, Windows drive paths); relative repo paths and URLs never match.
+# Root-independent absolute filesystem paths: file:// URLs, UNC, Windows drive (either slash) and any
+# multi-segment POSIX path. http(s) URLs match first as a pass-through group; relative paths never match.
+_PATH_TAIL = r"[^\s`'\"<>)\]]+"
 _ABS_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9_:/])(?:/(?:home|Users|root|tmp|var|etc|opt|srv|mnt|private|Volumes|proc|sys|dev|run|usr)"
-    r"/[^\s`'\"<>)\]]+|[A-Za-z]:\\[^\s`'\"<>)\]]+)"
+    rf"(?P<url>(?i:https?)://{_PATH_TAIL})"
+    rf"|(?i:file)://{_PATH_TAIL}"
+    rf"|(?<![A-Za-z0-9_.:/\\])(?:\\\\|//)[A-Za-z0-9._$-]+[\\/]{_PATH_TAIL}"
+    rf"|(?<![A-Za-z0-9_])[A-Za-z]:[\\/]{_PATH_TAIL}"
+    rf"|(?<![A-Za-z0-9_.:/\\])/[A-Za-z0-9._-]+(?:/{_PATH_TAIL})+"
 )
+
+
+def _scrub_abs_paths(text: str) -> tuple[str, bool]:
+    hits = 0
+
+    def repl(match: re.Match) -> str:
+        nonlocal hits
+        if match.group("url") is not None:
+            return match.group(0)
+        hits += 1
+        return "[REDACTED]"
+
+    return _ABS_PATH_RE.sub(repl, text), hits > 0
+
+
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
 
@@ -472,8 +492,8 @@ def _redact_report(text: str) -> tuple[str, bool]:
     out = "\n".join(kept)
     if _trail.contains_holdout_reference(out):
         return "[redacted]", True
-    out, paths = _ABS_PATH_RE.subn("[REDACTED]", out)
-    return out, kept != lines or paths > 0
+    out, paths = _scrub_abs_paths(out)
+    return out, kept != lines or paths
 
 
 def _read_confined_report(tenant_dir: str) -> Optional[tuple[bytes, os.stat_result]]:
