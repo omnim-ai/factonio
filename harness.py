@@ -1718,7 +1718,7 @@ def _concrete_prefix_match(globs: Iterable[str], rel: str) -> bool:
     return False
 
 
-_MAX_LIVE_SCAN = 10000
+_MAX_LIVE_SCAN = 20000
 
 
 def _live_walk_exposes(base: Path, vprefix: str, globs: list[str]) -> bool:
@@ -1740,22 +1740,47 @@ def _live_walk_exposes(base: Path, vprefix: str, globs: list[str]) -> bool:
                 return True
         for name in filenames:
             rel = f"{prefix}/{name}"
-            if _any_match(globs, rel) or (os.path.islink(os.path.join(dirpath, name))
+            full = os.path.join(dirpath, name)
+            # a file link to a regular file exposes nothing below it (directory links are in ``dirnames``)
+            if _any_match(globs, rel) or (os.path.islink(full) and not os.path.isfile(full)
                                           and _could_prefix_match(globs, rel)):
                 return True
     return False
 
 
-def _literal_dir_prefixes(glob: str) -> list[str]:
-    """Directory prefixes a glob spells out literally before its first wildcard (`a`, `a/b` for `a/b/*.png`)."""
-    pat = glob.strip()
-    parts = pat[:-1].split("/") if pat.endswith("/") else pat.split("/")[:-1]
-    out: list[str] = []
-    for part in parts:
-        if any(ch in part for ch in "*?["):
-            break
-        out.append(f"{out[-1]}/{part}" if out else part)
-    return out
+def _symlink_breaks_contract(root: Path, real_root: str, rel: str, globs: list[str]) -> bool:
+    """Whether the symlink at ``rel`` puts a frozen baseline behind a link: it matches ``globs``, sits at a
+    concrete glob directory prefix, or (under a `**` prefix) is a live directory link escaping the repository
+    or exposing a path matching ``globs``. Unrelated links stay clean."""
+    if _any_match(globs, rel) or _concrete_prefix_match(globs, rel):
+        return True
+    if not (_could_prefix_match(globs, rel) and os.path.isdir(root / rel)):
+        return False
+    target = os.path.realpath(root / rel)
+    return os.path.commonpath([real_root, target]) != real_root or _live_walk_exposes(root / rel, rel, globs)
+
+
+def _live_symlinks(root: Path, globs: list[str]) -> Optional[set[str]]:
+    """Every live symlink where a baseline could sit or be reached: one `os.walk` that never follows links,
+    skips `.git` and prunes real directories no glob reaches below. None past `_MAX_LIVE_SCAN` (fail closed)."""
+    found: set[str] = set()
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        sub = os.path.relpath(dirpath, root).replace(os.sep, "/")
+        prefix = "" if sub == "." else f"{sub}/"
+        seen += len(dirnames) + len(filenames)
+        if seen > _MAX_LIVE_SCAN:
+            return None
+        keep = []
+        for name in dirnames:
+            rel = prefix + name
+            if os.path.islink(os.path.join(dirpath, name)):
+                found.add(rel)
+            elif name != ".git" and _could_prefix_match(globs, rel):
+                keep.append(name)
+        dirnames[:] = keep
+        found.update(prefix + n for n in filenames if os.path.islink(os.path.join(dirpath, n)))
+    return found
 
 
 def _committed_blob_mismatches(root: Path, ref: str, globs: list[str]) -> set[str]:
@@ -1766,45 +1791,31 @@ def _committed_blob_mismatches(root: Path, ref: str, globs: list[str]) -> set[st
       live index (`ls-files --stage`, read-only; unmerged fails closed) and, when ``HEAD`` moved past ``ref``,
       in the ``HEAD`` tree, and must be a real regular file under real directories on disk whose bytes hash
       to the committed blob (immune to `assume-unchanged`/`skip-worktree`; Git-filtered content fails closed);
-    - a committed symlink matching ``globs`` or at a concrete glob directory prefix (`_concrete_prefix_match`)
-      is reported; under a `**` prefix only a link resolving to a live directory counts, when it escapes the
-      repository or exposes a live path matching ``globs`` (`_live_walk_exposes`), so unrelated file links
-      and links to non-matching directories stay clean;
-    - a live symlink at any literal directory prefix of a glob (`snapshots -> ../evil`) is reported."""
+    - every symlink at ``ref``, at ``HEAD``, in the live index or on disk (`_live_symlinks`) is checked by the
+      same rule (`_symlink_breaks_contract`), so a link added by the PR, staged, or created by a hook counts
+      exactly like a committed one, including for a frozen hook new since ``ref``."""
     bad: set[str] = {g for g in globs if _unnormalized_baseline_glob(g)}
     globs = [g for g in globs if g not in bad]
     tree = _committed_tree(root, ref) if globs else None
     if tree is None:
         return bad
+    index = _index_entries(root)
+    head_sha = _git_ro(root, ["rev-parse", "--verify", "-q", "HEAD^{commit}"]).stdout.strip()
+    ref_sha = _git_ro(root, ["rev-parse", "--verify", "-q", f"{ref}^{{commit}}"]).stdout.strip()
+    check_head = bool(head_sha) and head_sha != ref_sha
+    head = _committed_tree(root, "HEAD") if check_head else None
+    links = {rel for entries in (tree, head or {}, index or {}) for rel, e in entries.items() if e[0] == "120000"}
+    live = _live_symlinks(root, globs)
+    if live is None:
+        bad.add(f"(more than {_MAX_LIVE_SCAN} live entries to scan for symlinks)")
     real_root = os.path.realpath(root)
-    baselines: dict[str, tuple[str, str]] = {}
-    for rel, entry in tree.items():
-        if entry[0] in ("100644", "100755") and _any_match(globs, rel):
-            baselines[rel] = entry
-        elif entry[0] == "120000":
-            if _any_match(globs, rel) or _concrete_prefix_match(globs, rel):
-                bad.add(rel)
-            elif _could_prefix_match(globs, rel) and os.path.isdir(root / rel):
-                target = os.path.realpath(root / rel)
-                if os.path.commonpath([real_root, target]) != real_root \
-                        or _live_walk_exposes(root / rel, rel, globs):
-                    bad.add(rel)
-    for glob in globs:
-        for prefix in _literal_dir_prefixes(glob):
-            if os.path.islink(root / prefix):
-                bad.add(prefix)  # the first symlinked ancestor: everything below is reached through it
-                break
-    if baselines:
-        index = _index_entries(root)
-        head_sha = _git_ro(root, ["rev-parse", "--verify", "-q", "HEAD^{commit}"]).stdout.strip()
-        ref_sha = _git_ro(root, ["rev-parse", "--verify", "-q", f"{ref}^{{commit}}"]).stdout.strip()
-        check_head = bool(head_sha) and head_sha != ref_sha
-        head = _committed_tree(root, "HEAD") if check_head else None
-        for rel, entry in baselines.items():
-            pinned = index is not None and index.get(rel) == entry \
-                and (not check_head or (head is not None and head.get(rel) == entry))
-            if not pinned or _live_regular_oid(root, rel, len(entry[1])) != entry[1]:
-                bad.add(rel)
+    bad.update(rel for rel in links | (live or set()) if _symlink_breaks_contract(root, real_root, rel, globs))
+    baselines = {rel: e for rel, e in tree.items() if e[0] in ("100644", "100755") and _any_match(globs, rel)}
+    for rel, entry in baselines.items():
+        pinned = index is not None and index.get(rel) == entry \
+            and (not check_head or (head is not None and head.get(rel) == entry))
+        if not pinned or _live_regular_oid(root, rel, len(entry[1])) != entry[1]:
+            bad.add(rel)
     return bad
 
 
@@ -1859,7 +1870,8 @@ def _merge_baseline_changes(*groups: list[dict[str, Any]]) -> list[dict[str, Any
 # not emulate the shell. A committed command left byte-identical is always clean. An edited one is clean only as
 # a pure in-place threshold tightening: the same tokens 1-to-1 with the same raw spelling (no insertions,
 # deletions, quote or operator edits, heredocs or line continuations), the same `--flag=val` / `--flag val`
-# syntax, and each changed committed threshold a plain fixed-point decimal no larger than before. On top of that,
+# syntax, and each changed committed threshold a max-difference one (`_MAX_DIFF_FLAGS`/`_MAX_DIFF_ENVS`) and a
+# plain fixed-point decimal no larger than before. On top of that,
 # every byte outside the tightened threshold value spans must match the committed command verbatim
 # (`_verbatim_tightening_ok`): whitespace, comments and quoting are never normalized. Edited commands allow this
 # only under a positive grammar (`_value_spans`): one simple command (optionally wrapped once in exactly
@@ -1871,6 +1883,11 @@ def _merge_baseline_changes(*groups: list[dict[str, Any]]) -> list[dict[str, Any
 _THRESHOLD_KEY_RE = re.compile(
     r"threshold|toleran|max[-_]?diff|fuzz|max[-_]?pixel|diff[-_]?ratio|mismatch", re.IGNORECASE
 )
+# Only these names provably mean "maximum allowed difference" (smaller = stricter). A bare `--threshold`,
+# `--tolerance` or `THRESHOLD` may be a minimum similarity (SSIM `0.99 -> 0.90` loosens it), so any edit to
+# such a value fails closed; it stays clean only while byte-identical.
+_MAX_DIFF_FLAGS = frozenset({"--max-diff-pixels", "--max-diff-pixel-ratio", "--max-diff", "--max-mismatch"})
+_MAX_DIFF_ENVS = frozenset({"MAX_DIFF_PIXELS", "MAX_DIFF_PIXEL_RATIO", "MAX_DIFF", "MAX_MISMATCH"})
 _REGEN_FLAG_RE = re.compile(r"\A--?(?:update|regen(?:erate)?|accept(?:-snapshots)?|snapshot[-_]?update|"
                             r"(?:force[-_]?)?update[-_]?(?:snapshots?|baselines?|goldens?)|"
                             r"overwrite[-_]?baselines?)\Z", re.IGNORECASE)
@@ -2077,13 +2094,17 @@ def _slot_ok(base: _Slot, live: _Slot) -> bool:
         return False  # `--t=v` <-> `--t v` drops the threshold for parsers that read only one form
     if live.raw == base.raw:
         return True
-    if base.value is None or live.value is None:
+    if base.value is None or live.value is None or not _max_diff_slot(base):
         return False
     if base.percent != live.percent:
         return False  # checkers read `1%` and `0.01` differently (`Number("1%")` is NaN): keep the committed unit
     if _integer_syntax_lost(base, live):
         return False
     return live.value <= base.value
+
+
+def _max_diff_slot(slot: _Slot) -> bool:
+    return slot.key in (_MAX_DIFF_FLAGS if slot.kind == "flag" else _MAX_DIFF_ENVS)
 
 
 def _integer_syntax_lost(base: _Slot, live: _Slot) -> bool:
@@ -2237,7 +2258,8 @@ def _value_spans(command: Any, depth: int = 0) -> list[tuple[int, int, int]]:
     offsets map 1:1. It is `[NAME=val ...] <cmd> ARG...` or `env [NAME=val ...] <cmd> ARG...` (a bare `env`: no
     flags, no assignment before it), where `<cmd>` is not a denied head (shell keyword, shell, test, text filter,
     expression interpreter, wrapper) and every ARG is either a threshold flag with a plain number
-    (`--threshold=0.05` / `--threshold 0.05`) or a plain positional (no leading `-`, no `=`, not `eval`/`exec`/
+    (`--max-diff=0.05` / `--max-diff 0.05`; only max-difference values are editable spans, any other threshold
+    value must stay verbatim) or a plain positional (no leading `-`, no `=`, not `eval`/`exec`/
     `grep`). Any other option (`-c`, `-Bc'...'`, `-E`, `--grep`, `--`, ...) could make the next word code or a
     filter, so it raises `_UnsupportedEdit`, as do shell operators, newlines, comments and `$`/`` ` ``/glob
     expansion; ValueError like `_tokenize_visual_cmd`."""
@@ -2258,7 +2280,7 @@ def _value_spans(command: Any, depth: int = 0) -> list[tuple[int, int, int]]:
         m = _ASSIGN_RE.fullmatch(tok.raw)
         if not m:
             return False
-        if _THRESHOLD_KEY_RE.search(m.group(1)):
+        if m.group(1) in _MAX_DIFF_ENVS:
             spans.extend((k if argv else 0, s, e) for s, e in
                          _value_span(m.group(2), tok.start + len(m.group(1)) + 1, tok.from_argv))
         return True
@@ -2305,7 +2327,8 @@ def _value_spans(command: Any, depth: int = 0) -> list[tuple[int, int, int]]:
             i += 1
         if not found:
             raise _UnsupportedEdit("threshold option without a plain number")
-        spans += found
+        if name in _MAX_DIFF_FLAGS:
+            spans += found  # any other threshold value is outside bytes and must stay verbatim
     return sorted(spans)
 
 
@@ -2376,6 +2399,8 @@ def _slot_problem(base: _Slot, live: _Slot) -> str:
         return "unit"
     if base.eq != live.eq:
         return "syntax"
+    if not _max_diff_slot(base):
+        return "direction"
     return "integer" if _integer_syntax_lost(base, live) else "loosen"
 
 
@@ -2414,6 +2439,10 @@ def _threshold_reasons(base_segs: list[list[str]], live_segs: list[list[str]]) -
         if "integer" in problems:
             reasons.append(f"rewrites integer threshold {label} as a non-integer "
                            f"({', '.join(s.raw for s in problems['integer'])}; integer parsers reject `0.5`)")
+        if "direction" in problems:
+            reasons.append(f"edits threshold {label} from {', '.join(s.raw for s in b_vals)} to "
+                           f"{', '.join(s.raw for s in l_vals)}; its direction (minimum similarity or maximum "
+                           "difference) is ambiguous, so only `max-diff`/`max-mismatch` thresholds may be tightened")
         if "loosen" in problems:
             reasons.append(f"loosens threshold {label} from {', '.join(s.raw for s in b_vals)} to "
                            f"{', '.join(s.raw for s in l_vals)}")

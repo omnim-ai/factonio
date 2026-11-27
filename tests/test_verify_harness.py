@@ -1888,8 +1888,8 @@ class TestFrozenVisualBaselines(unittest.TestCase):
                 "--regenerate": {"command": self.COMMAND + " --regenerate"},
                 "UPDATE_SNAPSHOTS=1": {"command": "UPDATE_SNAPSHOTS=1 " + self.COMMAND},
                 "max-diff-pixels": {"command": "npx playwright test --max-diff-pixels=500"},
-                "threshold": {"command": self.COMMAND + " --threshold 0.3"},
-                "zero threshold added": {"command": self.COMMAND + " --threshold 0"},
+                "threshold": {"command": self.COMMAND + " --max-diff 0.3"},
+                "zero threshold added": {"command": self.COMMAND + " --max-diff 0"},
                 "unfrozen": {"frozen_baseline": False},
                 "unpinned": {"baseline_paths": None, "frozen_baseline": None},
                 # Round 19: an edit is clean only as pure in-place tightening; syntax swaps and insertions fail closed
@@ -2310,8 +2310,8 @@ class TestFixRound3PinnedAuditBase(unittest.TestCase):
 
         for value in ("nan", "inf", "-inf", "NaN%"):
             with self.subTest(value), isolated_hermes_home() as home:
-                repo = TestFixRound2VisualGuardAndHarnessGaps._visual_repo(home, "true --threshold 0.01")
-                TestFixRound2VisualGuardAndHarnessGaps._set_command(repo, f"true --threshold {value}")
+                repo = TestFixRound2VisualGuardAndHarnessGaps._visual_repo(home, "true --max-diff 0.01")
+                TestFixRound2VisualGuardAndHarnessGaps._set_command(repo, f"true --max-diff {value}")
                 gate = detect_harness_gate_loosening(repo)
                 self.assertTrue(gate["loosened"], gate)
                 self.assertEqual(gate["loosened_visual_hooks"], ["pixels"])
@@ -2669,60 +2669,60 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
 
     _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
     _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
-    # The visual diff is 0.25: the committed THRESHOLD=0.01 fails it, the lenient default (THRESHOLD unset) or a
+    # The visual diff is 0.25: the committed MAX_DIFF=0.01 fails it, the lenient default (MAX_DIFF unset) or a
     # regenerating `-u` passes it, so every bypass below turns the failing committed check green.
     _CHECK = ("import os, sys\n"
-              "t = os.environ.get('THRESHOLD')\n"
+              "t = os.environ.get('MAX_DIFF')\n"
               "sys.exit(0 if '-u' in sys.argv[1:] or 0.25 <= float(t if t is not None else '1.0') else 1)\n")
-    _EXPORTED = "export THRESHOLD=0.01; python3 check.py"
+    _EXPORTED = "export MAX_DIFF=0.01; python3 check.py"
     _UNVERIFIABLE = "unverifiable shell/structural rewrite"
 
     # Round 12 attack classes against the committed `_EXPORTED` hook, each executed by `/bin/sh` (dash or bash).
     _EXECUTED_BYPASSES = (
         "export threshold=0.01; python3 check.py",                                  # case-renamed variable
-        "false && export THRESHOLD=0.01; python3 check.py",                         # short-circuited export
-        "export THRESHOLD=0.01; bash -c 'exec -c python3 check.py'",               # bash `exec -c`
-        "export THRESHOLD=0.01; bash -c 'exec -ca visual python3 check.py'",
-        "export THRESHOLD=0.01; bash -c 'unset \"$0\"; python3 check.py' THRESHOLD",  # positional expansion
-        "unset THRESHOLD; (export THRESHOLD=0.01); python3 check.py",               # subshell re-export
-        "sh -c 'export THRESHOLD=0.01'; python3 check.py",                          # child-shell re-export
-        "export THRESHOLD=0.01 | true; python3 check.py",                           # pipeline re-export
-        "eval 'export THRESHOLD=0.01' | true; python3 check.py",                    # `eval` in a pipeline
-        "{ export THRESHOLD=0.01; } | true; python3 check.py",                      # brace group in a pipeline
-        "export THRESHOLD=0.01; env -u THRESHOLD python3 check.py",                 # env mutators
-        "export THRESHOLD=0.01; env -i PATH=\"$PATH\" python3 check.py",
-        "bash -c 'export -f THRESHOLD=0.01; python3 check.py'",                      # function-mode export
-        "f() { export THRESHOLD=0.01; }; python3 check.py",                         # uncalled function body
-        "export THRESHOLD=0.01; python3 check.py || true",                          # `||` fallback
-        "export THRESHOLD=0.01; python3 check.py -u",                               # regeneration flag
-        "export THRESHOLD=0.01; eval 'python3 check.py -u'",
-        "export THRESHOLD=0.01\nunset THRESHOLD\npython3 check.py",                 # newline injection
+        "false && export MAX_DIFF=0.01; python3 check.py",                         # short-circuited export
+        "export MAX_DIFF=0.01; bash -c 'exec -c python3 check.py'",               # bash `exec -c`
+        "export MAX_DIFF=0.01; bash -c 'exec -ca visual python3 check.py'",
+        "export MAX_DIFF=0.01; bash -c 'unset \"$0\"; python3 check.py' MAX_DIFF",  # positional expansion
+        "unset MAX_DIFF; (export MAX_DIFF=0.01); python3 check.py",               # subshell re-export
+        "sh -c 'export MAX_DIFF=0.01'; python3 check.py",                          # child-shell re-export
+        "export MAX_DIFF=0.01 | true; python3 check.py",                           # pipeline re-export
+        "eval 'export MAX_DIFF=0.01' | true; python3 check.py",                    # `eval` in a pipeline
+        "{ export MAX_DIFF=0.01; } | true; python3 check.py",                      # brace group in a pipeline
+        "export MAX_DIFF=0.01; env -u MAX_DIFF python3 check.py",                 # env mutators
+        "export MAX_DIFF=0.01; env -i PATH=\"$PATH\" python3 check.py",
+        "bash -c 'export -f MAX_DIFF=0.01; python3 check.py'",                      # function-mode export
+        "f() { export MAX_DIFF=0.01; }; python3 check.py",                         # uncalled function body
+        "export MAX_DIFF=0.01; python3 check.py || true",                          # `||` fallback
+        "export MAX_DIFF=0.01; python3 check.py -u",                               # regeneration flag
+        "export MAX_DIFF=0.01; eval 'python3 check.py -u'",
+        "export MAX_DIFF=0.01\nunset MAX_DIFF\npython3 check.py",                 # newline injection
     )
     # Parser-level attacks (bash/GNU-only forms or non-executing fixtures) that must be rejected as well.
     _REJECTED = {
-        "env --split-str": (_EXPORTED, "export THRESHOLD=0.01; env --split-str='-u THRESHOLD python3 check.py'"),
-        "env -S": (_EXPORTED, "export THRESHOLD=0.01; env -S '-u THRESHOLD python3 check.py'"),
-        "env -": (_EXPORTED, "export THRESHOLD=0.01; env - python3 check.py"),
-        "env -u $0": (_EXPORTED, "export THRESHOLD=0.01; bash -c 'env -u \"$0\" python3 check.py' THRESHOLD"),
-        "export -f": (_EXPORTED, "export -f THRESHOLD=0.01; python3 check.py"),
-        "assign + export -f": (_EXPORTED, "THRESHOLD=0.01; export -f THRESHOLD; python3 check.py"),
-        "declare -xf": (_EXPORTED, "declare -xf THRESHOLD=0.01; python3 check.py"),
-        "typeset -xf": (_EXPORTED, "typeset -xf THRESHOLD=0.01; python3 check.py"),
+        "env --split-str": (_EXPORTED, "export MAX_DIFF=0.01; env --split-str='-u MAX_DIFF python3 check.py'"),
+        "env -S": (_EXPORTED, "export MAX_DIFF=0.01; env -S '-u MAX_DIFF python3 check.py'"),
+        "env -": (_EXPORTED, "export MAX_DIFF=0.01; env - python3 check.py"),
+        "env -u $0": (_EXPORTED, "export MAX_DIFF=0.01; bash -c 'env -u \"$0\" python3 check.py' MAX_DIFF"),
+        "export -f": (_EXPORTED, "export -f MAX_DIFF=0.01; python3 check.py"),
+        "assign + export -f": (_EXPORTED, "MAX_DIFF=0.01; export -f MAX_DIFF; python3 check.py"),
+        "declare -xf": (_EXPORTED, "declare -xf MAX_DIFF=0.01; python3 check.py"),
+        "typeset -xf": (_EXPORTED, "typeset -xf MAX_DIFF=0.01; python3 check.py"),
         "builtin eval": ("python3 check.py", "builtin eval 'python3 check.py -u'"),
         "python3 -c": ("python3 check.py", "python3 -c 'import sys; sys.exit(0)' check.py"),
-        "option swallowing": ("npx playwright test --threshold 0.01", "npx playwright test --output --threshold 0.01"),
-        "-- bypass": ("npx playwright test --threshold 0.01", "npx playwright test -- --threshold 0.01"),
-        "new positive threshold": ("python3 check.py", "python3 check.py --threshold 0.5"),
-        "threshold removed": ("python3 check.py --threshold 0.01", "python3 check.py"),
-        "NaN": ("python3 check.py --threshold 0.01", "python3 check.py --threshold NaN"),
-        "inf": ("python3 check.py --threshold 0.01", "python3 check.py --threshold=inf"),
-        "% loosened": ("python3 check.py --threshold 1%", "python3 check.py --threshold 0.05"),
-        "ratio to %": ("python3 check.py --threshold 0.05", "python3 check.py --threshold 10%"),
-        "% to ratio": ("python3 check.py --threshold 5%", "python3 check.py --threshold 0.01"),
-        "% vs pixels": ("python3 check.py --threshold 1%", "python3 check.py --threshold 5"),
-        "swapped thresholds": ("a --threshold 0.01 && b --threshold 0.05", "a --threshold 0.05 && b --threshold 0.01"),
-        "prefix loosened": ("THRESHOLD=0.05 python3 check.py", "THRESHOLD=0.5 python3 check.py"),
-        "new env threshold": ("python3 check.py", "THRESHOLD=0 python3 check.py"),
+        "option swallowing": ("npx playwright test --max-diff 0.01", "npx playwright test --output --max-diff 0.01"),
+        "-- bypass": ("npx playwright test --max-diff 0.01", "npx playwright test -- --max-diff 0.01"),
+        "new positive threshold": ("python3 check.py", "python3 check.py --max-diff 0.5"),
+        "threshold removed": ("python3 check.py --max-diff 0.01", "python3 check.py"),
+        "NaN": ("python3 check.py --max-diff 0.01", "python3 check.py --max-diff NaN"),
+        "inf": ("python3 check.py --max-diff 0.01", "python3 check.py --max-diff=inf"),
+        "% loosened": ("python3 check.py --max-diff 1%", "python3 check.py --max-diff 0.05"),
+        "ratio to %": ("python3 check.py --max-diff 0.05", "python3 check.py --max-diff 10%"),
+        "% to ratio": ("python3 check.py --max-diff 5%", "python3 check.py --max-diff 0.01"),
+        "% vs pixels": ("python3 check.py --max-diff 1%", "python3 check.py --max-diff 5"),
+        "swapped thresholds": ("a --max-diff 0.01 && b --max-diff 0.05", "a --max-diff 0.05 && b --max-diff 0.01"),
+        "prefix loosened": ("MAX_DIFF=0.05 python3 check.py", "MAX_DIFF=0.5 python3 check.py"),
+        "new env threshold": ("python3 check.py", "MAX_DIFF=0 python3 check.py"),
         "jest -u": ("npx jest", "npx jest -u"),
         "bundled -vu": ("npx jest", "npx jest -vu"),
         "UPDATE_SNAPSHOTS=1": ("npx jest", "UPDATE_SNAPSHOTS=1 npx jest"),
@@ -2746,13 +2746,13 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
         "unclosed quote": ("python3 check.py", "python3 check.py 'unclosed"),
         "trailing backslash": ("python3 check.py", "python3 check.py \\"),
         # quoting is never normalized away: a quote-only edit of any word is an unverifiable rewrite
-        "quoted export argument": (_EXPORTED, "export 'THRESHOLD=0.01'; python3 check.py"),
-        "quoted script argument": (_EXPORTED, "export THRESHOLD=0.01; python3 \"check.py\""),
-        "quote mutations": (_EXPORTED, "export 'THRESHOLD=0.01'; python3 \"check.py\""),
+        "quoted export argument": (_EXPORTED, "export 'MAX_DIFF=0.01'; python3 check.py"),
+        "quoted script argument": (_EXPORTED, "export MAX_DIFF=0.01; python3 \"check.py\""),
+        "quote mutations": (_EXPORTED, "export 'MAX_DIFF=0.01'; python3 \"check.py\""),
         # Round 19: nothing may be inserted, and operators, flag syntax and line structure keep their spelling
-        "--flag val -> --flag=val": ("python3 check.py --threshold 0.05", "python3 check.py --threshold=0.01"),
-        "--reporter=list inserted": ("npx playwright test --threshold 0.01",
-                                     "npx playwright test --reporter=list --threshold 0.01"),
+        "--flag val -> --flag=val": ("python3 check.py --max-diff 0.05", "python3 check.py --max-diff=0.01"),
+        "--reporter=list inserted": ("npx playwright test --max-diff 0.01",
+                                     "npx playwright test --reporter=list --max-diff 0.01"),
         "--color=never inserted": ("npx playwright test", "npx playwright test --color=never"),
         "--no-color inserted": ("npx playwright test", "npx playwright test --no-color"),
         "--verbose inserted": ("npx playwright test", "npx playwright test --verbose"),
@@ -2760,37 +2760,37 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
         "python3 -u inserted": ("python3 check.py", "python3 -u check.py"),
         "--update-snapshots=false inserted": ("npx playwright test", "npx playwright test --update-snapshots=false"),
         "UPDATE_SNAPSHOTS=0 inserted": ("npx playwright test", "UPDATE_SNAPSHOTS=0 npx playwright test"),
-        "; -> newline": (_EXPORTED, "export THRESHOLD=0.01\npython3 check.py\n"),
-        "line continuation": ("python3 check.py --threshold 0.01", "python3 check.py \\\n  --threshold 0.01"),
+        "; -> newline": (_EXPORTED, "export MAX_DIFF=0.01\npython3 check.py\n"),
+        "line continuation": ("python3 check.py --max-diff 0.01", "python3 check.py \\\n  --max-diff 0.01"),
         # Round 22: an edited command carries no non-threshold option (it could consume the threshold word)
-        "committed --reporter=list tightened": ("npx playwright test --reporter=list --threshold 0.05",
-                                                "npx playwright test --reporter=list --threshold 0.01"),
+        "committed --reporter=list tightened": ("npx playwright test --reporter=list --max-diff 0.05",
+                                                "npx playwright test --reporter=list --max-diff 0.01"),
     }
     _UNCHANGED = (
-        _EXPORTED, "export 'THRESHOLD=0.01'; python3 \"check.py\"", "env - python3 -u check.py", "env -S '-u FOO python3 -u check.py'",
-        "bash -c 'export THRESHOLD=0.01; python3 check.py'", "go test -run TestVisual -fuzz=FuzzUI ./...",
+        _EXPORTED, "export 'MAX_DIFF=0.01'; python3 \"check.py\"", "env - python3 -u check.py", "env -S '-u FOO python3 -u check.py'",
+        "bash -c 'export MAX_DIFF=0.01; python3 check.py'", "go test -run TestVisual -fuzz=FuzzUI ./...",
         "npx playwright test --project=chromium",
         "timeout 30 python3 -u check.py", "UPDATE_SNAPSHOTS=0 npx playwright test",
         "npx playwright test --update-snapshots=false", "npx jest -u", "python3 check.py || true",
         ["sh", "-c", "python3 check.py -u"],
         "npx playwright test --reporter=list --color=never --verbose", "python3 -u check.py", "pytest -q tests/visual",
-        "npx playwright test --reporter=list --threshold 0.05",
+        "npx playwright test --reporter=list --max-diff 0.05",
         "cat <<EOF >/dev/null\nunused\nEOF\npython3 check.py", "python3 check.py | tee log.txt",
-        "python3 check.py \\\n  --threshold 0.01", "node check.js --threshold 1e-2",
+        "python3 check.py \\\n  --max-diff 0.01", "node check.js --max-diff 1e-2",
     )
     _CLEAN = {
-        "--threshold tightened": ("python3 check.py --threshold 0.05", "python3 check.py --threshold 0.01"),
-        "--threshold= tightened": ("python3 check.py --threshold=0.05", "python3 check.py --threshold=0.01"),
-        "% tightened": ("python3 check.py --threshold 5%", "python3 check.py --threshold 1%"),
-        "prefix tightened": ("THRESHOLD=0.05 python3 check.py", "THRESHOLD=0.01 python3 check.py"),
-        "quoted prefix tightened": ("THRESHOLD='0.05' python3 check.py", "THRESHOLD='0.01' python3 check.py"),
-        "env tightened": ("env THRESHOLD=0.05 python3 check.py", "env THRESHOLD=0.01 python3 check.py"),
-        "sh -c prefix tightened": ("bash -c 'THRESHOLD=0.05 python3 check.py'", "bash -c 'THRESHOLD=0.01 python3 check.py'"),
+        "--max-diff tightened": ("python3 check.py --max-diff 0.05", "python3 check.py --max-diff 0.01"),
+        "--max-diff= tightened": ("python3 check.py --max-diff=0.05", "python3 check.py --max-diff=0.01"),
+        "% tightened": ("python3 check.py --max-diff 5%", "python3 check.py --max-diff 1%"),
+        "prefix tightened": ("MAX_DIFF=0.05 python3 check.py", "MAX_DIFF=0.01 python3 check.py"),
+        "quoted prefix tightened": ("MAX_DIFF='0.05' python3 check.py", "MAX_DIFF='0.01' python3 check.py"),
+        "env tightened": ("env MAX_DIFF=0.05 python3 check.py", "env MAX_DIFF=0.01 python3 check.py"),
+        "sh -c prefix tightened": ("bash -c 'MAX_DIFF=0.05 python3 check.py'", "bash -c 'MAX_DIFF=0.01 python3 check.py'"),
         "sh -c pixels tightened": ("sh -c 'node check.js --max-diff-pixels=5'",
                                    "sh -c 'node check.js --max-diff-pixels=1'"),
-        "committed UPDATE_SNAPSHOTS=0 tightened": ("UPDATE_SNAPSHOTS=0 THRESHOLD=0.05 npx playwright test",
-                                                   "UPDATE_SNAPSHOTS=0 THRESHOLD=0.01 npx playwright test"),
-        "threshold tightened to zero": ("npx playwright test --threshold 0.05", "npx playwright test --threshold 0"),
+        "committed UPDATE_SNAPSHOTS=0 tightened": ("UPDATE_SNAPSHOTS=0 MAX_DIFF=0.05 npx playwright test",
+                                                   "UPDATE_SNAPSHOTS=0 MAX_DIFF=0.01 npx playwright test"),
+        "threshold tightened to zero": ("npx playwright test --max-diff 0.05", "npx playwright test --max-diff 0"),
     }
 
     def _checked_repo(self, home: Path, command: str) -> Path:
@@ -2851,18 +2851,18 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
             return _visual_hook_loosening({"command": base}, {"command": live})
 
         renamed = reasons(self._EXPORTED, "export threshold=0.01; python3 check.py")
-        self.assertIn("removes threshold `THRESHOLD=0.01` (falls back to the tool default)", renamed)
+        self.assertIn("removes threshold `MAX_DIFF=0.01` (falls back to the tool default)", renamed)
         self.assertTrue(any("adds threshold `threshold=0.01`" in r for r in renamed), renamed)
-        self.assertIn("loosens threshold `--threshold` from 0.01 to 0.5",
-                      reasons("python3 check.py --threshold 0.01", "python3 check.py --threshold 0.5"))
-        self.assertIn("changes threshold unit `--threshold` (`%` vs plain number) from 1% to 0.05",
-                      reasons("python3 check.py --threshold 1%", "python3 check.py --threshold 0.05"))
-        self.assertIn("loosens threshold `--threshold` from 1% to 5%",
-                      reasons("python3 check.py --threshold 1%", "python3 check.py --threshold 5%"))
-        self.assertTrue(any(r.startswith("sets non-finite or unparseable threshold `--threshold`")
-                            for r in reasons("x --threshold 0.01", "x --threshold nan")))
-        self.assertTrue(any(r.startswith("adds threshold `--threshold=0.5`")
-                            for r in reasons("python3 check.py", "python3 check.py --threshold 0.5")))
+        self.assertIn("loosens threshold `--max-diff` from 0.01 to 0.5",
+                      reasons("python3 check.py --max-diff 0.01", "python3 check.py --max-diff 0.5"))
+        self.assertIn("changes threshold unit `--max-diff` (`%` vs plain number) from 1% to 0.05",
+                      reasons("python3 check.py --max-diff 1%", "python3 check.py --max-diff 0.05"))
+        self.assertIn("loosens threshold `--max-diff` from 1% to 5%",
+                      reasons("python3 check.py --max-diff 1%", "python3 check.py --max-diff 5%"))
+        self.assertTrue(any(r.startswith("sets non-finite or unparseable threshold `--max-diff`")
+                            for r in reasons("x --max-diff 0.01", "x --max-diff nan")))
+        self.assertTrue(any(r.startswith("adds threshold `--max-diff=0.5`")
+                            for r in reasons("python3 check.py", "python3 check.py --max-diff 0.5")))
         self.assertIn("adds snapshot-regeneration flag(s) `-u`", reasons("npx jest", "npx jest -u"))
         self.assertIn("adds snapshot-regeneration flag(s) `UPDATE_SNAPSHOTS=1`",
                       reasons("npx jest", "UPDATE_SNAPSHOTS=1 npx jest"))
@@ -2870,7 +2870,7 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
                       reasons("python3 check.py", "python3 check.py || true"))
         self.assertEqual(reasons("python3 check.py", "python3 check.py 'x"),
                          ["mutates visual_diff command with unparseable shell syntax"])
-        self.assertEqual(reasons(self._EXPORTED, "export THRESHOLD=0.01; (unset THRESHOLD); python3 check.py"),
+        self.assertEqual(reasons(self._EXPORTED, "export MAX_DIFF=0.01; (unset MAX_DIFF); python3 check.py"),
                          ["mutates committed visual_diff command with an unverifiable shell/structural rewrite"])
 
     def test_unchanged_commands_of_any_shell_complexity_stay_clean(self):
@@ -2910,11 +2910,11 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
         the effective threshold: the guard does not emulate the shell. Committing the same command is clean."""
         from factonio.harness import _visual_hook_loosening, check_harness
 
-        rewrites = ("(unset THRESHOLD); python3 check.py", "(export THRESHOLD=0.9); python3 check.py",
-                    "export -n THRESHOLD; export THRESHOLD; python3 check.py", "unset -fv FOO; python3 check.py")
+        rewrites = ("(unset MAX_DIFF); python3 check.py", "(export MAX_DIFF=0.9); python3 check.py",
+                    "export -n MAX_DIFF; export MAX_DIFF; python3 check.py", "unset -fv FOO; python3 check.py")
         with isolated_hermes_home() as home:
             repo = self._checked_repo(home, self._EXPORTED)
-            for live in (f"export THRESHOLD=0.01; {r}" for r in rewrites):
+            for live in (f"export MAX_DIFF=0.01; {r}" for r in rewrites):
                 with self.subTest(live=live):
                     self._set_command(repo, live)
                     chk = check_harness(str(repo), run_hooks=True)
@@ -2929,7 +2929,7 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
         def sig(cmd: Any) -> list[tuple[str, bool]]:
             return [(t.text, t.is_op) for t in _tokenize_visual_cmd(cmd)]
 
-        self.assertEqual(sig("a 'b c' \"d\" # e --threshold 9\n\nf;;"), sig("a \"b c\" d; f;;"))
+        self.assertEqual(sig("a 'b c' \"d\" # e --max-diff 9\n\nf;;"), sig("a \"b c\" d; f;;"))
         self.assertEqual(sig("x --color=#fff y#z"), [("x", False), ("--color=#fff", False), ("y#z", False)])
         self.assertEqual(sig("cmd 2>&1 | tee log"), [("cmd", False), ("2>&", True), ("1", False), ("|", True),
                                                       ("tee", False), ("log", False)])
@@ -2959,19 +2959,19 @@ class TestFixRound13StructuralGuardHardening(unittest.TestCase):
         "if any(a in SKIP or a.split('=')[0] in ('--override-ini', '--mode', '--project') for a in sys.argv[1:]):\n"
         "    sys.exit(0)\n"
         "p = argparse.ArgumentParser(add_help=False)\n"
-        "p.add_argument('--threshold', type=float, default=1.0)\n"
+        "p.add_argument('--max-diff', type=float, default=1.0)\n"
         "p.add_argument('--max-diff-pixels', type=int, default=10 ** 9)\n"
         "a, _ = p.parse_known_args()\n"
-        "t = float(os.environ.get('THRESHOLD') or a.threshold)\n"
+        "t = float(os.environ.get('MAX_DIFF') or a.max_diff)\n"
         "sys.exit(0 if 0.25 <= t and 100 <= a.max_diff_pixels else 1)\n"
     )
     # Visual diff 0.80 against a JS `Number(...)` threshold: NaN makes `0.80 > t` false, so the check passes.
     _JS_CHECK = (
         "const args = process.argv.slice(2);\n"
-        "let raw = process.env.THRESHOLD;\n"
+        "let raw = process.env.MAX_DIFF;\n"
         "for (let i = 0; i < args.length; i++) {\n"
-        "  if (args[i] === '--threshold') raw = args[i + 1];\n"
-        "  else if (args[i].startsWith('--threshold=')) raw = args[i].slice(12);\n"
+        "  if (args[i] === '--max-diff') raw = args[i + 1];\n"
+        "  else if (args[i].startsWith('--max-diff=')) raw = args[i].slice(12);\n"
         "}\n"
         "if (raw === undefined) raw = '1';\n"
         "const t = raw.endsWith('%') ? Number(raw.slice(0, -1)) / 100 : Number(raw);\n"
@@ -3041,8 +3041,8 @@ class TestFixRound13StructuralGuardHardening(unittest.TestCase):
             "--reporter path": ("npx playwright test", "npx playwright test --reporter=./reporter.js"),
             "--reporter plugin": ("npx playwright test", "npx playwright test --reporter=evil"),
             "--color expansion": ("npx playwright test", "npx playwright test --color=$C"),
-            "--verbose not trailing": ("npx playwright test --threshold 0.01",
-                                       "npx playwright test --verbose --threshold 0.01"),
+            "--verbose not trailing": ("npx playwright test --max-diff 0.01",
+                                       "npx playwright test --verbose --max-diff 0.01"),
             "swallowed by -run": ("go test -run TestVisual ./...", "go test -run --color=never TestVisual ./..."),
             "UPDATE_SNAPSHOTS=$X": ("npx jest", "UPDATE_SNAPSHOTS=$X npx jest"),
         })
@@ -3071,31 +3071,31 @@ class TestFixRound13StructuralGuardHardening(unittest.TestCase):
             "unchanged --project": ("npx playwright test --project=chromium", "npx playwright test --project=chromium"),
         })
         self._assert_executed_bypasses_rejected([
-            ("python3 check.py tests/visual --threshold 0.01",
-             f"python3 check.py tests/visual --threshold 0.01 {opt}")
+            ("python3 check.py tests/visual --max-diff 0.01",
+             f"python3 check.py tests/visual --max-diff 0.01 {opt}")
             for opt in ("--override-ini=addopts=--collect-only", "--co", "--fixtures", "--markers", "--setup-plan",
                         "-run=NEVER", "--mode=update", "--approve", "--bless", "--project=empty")
         ])
 
     def test_flag_thresholds_keep_their_exact_spelling(self):
         self._assert_rejected({
-            "--THRESHOLD": ("python3 check.py --threshold 0.01", "python3 check.py --THRESHOLD 0.01"),
-            "---threshold": ("python3 check.py --threshold 0.01", "python3 check.py ---threshold 0.01"),
-            "-threshold": ("python3 check.py --threshold 0.01", "python3 check.py -threshold 0.01"),
+            "--MAX_DIFF": ("python3 check.py --max-diff 0.01", "python3 check.py --MAX_DIFF 0.01"),
+            "---max-diff": ("python3 check.py --max-diff 0.01", "python3 check.py ---max-diff 0.01"),
+            "-threshold": ("python3 check.py --max-diff 0.01", "python3 check.py -threshold 0.01"),
             "--max_diff_pixels": ("python3 check.py --max-diff-pixels=0", "python3 check.py --max_diff_pixels=0"),
         })
         self._assert_rejected({  # Round 19: the `=` / space syntax is part of the flag's spelling
-            "--flag val -> --flag=val": ("python3 check.py --threshold 0.05", "python3 check.py --threshold=0.01"),
+            "--flag val -> --flag=val": ("python3 check.py --max-diff 0.05", "python3 check.py --max-diff=0.01"),
             "--flag=val -> --flag val": ("python3 check.py --max-diff-pixels=5", "python3 check.py --max-diff-pixels 0"),
         })
         self._assert_clean({
-            "--flag val tightened": ("python3 check.py --threshold 0.05", "python3 check.py --threshold 0.01"),
+            "--flag val tightened": ("python3 check.py --max-diff 0.05", "python3 check.py --max-diff 0.01"),
             "pixels tightened": ("python3 check.py --max-diff-pixels=5", "python3 check.py --max-diff-pixels=0"),
         })
         self._assert_executed_bypasses_rejected([
-            ("python3 check.py --threshold 0.01", "python3 check.py --THRESHOLD 0.01"),
-            ("python3 check.py --threshold 0.01", "python3 check.py ---threshold 0.01"),
-            ("python3 check.py --threshold 0.01", "python3 check.py -threshold 0.01"),
+            ("python3 check.py --max-diff 0.01", "python3 check.py --MAX_DIFF 0.01"),
+            ("python3 check.py --max-diff 0.01", "python3 check.py ---max-diff 0.01"),
+            ("python3 check.py --max-diff 0.01", "python3 check.py -threshold 0.01"),
             ("python3 check.py --max-diff-pixels=0", "python3 check.py --max_diff_pixels=0"),
         ])
 
@@ -3119,49 +3119,49 @@ class TestFixRound13StructuralGuardHardening(unittest.TestCase):
         pairs: list[tuple[Any, Any]] = []
         for v in ("0.0_1", "\uff10.\uff10\uff11", "\u0660.\u0660\u0661"):
             pairs += [
-                ("node check.js --threshold 0.05", f"node check.js --threshold {v}"),
-                ("node check.js --threshold=0.05", f"node check.js --threshold={v}"),
-                ("THRESHOLD=0.05 node check.js", f"THRESHOLD={v} node check.js"),
-                ("export THRESHOLD=0.05; node check.js", f"export THRESHOLD={v}; node check.js"),
-                ("bash -c 'node check.js --threshold 0.05'", f"bash -c 'node check.js --threshold {v}'"),
+                ("node check.js --max-diff 0.05", f"node check.js --max-diff {v}"),
+                ("node check.js --max-diff=0.05", f"node check.js --max-diff={v}"),
+                ("MAX_DIFF=0.05 node check.js", f"MAX_DIFF={v} node check.js"),
+                ("export MAX_DIFF=0.05; node check.js", f"export MAX_DIFF={v}; node check.js"),
+                ("bash -c 'node check.js --max-diff 0.05'", f"bash -c 'node check.js --max-diff {v}'"),
             ]
-        pairs += [("node check.js --threshold 5%", f"node check.js --threshold {v}") for v in ("0_1%", "\uff11%")]
+        pairs += [("node check.js --max-diff 5%", f"node check.js --max-diff {v}") for v in ("0_1%", "\uff11%")]
         self._assert_executed_bypasses_rejected(pairs)
-        self._assert_clean({v: ("node check.js --threshold 0.05", f"node check.js --threshold {v}")
+        self._assert_clean({v: ("node check.js --max-diff 0.05", f"node check.js --max-diff {v}")
                             for v in ("0.01", "0.005", "0")})
-        self._assert_rejected({v: ("node check.js --threshold 0.05", f"node check.js --threshold {v}")
+        self._assert_rejected({v: ("node check.js --max-diff 0.05", f"node check.js --max-diff {v}")
                                for v in (".01", "1e-2")})
-        self._assert_clean({f"unchanged {v}": (f"node check.js --threshold {v}", f"node check.js --threshold {v}")
+        self._assert_clean({f"unchanged {v}": (f"node check.js --max-diff {v}", f"node check.js --max-diff {v}")
                             for v in (".01", "1e-2")})
-        self._assert_clean({"unchanged odd literal": ("node check.js --threshold 0.0_1",
-                                                      "node check.js --threshold 0.0_1")})
+        self._assert_clean({"unchanged odd literal": ("node check.js --max-diff 0.0_1",
+                                                      "node check.js --max-diff 0.0_1")})
 
     def test_outer_quoting_of_sh_c_scripts_and_argv_lists_is_preserved(self):
-        single = "bash -c 'T=0.01; export THRESHOLD=$T; python3 check.py'"
-        double = 'bash -c "T=0.01; export THRESHOLD=$T; python3 check.py"'
-        argv = ["bash", "-c", "T=0.01; export THRESHOLD=$T; python3 check.py"]
+        single = "bash -c 'T=0.01; export MAX_DIFF=$T; python3 check.py'"
+        double = 'bash -c "T=0.01; export MAX_DIFF=$T; python3 check.py"'
+        argv = ["bash", "-c", "T=0.01; export MAX_DIFF=$T; python3 check.py"]
         self._assert_rejected({
             "single -> double quotes": (single, double),
             "argv list -> double quotes": (argv, double),
             "argv list -> unquoted glob": (["python3", "check.py", "*.png"], "python3 check.py *.png"),
             "string -> argv with spaces": ("python3 check.py 'a b'", ["python3", "check.py", "a b"]),
             # Round 19: the script keeps its committed outer quote style even without expansions
-            "single -> double quotes without expansions": ("bash -c 'export THRESHOLD=0.05; python3 check.py'",
-                                                           'bash -c "export THRESHOLD=0.01; python3 check.py"'),
+            "single -> double quotes without expansions": ("bash -c 'export MAX_DIFF=0.05; python3 check.py'",
+                                                           'bash -c "export MAX_DIFF=0.01; python3 check.py"'),
             # Round 20: an argv list and a shell string have no common bytes to compare verbatim
-            "argv list -> plain string": (["python3", "check.py", "--threshold", "0.05"],
-                                          "python3 check.py --threshold 0.01"),
+            "argv list -> plain string": (["python3", "check.py", "--max-diff", "0.05"],
+                                          "python3 check.py --max-diff 0.01"),
         })
         # Round 21: an edited script must be one simple command, so even a threshold-named variable in a
         # compound script is never editable; a leading assignment inside the single-quoted script is.
-        compound = "bash -c 'T_THRESHOLD=0.05; export THRESHOLD=$T_THRESHOLD; python3 check.py'"
+        compound = "bash -c 'T_THRESHOLD=0.05; export MAX_DIFF=$T_THRESHOLD; python3 check.py'"
         self._assert_rejected({"compound script tightened": (compound, compound.replace("0.05", "0.01"))})
         self._assert_clean({
-            "single-quoted tightening": ("bash -c 'THRESHOLD=0.05 python3 check.py'",
-                                         "bash -c 'THRESHOLD=0.01 python3 check.py'"),
+            "single-quoted tightening": ("bash -c 'MAX_DIFF=0.05 python3 check.py'",
+                                         "bash -c 'MAX_DIFF=0.01 python3 check.py'"),
             "unchanged compound script": (compound, compound),
-            "argv list tightened": (["python3", "check.py", "--threshold", "0.05"],
-                                    ["python3", "check.py", "--threshold", "0.01"]),
+            "argv list tightened": (["python3", "check.py", "--max-diff", "0.05"],
+                                    ["python3", "check.py", "--max-diff", "0.01"]),
             "unchanged double-quoted": (double, double),
             "unchanged argv list": (argv, argv),
         })
@@ -3197,8 +3197,8 @@ class TestFixRound14ShellWordsQuotingUnitsAndWrappers(unittest.TestCase):
         "const args = process.argv.slice(2);\n"
         "let raw = '1';\n"
         "for (let i = 0; i < args.length; i++) {\n"
-        "  if (args[i] === '--threshold') raw = args[i + 1];\n"
-        "  else if (args[i].startsWith('--threshold=')) raw = args[i].slice(12);\n"
+        "  if (args[i] === '--max-diff') raw = args[i + 1];\n"
+        "  else if (args[i].startsWith('--max-diff=')) raw = args[i].slice(12);\n"
         "}\n"
         "process.exit(0.80 > Number(raw) ? 1 : 0);\n"
     )
@@ -3225,73 +3225,73 @@ class TestFixRound14ShellWordsQuotingUnitsAndWrappers(unittest.TestCase):
     def test_carriage_return_is_part_of_the_shell_word(self):
         from factonio.harness import _tokenize_visual_cmd
 
-        self.assertEqual([t.text for t in _tokenize_visual_cmd("a --threshold\r 0.01\r#c")],
-                         ["a", "--threshold\r", "0.01\r#c"])
+        self.assertEqual([t.text for t in _tokenize_visual_cmd("a --max-diff\r 0.01\r#c")],
+                         ["a", "--max-diff\r", "0.01\r#c"])
         self._assert_rejected({
-            "python flag": ("python3 check.py --threshold 0.01", "python3 check.py --threshold\r 0.01"),
-            "value + comment": ("node check.js --threshold 0.01", "node check.js --threshold 0.01\r#comment"),
-            "bash -c flag": ("bash -c 'python3 check.py --threshold 0.01'",
-                             "bash -c 'python3 check.py --threshold\r 0.01'"),
+            "python flag": ("python3 check.py --max-diff 0.01", "python3 check.py --max-diff\r 0.01"),
+            "value + comment": ("node check.js --max-diff 0.01", "node check.js --max-diff 0.01\r#comment"),
+            "bash -c flag": ("bash -c 'python3 check.py --max-diff 0.01'",
+                             "bash -c 'python3 check.py --max-diff\r 0.01'"),
         })
         pairs: list[tuple[Any, Any]] = [
-            ("python3 check.py --threshold 0.01", "python3 check.py --threshold\r 0.01"),
-            ("bash -c 'python3 check.py --threshold 0.01'", "bash -c 'python3 check.py --threshold\r 0.01'"),
+            ("python3 check.py --max-diff 0.01", "python3 check.py --max-diff\r 0.01"),
+            ("bash -c 'python3 check.py --max-diff 0.01'", "bash -c 'python3 check.py --max-diff\r 0.01'"),
         ]
         if shutil.which("node"):  # Node's `Number("0.01\r#comment")` / `Number("1%\r")` is NaN
             pairs += [
-                ("node check.js --threshold 0.01", "node check.js --threshold\r 0.01"),
-                ("node check.js --threshold 0.01", "node check.js --threshold 0.01\r#comment"),
-                ("node check.js --threshold=1% --color=never", "node check.js --threshold=1%\r --color=never"),
+                ("node check.js --max-diff 0.01", "node check.js --max-diff\r 0.01"),
+                ("node check.js --max-diff 0.01", "node check.js --max-diff 0.01\r#comment"),
+                ("node check.js --max-diff=1% --color=never", "node check.js --max-diff=1%\r --color=never"),
             ]
         self._assert_executed_bypasses_rejected(pairs)
 
     def test_sh_c_outer_quoting_is_preserved_in_both_directions(self):
         flips = {
-            "${T:-...} double -> single": ('T=0.01; bash -c "python3 check.py --threshold ${T:-0.99}"',
-                                           "T=0.01; bash -c 'python3 check.py --threshold ${T:-0.99}'"),
-            "export $T double -> single": ('T=0.01; bash -c "export THRESHOLD=$T; python3 check.py"',
-                                           "T=0.01; bash -c 'export THRESHOLD=$T; python3 check.py'"),
-            "sh -c": ('T=0.01; sh -c "python3 check.py --threshold ${T:-0.99}"',
-                      "T=0.01; sh -c 'python3 check.py --threshold ${T:-0.99}'"),
-            "bash -ec": ('T=0.01; bash -ec "python3 check.py --threshold ${T:-0.99}"',
-                         "T=0.01; bash -ec 'python3 check.py --threshold ${T:-0.99}'"),
-            "$(...)": ('T=0.01; bash -c "python3 check.py --threshold $(echo ${T:-0.99})"',
-                       "T=0.01; bash -c 'python3 check.py --threshold $(echo ${T:-0.99})'"),
-            "backticks": ('T=0.01; bash -c "python3 check.py --threshold `echo ${T:-0.99}`"',
-                          "T=0.01; bash -c 'python3 check.py --threshold `echo ${T:-0.99}`'"),
-            "unquoted -> single": ("T=0.01; bash -c python3\\ check.py\\ --threshold\\ ${T:-0.99}",
-                                   "T=0.01; bash -c 'python3 check.py --threshold ${T:-0.99}'"),
-            "nested sh -c bash -c": ('T=0.01; sh -c "bash -c \'python3 check.py --threshold ${T:-0.99}\'"',
-                                     "T=0.01; sh -c 'bash -c \"python3 check.py --threshold ${T:-0.99}\"'"),
+            "${T:-...} double -> single": ('T=0.01; bash -c "python3 check.py --max-diff ${T:-0.99}"',
+                                           "T=0.01; bash -c 'python3 check.py --max-diff ${T:-0.99}'"),
+            "export $T double -> single": ('T=0.01; bash -c "export MAX_DIFF=$T; python3 check.py"',
+                                           "T=0.01; bash -c 'export MAX_DIFF=$T; python3 check.py'"),
+            "sh -c": ('T=0.01; sh -c "python3 check.py --max-diff ${T:-0.99}"',
+                      "T=0.01; sh -c 'python3 check.py --max-diff ${T:-0.99}'"),
+            "bash -ec": ('T=0.01; bash -ec "python3 check.py --max-diff ${T:-0.99}"',
+                         "T=0.01; bash -ec 'python3 check.py --max-diff ${T:-0.99}'"),
+            "$(...)": ('T=0.01; bash -c "python3 check.py --max-diff $(echo ${T:-0.99})"',
+                       "T=0.01; bash -c 'python3 check.py --max-diff $(echo ${T:-0.99})'"),
+            "backticks": ('T=0.01; bash -c "python3 check.py --max-diff `echo ${T:-0.99}`"',
+                          "T=0.01; bash -c 'python3 check.py --max-diff `echo ${T:-0.99}`'"),
+            "unquoted -> single": ("T=0.01; bash -c python3\\ check.py\\ --max-diff\\ ${T:-0.99}",
+                                   "T=0.01; bash -c 'python3 check.py --max-diff ${T:-0.99}'"),
+            "nested sh -c bash -c": ('T=0.01; sh -c "bash -c \'python3 check.py --max-diff ${T:-0.99}\'"',
+                                     "T=0.01; sh -c 'bash -c \"python3 check.py --max-diff ${T:-0.99}\"'"),
         }
         self._assert_rejected(flips)
         self._assert_rejected({
-            "positional after an earlier -c": ("bash -c 'python3 check.py' -c 'x --threshold 0.05'",
-                                               "bash -c 'python3 check.py' -c 'x --threshold 0.01'"),
-            "option with a value": ("bash -o pipefail -c 'python3 check.py --threshold 0.05'",
-                                    "bash -o pipefail -c 'python3 check.py --threshold 0.01'"),
+            "positional after an earlier -c": ("bash -c 'python3 check.py' -c 'x --max-diff 0.05'",
+                                               "bash -c 'python3 check.py' -c 'x --max-diff 0.01'"),
+            "option with a value": ("bash -o pipefail -c 'python3 check.py --max-diff 0.05'",
+                                    "bash -o pipefail -c 'python3 check.py --max-diff 0.01'"),
             # Round 22: the one wrapper is exactly `sh|bash -c SCRIPT`, with no other shell option
-            "bash -e -c tightening": ("bash -e -c 'python3 check.py --threshold 0.05'",
-                                      "bash -e -c 'python3 check.py --threshold 0.01'"),
+            "bash -e -c tightening": ("bash -e -c 'python3 check.py --max-diff 0.05'",
+                                      "bash -e -c 'python3 check.py --max-diff 0.01'"),
         })
         self._assert_clean({
-            "single-quoted tightening": ("bash -c 'python3 check.py --threshold 0.05'",
-                                         "bash -c 'python3 check.py --threshold 0.01'"),
-            "unchanged bash -e -c": ("bash -e -c 'python3 check.py --threshold 0.05'",
-                                     "bash -e -c 'python3 check.py --threshold 0.05'"),
+            "single-quoted tightening": ("bash -c 'python3 check.py --max-diff 0.05'",
+                                         "bash -c 'python3 check.py --max-diff 0.01'"),
+            "unchanged bash -e -c": ("bash -e -c 'python3 check.py --max-diff 0.05'",
+                                     "bash -e -c 'python3 check.py --max-diff 0.05'"),
             "unchanged expanding script": (flips["sh -c"][0], flips["sh -c"][0]),
         })
         self._assert_executed_bypasses_rejected(list(flips.values()))
 
     def test_threshold_keeps_its_committed_unit(self):
         self._assert_rejected({
-            "plain -> %": ("node check.js --threshold 0.05", "node check.js --threshold 1%"),
-            "% -> plain": ("node check.js --threshold 5%", "node check.js --threshold 0.01"),
-            "env plain -> %": ("THRESHOLD=0.05 node check.js", "THRESHOLD=1% node check.js"),
+            "plain -> %": ("node check.js --max-diff 0.05", "node check.js --max-diff 1%"),
+            "% -> plain": ("node check.js --max-diff 5%", "node check.js --max-diff 0.01"),
+            "env plain -> %": ("MAX_DIFF=0.05 node check.js", "MAX_DIFF=1% node check.js"),
         })
         self._assert_clean({
-            "plain tightened": ("node check.js --threshold 0.05", "node check.js --threshold 0.01"),
-            "% tightened": ("node check.js --threshold 5%", "node check.js --threshold 1%"),
+            "plain tightened": ("node check.js --max-diff 0.05", "node check.js --max-diff 0.01"),
+            "% tightened": ("node check.js --max-diff 5%", "node check.js --max-diff 1%"),
         })
 
     @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
@@ -3300,14 +3300,14 @@ class TestFixRound14ShellWordsQuotingUnitsAndWrappers(unittest.TestCase):
         from factonio.harness import audit_harness, check_harness
 
         self._assert_executed_bypasses_rejected([
-            ("node plain.js --threshold 0.05", "node plain.js --threshold 1%"),
-            ("node plain.js --threshold=0.05", "node plain.js --threshold=1%"),
+            ("node plain.js --max-diff 0.05", "node plain.js --max-diff 1%"),
+            ("node plain.js --max-diff=0.05", "node plain.js --max-diff=1%"),
         ])
         with isolated_hermes_home() as home:
             for n, (base, live, loosened) in enumerate((
-                    ("node plain.js --threshold 5%", "node plain.js --threshold 0.01", True),
-                    ("node plain.js --threshold 0.05", "node plain.js --threshold 0.01", False),
-                    ("node check.js --threshold=5%", "node check.js --threshold=1%", False))):
+                    ("node plain.js --max-diff 5%", "node plain.js --max-diff 0.01", True),
+                    ("node plain.js --max-diff 0.05", "node plain.js --max-diff 0.01", False),
+                    ("node check.js --max-diff=5%", "node check.js --max-diff=1%", False))):
                 with self.subTest(base=base, live=live):
                     repo = self._repo(home, f"svc{n}", base)
                     self._set_command(repo, live)
@@ -3459,13 +3459,13 @@ class TestFixRound15BlobHashBaselinesAndNoNewInsertions(unittest.TestCase):
         from factonio.harness import _visual_hook_loosening
 
         added = {
-            "duplicate =0%": ("node plain.js --threshold 0.05", "node plain.js --threshold 0.05 --threshold=0%"),
-            "duplicate 0%": ("node plain.js --threshold 0.05", "node plain.js --threshold 0.05 --threshold 0%"),
-            "duplicate =0": ("node plain.js --threshold 0.05", "node plain.js --threshold 0.05 --threshold=0"),
-            "new =0%": ("node plain.js", "node plain.js --threshold=0%"),
-            "new =0": ("node plain.js", "node plain.js --threshold=0"),
-            "new 0": ("node plain.js", "node plain.js --threshold 0"),
-            "new env 0": ("node plain.js", "THRESHOLD=0 node plain.js"),
+            "duplicate =0%": ("node plain.js --max-diff 0.05", "node plain.js --max-diff 0.05 --max-diff=0%"),
+            "duplicate 0%": ("node plain.js --max-diff 0.05", "node plain.js --max-diff 0.05 --max-diff 0%"),
+            "duplicate =0": ("node plain.js --max-diff 0.05", "node plain.js --max-diff 0.05 --max-diff=0"),
+            "new =0%": ("node plain.js", "node plain.js --max-diff=0%"),
+            "new =0": ("node plain.js", "node plain.js --max-diff=0"),
+            "new 0": ("node plain.js", "node plain.js --max-diff 0"),
+            "new env 0": ("node plain.js", "MAX_DIFF=0 node plain.js"),
         }
         self._assert_rejected(added)
         for label, (base, live) in added.items():
@@ -3473,22 +3473,22 @@ class TestFixRound15BlobHashBaselinesAndNoNewInsertions(unittest.TestCase):
                 self.assertTrue(any(r.startswith("adds threshold `") and "tightened in place" in r
                                     for r in _visual_hook_loosening({"command": base}, {"command": live})))
         self._assert_clean({
-            "tightened to 0": ("node plain.js --threshold 0.05", "node plain.js --threshold 0"),
-            "tightened to =0": ("node plain.js --threshold=0.05", "node plain.js --threshold=0"),
-            "% tightened to 0%": ("node plain.js --threshold 5%", "node plain.js --threshold 0%"),
+            "tightened to 0": ("node plain.js --max-diff 0.05", "node plain.js --max-diff 0"),
+            "tightened to =0": ("node plain.js --max-diff=0.05", "node plain.js --max-diff=0"),
+            "% tightened to 0%": ("node plain.js --max-diff 5%", "node plain.js --max-diff 0%"),
         })
 
     @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
     def test_duplicate_zero_percent_threshold_is_rejected_end_to_end(self):
-        """`plain.js` keeps the last `--threshold`: `Number("0%")` is NaN and `0.80 > NaN` is false."""
+        """`plain.js` keeps the last `--max-diff`: `Number("0%")` is NaN and `0.80 > NaN` is false."""
         from factonio.harness import audit_harness, check_harness
 
         self._assert_executed_bypasses_rejected([
-            ("node plain.js --threshold 0.05", "node plain.js --threshold 0.05 --threshold=0%"),
-            ("node plain.js --threshold 0.05", "node plain.js --threshold 0.05 --threshold 0%"),
+            ("node plain.js --max-diff 0.05", "node plain.js --max-diff 0.05 --max-diff=0%"),
+            ("node plain.js --max-diff 0.05", "node plain.js --max-diff 0.05 --max-diff 0%"),
         ])
         with isolated_hermes_home() as home:
-            for n, live in enumerate(("node plain.js --threshold=0%", "node plain.js --threshold=0")):
+            for n, live in enumerate(("node plain.js --max-diff=0%", "node plain.js --max-diff=0")):
                 with self.subTest(live=live):
                     repo = self._repo(home, f"new{n}", "node plain.js")
                     self._set_command(repo, live)
@@ -3588,14 +3588,14 @@ class TestFixRound16IntegerThresholdsAndStrictRunners(unittest.TestCase):
         self.assertTrue(any(r.startswith("rewrites integer threshold `--max-diff-pixels` as a non-integer (0.5")
                             for r in reasons), reasons)
         self.assertFalse(any(r.startswith("loosens threshold") for r in reasons), reasons)
-        self._assert_rejected({"float 0.05 -> 1e-2": ("node check.js --threshold 0.05", "node check.js --threshold 1e-2")})
+        self._assert_rejected({"float 0.05 -> 1e-2": ("node check.js --max-diff 0.05", "node check.js --max-diff 1e-2")})
         self._assert_clean({
             "5 -> 2": (base, "node pixels.js --max-diff-pixels=2"),
             "5 -> 0": (base, "node pixels.js --max-diff-pixels=0"),
             "5% -> 1%": ("node pixels.js --max-diff-pixels=5%", "node pixels.js --max-diff-pixels=1%"),
-            "float 0.05 -> 0.01": ("node check.js --threshold 0.05", "node check.js --threshold 0.01"),
-            "float 0.05 -> 0": ("node check.js --threshold 0.05", "node check.js --threshold 0"),
-            "float 0.05 -> 0.005": ("node check.js --threshold 0.05", "node check.js --threshold 0.005"),
+            "float 0.05 -> 0.01": ("node check.js --max-diff 0.05", "node check.js --max-diff 0.01"),
+            "float 0.05 -> 0": ("node check.js --max-diff 0.05", "node check.js --max-diff 0"),
+            "float 0.05 -> 0.005": ("node check.js --max-diff 0.05", "node check.js --max-diff 0.005"),
         })
 
     @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
@@ -3719,7 +3719,7 @@ class TestFixRound17ExactThresholdsAndRawQuoting(unittest.TestCase):
             "2**53 -> 2**53 + 1": (base.format(9007199254740992), base.format(9007199254740993)),
             "40-digit integer + 1": (base.format(big), base.format(big[:-1] + "1")),
             "40-digit percent + 1": (base.format(big + "%"), base.format(big[:-1] + "1%")),
-            "40-digit decimal + ulp": ("node check.js --threshold " + tiny + "1", "node check.js --threshold " + tiny + "2"),
+            "40-digit decimal + ulp": ("node check.js --max-diff " + tiny + "1", "node check.js --max-diff " + tiny + "2"),
             "env 2**53 + 1": ("MAX_DIFF_PIXELS=9007199254740992 python3 pixels.py",
                               "MAX_DIFF_PIXELS=9007199254740993 python3 pixels.py"),
         })
@@ -3728,7 +3728,7 @@ class TestFixRound17ExactThresholdsAndRawQuoting(unittest.TestCase):
             "2**53 + 1 -> 2**53": (base.format(9007199254740993), base.format(9007199254740992)),
             "40-digit integer - 1": (base.format(big[:-1] + "1"), base.format(big)),
             "40-digit percent - 1": (base.format(big[:-1] + "1%"), base.format(big + "%")),
-            "40-digit decimal - ulp": ("node check.js --threshold " + tiny + "2", "node check.js --threshold " + tiny + "1"),
+            "40-digit decimal - ulp": ("node check.js --max-diff " + tiny + "2", "node check.js --max-diff " + tiny + "1"),
         })
 
     def test_raised_integer_threshold_past_2_53_is_rejected_end_to_end(self):
@@ -3738,53 +3738,53 @@ class TestFixRound17ExactThresholdsAndRawQuoting(unittest.TestCase):
         ])
 
     def test_quoted_assignments_and_negations_are_not_collapsed(self):
-        assign = "THRESHOLD=0.05; export THRESHOLD; node check.js"
-        neg_if = "if ! node check.js --threshold 0.05; then exit 1; fi"
-        neg_and = "! node check.js --threshold 0.05 && exit 1; true"
-        nested = "bash -c 'if ! node check.js --threshold 0.05; then exit 1; fi'"
+        assign = "MAX_DIFF=0.05; export MAX_DIFF; node check.js"
+        neg_if = "if ! node check.js --max-diff 0.05; then exit 1; fi"
+        neg_and = "! node check.js --max-diff 0.05 && exit 1; true"
+        nested = "bash -c 'if ! node check.js --max-diff 0.05; then exit 1; fi'"
         self._assert_rejected({
-            "single-quoted assignment": (assign, "'THRESHOLD=0.05'; export THRESHOLD; node check.js"),
-            "escaped =": (assign, "THRESHOLD\\=0.05; export THRESHOLD; node check.js"),
-            "double-quoted name": (assign, '"THRESHOLD"=0.05; export THRESHOLD; node check.js'),
-            "quoted tightened assignment": (assign, "'THRESHOLD=0.01'; export THRESHOLD; node check.js"),
-            "quoted ! in if": (neg_if, "if '!' node check.js --threshold 0.05; then exit 1; fi"),
-            "double-quoted ! in if": (neg_if, 'if "!" node check.js --threshold 0.05; then exit 1; fi'),
-            "escaped ! in if": (neg_if, "if \\! node check.js --threshold 0.05; then exit 1; fi"),
-            "quoted ! before &&": (neg_and, "'!' node check.js --threshold 0.05 && exit 1; true"),
-            "quoted ! in bash -c": (nested, "bash -c 'if \"!\" node check.js --threshold 0.05; then exit 1; fi'"),
-            "quoted assignment after assignment": ("A=1 THRESHOLD=0.05 node check.js",
-                                                   "A=1 'THRESHOLD=0.05' node check.js"),
-            "quoted ! after then": ("if true; then ! node check.js --threshold 0.05; fi",
-                                    "if true; then '!' node check.js --threshold 0.05; fi"),
-            "quoted assignment after redirection": ("2>/dev/null THRESHOLD=0.05 node check.js",
-                                                    "2>/dev/null 'THRESHOLD=0.05' node check.js"),
+            "single-quoted assignment": (assign, "'MAX_DIFF=0.05'; export MAX_DIFF; node check.js"),
+            "escaped =": (assign, "MAX_DIFF\\=0.05; export MAX_DIFF; node check.js"),
+            "double-quoted name": (assign, '"MAX_DIFF"=0.05; export MAX_DIFF; node check.js'),
+            "quoted tightened assignment": (assign, "'MAX_DIFF=0.01'; export MAX_DIFF; node check.js"),
+            "quoted ! in if": (neg_if, "if '!' node check.js --max-diff 0.05; then exit 1; fi"),
+            "double-quoted ! in if": (neg_if, 'if "!" node check.js --max-diff 0.05; then exit 1; fi'),
+            "escaped ! in if": (neg_if, "if \\! node check.js --max-diff 0.05; then exit 1; fi"),
+            "quoted ! before &&": (neg_and, "'!' node check.js --max-diff 0.05 && exit 1; true"),
+            "quoted ! in bash -c": (nested, "bash -c 'if \"!\" node check.js --max-diff 0.05; then exit 1; fi'"),
+            "quoted assignment after assignment": ("A=1 MAX_DIFF=0.05 node check.js",
+                                                   "A=1 'MAX_DIFF=0.05' node check.js"),
+            "quoted ! after then": ("if true; then ! node check.js --max-diff 0.05; fi",
+                                    "if true; then '!' node check.js --max-diff 0.05; fi"),
+            "quoted assignment after redirection": ("2>/dev/null MAX_DIFF=0.05 node check.js",
+                                                    "2>/dev/null 'MAX_DIFF=0.05' node check.js"),
             "quoted plain argument": ("node check.js snapshots/home.png", "node check.js 'snapshots/home.png'"),
-            "quoted export argument": ("export THRESHOLD=0.05; node check.js", "export 'THRESHOLD=0.05'; node check.js"),
+            "quoted export argument": ("export MAX_DIFF=0.05; node check.js", "export 'MAX_DIFF=0.05'; node check.js"),
             # Round 20: quoting is outside the value span, so adding or dropping it is a verbatim mismatch
-            "value quoting added": (assign, "THRESHOLD='0.05'; export THRESHOLD; node check.js"),
-            "flag value quoting tightened": ("node check.js --threshold 0.05", "node check.js --threshold '0.01'"),
+            "value quoting added": (assign, "MAX_DIFF='0.05'; export MAX_DIFF; node check.js"),
+            "flag value quoting tightened": ("node check.js --max-diff 0.05", "node check.js --max-diff '0.01'"),
         })
         self._assert_clean({
-            "unchanged quoted assignment word": ("'THRESHOLD=0.05'; node check.js", "'THRESHOLD=0.05'; node check.js"),
-            "unchanged quoted value": ("THRESHOLD='0.05' node check.js", "THRESHOLD='0.05' node check.js"),
-            "quoted value tightened": ("THRESHOLD='0.05' node check.js", "THRESHOLD='0.01' node check.js"),
-            "unchanged quoted export argument": ("export 'THRESHOLD=0.05'; node check.js",
-                                                 "export 'THRESHOLD=0.05'; node check.js"),
+            "unchanged quoted assignment word": ("'MAX_DIFF=0.05'; node check.js", "'MAX_DIFF=0.05'; node check.js"),
+            "unchanged quoted value": ("MAX_DIFF='0.05' node check.js", "MAX_DIFF='0.05' node check.js"),
+            "quoted value tightened": ("MAX_DIFF='0.05' node check.js", "MAX_DIFF='0.01' node check.js"),
+            "unchanged quoted export argument": ("export 'MAX_DIFF=0.05'; node check.js",
+                                                 "export 'MAX_DIFF=0.05'; node check.js"),
         })
 
     @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
     def test_quoted_assignments_and_negations_are_rejected_end_to_end(self):
         """Each mutation exits 127 on the quoted word: the assignment never happens and `if`/`&&` see failure."""
-        assign = "THRESHOLD=0.05; export THRESHOLD; node check.js"
-        neg_if = "if ! node check.js --threshold 0.05; then exit 1; fi"
+        assign = "MAX_DIFF=0.05; export MAX_DIFF; node check.js"
+        neg_if = "if ! node check.js --max-diff 0.05; then exit 1; fi"
         self._assert_executed_bypasses_rejected([
-            (assign, "'THRESHOLD=0.05'; export THRESHOLD; node check.js"),
-            (assign, "THRESHOLD\\=0.05; export THRESHOLD; node check.js"),
-            (assign, '"THRESHOLD"=0.05; export THRESHOLD; node check.js'),
-            (assign, "'THRESHOLD=0.01'; export THRESHOLD; node check.js"),
-            (neg_if, "if '!' node check.js --threshold 0.05; then exit 1; fi"),
-            ("! node check.js --threshold 0.05 && exit 1; true", "'!' node check.js --threshold 0.05 && exit 1; true"),
-            ("bash -c 'if ! node check.js --threshold 0.05; then exit 1; fi'", "bash -c 'if \"!\" node check.js --threshold 0.05; then exit 1; fi'"),
+            (assign, "'MAX_DIFF=0.05'; export MAX_DIFF; node check.js"),
+            (assign, "MAX_DIFF\\=0.05; export MAX_DIFF; node check.js"),
+            (assign, '"MAX_DIFF"=0.05; export MAX_DIFF; node check.js'),
+            (assign, "'MAX_DIFF=0.01'; export MAX_DIFF; node check.js"),
+            (neg_if, "if '!' node check.js --max-diff 0.05; then exit 1; fi"),
+            ("! node check.js --max-diff 0.05 && exit 1; true", "'!' node check.js --max-diff 0.05 && exit 1; true"),
+            ("bash -c 'if ! node check.js --max-diff 0.05; then exit 1; fi'", "bash -c 'if \"!\" node check.js --max-diff 0.05; then exit 1; fi'"),
         ])
 
 
@@ -3806,12 +3806,12 @@ class TestFixRound18RawQuotingAndFixedPointThresholds(unittest.TestCase):
     _REGEX = "bash -c 'out=$(python3 check.py); [[ ! $out =~ ^FAIL ]]'"
     _ARITH = "bash -c 'diff=$(python3 check.py); if (( diff != 0 )); then exit 1; fi'"
     _TIME_NEG = "bash -c 'if time -p ! python3 check.py; then exit 1; fi'"
-    _TIME_ASSIGN = "bash -c 'time -p THRESHOLD=0.05; export THRESHOLD; python3 check.py'"
+    _TIME_ASSIGN = "bash -c 'time -p MAX_DIFF=0.05; export MAX_DIFF; python3 check.py'"
     _QUOTE_MUTATIONS = (
         (_REGEX, "bash -c 'out=$(python3 check.py); [[ ! $out =~ \"^FAIL\" ]]'"),
         (_ARITH, "bash -c 'diff=$(python3 check.py); if (( diff \\!= 0 )); then exit 1; fi'"),
         (_TIME_NEG, "bash -c 'if time -p \"!\" python3 check.py; then exit 1; fi'"),
-        (_TIME_ASSIGN, "bash -c 'time -p \"THRESHOLD=0.05\"; export THRESHOLD; python3 check.py'"),
+        (_TIME_ASSIGN, "bash -c 'time -p \"MAX_DIFF=0.05\"; export MAX_DIFF; python3 check.py'"),
     )
     # The `check.py` each committed command runs; every committed command fails its hook.
     _CHECKS = {
@@ -3819,7 +3819,7 @@ class TestFixRound18RawQuotingAndFixedPointThresholds(unittest.TestCase):
         _ARITH: "print(100)\n",
         _TIME_NEG: "import sys\nsys.exit(1)\n",
         _TIME_ASSIGN: ("import os, sys\n"
-                       "sys.exit(0 if 0.25 <= float(os.environ.get('THRESHOLD') or '1.0') else 1)\n"),
+                       "sys.exit(0 if 0.25 <= float(os.environ.get('MAX_DIFF') or '1.0') else 1)\n"),
     }
 
     def _repo(self, home: Path, name: str, command: Any) -> Path:
@@ -3844,7 +3844,7 @@ class TestFixRound18RawQuotingAndFixedPointThresholds(unittest.TestCase):
     @unittest.skipUnless(shutil.which("bash"), "bash is required for `[[`, `((` and `time -p`")
     def test_quote_only_mutations_are_rejected_end_to_end(self):
         """Each quoted word changes bash semantics: a literal `=~` pattern, an arithmetic syntax error, a `!`
-        command instead of negation, a `THRESHOLD=0.05` command instead of an assignment; each turns green."""
+        command instead of negation, a `MAX_DIFF=0.05` command instead of an assignment; each turns green."""
         self._assert_executed_bypasses_rejected(list(self._QUOTE_MUTATIONS))
 
     def test_edited_thresholds_must_be_plain_fixed_point(self):
@@ -3855,11 +3855,11 @@ class TestFixRound18RawQuotingAndFixedPointThresholds(unittest.TestCase):
             "0.5 -> 9e-2": (flag.format("0.5"), flag.format("9e-2")),
             "0.5 -> .0": (flag.format("0.5"), flag.format(".0")),
             "1.5 -> 999e-3": (flag.format("1.5"), flag.format("999e-3")),
-            "0.05 -> 1e-2": ("node check.js --threshold 0.05", "node check.js --threshold 1e-2"),
-            "0.05 -> .01": ("node check.js --threshold 0.05", "node check.js --threshold .01"),
-            "1e-1 -> 1e-2": ("node check.js --threshold 1e-1", "node check.js --threshold 1e-2"),
-            ".05 -> 0.01": ("node check.js --threshold .05", "node check.js --threshold 0.01"),
-            "env 0.05 -> 1e-2": ("THRESHOLD=0.05 node check.js", "THRESHOLD=1e-2 node check.js"),
+            "0.05 -> 1e-2": ("node check.js --max-diff 0.05", "node check.js --max-diff 1e-2"),
+            "0.05 -> .01": ("node check.js --max-diff 0.05", "node check.js --max-diff .01"),
+            "1e-1 -> 1e-2": ("node check.js --max-diff 1e-1", "node check.js --max-diff 1e-2"),
+            ".05 -> 0.01": ("node check.js --max-diff .05", "node check.js --max-diff 0.01"),
+            "env 0.05 -> 1e-2": ("MAX_DIFF=0.05 node check.js", "MAX_DIFF=1e-2 node check.js"),
         })
         self.assertIn("sets non-finite or unparseable threshold `--max-diff-pixels` (9e-2)",
                       _visual_hook_loosening({"command": flag.format("0.5")}, {"command": flag.format("9e-2")}))
@@ -3867,12 +3867,12 @@ class TestFixRound18RawQuotingAndFixedPointThresholds(unittest.TestCase):
             "0.5 -> 0.1": (flag.format("0.5"), flag.format("0.1")),
             "1.5 -> 1.2": (flag.format("1.5"), flag.format("1.2")),
             "1.5 -> 0.5": (flag.format("1.5"), flag.format("0.5")),
-            "0.05 -> 0": ("node check.js --threshold 0.05", "node check.js --threshold 0"),
-            "5% -> 1%": ("node check.js --threshold 5%", "node check.js --threshold 1%"),
-            "1.5% -> 0.5%": ("node check.js --threshold 1.5%", "node check.js --threshold 0.5%"),
-            "unchanged 1e-2": ("node check.js --threshold 1e-2", "node check.js --threshold 1e-2"),
-            "unchanged .01": ("node check.js --threshold .01", "node check.js --threshold .01"),
-            "quoted value tightened": ("THRESHOLD='0.05' node check.js", "THRESHOLD='0.01' node check.js"),
+            "0.05 -> 0": ("node check.js --max-diff 0.05", "node check.js --max-diff 0"),
+            "5% -> 1%": ("node check.js --max-diff 5%", "node check.js --max-diff 1%"),
+            "1.5% -> 0.5%": ("node check.js --max-diff 1.5%", "node check.js --max-diff 0.5%"),
+            "unchanged 1e-2": ("node check.js --max-diff 1e-2", "node check.js --max-diff 1e-2"),
+            "unchanged .01": ("node check.js --max-diff .01", "node check.js --max-diff .01"),
+            "quoted value tightened": ("MAX_DIFF='0.05' node check.js", "MAX_DIFF='0.01' node check.js"),
         })
 
     @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
@@ -3923,23 +3923,23 @@ class TestFixRound19PureInPlaceTightening(unittest.TestCase):
     _SUBST = "bash -c 'out=$(python3 check.py); [[ ! $out =~ ^FAIL ]]'"
     _PIPE = "python3 check.py | awk '/FAIL/ { exit 1 }'"
     _GREP = "grep -q FAIL report.txt && exit 1; true"
-    _TIME_ASSIGN = "bash -c 'time -p THRESHOLD=0.05; export THRESHOLD; python3 check.py'"
+    _TIME_ASSIGN = "bash -c 'time -p MAX_DIFF=0.05; export MAX_DIFF; python3 check.py'"
     _TIME_NEG = "bash -c 'time ! python3 check.py'"
     _POSITIONAL = "python3 check.py snapshots/home.png"
-    _EQ_JS = "node eq.js --threshold=0.05"
-    _SPACE_JS = "node space.js --threshold 0.05"
+    _EQ_JS = "node eq.js --max-diff=0.05"
+    _SPACE_JS = "node space.js --max-diff 0.05"
     # The `check.py` each committed command runs; every committed command fails its hook.
     _CHECKS = {
         _SUBST: _PRINT_FAIL,
         _PIPE: _PRINT_FAIL,
-        _TIME_ASSIGN: "import os, sys\nsys.exit(0 if 0.25 <= float(os.environ.get('THRESHOLD') or '1.0') else 1)\n",
+        _TIME_ASSIGN: "import os, sys\nsys.exit(0 if 0.25 <= float(os.environ.get('MAX_DIFF') or '1.0') else 1)\n",
         _TIME_NEG: "import sys\nsys.exit(0)\n",
         _POSITIONAL: "import sys\nsys.exit(1 if sys.argv[1:2] == ['snapshots/home.png'] else 0)\n",
     }
     # Single-syntax Node checkers: visual diff 0.25, lenient default 1 when their one form is absent.
-    _EQ_CHECK = ("const a = process.argv.slice(2).find((x) => x.startsWith('--threshold='));\n"
+    _EQ_CHECK = ("const a = process.argv.slice(2).find((x) => x.startsWith('--max-diff='));\n"
                  "process.exit(0.25 > Number(a ? a.slice(12) : '1') ? 1 : 0);\n")
-    _SPACE_CHECK = ("const args = process.argv.slice(2); const i = args.indexOf('--threshold');\n"
+    _SPACE_CHECK = ("const args = process.argv.slice(2); const i = args.indexOf('--max-diff');\n"
                     "process.exit(0.25 > Number(i >= 0 ? args[i + 1] : '1') ? 1 : 0);\n")
     _SWALLOWED = (
         (_HEREDOC, "cat <<EOF >/dev/null\nunused\n EOF\npython3 check.py"),
@@ -3949,13 +3949,13 @@ class TestFixRound19PureInPlaceTightening(unittest.TestCase):
         (_SUBST, "bash -c 'out=$(python3 --color=never check.py); [[ ! $out =~ ^FAIL ]]'"),
         (_PIPE, "python3 --color=never check.py | awk '/FAIL/ { exit 1 }'"),
         (_GREP, "grep --reporter=list -q FAIL report.txt && exit 1; true"),
-        (_TIME_ASSIGN, "bash -c 'UPDATE_SNAPSHOTS=0 time -p THRESHOLD=0.05; export THRESHOLD; python3 check.py'"),
+        (_TIME_ASSIGN, "bash -c 'UPDATE_SNAPSHOTS=0 time -p MAX_DIFF=0.05; export MAX_DIFF; python3 check.py'"),
         (_TIME_NEG, "bash -c 'time ! --color=never python3 check.py'"),
         (_POSITIONAL, "python3 check.py --color=never snapshots/home.png"),
     )
     _SYNTAX_SWAPS = (
-        (_EQ_JS, "node eq.js --threshold 0.01"),
-        (_SPACE_JS, "node space.js --threshold=0.01"),
+        (_EQ_JS, "node eq.js --max-diff 0.01"),
+        (_SPACE_JS, "node space.js --max-diff=0.01"),
     )
 
     def _repo(self, home: Path, name: str, command: Any) -> Path:
@@ -3978,7 +3978,7 @@ class TestFixRound19PureInPlaceTightening(unittest.TestCase):
         from factonio.harness import _tokenize_visual_cmd, _UnsupportedEdit, _visual_hook_loosening
 
         for cmd in ("cat <<EOF\nx\nEOF", "cat <<-EOF\n\tx\n\tEOF", "cat <<< x", "a $(cat <<E\nE\n)",
-                    "python3 check.py \\\n --threshold 0.01", 'echo "a\\\nb"'):
+                    "python3 check.py \\\n --max-diff 0.01", 'echo "a\\\nb"'):
             with self.subTest(cmd=cmd), self.assertRaises(_UnsupportedEdit):
                 _tokenize_visual_cmd(cmd)
         self.assertEqual([t.text for t in _tokenize_visual_cmd("echo '<<' \"<<<\" '\\\n'")], ["echo", "<<", "<<<", "\\\n"])
@@ -3988,28 +3988,28 @@ class TestFixRound19PureInPlaceTightening(unittest.TestCase):
             "heredoc added": ("python3 check.py", "cat <<EOF\nEOF\npython3 check.py"),
             "heredoc removed": (self._HEREDOC, "python3 check.py"),
             "herestring": ("python3 check.py", "python3 check.py <<< x"),
-            "continuation added": ("python3 check.py --threshold 0.05", "python3 check.py \\\n --threshold 0.01"),
+            "continuation added": ("python3 check.py --max-diff 0.05", "python3 check.py \\\n --max-diff 0.01"),
         })
         reasons = _visual_hook_loosening({"command": self._HEREDOC}, {"command": self._SWALLOWED[0][1]})
         self.assertEqual(reasons, ["mutates visual_diff command with a heredoc/herestring (allowed only when "
                                    "byte-identical to the committed command)"])
         self._assert_clean({f"unchanged {cmd!r}": (cmd, cmd) for cmd in (
-            self._HEREDOC, self._NESTED_HEREDOC, "python3 check.py \\\n --threshold 0.01", "cat <<< x")})
+            self._HEREDOC, self._NESTED_HEREDOC, "python3 check.py \\\n --max-diff 0.01", "cat <<< x")})
 
     def test_operators_and_sh_c_quote_style_keep_their_spelling(self):
         self._assert_rejected({
-            "; -> newline": ("a --threshold 0.05; b", "a --threshold 0.01\nb"),
+            "; -> newline": ("a --max-diff 0.05; b", "a --max-diff 0.01\nb"),
             "newline -> ;": ("a\nb", "a; b"),
             "trailing ; added": ("python3 check.py", "python3 check.py;"),
             "( ( -> ((": ("( (python3 check.py) )", "((python3 check.py))"),
             "$( -> $ (": ("x=$(python3 check.py)", "x=$ (python3 check.py)"),
-            "single -> double": ("sh -c 'node c.js --threshold 0.05'", 'sh -c "node c.js --threshold 0.01"'),
-            "double -> single": ('sh -c "node c.js --threshold 0.05"', "sh -c 'node c.js --threshold 0.01'"),
+            "single -> double": ("sh -c 'node c.js --max-diff 0.05'", 'sh -c "node c.js --max-diff 0.01"'),
+            "double -> single": ('sh -c "node c.js --max-diff 0.05"', "sh -c 'node c.js --max-diff 0.01'"),
         })
         self._assert_rejected({"blank lines": ("a\nb", "a\n\n\nb\n")})
         self._assert_clean({
-            "single-quoted tightened": ("sh -c 'node c.js --threshold 0.05'", "sh -c 'node c.js --threshold 0.01'"),
-            "double-quoted tightened": ('sh -c "node c.js --threshold 0.05"', 'sh -c "node c.js --threshold 0.01"'),
+            "single-quoted tightened": ("sh -c 'node c.js --max-diff 0.05'", "sh -c 'node c.js --max-diff 0.01'"),
+            "double-quoted tightened": ('sh -c "node c.js --max-diff 0.05"', 'sh -c "node c.js --max-diff 0.01"'),
         })
 
     def test_no_token_may_be_inserted_anywhere(self):
@@ -4028,14 +4028,14 @@ class TestFixRound19PureInPlaceTightening(unittest.TestCase):
         self._assert_rejected({live: (base, live) for base, live in self._SYNTAX_SWAPS})
         for base, live in self._SYNTAX_SWAPS:
             with self.subTest(live=live):
-                self.assertIn("changes threshold syntax `--threshold` (`--flag=value` vs `--flag value`; checkers "
+                self.assertIn("changes threshold syntax `--max-diff` (`--flag=value` vs `--flag value`; checkers "
                               "often read only one form)",
                               _visual_hook_loosening({"command": base}, {"command": live}))
         self._assert_clean({
-            "= tightened": (self._EQ_JS, "node eq.js --threshold=0.01"),
-            "space tightened": (self._SPACE_JS, "node space.js --threshold 0.01"),
+            "= tightened": (self._EQ_JS, "node eq.js --max-diff=0.01"),
+            "space tightened": (self._SPACE_JS, "node space.js --max-diff 0.01"),
         })
-        self._assert_rejected({"quoted value tightened": (self._SPACE_JS, "node space.js --threshold '0.01'")})
+        self._assert_rejected({"quoted value tightened": (self._SPACE_JS, "node space.js --max-diff '0.01'")})
 
     @unittest.skipUnless(shutil.which("bash"), "bash is required for `[[`, `time` and heredocs in `bash -c`")
     def test_heredoc_and_insertion_bypasses_are_rejected_end_to_end(self):
@@ -4052,8 +4052,8 @@ class TestFixRound19PureInPlaceTightening(unittest.TestCase):
         from factonio.harness import audit_harness, check_harness
 
         cases = ((self._HEREDOC, self._HEREDOC), (self._PIPE, self._PIPE),
-                 ("THRESHOLD='0.05' python3 check.py", "THRESHOLD='0.01' python3 check.py"),
-                 ("python3 check.py --threshold=0.05", "python3 check.py --threshold=0.01"),
+                 ("MAX_DIFF='0.05' python3 check.py", "MAX_DIFF='0.01' python3 check.py"),
+                 ("python3 check.py --max-diff=0.05", "python3 check.py --max-diff=0.01"),
                  ("sh -c 'python3 check.py --max-diff-pixels=5'", "sh -c 'python3 check.py --max-diff-pixels=1'"))
         with isolated_hermes_home() as home:
             for n, (base, live) in enumerate(cases):
@@ -4082,11 +4082,11 @@ class TestFixRound20VerbatimOutsideThresholdValueSpans(unittest.TestCase):
                "def strict(v):\n"
                "    return float(v) if v is not None and re.fullmatch(r'[0-9]+(?:\\.[0-9]+)?', v) else 0.10\n"
                "args = sys.argv[1:]\n"
-               "raw = os.environ.get('THRESHOLD')\n"
+               "raw = os.environ.get('MAX_DIFF')\n"
                "for k, a in enumerate(args):\n"
-               "    if a.startswith('--threshold='):\n"
-               "        raw = a[len('--threshold='):]\n"
-               "    elif a == '--threshold' and k + 1 < len(args):\n"
+               "    if a.startswith('--max-diff='):\n"
+               "        raw = a[len('--max-diff='):]\n"
+               "    elif a == '--max-diff' and k + 1 < len(args):\n"
                "        raw = args[k + 1]\n"
                "sys.exit(1 if 0.08 > strict(raw) else 0)\n")
     # Compares only when `--baseline=` names an existing file (the committed snapshot differs: exit 1).
@@ -4095,9 +4095,9 @@ class TestFixRound20VerbatimOutsideThresholdValueSpans(unittest.TestCase):
                  "sys.exit(1 if os.path.isfile(p) else 0)\n")
     _COUNT = "print(5)\n"  # 5 differing pixels
     _NEWLINES = (
-        ("python3 check.py --threshold 0.05", 'python3 check.py --threshold "0.01\n"'),
-        ("python3 check.py --threshold=0.05", "python3 check.py --threshold='0.01\n'"),
-        ("THRESHOLD=0.05 python3 check.py", 'THRESHOLD="0.01\n" python3 check.py'),
+        ("python3 check.py --max-diff 0.05", 'python3 check.py --max-diff "0.01\n"'),
+        ("python3 check.py --max-diff=0.05", "python3 check.py --max-diff='0.01\n'"),
+        ("MAX_DIFF=0.05 python3 check.py", 'MAX_DIFF="0.01\n" python3 check.py'),
     )
     _EXTGLOB = "bash -c 'shopt -s extglob\n[[ $(cat report.txt) != @(FAIL|ERROR)* ]]'"
     _ARITH = "bash -c 'diff=$(python3 check.py); if ((\n  diff != 0\n)); then exit 1; fi'"
@@ -4116,14 +4116,14 @@ class TestFixRound20VerbatimOutsideThresholdValueSpans(unittest.TestCase):
         _ARITH: _COUNT,
     }
     _TIGHTENED = (
-        ("python3 check.py --threshold=0.05", "python3 check.py --threshold=0.01"),
-        ("python3 check.py --threshold 0.05", "python3 check.py --threshold 0.01"),
-        ("THRESHOLD=0.05 python3 check.py", "THRESHOLD=0.01 python3 check.py"),
-        ("THRESHOLD='0.05' python3 check.py", "THRESHOLD='0.01' python3 check.py"),
+        ("python3 check.py --max-diff=0.05", "python3 check.py --max-diff=0.01"),
+        ("python3 check.py --max-diff 0.05", "python3 check.py --max-diff 0.01"),
+        ("MAX_DIFF=0.05 python3 check.py", "MAX_DIFF=0.01 python3 check.py"),
+        ("MAX_DIFF='0.05' python3 check.py", "MAX_DIFF='0.01' python3 check.py"),
         ("sh -c 'node check.js --max-diff-pixels=5'", "sh -c 'node check.js --max-diff-pixels=1'"),
     )
     _UNCHANGED = (
-        "python3 check.py  --threshold 0.05   # pixel-exact",
+        "python3 check.py  --max-diff 0.05   # pixel-exact",
         _EXTGLOB, _ARITH, *(live for _, live in _COMMENT),
         "if (( $(python3 check.py) > 0 )); then exit 1; fi",
         "cat <<EOF >/dev/null\nunused\nEOF\npython3 check.py",
@@ -4157,8 +4157,8 @@ class TestFixRound20VerbatimOutsideThresholdValueSpans(unittest.TestCase):
                 self.assertNotIn("^", regex.pattern.replace("[^", ""))
                 self.assertNotIn("$", regex.pattern)
         # `_ASSIGN_RE` keeps a multi-line value whole (the value regex then rejects it); its name cannot end in LF
-        self.assertIsNone(harness._ASSIGN_RE.fullmatch("THRESHOLD\n=0.01"))
-        self.assertEqual(harness._ASSIGN_RE.fullmatch("THRESHOLD=0.01\n").group(2), "0.01\n")
+        self.assertIsNone(harness._ASSIGN_RE.fullmatch("MAX_DIFF\n=0.01"))
+        self.assertEqual(harness._ASSIGN_RE.fullmatch("MAX_DIFF=0.01\n").group(2), "0.01\n")
         self.assertNotIn("$", harness._ASSIGN_RE.pattern)
         self.assertEqual(harness._parse_value("0.01\n"), (None, False))
         self.assertEqual(harness._parse_value("0.01"), (Decimal("0.01"), False))
@@ -4173,35 +4173,35 @@ class TestFixRound20VerbatimOutsideThresholdValueSpans(unittest.TestCase):
             items = cmd if isinstance(cmd, list) else [cmd]
             return [items[u][s:e] for u, s, e in _value_spans(cmd)]
 
-        self.assertEqual(spans("THRESHOLD='0.05' a --threshold=\"1%\" --max-diff-pixels 5"), ["0.05", "1%", "5"])
+        self.assertEqual(spans("MAX_DIFF='0.05' a --max-diff=\"1%\" --max-diff-pixels 5"), ["0.05", "1%", "5"])
         self.assertEqual(spans("sh -c 'node c.js --max-diff-pixels=5'"), ["5"])
-        self.assertEqual(spans(["bash", "-c", "node c.js --threshold 0.05"]), ["0.05"])
-        for compound in ("[[ $x =~ --threshold=0.05 ]] && (( --threshold=5 )) && $((--threshold=5))",
-                         "a --threshold=0.05 # c", 'a --threshold "0.01\n"'):
+        self.assertEqual(spans(["bash", "-c", "node c.js --max-diff 0.05"]), ["0.05"])
+        for compound in ("[[ $x =~ --max-diff=0.05 ]] && (( --max-diff=5 )) && $((--max-diff=5))",
+                         "a --max-diff=0.05 # c", 'a --max-diff "0.01\n"'):
             with self.assertRaises(ValueError):
                 spans(compound)
         with self.assertRaises(ValueError):  # escapes: offsets do not map 1:1
-            spans('sh -c "node c.js --threshold=\\"0.05\\""')
+            spans('sh -c "node c.js --max-diff=\\"0.05\\""')
 
     def test_any_edit_outside_a_value_span_is_rejected(self):
-        exported = "export THRESHOLD=0.01; python3 check.py"
+        exported = "export MAX_DIFF=0.01; python3 check.py"
         self._assert_rejected({
             **{live: (base, live) for base, live in (*self._NEWLINES, *self._WHITESPACE, *self._COMMENT)},
-            "comment + whitespace": (exported, "export THRESHOLD=0.01;   python3 check.py  # visual check"),
-            "comment added": ("python3 check.py --threshold 0.05", "python3 check.py --threshold 0.01  # ok"),
+            "comment + whitespace": (exported, "export MAX_DIFF=0.01;   python3 check.py  # visual check"),
+            "comment added": ("python3 check.py --max-diff 0.05", "python3 check.py --max-diff 0.01  # ok"),
             "argv form": ("python3 check.py", ["python3", "check.py"]),
-            "quoting added": ("THRESHOLD=0.05 python3 check.py", "THRESHOLD='0.01' python3 check.py"),
-            "quoting dropped": ("THRESHOLD='0.05' python3 check.py", "THRESHOLD=0.01 python3 check.py"),
-            "argv value quoted": (["node", "c.js", "--threshold=0.05"], ["node", "c.js", "--threshold='0.01'"]),
-            "[[ ]] word": ("bash -c '[[ $x =~ --threshold=0.05 ]]'", "bash -c '[[ $x =~ --threshold=0.01 ]]'"),
-            "(( )) word": ("(( --threshold=5 ))", "(( --threshold=1 ))"),
-            "escaped double-quoted script": ('sh -c "node c.js --threshold=\\"0.05\\""',
-                                             'sh -c "node c.js --threshold=\\"0.01\\""'),
-            "loosened": ("python3 check.py --threshold=0.05", "python3 check.py --threshold=0.06"),
-            "comment kept": ("a  --threshold=5%  # c", "a  --threshold=1%  # c"),
+            "quoting added": ("MAX_DIFF=0.05 python3 check.py", "MAX_DIFF='0.01' python3 check.py"),
+            "quoting dropped": ("MAX_DIFF='0.05' python3 check.py", "MAX_DIFF=0.01 python3 check.py"),
+            "argv value quoted": (["node", "c.js", "--max-diff=0.05"], ["node", "c.js", "--max-diff='0.01'"]),
+            "[[ ]] word": ("bash -c '[[ $x =~ --max-diff=0.05 ]]'", "bash -c '[[ $x =~ --max-diff=0.01 ]]'"),
+            "(( )) word": ("(( --max-diff=5 ))", "(( --max-diff=1 ))"),
+            "escaped double-quoted script": ('sh -c "node c.js --max-diff=\\"0.05\\""',
+                                             'sh -c "node c.js --max-diff=\\"0.01\\""'),
+            "loosened": ("python3 check.py --max-diff=0.05", "python3 check.py --max-diff=0.06"),
+            "comment kept": ("a  --max-diff=5%  # c", "a  --max-diff=1%  # c"),
             "integer to decimal": ("sh -c 'node check.js --max-diff-pixels=5'",
                                    "sh -c 'node check.js --max-diff-pixels=0.5'"),
-            "unit dropped": ("a --threshold=5%", "a --threshold=1"),
+            "unit dropped": ("a --max-diff=5%", "a --max-diff=1"),
             "no threshold": ("python3 check.py a", "python3 check.py b"),
         })
 
@@ -4209,9 +4209,9 @@ class TestFixRound20VerbatimOutsideThresholdValueSpans(unittest.TestCase):
         self._assert_clean({
             **{live: (base, live) for base, live in self._TIGHTENED},
             **{f"unchanged {cmd!r}": (cmd, cmd) for cmd in self._UNCHANGED},
-            "double-quoted script": ('sh -c "node c.js --threshold 0.05"', 'sh -c "node c.js --threshold 0.01"'),
-            "argv tightened": (["bash", "-c", "node c.js --threshold 0.05"], ["bash", "-c", "node c.js --threshold 0.01"]),
-            "spacing kept": ("a  --threshold=5%  ", "a  --threshold=1%  "),
+            "double-quoted script": ('sh -c "node c.js --max-diff 0.05"', 'sh -c "node c.js --max-diff 0.01"'),
+            "argv tightened": (["bash", "-c", "node c.js --max-diff 0.05"], ["bash", "-c", "node c.js --max-diff 0.01"]),
+            "spacing kept": ("a  --max-diff=5%  ", "a  --max-diff=1%  "),
         })
 
     def test_trailing_newline_thresholds_are_rejected_end_to_end(self):
@@ -4256,69 +4256,69 @@ class TestFixRound21SingleSimpleCommandTightening(unittest.TestCase):
     _STRICT = TestFixRound20VerbatimOutsideThresholdValueSpans._STRICT
     _EXECUTED = (
         # OpenAI Diff t_19be3775: a POSIX `[` comparison literal is not an environment threshold
-        ('out=THRESHOLD=0.05; if [ "$out" = THRESHOLD=0.05 ]; then exit 1; fi',
-         'out=THRESHOLD=0.05; if [ "$out" = THRESHOLD=0.01 ]; then exit 1; fi'),
-        ('out=--threshold=0.05; if [ "$out" = --threshold=0.05 ]; then exit 1; fi',
-         'out=--threshold=0.05; if [ "$out" = --threshold=0.01 ]; then exit 1; fi'),
-        ("python3 check.py THRESHOLD=0.05", "python3 check.py THRESHOLD=0.01"),            # positional, not leading
-        ("python3 check.py -- --threshold=0.05", "python3 check.py -- --threshold=0.01"),  # after `--`
-        ("python3 -c 'import sys; sys.exit(\"--threshold=0.05\" in sys.argv)' --threshold=0.05",
-         "python3 -c 'import sys; sys.exit(\"--threshold=0.05\" in sys.argv)' --threshold=0.01"),  # inline code
+        ('out=MAX_DIFF=0.05; if [ "$out" = MAX_DIFF=0.05 ]; then exit 1; fi',
+         'out=MAX_DIFF=0.05; if [ "$out" = MAX_DIFF=0.01 ]; then exit 1; fi'),
+        ('out=--max-diff=0.05; if [ "$out" = --max-diff=0.05 ]; then exit 1; fi',
+         'out=--max-diff=0.05; if [ "$out" = --max-diff=0.01 ]; then exit 1; fi'),
+        ("python3 check.py MAX_DIFF=0.05", "python3 check.py MAX_DIFF=0.01"),            # positional, not leading
+        ("python3 check.py -- --max-diff=0.05", "python3 check.py -- --max-diff=0.01"),  # after `--`
+        ("python3 -c 'import sys; sys.exit(\"--max-diff=0.05\" in sys.argv)' --max-diff=0.05",
+         "python3 -c 'import sys; sys.exit(\"--max-diff=0.05\" in sys.argv)' --max-diff=0.01"),  # inline code
     )
     _CHECKS = {
-        "python3 check.py THRESHOLD=0.05": _ARGV_CHECK.format("THRESHOLD=0.05"),
-        "python3 check.py -- --threshold=0.05": _ARGV_CHECK.format("--threshold=0.05"),
-        "THRESHOLD=0.05 python3 check.py": _STRICT,
-        "env THRESHOLD=0.05 python3 check.py": _STRICT,
-        "python3 check.py --threshold=0.05": _STRICT,
-        "python3 check.py --threshold 0.05": _STRICT,
-        "sh -c 'python3 check.py --threshold=0.05'": _STRICT,
+        "python3 check.py MAX_DIFF=0.05": _ARGV_CHECK.format("MAX_DIFF=0.05"),
+        "python3 check.py -- --max-diff=0.05": _ARGV_CHECK.format("--max-diff=0.05"),
+        "MAX_DIFF=0.05 python3 check.py": _STRICT,
+        "env MAX_DIFF=0.05 python3 check.py": _STRICT,
+        "python3 check.py --max-diff=0.05": _STRICT,
+        "python3 check.py --max-diff 0.05": _STRICT,
+        "sh -c 'python3 check.py --max-diff=0.05'": _STRICT,
     }
     _REJECTED = {
-        "node -e": ("node -e 'process.exit(process.argv.includes(\"--threshold=0.05\") ? 1 : 0)' --threshold=0.05",
-                    "node -e 'process.exit(process.argv.includes(\"--threshold=0.05\") ? 1 : 0)' --threshold=0.01"),
-        "[ ] head": ("[ x = --threshold=0.05 ]", "[ x = --threshold=0.01 ]"),
-        "test head": ("test x = THRESHOLD=0.05", "test x = THRESHOLD=0.01"),
-        "assignment only": ("THRESHOLD=0.05", "THRESHOLD=0.01"),
-        "env without head": ("env THRESHOLD=0.05", "env THRESHOLD=0.01"),
-        "env -S": ("env -S 'node check.js' THRESHOLD=0.05 node c.js", "env -S 'node check.js' THRESHOLD=0.01 node c.js"),
-        "env -S split string": ("env -S 'node c.js' --threshold=0.05", "env -S 'node c.js' --threshold=0.01"),
-        "env -u": ("env -u X node c.js --threshold=0.05", "env -u X node c.js --threshold=0.01"),
-        "echo head": ("echo --threshold=0.05", "echo --threshold=0.01"),
-        "grep head": ("grep -q --threshold=0.05 report.txt", "grep -q --threshold=0.01 report.txt"),
-        "wrapper head": ("timeout 60 test x = --threshold=0.05", "timeout 60 test x = --threshold=0.01"),
-        "export head": ("export THRESHOLD=0.05", "export THRESHOLD=0.01"),
-        "export then run": ("export THRESHOLD=0.05; python3 check.py", "export THRESHOLD=0.01; python3 check.py"),
-        "assign; export; run": ("THRESHOLD=0.05; export THRESHOLD; node check.js",
-                                "THRESHOLD=0.01; export THRESHOLD; node check.js"),
-        "export &&": ("export THRESHOLD=0.05 && node check.js", "export THRESHOLD=0.01 && node check.js"),
-        "compound &&": ("a --threshold 0.05 && b --threshold 0.02", "a --threshold 0.01 && b --threshold 0.01"),
-        "pipeline": ("node check.js --threshold=0.05 | cat", "node check.js --threshold=0.01 | cat"),
-        "sh -c compound": ("bash -c 'export THRESHOLD=0.05; python3 check.py'",
-                           "bash -c 'export THRESHOLD=0.01; python3 check.py'"),
-        "sh -c test": ("sh -c '[ x = --threshold=0.05 ]'", "sh -c '[ x = --threshold=0.01 ]'"),
-        "sh -c extra args": ("sh -c 'node c.js --threshold=0.05' x", "sh -c 'node c.js --threshold=0.01' x"),
-        "$ expansion": ('node check.js "$X" --threshold=0.05', 'node check.js "$X" --threshold=0.01'),
-        "comment": ("node check.js --threshold=0.05 # c", "node check.js --threshold=0.01 # c"),
-        "argv positional": (["python3", "check.py", "THRESHOLD=0.05"], ["python3", "check.py", "THRESHOLD=0.01"]),
-        "argv after --": (["python3", "check.py", "--", "--threshold=0.05"],
-                          ["python3", "check.py", "--", "--threshold=0.01"]),
-        "argv test": (["test", "x", "=", "--threshold=0.05"], ["test", "x", "=", "--threshold=0.01"]),
-        "-pe cluster": ("perl -pe 1 --threshold=0.05", "perl -pe 1 --threshold=0.01"),
-        "--eval=": ("deno --eval=1 --threshold=0.05", "deno --eval=1 --threshold=0.01"),
+        "node -e": ("node -e 'process.exit(process.argv.includes(\"--max-diff=0.05\") ? 1 : 0)' --max-diff=0.05",
+                    "node -e 'process.exit(process.argv.includes(\"--max-diff=0.05\") ? 1 : 0)' --max-diff=0.01"),
+        "[ ] head": ("[ x = --max-diff=0.05 ]", "[ x = --max-diff=0.01 ]"),
+        "test head": ("test x = MAX_DIFF=0.05", "test x = MAX_DIFF=0.01"),
+        "assignment only": ("MAX_DIFF=0.05", "MAX_DIFF=0.01"),
+        "env without head": ("env MAX_DIFF=0.05", "env MAX_DIFF=0.01"),
+        "env -S": ("env -S 'node check.js' MAX_DIFF=0.05 node c.js", "env -S 'node check.js' MAX_DIFF=0.01 node c.js"),
+        "env -S split string": ("env -S 'node c.js' --max-diff=0.05", "env -S 'node c.js' --max-diff=0.01"),
+        "env -u": ("env -u X node c.js --max-diff=0.05", "env -u X node c.js --max-diff=0.01"),
+        "echo head": ("echo --max-diff=0.05", "echo --max-diff=0.01"),
+        "grep head": ("grep -q --max-diff=0.05 report.txt", "grep -q --max-diff=0.01 report.txt"),
+        "wrapper head": ("timeout 60 test x = --max-diff=0.05", "timeout 60 test x = --max-diff=0.01"),
+        "export head": ("export MAX_DIFF=0.05", "export MAX_DIFF=0.01"),
+        "export then run": ("export MAX_DIFF=0.05; python3 check.py", "export MAX_DIFF=0.01; python3 check.py"),
+        "assign; export; run": ("MAX_DIFF=0.05; export MAX_DIFF; node check.js",
+                                "MAX_DIFF=0.01; export MAX_DIFF; node check.js"),
+        "export &&": ("export MAX_DIFF=0.05 && node check.js", "export MAX_DIFF=0.01 && node check.js"),
+        "compound &&": ("a --max-diff 0.05 && b --max-diff 0.02", "a --max-diff 0.01 && b --max-diff 0.01"),
+        "pipeline": ("node check.js --max-diff=0.05 | cat", "node check.js --max-diff=0.01 | cat"),
+        "sh -c compound": ("bash -c 'export MAX_DIFF=0.05; python3 check.py'",
+                           "bash -c 'export MAX_DIFF=0.01; python3 check.py'"),
+        "sh -c test": ("sh -c '[ x = --max-diff=0.05 ]'", "sh -c '[ x = --max-diff=0.01 ]'"),
+        "sh -c extra args": ("sh -c 'node c.js --max-diff=0.05' x", "sh -c 'node c.js --max-diff=0.01' x"),
+        "$ expansion": ('node check.js "$X" --max-diff=0.05', 'node check.js "$X" --max-diff=0.01'),
+        "comment": ("node check.js --max-diff=0.05 # c", "node check.js --max-diff=0.01 # c"),
+        "argv positional": (["python3", "check.py", "MAX_DIFF=0.05"], ["python3", "check.py", "MAX_DIFF=0.01"]),
+        "argv after --": (["python3", "check.py", "--", "--max-diff=0.05"],
+                          ["python3", "check.py", "--", "--max-diff=0.01"]),
+        "argv test": (["test", "x", "=", "--max-diff=0.05"], ["test", "x", "=", "--max-diff=0.01"]),
+        "-pe cluster": ("perl -pe 1 --max-diff=0.05", "perl -pe 1 --max-diff=0.01"),
+        "--eval=": ("deno --eval=1 --max-diff=0.05", "deno --eval=1 --max-diff=0.01"),
         # Round 22: no `env` option and no option word other than a threshold flag (`--` included)
-        "env -i assignment": ("env -i THRESHOLD=0.05 node check.js", "env -i THRESHOLD=0.01 node check.js"),
-        "flag before --": ("npx jest --threshold=0.05 -- x", "npx jest --threshold=0.01 -- x"),
+        "env -i assignment": ("env -i MAX_DIFF=0.05 node check.js", "env -i MAX_DIFF=0.01 node check.js"),
+        "flag before --": ("npx jest --max-diff=0.05 -- x", "npx jest --max-diff=0.01 -- x"),
     }
     _CLEAN = {
-        "leading assignment": ("THRESHOLD=0.05 node check.js", "THRESHOLD=0.01 node check.js"),
-        "env assignment": ("env THRESHOLD=0.05 node check.js", "env THRESHOLD=0.01 node check.js"),
-        "--flag=": ("node check.js --threshold=0.05", "node check.js --threshold=0.01"),
-        "--flag value": ("node check.js --threshold 0.05", "node check.js --threshold 0.01"),
+        "leading assignment": ("MAX_DIFF=0.05 node check.js", "MAX_DIFF=0.01 node check.js"),
+        "env assignment": ("env MAX_DIFF=0.05 node check.js", "env MAX_DIFF=0.01 node check.js"),
+        "--flag=": ("node check.js --max-diff=0.05", "node check.js --max-diff=0.01"),
+        "--flag value": ("node check.js --max-diff 0.05", "node check.js --max-diff 0.01"),
         "playwright": ("npx playwright test --max-diff-pixel-ratio=0.05", "npx playwright test --max-diff-pixel-ratio=0.01"),
         "sh -c pixels": ("sh -c 'node check.js --max-diff-pixels=5'", "sh -c 'node check.js --max-diff-pixels=1'"),
-        "argv env": (["env", "THRESHOLD=0.05", "node", "check.js"], ["env", "THRESHOLD=0.01", "node", "check.js"]),
-        "argv flag": (["node", "check.js", "--threshold=0.05"], ["node", "check.js", "--threshold=0.01"]),
+        "argv env": (["env", "MAX_DIFF=0.05", "node", "check.js"], ["env", "MAX_DIFF=0.01", "node", "check.js"]),
+        "argv flag": (["node", "check.js", "--max-diff=0.05"], ["node", "check.js", "--max-diff=0.01"]),
     }
     _UNCHANGED = (
         *(base for base, _ in _EXECUTED), *(base for base, _ in _REJECTED.values()),
@@ -4343,13 +4343,13 @@ class TestFixRound21SingleSimpleCommandTightening(unittest.TestCase):
             items = cmd if isinstance(cmd, list) else [cmd]
             return [items[u][s:e] for u, s, e in _value_spans(cmd)]
 
-        self.assertEqual(spans("A=1 THRESHOLD=0.05 MAX_DIFF=2 node c.js --threshold 4"), ["0.05", "2", "4"])
-        self.assertEqual(spans(["env", "THRESHOLD=1", "node", "--threshold", "2"]), ["1", "2"])
-        for cmd in ('[ "$out" = THRESHOLD=0.05 ]', "THRESHOLD=0.05", "x=1; node c.js --threshold=1",
-                    "A=1 THRESHOLD=0.05 env -i MAX_DIFF=2 node c.js", "node c.js THRESHOLD=3 --threshold 4",
-                    "node c.js --threshold 4 -- --threshold=5",
-                    ["env", "THRESHOLD=1", "node", "--threshold", "2", "--", "--threshold=3"],
-                    "node -e 1 --threshold=1", "bash -c 'a; b --threshold=1'", "test 1 --threshold=1"):
+        self.assertEqual(spans("A=1 MAX_DIFF=0.05 MAX_DIFF=2 node c.js --max-diff 4"), ["0.05", "2", "4"])
+        self.assertEqual(spans(["env", "MAX_DIFF=1", "node", "--max-diff", "2"]), ["1", "2"])
+        for cmd in ('[ "$out" = MAX_DIFF=0.05 ]', "MAX_DIFF=0.05", "x=1; node c.js --max-diff=1",
+                    "A=1 MAX_DIFF=0.05 env -i MAX_DIFF=2 node c.js", "node c.js MAX_DIFF=3 --max-diff 4",
+                    "node c.js --max-diff 4 -- --max-diff=5",
+                    ["env", "MAX_DIFF=1", "node", "--max-diff", "2", "--", "--max-diff=3"],
+                    "node -e 1 --max-diff=1", "bash -c 'a; b --max-diff=1'", "test 1 --max-diff=1"):
             with self.subTest(cmd=cmd), self.assertRaises(ValueError):
                 spans(cmd)
 
@@ -4384,71 +4384,71 @@ class TestFixRound22SymlinkReferentsAndPositiveCommandGrammar(unittest.TestCase)
     _GREP = ("import sys\n"
              "a = sys.argv[1:]\n"
              "pat = a[a.index('--grep') + 1] if '--grep' in a else ''\n"
-             "sys.exit(1 if pat in 'visual --threshold=0.05 home' else 0)\n")
+             "sys.exit(1 if pat in 'visual --max-diff=0.05 home' else 0)\n")
     # Passes only when its argv carries the edited `0.01` literal.
     _CHECKER = "#!/usr/bin/env python3\nimport sys\nsys.exit(0 if '0.01' in sys.argv[1:] else 1)\n"
-    _PY_CODE = "import sys; sys.exit(0 if \"--threshold=0.01\" in sys.argv or \"0.01\" in sys.argv else 1)"
+    _PY_CODE = "import sys; sys.exit(0 if \"--max-diff=0.01\" in sys.argv or \"0.01\" in sys.argv else 1)"
     _EXECUTED = (
-        ("python3 visual.py --grep --threshold=0.05", "python3 visual.py --grep --threshold=0.01"),
-        (f"python3 -Bc'{_PY_CODE}' --threshold=0.05", f"python3 -Bc'{_PY_CODE}' --threshold=0.01"),
-        (f"python3 -Ic'{_PY_CODE}' --threshold 0.05", f"python3 -Ic'{_PY_CODE}' --threshold 0.01"),
-        (f"python3 -EsBc '{_PY_CODE}' --threshold=0.05", f"python3 -EsBc '{_PY_CODE}' --threshold=0.01"),
-        (["python3", f"-Bc{_PY_CODE}", "--threshold", "0.05"], ["python3", f"-Bc{_PY_CODE}", "--threshold", "0.01"]),
-        ("sh -c \"sh -c './checker.py --threshold 0.05'\"", "sh -c \"sh -c './checker.py --threshold 0.01'\""),
-        ("bash -c \"bash -c './checker.py --threshold 0.05'\"", "bash -c \"bash -c './checker.py --threshold 0.01'\""),
+        ("python3 visual.py --grep --max-diff=0.05", "python3 visual.py --grep --max-diff=0.01"),
+        (f"python3 -Bc'{_PY_CODE}' --max-diff=0.05", f"python3 -Bc'{_PY_CODE}' --max-diff=0.01"),
+        (f"python3 -Ic'{_PY_CODE}' --max-diff 0.05", f"python3 -Ic'{_PY_CODE}' --max-diff 0.01"),
+        (f"python3 -EsBc '{_PY_CODE}' --max-diff=0.05", f"python3 -EsBc '{_PY_CODE}' --max-diff=0.01"),
+        (["python3", f"-Bc{_PY_CODE}", "--max-diff", "0.05"], ["python3", f"-Bc{_PY_CODE}", "--max-diff", "0.01"]),
+        ("sh -c \"sh -c './checker.py --max-diff 0.05'\"", "sh -c \"sh -c './checker.py --max-diff 0.01'\""),
+        ("bash -c \"bash -c './checker.py --max-diff 0.05'\"", "bash -c \"bash -c './checker.py --max-diff 0.01'\""),
     )
     _INTERPRETERS = (
-        ("perl", "THRESHOLD=0.05 perl -E 'exit($ENV{THRESHOLD} eq \"0.01\" ? 0 : 1)'"),
-        ("perl", "THRESHOLD=0.05 perl -we'exit($ENV{THRESHOLD} eq \"0.01\" ? 0 : 1)'"),
-        ("ruby", "THRESHOLD=0.05 ruby -we'exit(ENV[\"THRESHOLD\"] == \"0.01\" ? 0 : 1)'"),
-        ("jq", "THRESHOLD=0.05 jq -n --exit-status 'env.THRESHOLD == \"0.01\"'"),
+        ("perl", "MAX_DIFF=0.05 perl -E 'exit($ENV{MAX_DIFF} eq \"0.01\" ? 0 : 1)'"),
+        ("perl", "MAX_DIFF=0.05 perl -we'exit($ENV{MAX_DIFF} eq \"0.01\" ? 0 : 1)'"),
+        ("ruby", "MAX_DIFF=0.05 ruby -we'exit(ENV[\"MAX_DIFF\"] == \"0.01\" ? 0 : 1)'"),
+        ("jq", "MAX_DIFF=0.05 jq -n --exit-status 'env.MAX_DIFF == \"0.01\"'"),
     )
     _REJECTED = {
-        "--grep operand": ("python3 visual.py --grep --threshold=0.05", "python3 visual.py --grep --threshold=0.01"),
-        "playwright --grep": ("npx playwright test --grep --threshold=0.05", "npx playwright test --grep --threshold=0.01"),
-        "-k operand": ("pytest -k --threshold=0.05", "pytest -k --threshold=0.01"),
-        "-wlne cluster": ("perl -wlne 1 --threshold=0.05", "perl -wlne 1 --threshold=0.01"),
-        "node -p": ("node -p 1 --threshold=0.05", "node -p 1 --threshold=0.01"),
-        "python3 -m": ("python3 -m pytest --threshold=0.05", "python3 -m pytest --threshold=0.01"),
-        "--project=": ("npx playwright test --project=chromium --threshold=0.05",
-                       "npx playwright test --project=chromium --threshold=0.01"),
-        "php -r": ("THRESHOLD=0.05 php -r 'exit(1);'", "THRESHOLD=0.01 php -r 'exit(1);'"),
-        "php -R": ("THRESHOLD=0.05 php -R 1", "THRESHOLD=0.01 php -R 1"),
-        "jq positional": ("THRESHOLD=0.05 jq . report.json", "THRESHOLD=0.01 jq . report.json"),
-        "yq head": ("THRESHOLD=0.05 yq report.yml", "THRESHOLD=0.01 yq report.yml"),
-        "lua head": ("THRESHOLD=0.05 lua check.lua", "THRESHOLD=0.01 lua check.lua"),
-        "git head": ("THRESHOLD=0.05 git diff", "THRESHOLD=0.01 git diff"),
-        "find head": ("THRESHOLD=0.05 find snapshots", "THRESHOLD=0.01 find snapshots"),
-        "env before env -i": ("THRESHOLD=0.05 env -i ./checker.py", "THRESHOLD=0.01 env -i ./checker.py"),
-        "env before env": ("THRESHOLD=0.05 env ./checker.py", "THRESHOLD=0.01 env ./checker.py"),
-        "env -": ("env - THRESHOLD=0.05 node check.js", "env - THRESHOLD=0.01 node check.js"),
-        "env --ignore-environment": ("env --ignore-environment THRESHOLD=0.05 node check.js",
-                                     "env --ignore-environment THRESHOLD=0.01 node check.js"),
-        "env -u": ("env -u X THRESHOLD=0.05 node check.js", "env -u X THRESHOLD=0.01 node check.js"),
-        "argv env -i": (["env", "-i", "THRESHOLD=0.05", "node", "c.js"], ["env", "-i", "THRESHOLD=0.01", "node", "c.js"]),
-        "bash -x -c": ("bash -x -c 'node c.js --threshold=0.05'", "bash -x -c 'node c.js --threshold=0.01'"),
-        "sh -ec": ("sh -ec 'node c.js --threshold=0.05'", "sh -ec 'node c.js --threshold=0.01'"),
-        "nested argv sh -c": (["sh", "-c", "sh -c 'node c.js --threshold=0.05'"],
-                              ["sh", "-c", "sh -c 'node c.js --threshold=0.01'"]),
-        "sh -c env -i": ("sh -c 'env -i THRESHOLD=0.05 node c.js'", "sh -c 'env -i THRESHOLD=0.01 node c.js'"),
-        "positional assignment": ("node c.js key=1 --threshold=0.05", "node c.js key=1 --threshold=0.01"),
-        "eval positional": ("deno eval 1 --threshold=0.05", "deno eval 1 --threshold=0.01"),
-        "exec positional": ("npm exec x --threshold=0.05", "npm exec x --threshold=0.01"),
-        "grep positional": ("cargo grep x --threshold=0.05", "cargo grep x --threshold=0.01"),
-        "threshold flag with a word": ("node c.js --threshold=low --max-diff=5", "node c.js --threshold=low --max-diff=1"),
-        "quoted flag name": ("node c.js '--threshold'=0.05", "node c.js '--threshold'=0.01"),
+        "--grep operand": ("python3 visual.py --grep --max-diff=0.05", "python3 visual.py --grep --max-diff=0.01"),
+        "playwright --grep": ("npx playwright test --grep --max-diff=0.05", "npx playwright test --grep --max-diff=0.01"),
+        "-k operand": ("pytest -k --max-diff=0.05", "pytest -k --max-diff=0.01"),
+        "-wlne cluster": ("perl -wlne 1 --max-diff=0.05", "perl -wlne 1 --max-diff=0.01"),
+        "node -p": ("node -p 1 --max-diff=0.05", "node -p 1 --max-diff=0.01"),
+        "python3 -m": ("python3 -m pytest --max-diff=0.05", "python3 -m pytest --max-diff=0.01"),
+        "--project=": ("npx playwright test --project=chromium --max-diff=0.05",
+                       "npx playwright test --project=chromium --max-diff=0.01"),
+        "php -r": ("MAX_DIFF=0.05 php -r 'exit(1);'", "MAX_DIFF=0.01 php -r 'exit(1);'"),
+        "php -R": ("MAX_DIFF=0.05 php -R 1", "MAX_DIFF=0.01 php -R 1"),
+        "jq positional": ("MAX_DIFF=0.05 jq . report.json", "MAX_DIFF=0.01 jq . report.json"),
+        "yq head": ("MAX_DIFF=0.05 yq report.yml", "MAX_DIFF=0.01 yq report.yml"),
+        "lua head": ("MAX_DIFF=0.05 lua check.lua", "MAX_DIFF=0.01 lua check.lua"),
+        "git head": ("MAX_DIFF=0.05 git diff", "MAX_DIFF=0.01 git diff"),
+        "find head": ("MAX_DIFF=0.05 find snapshots", "MAX_DIFF=0.01 find snapshots"),
+        "env before env -i": ("MAX_DIFF=0.05 env -i ./checker.py", "MAX_DIFF=0.01 env -i ./checker.py"),
+        "env before env": ("MAX_DIFF=0.05 env ./checker.py", "MAX_DIFF=0.01 env ./checker.py"),
+        "env -": ("env - MAX_DIFF=0.05 node check.js", "env - MAX_DIFF=0.01 node check.js"),
+        "env --ignore-environment": ("env --ignore-environment MAX_DIFF=0.05 node check.js",
+                                     "env --ignore-environment MAX_DIFF=0.01 node check.js"),
+        "env -u": ("env -u X MAX_DIFF=0.05 node check.js", "env -u X MAX_DIFF=0.01 node check.js"),
+        "argv env -i": (["env", "-i", "MAX_DIFF=0.05", "node", "c.js"], ["env", "-i", "MAX_DIFF=0.01", "node", "c.js"]),
+        "bash -x -c": ("bash -x -c 'node c.js --max-diff=0.05'", "bash -x -c 'node c.js --max-diff=0.01'"),
+        "sh -ec": ("sh -ec 'node c.js --max-diff=0.05'", "sh -ec 'node c.js --max-diff=0.01'"),
+        "nested argv sh -c": (["sh", "-c", "sh -c 'node c.js --max-diff=0.05'"],
+                              ["sh", "-c", "sh -c 'node c.js --max-diff=0.01'"]),
+        "sh -c env -i": ("sh -c 'env -i MAX_DIFF=0.05 node c.js'", "sh -c 'env -i MAX_DIFF=0.01 node c.js'"),
+        "positional assignment": ("node c.js key=1 --max-diff=0.05", "node c.js key=1 --max-diff=0.01"),
+        "eval positional": ("deno eval 1 --max-diff=0.05", "deno eval 1 --max-diff=0.01"),
+        "exec positional": ("npm exec x --max-diff=0.05", "npm exec x --max-diff=0.01"),
+        "grep positional": ("cargo grep x --max-diff=0.05", "cargo grep x --max-diff=0.01"),
+        "threshold flag with a word": ("node c.js --max-diff=low --max-diff=5", "node c.js --max-diff=low --max-diff=1"),
+        "quoted flag name": ("node c.js '--max-diff'=0.05", "node c.js '--max-diff'=0.01"),
     }
     _CLEAN = {
-        "--flag=": ("node check.js --threshold=0.05", "node check.js --threshold=0.01"),
-        "--flag value": ("node check.js --threshold 0.05", "node check.js --threshold 0.01"),
+        "--flag=": ("node check.js --max-diff=0.05", "node check.js --max-diff=0.01"),
+        "--flag value": ("node check.js --max-diff 0.05", "node check.js --max-diff 0.01"),
         "playwright": ("npx playwright test --max-diff-pixel-ratio=0.05", "npx playwright test --max-diff-pixel-ratio=0.01"),
-        "leading assignment": ("THRESHOLD=0.05 node check.js", "THRESHOLD=0.01 node check.js"),
-        "bare env": ("env THRESHOLD=0.05 node check.js", "env THRESHOLD=0.01 node check.js"),
+        "leading assignment": ("MAX_DIFF=0.05 node check.js", "MAX_DIFF=0.01 node check.js"),
+        "bare env": ("env MAX_DIFF=0.05 node check.js", "env MAX_DIFF=0.01 node check.js"),
         "sh -c pixels": ("sh -c 'node check.js --max-diff-pixels=5'", "sh -c 'node check.js --max-diff-pixels=1'"),
-        "bash -c": ("bash -c 'node check.js --threshold 0.05'", "bash -c 'node check.js --threshold 0.01'"),
-        "argv sh -c": (["sh", "-c", "node c.js --threshold=0.05"], ["sh", "-c", "node c.js --threshold=0.01"]),
-        "positional paths": ("node check.js tests/visual.spec.ts snapshots/home.png --threshold=0.05",
-                             "node check.js tests/visual.spec.ts snapshots/home.png --threshold=0.01"),
+        "bash -c": ("bash -c 'node check.js --max-diff 0.05'", "bash -c 'node check.js --max-diff 0.01'"),
+        "argv sh -c": (["sh", "-c", "node c.js --max-diff=0.05"], ["sh", "-c", "node c.js --max-diff=0.01"]),
+        "positional paths": ("node check.js tests/visual.spec.ts snapshots/home.png --max-diff=0.05",
+                             "node check.js tests/visual.spec.ts snapshots/home.png --max-diff=0.01"),
     }
     _UNCHANGED = (
         *(base for base, _ in _EXECUTED), *(cmd for _, cmd in _INTERPRETERS),
@@ -4498,11 +4498,11 @@ class TestFixRound22SymlinkReferentsAndPositiveCommandGrammar(unittest.TestCase)
     def test_value_spans_raise_on_any_non_threshold_option(self):
         from factonio.harness import _value_spans
 
-        self.assertEqual(len(_value_spans("env THRESHOLD=1 node c.js a/b.png --threshold 2 --max-diff=3")), 3)
-        for cmd in ("node c.js --grep x --threshold=1", "node c.js --threshold=1 --", "node c.js -x --threshold=1",
-                    "python3 -Bc'1' --threshold=1", "T=1 env node c.js", "env -i T=1 node c.js",
-                    "sh -c \"sh -c 'node c.js --threshold=1'\"", "bash -e -c 'node c.js --threshold=1'",
-                    "perl c.pl --threshold=1", "jq . --threshold=1", "node c.js --threshold"):
+        self.assertEqual(len(_value_spans("env MAX_DIFF=1 node c.js a/b.png --max-diff 2 --max-diff=3")), 3)
+        for cmd in ("node c.js --grep x --max-diff=1", "node c.js --max-diff=1 --", "node c.js -x --max-diff=1",
+                    "python3 -Bc'1' --max-diff=1", "T=1 env node c.js", "env -i T=1 node c.js",
+                    "sh -c \"sh -c 'node c.js --max-diff=1'\"", "bash -e -c 'node c.js --max-diff=1'",
+                    "perl c.pl --max-diff=1", "jq . --max-diff=1", "node c.js --max-diff"):
             with self.subTest(cmd=cmd), self.assertRaises(ValueError):
                 _value_spans(cmd)
 
@@ -4711,21 +4711,24 @@ class TestFrozenBaselinesAreRegularFiles(unittest.TestCase):
 
     def test_directory_link_that_starts_exposing_matches_fails_closed(self):
         with isolated_hermes_home() as home:
-            for n, (label, mutate) in enumerate((
-                ("matching file added below", lambda r: _write(r, "empty/sneaky.png", "png-other\n")),
-                ("matching file inside an ordinary directory", lambda r: _write(r, "empty/cache.png/real.png", "x\n")),
-                ("nested live symlink that can lead to matches", lambda r: os.symlink("../snapshots", r / "empty" / "sub")),
+            for n, (label, mutate, extra) in enumerate((
+                ("matching file added below", lambda r: _write(r, "empty/sneaky.png", "png-other\n"), []),
+                ("matching file inside an ordinary directory",
+                 lambda r: _write(r, "empty/cache.png/real.png", "x\n"), []),
+                # the nested link is itself a live symlink exposing matches, so it is reported too
+                ("nested live symlink that can lead to matches",
+                 lambda r: os.symlink("../snapshots", r / "empty" / "sub"), ["empty/sub"]),
                 ("retargeted outside the repository", lambda r: ((r / "not-image").unlink(),
-                                                                 os.symlink("../outside_dir", r / "not-image"))),
+                                                                 os.symlink("../outside_dir", r / "not-image")), []),
                 ("retargeted to matching files", lambda r: (_write(r, "evil/home.png", "png-other\n"), (r / "not-image").unlink(),
-                                                            os.symlink("evil", r / "not-image"))),
+                                                            os.symlink("evil", r / "not-image")), []),
             )):
                 with self.subTest(label):
                     (home / "outside_dir").mkdir(exist_ok=True)
                     repo = self._star_repo(home, f"svc{n}", ["**/*.png"], {}, {"not-image": "empty"})
                     (repo / "empty").mkdir()
                     mutate(repo)
-                    self._assert_tampered(repo, ["not-image"])
+                    self._assert_tampered(repo, sorted(["not-image", *extra]))
 
     # -- committed regular baselines are pinned in the index, HEAD and the live disk --------------------
 
@@ -4810,7 +4813,7 @@ class TestFrozenBaselinesAreRegularFiles(unittest.TestCase):
     # -- glob helpers -----------------------------------------------------------------------------------
 
     def test_prefix_match_helpers(self):
-        from factonio.harness import _concrete_prefix_match, _could_prefix_match, _literal_dir_prefixes
+        from factonio.harness import _concrete_prefix_match, _could_prefix_match
 
         for link, globs in (("snapshots", ["snapshots/**"]), ("snapshots", ["snapshots/*.png"]),
                             ("snapshots", ["snapshots/home.png"]), ("snapshots", ["**/home.png"]),
@@ -4831,10 +4834,6 @@ class TestFrozenBaselinesAreRegularFiles(unittest.TestCase):
                            ("docs", ["snapshots/**"]), ("snapshots", ["snapshots"])):
             with self.subTest("not concrete", rel=rel, globs=globs):
                 self.assertFalse(_concrete_prefix_match(globs, rel))
-        for glob, expected in (("a/b/*.png", ["a", "a/b"]), ("snapshots/", ["snapshots"]), ("**/*.png", []),
-                               ("home.png", []), ("a/*/b/c.png", ["a"]), ("a/[bc]/d.png", ["a"])):
-            with self.subTest("literal", glob=glob):
-                self.assertEqual(_literal_dir_prefixes(glob), expected)
 
     def test_live_walk_follows_nested_symlinks_but_not_directory_names(self):
         from factonio.harness import _live_walk_exposes
@@ -4851,6 +4850,166 @@ class TestFrozenBaselinesAreRegularFiles(unittest.TestCase):
             os.symlink("../evil/home.png", root / "fake3" / "a")
             self.assertTrue(_live_walk_exposes(root / "fake3", "docs3", ["docs3/**"]))
             self.assertFalse(_live_walk_exposes(root / "fake3", "docs3", ["docs3/*.png"]))
+
+
+class TestFixRound23MaxDiffDirectionAndUniformSymlinkScan(unittest.TestCase):
+    """Round 23: only unambiguous maximum-difference thresholds (`--max-diff*`, `--max-mismatch`, `MAX_DIFF*`,
+    `MAX_MISMATCH`) may be tightened by lowering them; any edit of an ambiguous `--threshold` / `--tolerance` /
+    `THRESHOLD` fails closed (a minimum similarity loosens when lowered). Every symlink at the base, at `HEAD`, in
+    the index or live on disk is held to the same regular-files-only rule, also for a frozen hook new in the PR."""
+
+    _repo = staticmethod(TestFrozenBaselinesAreRegularFiles._repo)
+    _visual = staticmethod(TestFrozenBaselinesAreRegularFiles._visual)
+    _changed = staticmethod(TestFrozenBaselinesAreRegularFiles._changed)
+    _assert_clean = TestFrozenBaselinesAreRegularFiles._assert_clean
+    _assert_tampered = TestFrozenBaselinesAreRegularFiles._assert_tampered
+    _assert_tampered_since = TestFrozenBaselinesAreRegularFiles._assert_tampered_since
+    # A minimum-similarity checker: the measured SSIM is 0.95 and the check passes when SSIM >= --threshold.
+    _SSIM_CHECK = (
+        "import argparse, sys\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('--threshold', type=float, required=True)\n"
+        "sys.exit(0 if 0.95 >= p.parse_args().threshold else 1)\n"
+    )
+
+    def test_lowered_minimum_similarity_threshold_is_gate_loosening_end_to_end(self):
+        from factonio.harness import audit_harness, check_harness
+
+        with isolated_hermes_home() as home:
+            repo = self._repo(home, "svc", {"ssim.py": self._SSIM_CHECK, "snapshots/home.png": "png-v1\n"}, {},
+                              self._visual(["snapshots/*.png"], "python3 ssim.py --threshold 0.99"))
+            committed = check_harness(str(repo), run_hooks=True)
+            self.assertEqual(committed["hook_results"]["failed_required"], ["pixels"])
+            self.assertFalse(committed["gate_loosening"]["loosened"], committed["gate_loosening"])
+            TestFixRound2VisualGuardAndHarnessGaps._set_command(repo, "python3 ssim.py --threshold 0.90")
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertEqual(chk["hook_results"]["failed_required"], [])  # the edit really turns it green...
+            self.assertFalse(chk["valid"])  # ...and is reported as loosening
+            self.assertTrue(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+            self.assertTrue(any("ambiguous" in f for f in chk["gate_loosening"]["findings"]), chk["gate_loosening"])
+            self.assertEqual(audit_harness(str(repo))["severity"], "stale")
+
+    def test_ambiguous_threshold_edits_fail_closed_and_max_diff_tightening_stays_clean(self):
+        from factonio.harness import _visual_hook_loosening
+
+        def reasons(base: Any, live: Any) -> list[str]:
+            return _visual_hook_loosening({"command": base}, {"command": live})
+
+        for base, live in (("python3 ssim.py --threshold 0.99", "python3 ssim.py --threshold 0.90"),
+                           ("python3 check.py --threshold 0.05", "python3 check.py --threshold 0.01"),
+                           ("python3 check.py --threshold=0.05", "python3 check.py --threshold=0.01"),
+                           ("python3 check.py --tolerance 5", "python3 check.py --tolerance 2"),
+                           ("python3 check.py --diff-threshold 0.1", "python3 check.py --diff-threshold 0.05"),
+                           ("python3 check.py --pixel-threshold 3", "python3 check.py --pixel-threshold 1"),
+                           ("THRESHOLD=0.99 python3 check.py", "THRESHOLD=0.90 python3 check.py"),
+                           ("TOLERANCE=5 python3 check.py", "TOLERANCE=2 python3 check.py"),
+                           ("VISUAL_THRESHOLD=0.05 python3 check.py", "VISUAL_THRESHOLD=0.01 python3 check.py"),
+                           (["python3", "check.py", "--threshold", "0.05"], ["python3", "check.py", "--threshold", "0.01"]),
+                           ("python3 check.py --max-diff-pixels 10 --threshold 0.2",
+                            "python3 check.py --max-diff-pixels 5 --threshold 0.1")):
+            with self.subTest(base=base, live=live):
+                self.assertNotEqual(reasons(base, live), [])
+        for base, live in (("python3 check.py --max-diff-pixels 10", "python3 check.py --max-diff-pixels 5"),
+                           ("python3 check.py --max-diff-pixel-ratio 0.05", "python3 check.py --max-diff-pixel-ratio 0.01"),
+                           ("python3 check.py --max-diff=3", "python3 check.py --max-diff=1"),
+                           ("python3 check.py --max-mismatch 2", "python3 check.py --max-mismatch 0"),
+                           ("MAX_DIFF_PIXELS=10 python3 check.py", "MAX_DIFF_PIXELS=5 python3 check.py"),
+                           ("MAX_MISMATCH=2 python3 check.py", "MAX_MISMATCH=1 python3 check.py"),
+                           ("python3 check.py --max-diff-pixels 10 --threshold 0.2",
+                            "python3 check.py --max-diff-pixels 5 --threshold 0.2"),
+                           ("python3 ssim.py --threshold 0.99", "python3 ssim.py --threshold 0.99")):
+            with self.subTest(base=base, live=live):
+                self.assertEqual(reasons(base, live), [])
+        self.assertNotEqual(reasons("python3 check.py --max-diff-pixels 5", "python3 check.py --max-diff-pixels 10"), [])
+
+    # -- every symlink (base, HEAD, index, live disk) is held to the regular-files-only rule ---------------
+
+    def _outside(self, home: Path) -> Path:
+        out = home / "outside"
+        _write(out, "evil.png", "evil\n")
+        return out
+
+    def test_pr_added_baseline_symlink_fails_closed_in_worktree_index_and_commit(self):
+        for stage in ("worktree", "staged", "committed"):
+            with self.subTest(stage), isolated_hermes_home() as home:
+                outside = self._outside(home)
+                repo = self._repo(home, "svc", {"snapshots/home.png": "png-v1\n"}, {}, self._visual(["snapshots/*.png"]))
+                base = _git(repo, "rev-parse", "HEAD")
+                os.symlink(outside / "evil.png", repo / "snapshots" / "modal.png")
+                if stage != "worktree":
+                    _git(repo, "add", "-A")
+                if stage == "committed":
+                    _git(repo, "commit", "-q", "-m", "add modal")
+                self._assert_tampered_since(repo, base, ["snapshots/modal.png"])
+
+    def test_pr_added_directory_symlink_at_wildcard_or_double_star_prefix_fails_closed(self):
+        for n, glob in enumerate(("snapshots/*/*.png", "snapshots/**/*.png")):
+            with self.subTest(glob=glob), isolated_hermes_home() as home:
+                outside = self._outside(home)
+                repo = self._repo(home, f"svc{n}", {"snapshots/v1/home.png": "png-v1\n"}, {}, self._visual([glob]))
+                base = _git(repo, "rev-parse", "HEAD")
+                os.symlink(outside, repo / "snapshots" / "v2")
+                self._assert_tampered_since(repo, base, ["snapshots/v2"])
+                _commit_all(repo, "add v2")
+                self._assert_tampered_since(repo, base, ["snapshots/v2"])
+
+    def test_untracked_symlink_at_literal_leaf_absent_at_head_fails_closed(self):
+        with isolated_hermes_home() as home:
+            outside = self._outside(home)
+            repo = self._repo(home, "svc", {"README.md": "x\n"}, {}, self._visual(["snapshots/home.png"]))
+            _write(repo, "snapshots/.keep", "")
+            os.symlink(outside / "evil.png", repo / "snapshots" / "home.png")
+            self._assert_tampered(repo, ["snapshots/home.png"])
+
+    def test_hook_created_symlink_fails_closed_after_the_hooks_ran(self):
+        with isolated_hermes_home() as home:
+            outside = self._outside(home)
+            cmd = f"ln -sf {outside / 'evil.png'} snapshots/new.png"
+            repo = self._repo(home, "svc", {"snapshots/home.png": "png-v1\n"}, {}, self._visual(["snapshots/*.png"], cmd))
+            self._assert_tampered(repo, ["snapshots/new.png"], run_hooks=True)
+
+    def test_new_frozen_hook_with_symlink_baseline_fails_closed_regular_file_stays_clean(self):
+        from factonio.harness import audit_harness, bootstrap_verify_harness, check_harness
+
+        lint = [{"name": "lint", "kind": "invariant", "command": "true"}]
+        for kind in ("symlink", "regular"):
+            with self.subTest(kind), isolated_hermes_home() as home:
+                outside = self._outside(home)
+                repo = self._repo(home, "svc", {"README.md": "x\n"}, {}, lint)
+                base = _git(repo, "rev-parse", "HEAD")
+                if kind == "symlink":
+                    (repo / "snapshots").mkdir()
+                    os.symlink(outside / "evil.png", repo / "snapshots" / "home.png")
+                else:
+                    _write(repo, "snapshots/home.png", "png-v1\n")
+                bootstrap_verify_harness(str(repo), force=True, hooks=[*lint, *self._visual(["snapshots/*.png"])])
+                _commit_all(repo, "new visual hook")
+                if kind == "symlink":
+                    self._assert_tampered_since(repo, base, ["snapshots/home.png"])
+                else:
+                    chk = check_harness(str(repo), base_ref=base, run_hooks=True)
+                    self.assertTrue(chk["valid"], chk["errors"])
+                    self.assertEqual(chk["visual_baseline_changes"], [])
+                    audit = audit_harness(str(repo), base_ref=base)
+                    self.assertEqual(audit["visual_baseline_changes"], [])
+
+    def test_file_link_inside_a_linked_directory_stays_clean(self):
+        with isolated_hermes_home() as home:
+            repo = self._repo(home, "svc", {"README.md": "x\n", "real_docs/guide.md": "g\n"},
+                              {"real_docs/readme_link": "../README.md", "docs": "real_docs"},
+                              self._visual(["**/*.png"]))
+            self._assert_clean(repo)
+
+    def test_live_scan_past_the_limit_fails_closed(self):
+        from factonio import harness
+
+        with isolated_hermes_home() as home:
+            repo = self._repo(home, "svc", {"snapshots/home.png": "png-v1\n"}, {}, self._visual(["**/*.png"]))
+            with mock.patch.object(harness, "_MAX_LIVE_SCAN", 3):
+                self.assertIsNone(harness._live_symlinks(repo, ["**/*.png"]))
+                self.assertTrue(any("live entries" in p for p in
+                                    harness._committed_blob_mismatches(repo, "HEAD", ["**/*.png"])))
+
 
 
 if __name__ == "__main__":
