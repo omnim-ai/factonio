@@ -2886,5 +2886,92 @@ class TestFixRound7TargetAwareThresholdsUnitsEnvAndShellArgs(unittest.TestCase):
                                 [f"sh -c '{script}' sh"])
 
 
+class TestFixRound8GroupedFlagsEnvDashShellClustersAndEnvOrder(unittest.TestCase):
+    """Bundled `-vu`/`-uv` update options, POSIX `env -`, `-oc`/`-oo`/`-Oc` shell clusters, and environment
+    thresholds that never borrow another command's budget or lose their assignment order."""
+
+    _visual_repo = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._visual_repo)
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_cases = TestFixRound4CompoundThresholdsAndShortFlags._assert_cases
+    _assert_end_to_end = TestFixRound7TargetAwareThresholdsUnitsEnvAndShellArgs._assert_end_to_end
+
+    _ARGPARSE = ("import argparse, sys\n"
+                 "p = argparse.ArgumentParser()\n"
+                 "p.add_argument('-u', action='store_true')\n"
+                 "p.add_argument('-v', action='store_true')\n"
+                 "p.add_argument('--threshold', type=float, default=0.01)\n"
+                 "a = p.parse_args()\n"
+                 "sys.exit(0 if a.u or a.threshold >= 0.25 else 1)\n")
+    _TARGETS = ("import os, sys\n"
+                "args = sys.argv[1:]\n"
+                "t = float(args[args.index('--threshold') + 1]) if '--threshold' in args "
+                "else float(os.environ.get('THRESHOLD', '0.01'))\n"
+                "sys.exit(1 if 0.25 > t else 0)\n")
+
+    def test_grouped_short_update_options_are_regeneration(self):
+        from factonio.harness import _command_tokens, _regen_flags
+
+        for cmd in ("python3 check.py -vu", "python3 check.py -uv", "npx jest -qu", "npm test -- -vu"):
+            with self.subTest(cmd):
+                self.assertTrue(_regen_flags(_command_tokens(cmd)), cmd)
+        for cmd in ("python3 -u check.py", "python3 -Bu check.py", "diff -ru a b", "sh -eu check.sh",
+                    "set -eu; python3 check.py", "python3 check.py -v", "env -u HOME python3 check.py"):
+            with self.subTest(clean=cmd):
+                self.assertEqual(_regen_flags(_command_tokens(cmd)), set(), cmd)
+        clean = ["python3 -u check.py", "python3 -Bu check.py", "diff -ru a b", "sh -eu check.sh",
+                 "set -eu; python3 check.py"]
+        cases = {live: ("python3 check.py", live, True) for live in ("python3 check.py -vu", "python3 check.py -uv")}
+        cases.update({c: ("python3 check.py", c, False) for c in clean})
+        self._assert_cases(cases)
+        self._assert_end_to_end(self._ARGPARSE, "python3 check.py",
+                                ["python3 check.py -vu", "python3 check.py -uv"], clean)
+
+    def test_posix_env_dash_is_an_env_option(self):
+        loosening = ["env - sh -c 'python3 check.py -u'", "env - sh -c 'python3 check.py --threshold 0.5'"]
+        cases = {live: ("python3 check.py", live, True) for live in loosening}
+        cases["env - python3 -u"] = ("python3 check.py", "env - python3 -u check.py", False)
+        self._assert_cases(cases)
+        self._assert_end_to_end(self._ARGPARSE, "python3 check.py", loosening, ["env - python3 -u check.py"])
+        from factonio.harness import check_harness
+
+        with isolated_hermes_home() as home:
+            repo = self._visual_repo(home, "python3 check.py")
+            _write(repo, "check.py", "import sys\nsys.exit(0)\n")
+            _commit_all(repo, "passing visual check")
+            self._set_command(repo, "env - python3 -u check.py")
+            chk = check_harness(str(repo), run_hooks=True)
+            self.assertEqual(chk["hook_results"]["failed_required"], [], chk["hook_results"])
+            self.assertTrue(chk["valid"], chk)
+            self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+
+    def test_shell_option_clusters_consume_one_word_per_o(self):
+        loosening = ["bash -oc pipefail 'python3 check.py -u'", "sh -oc errexit 'python3 check.py --threshold 0.5'",
+                     "bash -oo pipefail errexit -c 'python3 check.py -u'", "bash -Oc extglob 'python3 check.py -u'"]
+        cases = {live: ("python3 check.py", live, True) for live in loosening}
+        cases["bash -ou errexit -u script.sh"] = ("python3 check.py", "bash -ou errexit -u script.sh", False)
+        self._assert_cases(cases)
+        self._assert_end_to_end(self._ARGPARSE, "python3 check.py", loosening, ["bash -ou errexit -u script.sh"])
+
+    def test_environment_thresholds_respect_default_commands_and_assignment_order(self):
+        a, b = "python3 check.py a", "python3 check.py b"
+        base = f"{a} --threshold 0.9 && {b}"
+        borrow = [f"export THRESHOLD=0.9; {base}", f"sh -c '{a} --threshold 0.9 && {b} \"$@\"' sh --threshold 0.9"]
+        cases = {live: (base, live, True) for live in borrow}
+        cases.update({
+            "assignment order swapped": ("THRESHOLD=0.9; THRESHOLD=0.01; python3 check.py",
+                                         "THRESHOLD=0.01; THRESHOLD=0.9; python3 check.py", True),
+            "assignment order kept": ("THRESHOLD=0.9; THRESHOLD=0.01; python3 check.py",
+                                      "THRESHOLD=0.9; THRESHOLD=0.01; python3 check.py", False),
+            "every command already at the bar": (f"{a} --threshold 0.9 && {b} --threshold 0.9",
+                                                 f"export THRESHOLD=0.9; {a} --threshold 0.9 && {b} --threshold 0.9",
+                                                 False),
+        })
+        self._assert_cases(cases)
+        self._assert_end_to_end(self._TARGETS, base, borrow, [base])
+        exported = "export THRESHOLD=0.9; export THRESHOLD=0.01; python3 check.py a"
+        self._assert_end_to_end(self._TARGETS, exported,
+                                ["export THRESHOLD=0.01; export THRESHOLD=0.9; python3 check.py a"], [exported])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1864,7 +1864,8 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
             j = i + 1
             script: Optional[str] = None
             gate = False
-            while j < len(tokens) and tokens[j].startswith("-") and len(tokens[j]) > 1 and script is None:
+            # A lone `-` is POSIX `env -` (same as `env -i`), an env option rather than the command.
+            while j < len(tokens) and tokens[j].startswith("-") and script is None:
                 opt = tokens[j]
                 if _is_gate_flag(opt):
                     gate = True
@@ -1905,8 +1906,8 @@ def _unwrap_shell_scripts(tokens: list[str], depth: int) -> list[str]:
                         j += 1  # `bash --rcfile FILE -c ...`: the option takes the next word
                     continue
                 has_c = has_c or "c" in opt[1:]
-                if opt[-1] in ("o", "O") and j < len(tokens):
-                    j += 1  # `-o pipefail` / `-euo pipefail`: the option takes the next word
+                # every `o`/`O` in a cluster takes the next word: `-euo pipefail`, `-oc pipefail SCRIPT`
+                j = min(len(tokens), j + sum(ch in "oO" for ch in opt[1:]))
             if j < len(tokens) and tokens[j] == "--":
                 j += 1
             if has_c and j < len(tokens):
@@ -1970,7 +1971,7 @@ def _command_head(seg: list[str]) -> int:
             i += 1
         elif _system_name(seg[i]) == "env":
             j = i + 1
-            while j < len(seg) and seg[j].startswith("-") and len(seg[j]) > 1 and not _is_gate_flag(seg[j]):
+            while j < len(seg) and seg[j].startswith("-") and not _is_gate_flag(seg[j]):
                 _, j = _env_split_script(seg[j], seg, j + 1)
             if j < len(seg) and _is_gate_flag(seg[j]):
                 break
@@ -2013,7 +2014,10 @@ def _shell_args_start(seg: list[str], i: int) -> int:
     while i < len(seg) and seg[i][:1] in ("-", "+") and len(seg[i]) > 1 and seg[i] != "--":
         if _is_gate_flag(seg[i]):
             return i
-        i += 2 if seg[i][-1] in ("o", "O") or seg[i] in _SHELL_LONG_VALUE_OPTS else 1
+        if seg[i].startswith("--"):
+            i += 2 if seg[i] in _SHELL_LONG_VALUE_OPTS else 1
+        else:
+            i += 1 + sum(ch in "oO" for ch in seg[i][1:])  # `-ou errexit`: one word per `o`/`O`
     if i < len(seg) and seg[i] == "--":
         i += 1
     return i + 1
@@ -2046,7 +2050,7 @@ def _regen_flags(tokens: list[str]) -> set[str]:
                 flag = flag.lower()
             elif not short_ok:
                 continue
-            if flag not in _REGEN_FLAGS:
+            if flag not in _REGEN_FLAGS and not _grouped_update(flag, eq):
                 continue
             if not eq and flag in _REGEN_MODE_FLAGS and _value_after(seg, i) is not None:
                 if seg[i + 1].strip().lower() in _REGEN_DISABLED:
@@ -2055,6 +2059,12 @@ def _regen_flags(tokens: list[str]) -> set[str]:
                 continue
             found.add(flag if eq else tok)
     return found
+
+
+def _grouped_update(flag: str, eq: str) -> bool:
+    """A bundled short-option cluster carrying `-u` (`-vu`, `-uv`), which argparse-style CLIs expand."""
+    return (not eq and not flag.startswith("--") and len(flag) > 2 and flag[1:].isalpha()
+            and "u" in flag[1:])
 
 
 # A finite threshold as (value, given in `%`); a percentage is stored as its ratio (`5%` -> 0.05).
@@ -2230,15 +2240,18 @@ def _threshold_loosening(base_tokens: list[str], live_tokens: list[str]) -> list
                 reasons.append(f"adds loosening threshold `{key}={_fmt_threshold(max(l_vals))}`{where}")
 
     env_base, env_live = pooled(base_segs, base_env), pooled(live_segs, live_env)
-    all_base = pooled(base_segs, list(range(len(base_segs))))
+    base_cmds = [k for k in range(len(base_segs)) if k not in base_env]
     where = " in a shell environment assignment"
     for key in sorted({*env_base, *env_live}):
-        b_vals, l_vals = sorted(env_base.get(key, [])), sorted(env_live.get(key, []))
+        # command order, not sorted: a later assignment overrides an earlier one
+        b_vals, l_vals = env_base.get(key, []), env_live.get(key, [])
         if b_vals:
             reasons.extend(_compare_thresholds(key, b_vals, l_vals, where))
             continue
-        ref = all_base.get(key)
-        strictest = min(ref, key=lambda t: t[0]) if ref else None
+        # A new assignment feeds every command, so it is only safe when no base command ran on the tool default.
+        per_cmd = [finite(base_segs[k][1], key) for k in base_cmds]
+        strictest = (min((t for vals in per_cmd for t in vals), key=lambda t: t[0])
+                     if per_cmd and all(per_cmd) else None)
         bad = [c for c in l_vals if (_looser(c, strictest) if strictest else c[0] > 0)]
         if bad:
             reasons.append(f"adds loosening threshold `{key}={_fmt_threshold(max(bad))}`{where} "
