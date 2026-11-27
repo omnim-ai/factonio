@@ -1687,14 +1687,20 @@ _SEALED_HEADS = _SHELLS | frozenset({
     "set", "shopt", "alias", "unalias", "trap", "source", ".", "if", "then", "elif", "else", "fi", "for",
     "while", "until", "do", "done", "case", "esac", "function", "!",
 })
-_OPTION_RE = re.compile(r"^--?[A-Za-z][A-Za-z0-9_-]*(?:=.*)?$", re.DOTALL)
-# Inserted options that select, skip or retry tests, exit early, load code/config or move baselines.
-_UNSAFE_OPTION_RE = re.compile(
-    r"grep|skip|ignore|only|filter|exclude|deselect|pattern|select|fail|exit|pass|retr(?:y|ies)|shard|env|"
-    r"require|import|loader|eval|exec|preload|inject|rc|init|conf|help|version|list|collect|dry|snapshot|"
-    r"baseline|golden|update|regen|accept|root|dir|path|cwd|output|resolver|^[cekmptvh]$",
-    re.IGNORECASE,
-)
+# The only options an edit may insert: output formatting/verbosity with fixed built-in values. Everything else
+# (runner config, plugins, filters, modes, help/version, unknown flags) can skip or regenerate the visual check.
+_INERT_EQ_OPTIONS = {
+    "--color": frozenset({"always", "never", "auto", "yes", "no"}),
+    "--reporter": frozenset({"list", "line", "dot", "json", "html", "junit", "github", "spec", "tap"}),
+}
+_INERT_TRAILING_FLAGS = frozenset({"--verbose", "--quiet", "--silent", "--no-color", "--color"})
+# Short verbosity flags per runner; jest and vitest are absent because their `-v` is `--version` (exits 0).
+_RUNNER_SHORT_FLAGS = {"pytest": frozenset({"-q", "-v"}), "go": frozenset({"-v"}), "cargo": frozenset({"-q", "-v"})}
+_LAUNCHERS = frozenset({"npx", "pnpx", "bunx", "uvx", "uv", "pnpm", "yarn", "bun"})
+_LAUNCHER_VERBS = frozenset({"run", "exec", "dlx", "x"})
+# A shell word whose meaning is identical as an argv item and as unquoted shell text.
+_PLAIN_WORD_RE = re.compile(r"[A-Za-z0-9_./:=+%,@-]+", re.ASCII)
+_ASCII_THRESHOLD_RE = re.compile(r"^(?:(?:0|[1-9][0-9]*)(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$", re.ASCII)
 _WRAPPER_ARG_RE = re.compile(r"^(?:run|-.*|\d+(?:\.\d+)?[smhd]?)$")  # `timeout 30`, `uv run`, `nice -n 5`
 _MAX_SCRIPT_DEPTH = 4
 _OPERATORS = ("<<<", "&>>", "&&", "||", "|&", ";;", ">>", "<<", "<>", ">&", "<&", "&>", ">|",
@@ -1707,6 +1713,7 @@ class _Tok(NamedTuple):
     raw: str      # the source slice
     is_op: bool
     quoted: bool
+    from_argv: bool = False  # an argv-list item: never seen by a shell
 
     @property
     def key(self) -> str:
@@ -1715,8 +1722,9 @@ class _Tok(NamedTuple):
 
 
 class _Slot(NamedTuple):
-    """A threshold: `--flag val` / `--flag=val` (kind `flag`, normalized key) or `VAR=val` (kind `env`, exact
-    case-sensitive name); ``value`` is the ratio (`1%` -> 0.01) or None when non-finite or unparseable."""
+    """A threshold: `--flag val` / `--flag=val` (kind `flag`) or `VAR=val` (kind `env`), keyed by the exact
+    spelling (dashes, case, `-` vs `_`: `--THRESHOLD` is another, unknown, flag); ``value`` is the ratio
+    (`1%` -> 0.01) or None when not strict ASCII decimal syntax."""
     kind: str
     key: str
     raw: str
@@ -1730,7 +1738,7 @@ def _tokenize_visual_cmd(command: Any) -> list[_Tok]:
     `#` at a word start comments to the end of the line, runs of `;` collapse and edge `;` are dropped, and a
     redirection keeps its fd (`2>`). Raises ValueError on an unclosed quote or a trailing lone backslash."""
     if isinstance(command, list):
-        return [_Tok(str(c), str(c), False, True) for c in command]
+        return [_Tok(str(c), str(c), False, True, True) for c in command]
     text = str(command or "")
     toks: list[_Tok] = []
     word: Optional[list[str]] = None
@@ -1758,11 +1766,11 @@ def _tokenize_visual_cmd(command: Any) -> list[_Tok]:
         elif ch == "\\" and text.startswith("\n", i + 1):
             i += 2  # line continuation
         elif op := next((o for o in _OPERATORS if text.startswith(o, i)), None):
-            i += len(op)
+            op_start, i = i, i + len(op)
             fd = "".join(word) if word is not None and not quoted else ""
             if re.fullmatch(r"\d+|\{[A-Za-z_]\w*\}", fd) and ("<" in op or ">" in op):
                 word, op = None, fd + op  # `2>`: the fd belongs to the redirection
-            flush(i)
+            flush(op_start)
             toks.append(_Tok(op, op, True, False))
         else:
             if word is None:
@@ -1814,11 +1822,13 @@ def _segments(toks: list[_Tok]) -> tuple[list[str], list[list[_Tok]]]:
 
 
 def _parse_value(raw: str) -> tuple[Optional[float], bool]:
+    """Strict ASCII decimal/scientific syntax only: Python's `float` also takes `0.0_1`, `inf` and non-ASCII
+    digits, which JS/Go/Rust checkers read as NaN or an error (and `0.8 > NaN` passes)."""
     pct = raw.endswith("%")
-    try:
-        value = float(raw[:-1] if pct else raw)
-    except ValueError:
+    number = raw[:-1] if pct else raw
+    if not _ASCII_THRESHOLD_RE.match(number):
         return None, pct
+    value = float(number)
     if not math.isfinite(value) or value < 0:
         return None, pct
     return (value / 100.0 if pct else value), pct
@@ -1832,13 +1842,12 @@ def _slot_items(words: list[str]) -> list[Any]:
         tok = words[i]
         m = _ASSIGN_RE.match(tok)
         if m and _THRESHOLD_KEY_RE.search(m.group(1)):
-            items.append(_Slot("env", m.group(1), m.group(2), *_parse_value(m.group(2).strip()), True))
+            items.append(_Slot("env", m.group(1), m.group(2), *_parse_value(m.group(2)), True))
         elif tok.startswith("-") and tok not in ("-", "--") and _THRESHOLD_KEY_RE.search(tok.partition("=")[0]):
             name, eq, raw = tok.partition("=")
             if not eq and i + 1 < len(words) and not words[i + 1].startswith("--"):
                 i, raw = i + 1, words[i + 1]
-            items.append(_Slot("flag", name.lstrip("-").lower().replace("_", "-"), raw,
-                               *_parse_value(raw.strip()), bool(eq)))
+            items.append(_Slot("flag", name, raw, *_parse_value(raw), bool(eq)))
         else:
             items.append(tok)
         i += 1
@@ -1849,7 +1858,7 @@ def _slot_ok(base: _Slot, live: _Slot) -> bool:
     """``live`` keeps ``base``'s bar: same slot, and the same text or a finite, comparable, no looser value."""
     if (base.kind, base.key) != (live.kind, live.key):
         return False
-    if live.raw.strip() == base.raw.strip():
+    if live.raw == base.raw:
         return True
     if base.value is None or live.value is None:
         return False
@@ -1884,28 +1893,66 @@ def _is_regen(tok: str, prev: Optional[str]) -> bool:
     return not exempt and word.lower() not in {"run", "sub", "cpu", "out", "url", "num"}
 
 
+def _runner(live: list[Any], head: int) -> Optional[str]:
+    """The command a segment runs: its head, or the tool after `npx`/`uvx`/`uv run`/`pnpm exec`/`yarn`/..."""
+    k = head
+    while k < len(live) and isinstance(live[k], str) and (
+            os.path.basename(live[k]) in _LAUNCHERS or (k > head and live[k] in _LAUNCHER_VERBS)):
+        k += 1
+    word = live[k] if k < len(live) else None
+    return os.path.basename(word) if isinstance(word, str) and not word.startswith("-") else None
+
+
 def _insert_ok(live: list[Any], j: int, head: int, trailing_from: int, matched: set[int]) -> bool:
-    """Whether item ``live[j]``, absent from the committed segment, is provably inert: a disabled regeneration
-    assignment before the head; after it a disabled regeneration option or self-contained `--flag=value`; a zero
-    threshold or plain option after every committed word (``trailing_from``); or Python's unbuffered `-u` right
-    after a committed interpreter head (`python3`, `timeout 30 python3`) and before its committed script."""
+    """Whether item ``live[j]``, absent from the committed segment, is on the positive allowlist of inert
+    insertions: a disabled regeneration assignment before the head; after it a disabled regeneration option
+    (`--update-snapshots=false`), `--color=`/`--reporter=` with a fixed built-in value, or a zero threshold; after
+    every committed word (``trailing_from``) a verbosity/color flag (`-q`/`-v` only for runners where they are);
+    or Python's unbuffered `-u` right after a committed interpreter head and before its committed script.
+    Nothing may follow a bare option, which could swallow it as its value (`-run --color=never`)."""
     item = live[j]
+    prev = live[j - 1] if j > 0 else None
+    if j > head and isinstance(prev, str) and prev.startswith("-") and "=" not in prev and item != "-u":
+        return False
     if isinstance(item, _Slot):
         return item.kind == "flag" and item.value == 0 and j > head and (item.eq or j >= trailing_from)
-    if any(c in item for c in "$`\n\r") or item == "--" or item.endswith("()"):
-        return False
     if _is_assignment(item):
-        return j < head and bool(_REGEN_ENV_RE.search(item.partition("=")[0])) and not _is_regen(item, None)
-    if j <= head or not _OPTION_RE.match(item):  # never a word: no command, shell, wrapper or positional
+        name, _, value = item.partition("=")
+        return j < head and bool(_REGEN_ENV_RE.search(name)) and value.lower() in _DISABLED
+    if j <= head:
         return False
     name, eq, value = item.partition("=")
-    if _REGEN_FLAG_RE.match(name) and eq:
-        return value.strip().lower() in _DISABLED
+    if eq:
+        if _REGEN_FLAG_RE.match(name):
+            return value.lower() in _DISABLED
+        return value in _INERT_EQ_OPTIONS.get(name, ())
     if item == "-u" and {j - 1, j + 1} <= matched and _PYTHON_RE.match(os.path.basename(live[j - 1])):
         return all(isinstance(w, str) and _WRAPPER_ARG_RE.match(w) for w in live[head + 1:j - 1])
-    if _is_regen(item, None) or _THRESHOLD_KEY_RE.search(item) or _UNSAFE_OPTION_RE.search(name.lstrip("-")):
+    if j < trailing_from:
         return False
-    return (name.startswith("--") and bool(eq)) or j >= trailing_from
+    return item in _INERT_TRAILING_FLAGS or item in _RUNNER_SHORT_FLAGS.get(_runner(live, head) or "", ())
+
+
+def _outer_expands(tok: _Tok) -> bool:
+    """Whether the outer shell expands part of ``tok`` (`$`/`` ` `` unquoted or in double quotes; globs, `~` and
+    braces unquoted), so the word a nested `sh -c` receives is not its literal text."""
+    if tok.from_argv:
+        return False
+    raw, i, dq = tok.raw, 0, False
+    while i < len(raw):
+        ch = raw[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "'" and not dq:
+            i = raw.index("'", i + 1) + 1
+            continue
+        if ch == '"':
+            dq = not dq
+        elif ch in "$`" or (not dq and ch in "*?[~{"):
+            return True
+        i += 1
+    return False
 
 
 def _segment_ok(base_toks: list[_Tok], live_toks: list[_Tok], depth: int, sealed: bool, trailing: bool) -> bool:
@@ -1919,7 +1966,9 @@ def _segment_ok(base_toks: list[_Tok], live_toks: list[_Tok], depth: int, sealed
         # an unchanged `sh|bash ... -c SCRIPT [args]` wrapper: only the script may differ, checked recursively
         diff = [k for k in range(len(base)) if base[k] != live[k]]
         if len(diff) == 1 and diff[0] > head + 1 and re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", base[diff[0] - 1]):
-            return _structure_ok(base_toks[diff[0]].text, live_toks[diff[0]].text, depth + 1)
+            # `bash -c '...$T...'` -> `bash -c "...$T..."`: the outer shell would expand the script first
+            return (not _outer_expands(live_toks[diff[0]])
+                    and _structure_ok(base_toks[diff[0]].text, live_toks[diff[0]].text, depth + 1))
     if sealed or head is None or name in _SEALED_HEADS:
         return len(b_items) == len(l_items) and all(map(_item_ok, b_items, l_items))
     matched: list[int] = []
@@ -1949,6 +1998,9 @@ def _structure_ok(base_cmd: Any, live_cmd: Any, depth: int = 0) -> bool:
         base, live = _tokenize_visual_cmd(base_cmd), _tokenize_visual_cmd(live_cmd)
     except ValueError:
         return False
+    if isinstance(base_cmd, list) != isinstance(live_cmd, list) and not all(
+            not t.is_op and _PLAIN_WORD_RE.fullmatch(t.text) for t in (*base, *live)):
+        return False  # argv list <-> shell string: only plain words mean the same thing in both
     if [(t.key, t.is_op) for t in base] == [(t.key, t.is_op) for t in live]:
         return True
     (b_ops, b_segs), (l_ops, l_segs) = _segments(base), _segments(live)
