@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/banner.svg">
     <source media="(prefers-color-scheme: light)" srcset="docs/images/banner-light.svg">
-    <img src="docs/images/banner.svg" width="100%" alt="Factonio — Pure-Hermes Software Factory">
+    <img src="docs/images/banner.svg" width="100%" alt="Factonio, an Omnim project: a pure-Hermes software factory that takes a GitHub issue to a merged pull request">
   </picture>
 </p>
 
@@ -41,7 +41,7 @@
 
 Factonio runs autonomous software delivery on a dedicated headless `factonio` worker profile across four explicit phases, with a strict **Information Barrier** during verification to prevent confirmation bias and test overfitting:
 
-![Factonio Software Factory Pipeline](docs/images/architecture.svg)
+![Factonio pipeline: Define, optional Design, parallel Implementation, isolated Diff and Black-Box checks behind an information barrier, then the exact-HEAD merge gate](docs/images/architecture.svg)
 
 1. **Phase 1 — Definition (`factonio:define`)** explores the repository, writes `spec.md` (acceptance criteria, technical plan, and a parallel task DAG), and authors hidden black-box acceptance checks under `holdout/`.
 2. **Phase 1b — Optional UI/UX Design (`factonio:design`)** runs when a task touches UI (`has_ui: true` or on request). It supervises interactive Claude Design (`/design`) when the `claude` CLI is authenticated, or falls back automatically to pure-Hermes HTML/CSS previews.
