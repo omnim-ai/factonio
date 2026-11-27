@@ -244,6 +244,10 @@ Special thanks to **Lauren Tan ([@poteto](https://x.com/poteto))** and **[pstack
 
 pstack's copyright and permission notice is reproduced in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
+## Setting this up for your team
+
+Factonio is free and MIT-licensed. If you want help deploying a software factory in your team's repositories, tuning the pipeline for your codebase, or figuring out broader AI adoption in your engineering workflow, reach out at [tony@omnim.ai](mailto:tony@omnim.ai) or connect on [LinkedIn](https://www.linkedin.com/in/antolourenco).
+
 ## Affiliation and trademarks
 
 Factonio is an **independent open-source project by [Omnim AI](https://github.com/omnim-ai)**. It is built for compatibility with [Hermes Agent](https://github.com/NousResearch/hermes-agent) and is not officially affiliated with, endorsed by, or sponsored by Nous Research.

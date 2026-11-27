@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repo": "omnim-ai/factonio",
-  "generated_at": "2026-11-27T12:45:00Z",
+  "generated_at": "2026-11-27T13:50:00Z",
   "base_commit": null,
   "stack": [
     "hermes-plugin",
@@ -384,7 +384,8 @@
         "CHANGELOG Unreleased and docs/architecture.md document the Wave 4 polish trail-audit, malformed-pr_number and lock-budget changes",
         "CHANGELOG Unreleased and docs/architecture.md document whole-field fail-closed recall redaction",
         "CHANGELOG Unreleased and docs/architecture.md document ANSI escape-sequence stripping in recall redaction",
-        "README.md, SECURITY.md, docs/architecture.md and CHANGELOG Unreleased document publish_policy / default_publish_policy, the exact-SHA fail-closed publish_pr gate, `hermes factonio publish-pr`, and `publish` / `published` in trail --audit"
+        "README.md, SECURITY.md, docs/architecture.md and CHANGELOG Unreleased document publish_policy / default_publish_policy, the exact-SHA fail-closed publish_pr gate, `hermes factonio publish-pr`, and `publish` / `published` in trail --audit",
+        "README.md keeps the `## Setting this up for your team` consulting section (mailto:tony@omnim.ai and LinkedIn links, no omnim.ai site link) immediately before `## Affiliation and trademarks`"
       ]
     },
     {
