@@ -486,13 +486,19 @@ def _local_target_from_metadata(meta: Mapping[str, Any]) -> Optional[dict[str, A
         return None
     base = meta.get("base_branch")
     repo = meta.get("repo")
-    return {
+    target: dict[str, Any] = {
         "repo": str(repo) if isinstance(repo, str) and repo.strip() else None,
         "branch": branch.strip(),
         "base_branch": base.strip() if isinstance(base, str) and base.strip() else None,
         "head_sha": sha,
         "source": "metadata",
     }
+    # Prefill for the Desktop Publish PR confirmation; present only as a clean, barrier-safe string.
+    for key in ("pr_title", "pr_body"):
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip() and not contains_holdout_reference(value):
+            target[key] = value
+    return target
 
 
 def _extract_local_target(task: dict[str, Any], runs: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -676,6 +682,158 @@ def load_panel_lanes(
                 continue
         grouped.setdefault(tag["panel_id"], []).append(lane)
     return grouped
+
+
+def _status_result(**fields: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "verified": False,
+        "mode": "none",
+        "consensus": "none",
+        "reason": "",
+        "panel_id": None,
+        "base_branch": None,
+        "lanes": [],
+    }
+    base.update(fields)
+    return base
+
+
+def _load_local_verify_cards(
+    conn: sqlite3.Connection, *, branch: str, tenant: Optional[str]
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    where = ["assignee = ?", "status != 'archived'", "instr(body, ?) > 0"]
+    params: list[Any] = [WORKER_PROFILE, f"- Local branch target: `{branch}` (base=`"]
+    if tenant:
+        where.append("tenant = ?")
+        params.append(tenant)
+    tasks = [
+        dict(r)
+        for r in conn.execute(
+            f"SELECT rowid AS seq, id, title, status, tenant, skills, created_at, result, body FROM tasks "
+            f"WHERE {' AND '.join(where)} ORDER BY created_at ASC, rowid ASC",
+            params,
+        ).fetchall()
+    ]
+    runs_by_task: dict[str, list[dict[str, Any]]] = {}
+    if tasks:
+        ids = [t["id"] for t in tasks]
+        run_cols = _table_columns(conn, "task_runs")
+        run_extra = "".join(f", {c}" for c in ("summary", "error") if c in run_cols)
+        for r in conn.execute(
+            f"SELECT id, task_id, started_at, ended_at, outcome, metadata{run_extra} FROM task_runs "
+            f"WHERE task_id IN ({','.join('?' for _ in ids)}) ORDER BY id ASC",
+            ids,
+        ).fetchall():
+            runs_by_task.setdefault(r["task_id"], []).append(dict(r))
+    return tasks, runs_by_task
+
+
+def local_branch_verification_status(
+    db_path: Path,
+    *,
+    repo: str,
+    branch: str,
+    head_sha: str,
+    tenant: Optional[str] = None,
+    trail_db: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Has the exact unpublished ``(repo, branch, head_sha)`` passed local verification? Read-only.
+
+    Only Verification cards carrying the orchestrator-written ``Local branch target:`` stamp for that
+    branch and full SHA (and ``- Repository:`` line for ``repo``) count. When a high-rigor panel exists
+    its newest round decides: ``summarize_panel`` with the lane roster from ``spawn_verify`` must reach
+    ``consensus: pass`` with ``merge_allowed`` and no missing lane (an unknown roster fails closed).
+    Otherwise the standard pair needs a ``done`` ``verify-diff`` and a ``done`` ``verify-blackbox``
+    card, every matching card ``done`` with an explicit ``pass`` verdict. Any rejecting or inconclusive
+    standard card at that SHA refuses in both modes. Returns ``{verified, mode, consensus, reason,
+    panel_id, base_branch, lanes}``; `kanban.db` is opened ``mode=ro`` and never created.
+    """
+    sha = head_sha.strip().lower() if isinstance(head_sha, str) else ""
+    repo_key = repo.strip().lower() if isinstance(repo, str) else ""
+    if not (repo_key and isinstance(branch, str) and branch.strip() and _FULL_SHA_RE.fullmatch(sha)):
+        return _status_result(reason="Invalid verification target: repo, branch and a full head SHA are required.")
+    conn = _open_ro(Path(db_path))
+    if conn is None:
+        return _status_result(reason="kanban.db not found: no local verification recorded.")
+    try:
+        with closing(conn):
+            tasks, runs_by_task = _load_local_verify_cards(conn, branch=branch, tenant=tenant)
+    except sqlite3.Error:
+        return _status_result(reason="kanban.db unreadable: local verification cannot be confirmed.")
+
+    matched: list[tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]] = []
+    for task in tasks:
+        phase = classify_phase(task)
+        local = _local_target_from_body(task.get("body"))
+        if phase not in _VERIFY_PHASES or local is None:
+            continue
+        if local["branch"] != branch or local["head_sha"] != sha or str(local.get("repo") or "").lower() != repo_key:
+            continue
+        runs = runs_by_task.get(task["id"], [])
+        tag = parse_panel_tag(task.get("body"))
+        lane = {
+            "task_id": task["id"],
+            "phase": phase,
+            "status": str(task.get("status") or ""),
+            "verdict": _explicit_verify_verdict(runs),
+            "panel_id": tag["panel_id"] if tag else None,
+            "vendor": tag["vendor"] if tag else None,
+        }
+        matched.append((task, runs, {**lane, "_base": local["base_branch"]}))
+    if not matched:
+        return _status_result(reason=f"No local verification cards found for {branch} at {sha}.")
+
+    lanes = [{k: v for k, v in lane.items() if k != "_base"} for _, _, lane in matched]
+    bases = sorted({lane["_base"] for _, _, lane in matched})
+    if len(bases) != 1:
+        return _status_result(lanes=lanes, reason=f"Conflicting verified base branches: {', '.join(bases)}.")
+    out = _status_result(lanes=lanes, base_branch=bases[0])
+    standard = [lane for lane in lanes if not lane["panel_id"]]
+    blockers = [lane for lane in standard if _verdict_bucket(lane["verdict"]) in ("reject", "inconclusive")]
+    blocker_note = (
+        f"{len(blockers)} standard verification card(s) rejected or were inconclusive at this SHA: "
+        + ", ".join(str(b["task_id"]) for b in blockers)
+    ) if blockers else ""
+
+    panels: dict[str, list[tuple[dict[str, Any], list[dict[str, Any]]]]] = {}
+    for task, runs, lane in matched:
+        if lane["panel_id"]:
+            panels.setdefault(lane["panel_id"], []).append((task, runs))
+    if panels:
+        from .orchestrator import _expected_panel_lane_ids
+
+        def _recency(pid: str) -> tuple[float, int]:
+            return max((float(t.get("created_at") or 0), int(t.get("seq") or 0)) for t, _ in panels[pid])
+
+        pid = max(panels, key=_recency)
+        panel_lanes = [_panel_lane(t, r, parse_panel_tag(t.get("body")) or {}) for t, r in panels[pid]]
+        expected = _expected_panel_lane_ids(pid, panel_lanes, db_path=trail_db)
+        summary = summarize_panel(pid, panel_lanes, expected_lane_ids=expected)
+        out.update(mode="panel", panel_id=pid, consensus=str(summary["consensus"]))
+        if expected is None:
+            out["reason"] = f"Panel {pid} has no recorded lane roster (spawn_verify); it cannot be confirmed complete."
+        elif summary["consensus"] != "pass" or summary.get("merge_allowed") is not True or summary["missing_lane_ids"]:
+            out["reason"] = f"Panel {pid} consensus is {summary['consensus']}: {summary.get('reason') or 'not passing'}"
+        elif blockers:
+            out["reason"] = blocker_note
+        else:
+            out.update(verified=True, reason=f"Panel {pid} passed with every expected lane at {sha}.")
+        return out
+
+    diff_ok = any(c["phase"] == "verify-diff" and c["status"] == "done" and c["verdict"] == "pass" for c in standard)
+    bb_ok = any(c["phase"] == "verify-blackbox" and c["status"] == "done" and c["verdict"] == "pass" for c in standard)
+    all_ok = all(c["status"] == "done" and c["verdict"] == "pass" for c in standard)
+    out["mode"] = "standard"
+    if blockers:
+        rejected = any(_verdict_bucket(b["verdict"]) == "reject" for b in blockers)
+        out.update(consensus="reject" if rejected else "inconclusive", reason=blocker_note)
+    elif diff_ok and bb_ok and all_ok:
+        out.update(verified=True, consensus="pass", reason=f"verify-diff and verify-blackbox passed at {sha}.")
+    else:
+        missing = [p for p, ok in (("verify-diff", diff_ok), ("verify-blackbox", bb_ok)) if not ok]
+        detail = f"missing a done explicit pass for {', '.join(missing)}" if missing else "a card is not done with an explicit pass"
+        out.update(consensus="pending", reason=f"Local verification incomplete: {detail}.")
+    return out
 
 
 def classify_phase(task: dict[str, Any]) -> str:

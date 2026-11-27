@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -572,6 +573,44 @@ def record_transition(decision: str, **kwargs: Any) -> Optional[dict[str, Any]]:
         return None
 
 
+TRAIL_SIGNALS = ("all", "key", "attention")
+# Routine machine ticks the `key` signal folds away (a human, superseding or failing row is never routine).
+_ROUTINE_DECISIONS = ("pr_gate", "bootstrap_verify")
+_KEY_EXEMPT_PHASES = ("escape", "retro")
+_KEY_EXEMPT_RESULTS = ("proof_failed", "product_regression", "error", "refused", "escalated")
+_ATTENTION_PHASES = ("escape", "watchdog")
+_ATTENTION_RESULTS = (
+    "reject", "blocked", "escalated", "needs_input", "inconclusive", "conflict", "proof_failed", "refused",
+    "error", "stalled", "dead_worker", "stop_the_line", "product_regression", "changes_requested", "fix_incomplete",
+)
+_SEARCH_COLUMNS = ("decision", "why", "result", "card_id", "tenant", "repo_slug", "evidence_json")
+MAX_QUERY_CHARS = 200
+
+
+def _sql_list(values: Iterable[str]) -> str:
+    return ", ".join(f"'{v}'" for v in values)
+
+
+def _validate_trail_filters(
+    actor: Optional[str], q: Optional[str], signal: Optional[str], include_superseded: Optional[bool]
+) -> None:
+    """Fail closed on malformed additive filters (``ValueError``; the API maps it to ``422``)."""
+    for name, value in (("actor", actor), ("q", q)):
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{name} must be a string; got {type(value).__name__}")
+    if q is not None and len(q) > MAX_QUERY_CHARS:
+        raise ValueError(f"q must be at most {MAX_QUERY_CHARS} characters")
+    if signal is not None and signal not in TRAIL_SIGNALS:
+        raise ValueError(f"signal must be one of {', '.join(TRAIL_SIGNALS)}; got {signal!r}")
+    if include_superseded is not None and not isinstance(include_superseded, bool):
+        raise ValueError(f"include_superseded must be a boolean; got {type(include_superseded).__name__}")
+
+
+def _like_pattern(text: str) -> str:
+    escaped = text.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 def _filter_sql(
     *,
     tenant: Optional[str],
@@ -580,8 +619,15 @@ def _filter_sql(
     card_id: Optional[str],
     since: Optional[str],
     alias: str = "",
+    actor: Optional[str] = None,
+    q: Optional[str] = None,
+    signal: Optional[str] = None,
+    include_superseded: Optional[bool] = None,
+    attention_ids: Optional[list[str]] = None,
 ) -> tuple[str, list[Any]]:
     a = f"{alias}." if alias else ""
+    # Correlated subqueries need the outer table spelled out: a bare `id` would bind to the inner alias.
+    outer = alias or "decisions"
     where: list[str] = []
     params: list[Any] = []
     if tenant:
@@ -601,7 +647,89 @@ def _filter_sql(
     if since:
         where.append(f"{a}ts >= ?")
         params.append(since)
+    if actor and actor.strip():
+        where.append(f"{a}actor = ?")
+        params.append(actor.strip())
+    needle = q.strip() if isinstance(q, str) else ""
+    if needle:
+        if contains_holdout_reference(needle):
+            # Barrier oracle guard: a search naming holdout must not reveal which rows were redacted.
+            where.append("0")
+        else:
+            where.append(
+                "(" + " OR ".join(f"lower({a}{col}) LIKE ? ESCAPE '\\'" for col in _SEARCH_COLUMNS) + ")"
+            )
+            params.extend([_like_pattern(needle)] * len(_SEARCH_COLUMNS))
+    active = f"NOT EXISTS (SELECT 1 FROM decisions s_ WHERE s_.supersedes_id = {outer}.id)"
+    if include_superseded is False:
+        where.append(active)
+    if signal == "key":
+        where.append(
+            f"NOT (lower(trim({a}decision)) IN ({_sql_list(_ROUTINE_DECISIONS)})"
+            f" AND lower(trim({a}actor)) != 'human' AND {a}supersedes_id IS NULL"
+            f" AND lower(trim({a}phase)) NOT IN ({_sql_list(_KEY_EXEMPT_PHASES)})"
+            f" AND lower(trim({a}result)) NOT IN ({_sql_list(_KEY_EXEMPT_RESULTS)}))"
+        )
+    elif signal == "attention":
+        where.append(
+            f"({active} AND ({a}id IN (SELECT value FROM json_each(?))"
+            f" OR lower(trim({a}phase)) IN ({_sql_list(_ATTENTION_PHASES)})"
+            f" OR lower(trim({a}result)) IN ({_sql_list(_ATTENTION_RESULTS)})))"
+        )
+        params.append(json.dumps(sorted(set(attention_ids or []))))
     return (" WHERE " + " AND ".join(where)) if where else "", params
+
+
+def scrub_public(value: Any) -> Any:
+    """Public serializer: drop holdout-named keys, redact any string referencing holdout, null non-finite floats.
+
+    Strings without a holdout reference pass through byte-for-byte, so ordinary rows are unchanged.
+    """
+    if isinstance(value, str):
+        return _HOLDOUT_REDACTED if contains_holdout_reference(value) else value
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, Mapping):
+        return {k: scrub_public(v) for k, v in value.items() if not contains_holdout_reference(str(k))}
+    if isinstance(value, (list, tuple)):
+        return [scrub_public(v) for v in value]
+    return value
+
+
+def _public_match(row: sqlite3.Row, needle: str) -> bool:
+    """``needle`` occurs in the row's public (scrubbed) text, so redacted content is never searchable."""
+    for col in _SEARCH_COLUMNS:
+        raw = row[col]
+        if col == "evidence_json":
+            try:
+                evidence = json.loads(raw or "{}")
+            except ValueError:
+                evidence = {}
+            text = json.dumps(scrub_public(evidence), sort_keys=True, default=str)
+        else:
+            text = scrub_public(str(raw or ""))
+        if needle in text.lower():
+            return True
+    return False
+
+
+def _attention_ids(
+    *, tenant: Optional[str], repo: Optional[str], phase: Optional[str], card_id: Optional[str], path: Path
+) -> list[str]:
+    audit = audit_trail_evidence(tenant=tenant, repo=repo, phase=phase, card_id=card_id, db_path=path)
+    return [str(f["decision_id"]) for f in audit.get("findings") or [] if f.get("decision_id")]
+
+
+def _query_trail_ro(path: Path) -> sqlite3.Connection:
+    """Read-only `trail.db` handle for every query path: never creates, migrates, or write-locks it."""
+    conn = _open_trail_ro(path)
+    try:
+        # Budget-aware like `_open`: best-effort telemetry reads give up fast on a held lock.
+        conn.execute(f"PRAGMA busy_timeout={_busy_timeout_ms()}")
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 def query_decisions(
@@ -613,27 +741,51 @@ def query_decisions(
     limit: Any = DEFAULT_LIMIT,
     since: Optional[str] = None,
     db_path: Optional[Path] = None,
+    actor: Optional[str] = None,
+    q: Optional[str] = None,
+    signal: Optional[str] = None,
+    include_superseded: Optional[bool] = None,
 ) -> list[dict[str, Any]]:
-    """Return matching decisions newest-first, each with `evidence`, `superseded_by`, `is_superseded`."""
+    """Return matching decisions newest-first, each with `evidence`, `superseded_by`, `is_superseded`.
+
+    Read-only (``mode=ro``). ``actor`` matches exactly; ``q`` is a case-insensitive substring of the
+    row's public (holdout-scrubbed) text; ``signal`` is ``all`` / ``key`` (routine ticks folded away) /
+    ``attention`` (active audit findings, escapes and failures); ``include_superseded=False`` keeps
+    only active rows. Raises ``ValueError`` for malformed filters.
+    """
+    _validate_trail_filters(actor, q, signal, include_superseded)
     path = Path(db_path) if db_path is not None else trail_db_path()
     if not path.is_file():
         return []
-    where_sql, params = _filter_sql(tenant=tenant, repo=repo, phase=phase, card_id=card_id, since=since)
-    with closing(_connect(path)) as conn:
-        rows = conn.execute(
-            f"SELECT * FROM decisions{where_sql} ORDER BY ts DESC, rowid DESC LIMIT ?",
-            [*params, _clamp_limit(limit)],
-        ).fetchall()
+    ids = _attention_ids(tenant=tenant, repo=repo, phase=phase, card_id=card_id, path=path) if signal == "attention" else None
+    where_sql, params = _filter_sql(
+        tenant=tenant, repo=repo, phase=phase, card_id=card_id, since=since, actor=actor, q=q, signal=signal,
+        include_superseded=include_superseded, attention_ids=ids,
+    )
+    cap = _clamp_limit(limit)
+    needle = q.strip().lower() if isinstance(q, str) else ""
+    with closing(_query_trail_ro(path)) as conn:
+        if not needle:
+            rows = conn.execute(
+                f"SELECT * FROM decisions{where_sql} ORDER BY ts DESC, rowid DESC LIMIT ?", [*params, cap]
+            ).fetchall()
+        else:
+            rows = []
+            for row in conn.execute(f"SELECT * FROM decisions{where_sql} ORDER BY ts DESC, rowid DESC", params):
+                if _public_match(row, needle):
+                    rows.append(row)
+                    if len(rows) >= cap:
+                        break
         return _enrich(conn, rows)
 
 
 def get_decision(decision_id: str, *, db_path: Optional[Path] = None) -> Optional[dict[str, Any]]:
-    """One decision by id (enriched like `query_decisions`), or ``None`` when absent."""
+    """One decision by id (enriched like `query_decisions`), or ``None`` when absent. Read-only."""
     key = str(decision_id or "").strip()
     path = Path(db_path) if db_path is not None else trail_db_path()
     if not key or not path.is_file():
         return None
-    with closing(_connect(path)) as conn:
+    with closing(_query_trail_ro(path)) as conn:
         row = conn.execute("SELECT * FROM decisions WHERE id = ?", (key,)).fetchone()
         return _enrich(conn, [row])[0] if row is not None else None
 
@@ -658,21 +810,33 @@ def summarize_trail(
     card_id: Optional[str] = None,
     since: Optional[str] = None,
     db_path: Optional[Path] = None,
+    actor: Optional[str] = None,
+    q: Optional[str] = None,
+    signal: Optional[str] = None,
+    include_superseded: Optional[bool] = None,
 ) -> dict[str, Any]:
-    """Aggregate counts over every matching decision (not truncated by any display limit)."""
+    """Aggregate counts over every matching decision (not truncated by any display limit). Read-only."""
+    _validate_trail_filters(actor, q, signal, include_superseded)
     path = Path(db_path) if db_path is not None else trail_db_path()
     if not path.is_file():
         return _empty_summary()
-    where_sql, params = _filter_sql(tenant=tenant, repo=repo, phase=phase, card_id=card_id, since=since, alias="d")
-    with closing(_connect(path)) as conn:
+    ids = _attention_ids(tenant=tenant, repo=repo, phase=phase, card_id=card_id, path=path) if signal == "attention" else None
+    where_sql, params = _filter_sql(
+        tenant=tenant, repo=repo, phase=phase, card_id=card_id, since=since, alias="d", actor=actor, q=q,
+        signal=signal, include_superseded=include_superseded, attention_ids=ids,
+    )
+    needle = q.strip().lower() if isinstance(q, str) else ""
+    with closing(_query_trail_ro(path)) as conn:
         rows = conn.execute(
             f"""
-            SELECT d.ts, d.tenant, d.phase, d.actor,
+            SELECT d.*,
                    EXISTS(SELECT 1 FROM decisions s WHERE s.supersedes_id = d.id) AS superseded
               FROM decisions d{where_sql}
             """,
             params,
         ).fetchall()
+    if needle:
+        rows = [r for r in rows if _public_match(r, needle)]
     if not rows:
         return _empty_summary()
     superseded = sum(1 for r in rows if r["superseded"])
@@ -695,17 +859,28 @@ def trail_payload(
     card_id: Optional[str] = None,
     limit: Any = DEFAULT_LIMIT,
     db_path: Optional[Path] = None,
+    actor: Optional[str] = None,
+    q: Optional[str] = None,
+    signal: Optional[str] = None,
+    include_superseded: Optional[bool] = None,
 ) -> dict[str, Any]:
-    """The `{decisions, summary, filters}` contract shared by the REST API and `--json` CLI."""
+    """The `{decisions, summary, filters}` contract shared by the REST API and `--json` CLI.
+
+    ``filters`` keeps the legacy keys exactly; ``actor`` / ``q`` / ``signal`` / ``include_superseded``
+    appear in it only when passed (not ``None``).
+    """
+    _validate_trail_filters(actor, q, signal, include_superseded)
     clamped = _clamp_limit(limit)
-    filters = {
+    filters: dict[str, Any] = {
         "tenant": tenant or None,
         "repo": repo or None,
         "phase": phase or None,
         "card_id": card_id or None,
         "limit": clamped,
     }
-    query = {"tenant": tenant, "repo": repo, "phase": phase, "card_id": card_id, "db_path": db_path}
+    extra = {"actor": actor, "q": q, "signal": signal, "include_superseded": include_superseded}
+    filters.update({k: v for k, v in extra.items() if v is not None})
+    query = {"tenant": tenant, "repo": repo, "phase": phase, "card_id": card_id, "db_path": db_path, **extra}
     return {
         "decisions": query_decisions(limit=clamped, **query),
         "summary": summarize_trail(**query),

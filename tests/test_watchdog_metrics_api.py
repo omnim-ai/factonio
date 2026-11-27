@@ -1271,5 +1271,443 @@ class TestTrailInformationBarrierApi(unittest.TestCase):
                              trail.get_decision(normal["id"]))
 
 
+# --- Interactive control-plane API (publish-pr, report, harness audit, panel/arena evaluate) -------
+
+_CP = "/api/plugins/factonio"
+_SHA = "ab" * 20
+
+
+def _cp_client(name: str):
+    return _client(_load_plugin_api(name))
+
+
+def _cp_register(home: Path, *, git_repo: bool = False) -> Path:
+    from tests.test_local_publish_gate import _register
+
+    return _register(home, git_repo=git_repo)
+
+
+def _cp_complete(task_id: str, verdict, **meta) -> None:
+    from tests.test_local_publish_gate import _complete
+
+    _complete(task_id, verdict, **meta)
+
+
+def _trail_rows(decision: str) -> list[dict]:
+    from factonio.trail import query_decisions
+
+    return [r for r in query_decisions(limit=1000) if r["decision"] == decision]
+
+
+class TestLocalBranchVerificationStatus(unittest.TestCase):
+    def test_metadata_prefill_is_scrubbed(self):
+        from factonio.metrics import _local_target_from_metadata
+
+        base = {"branch": "feat/y", "head_sha": _SHA, "repo": "acme/svc"}
+        got = _local_target_from_metadata({**base, "pr_title": "Add y", "pr_body": "## Why\ny"})
+        self.assertEqual((got["pr_title"], got["pr_body"]), ("Add y", "## Why\ny"))
+        for title, body in (("", "  "), (7, ["x"]), ("see holdout/s1.md", "copied hold-out/x"), (None, None)):
+            with self.subTest(title=title):
+                got = _local_target_from_metadata({**base, "pr_title": title, "pr_body": body})
+                self.assertNotIn("pr_title", got)
+                self.assertNotIn("pr_body", got)
+
+    def test_standard_pair_states(self):
+        from factonio.metrics import local_branch_verification_status as status
+        from factonio.orchestrator import spawn_verification_pair
+
+        with isolated_hermes_home() as home:
+            db = home / "kanban.db"
+            missing = status(home / "nope.db", repo="acme/svc", branch="feat/x", head_sha=_SHA)
+            self.assertEqual((missing["verified"], missing["mode"]), (False, "none"))
+            self.assertFalse((home / "nope.db").exists())
+            _cp_register(home)
+            self.assertFalse(status(db, repo="acme/svc", branch="feat/x", head_sha=_SHA)["verified"])
+            pair = spawn_verification_pair("acme/svc", "ws-loc", branch="feat/x", head_sha=_SHA)
+            pending = status(db, repo="acme/svc", branch="feat/x", head_sha=_SHA)
+            self.assertEqual((pending["verified"], pending["mode"], pending["consensus"]), (False, "standard", "pending"))
+            self.assertEqual(len(pending["lanes"]), 2)
+            _cp_complete(pair["verify_diff_task_id"], "pass")
+            _cp_complete(pair["verify_blackbox_task_id"], None)
+            self.assertFalse(status(db, repo="acme/svc", branch="feat/x", head_sha=_SHA)["verified"],
+                             "a done card without an explicit verdict never counts as a pass")
+            again = spawn_verification_pair("acme/svc", "ws-loc", branch="feat/x", head_sha=_SHA)
+            _cp_complete(again["verify_diff_task_id"], "pass")
+            _cp_complete(again["verify_blackbox_task_id"], "pass")
+            self.assertFalse(status(db, repo="acme/svc", branch="feat/x", head_sha=_SHA)["verified"])
+
+        with isolated_hermes_home() as home:
+            db = home / "kanban.db"
+            _cp_register(home)
+            pair = spawn_verification_pair("acme/svc", "ws-loc", branch="feat/x", head_sha=_SHA)
+            _cp_complete(pair["verify_diff_task_id"], "pass")
+            _cp_complete(pair["verify_blackbox_task_id"], "pass")
+            ok = status(db, repo="acme/svc", branch="feat/x", head_sha=_SHA.upper())
+            self.assertEqual((ok["verified"], ok["mode"], ok["consensus"], ok["base_branch"]),
+                             (True, "standard", "pass", "main"))
+            self.assertTrue(status(db, repo="ACME/svc", branch="feat/x", head_sha=_SHA, tenant="ws-loc")["verified"])
+            for kwargs in ({"head_sha": "cd" * 20}, {"branch": "feat/x2"}, {"repo": "acme/other"},
+                           {"tenant": "ws-other"}, {"head_sha": _SHA[:12]}):
+                with self.subTest(kwargs=kwargs):
+                    args = {"repo": "acme/svc", "branch": "feat/x", "head_sha": _SHA, **kwargs}
+                    self.assertFalse(status(db, **args)["verified"])
+            reject = spawn_verification_pair("acme/svc", "ws-loc", branch="feat/x", head_sha=_SHA)
+            _cp_complete(reject["verify_blackbox_task_id"], "reject", findings=["boom"])
+            rej = status(db, repo="acme/svc", branch="feat/x", head_sha=_SHA)
+            self.assertEqual((rej["verified"], rej["consensus"]), (False, "reject"))
+
+    def test_panel_round(self):
+        from factonio.metrics import local_branch_verification_status as status
+        from factonio.orchestrator import spawn_verification_pair
+        from tests.test_local_publish_gate import TWO_VENDORS
+
+        with isolated_hermes_home() as home:
+            db = home / "kanban.db"
+            _cp_register(home)
+            loc = spawn_verification_pair("acme/svc", "ws-p", branch="feat/p", head_sha=_SHA, rigor="high",
+                                          panel_models=TWO_VENDORS)
+            lanes = loc["panel"]["lanes"]
+            for lane in lanes[:1]:
+                _cp_complete(lane["verify_diff_task_id"], "pass")
+                _cp_complete(lane["verify_blackbox_task_id"], "pass")
+            partial = status(db, repo="acme/svc", branch="feat/p", head_sha=_SHA)
+            self.assertEqual((partial["verified"], partial["mode"], partial["consensus"]), (False, "panel", "pending"))
+            self.assertEqual(partial["panel_id"], loc["panel"]["panel_id"])
+            for lane in lanes[1:]:
+                _cp_complete(lane["verify_diff_task_id"], "pass")
+                _cp_complete(lane["verify_blackbox_task_id"], "pass")
+            ok = status(db, repo="acme/svc", branch="feat/p", head_sha=_SHA)
+            self.assertEqual((ok["verified"], ok["consensus"], len(ok["lanes"])), (True, "pass", 4))
+            # Archiving a spawned lane shrinks the panel: the recorded roster makes it fail closed.
+            from hermes_cli.kanban_db_connect import connect_closing
+
+            with connect_closing(db_path=db) as conn:
+                conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (lanes[1]["verify_diff_task_id"],))
+                conn.commit()
+            shrunk = status(db, repo="acme/svc", branch="feat/p", head_sha=_SHA)
+            self.assertEqual((shrunk["verified"], shrunk["consensus"]), (False, "inconclusive"))
+
+
+class TestPublishPrApi(unittest.TestCase):
+    OK = {"repo": "acme/svc", "branch": "feat/x", "expected_head_sha": _SHA, "title": "Add x", "confirmed": True}
+
+    def _verified(self, home: Path, sha: str = _SHA) -> None:
+        from factonio.orchestrator import spawn_verification_pair
+
+        pair = spawn_verification_pair("acme/svc", "ws-pub", branch="feat/x", head_sha=sha)
+        _cp_complete(pair["verify_diff_task_id"], "pass")
+        _cp_complete(pair["verify_blackbox_task_id"], "pass")
+
+    def test_strict_validation_and_unregistered(self):
+        from unittest import mock
+
+        with isolated_hermes_home() as home:
+            _cp_register(home)
+            mod = _load_plugin_api("factonio_test_cp_publish_validation")
+            client = _client(mod)
+            bad = [
+                None, [], "x",
+                {**self.OK, "confirmed": False}, {**self.OK, "confirmed": "true"}, {**self.OK, "confirmed": 1},
+                {k: v for k, v in self.OK.items() if k != "confirmed"},
+                {**self.OK, "body_file": "/etc/passwd"}, {**self.OK, "remote": "evil"}, {**self.OK, "actor": "human"},
+                {**self.OK, "expected_head_sha": _SHA[:12]}, {**self.OK, "expected_head_sha": "g" * 40},
+                {**self.OK, "expected_head_sha": _SHA + "0"}, {**self.OK, "expected_head_sha": 7},
+                {**self.OK, "title": ""}, {**self.OK, "title": "   "}, {**self.OK, "title": "a\nb"},
+                {**self.OK, "title": None}, {**self.OK, "branch": True}, {**self.OK, "branch": 12},
+                {**self.OK, "branch": {"x": 1}}, {**self.OK, "repo": ["acme/svc"]}, {**self.OK, "draft": "true"},
+                {**self.OK, "draft": 1}, {**self.OK, "draft": None}, {**self.OK, "body": 5},
+                {**self.OK, "body": "x\x00"}, {**self.OK, "base_branch": False}, {**self.OK, "tenant": "../ws"},
+                {**self.OK, "tenant": "ws/a"}, {**self.OK, "card_id": 3},
+            ]
+            with mock.patch.object(mod._repos, "publish_pr", side_effect=AssertionError("must not publish")):
+                for payload in bad:
+                    with self.subTest(payload=payload):
+                        r = client.post(f"{_CP}/publish-pr", json=payload)
+                        self.assertEqual(r.status_code, 422, r.text)
+                r = client.post(f"{_CP}/publish-pr", json={**self.OK, "repo": "acme/unknown"})
+                self.assertEqual(r.status_code, 404, r.text)
+            self.assertEqual(_trail_rows("publish_pr"), [])
+
+    def test_unverified_refuses_without_git_or_gh(self):
+        import subprocess as sp
+        from unittest import mock
+
+        with isolated_hermes_home() as home:
+            _cp_register(home)
+            mod = _load_plugin_api("factonio_test_cp_publish_unverified")
+            client = _client(mod)
+            with mock.patch.object(mod._repos, "publish_pr", side_effect=AssertionError("must not publish")), \
+                    mock.patch.object(sp, "run", side_effect=AssertionError("no subprocess")), \
+                    mock.patch.object(sp, "Popen", side_effect=AssertionError("no subprocess")):
+                r = client.post(f"{_CP}/publish-pr", json=self.OK)
+            self.assertEqual(r.status_code, 409, r.text)
+            detail = r.json()["detail"]
+            self.assertTrue(detail["refused"])
+            self.assertFalse(detail["verification"]["verified"])
+            rows = _trail_rows("publish_pr")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual((rows[0]["actor"], rows[0]["result"], rows[0]["phase"]), ("human", "refused", "publish"))
+            self.assertEqual(rows[0]["evidence"]["expected_head_sha"], _SHA)
+            self.assertFalse(rows[0]["evidence"]["gate"]["pushed"])
+
+            self._verified(home)
+            with mock.patch.object(mod._repos, "publish_pr", side_effect=AssertionError("must not publish")):
+                drifted = client.post(f"{_CP}/publish-pr", json={**self.OK, "expected_head_sha": "cd" * 20})
+                wrong_base = client.post(f"{_CP}/publish-pr", json={**self.OK, "base_branch": "develop"})
+            self.assertEqual((drifted.status_code, wrong_base.status_code), (409, 409))
+            self.assertEqual(len(_trail_rows("publish_pr")), 3)
+
+    def test_verified_publish_maps_outcomes(self):
+        from unittest import mock
+
+        with isolated_hermes_home() as home:
+            _cp_register(home)
+            self._verified(home)
+            mod = _load_plugin_api("factonio_test_cp_publish_verified")
+            client = _client(mod)
+            published = {"ok": True, "published": True, "refused": False, "pr_number": 12,
+                         "url": "https://github.com/acme/svc/pull/12", "head_sha": _SHA}
+            with mock.patch.object(mod._repos, "publish_pr", return_value=published) as pub:
+                r = client.post(f"{_CP}/publish-pr", json={**self.OK, "expected_head_sha": _SHA.upper(),
+                                                           "body": "## Why\nx", "draft": True, "tenant": "ws-pub"})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual((r.json()["pr_number"], r.json()["verification"]["mode"]), (12, "standard"))
+            args, kwargs = pub.call_args
+            self.assertEqual(args, ("acme/svc", "feat/x"))
+            self.assertEqual(
+                {k: kwargs[k] for k in ("expected_head_sha", "remote", "actor", "base_branch", "draft", "body", "tenant")},
+                {"expected_head_sha": _SHA, "remote": "origin", "actor": "human", "base_branch": "main",
+                 "draft": True, "body": "## Why\nx", "tenant": "ws-pub"},
+            )
+            self.assertNotIn("body_file", kwargs)
+            for res, code in (({"ok": False, "refused": True, "error": "HEAD drift"}, 409),
+                              ({"ok": False, "refused": False, "pushed": True, "error": "gh pr create failed"}, 502)):
+                with self.subTest(code=code), mock.patch.object(mod._repos, "publish_pr", return_value=res):
+                    self.assertEqual(client.post(f"{_CP}/publish-pr", json=self.OK).status_code, code)
+
+    def test_real_head_drift_is_refused_before_push(self):
+        from tests.test_local_publish_gate import _git, _git_env
+
+        with isolated_hermes_home() as home, _git_env():
+            repo = _cp_register(home, git_repo=True)
+            _git(repo, "checkout", "-q", "-b", "feat/x")
+            (repo / "new.txt").write_text("x\n", encoding="utf-8")
+            _git(repo, "add", "new.txt")
+            _git(repo, "commit", "-q", "-m", "feat")
+            head = _git(repo, "rev-parse", "HEAD")
+            self._verified(home, sha=head)
+            (repo / "new.txt").write_text("y\n", encoding="utf-8")
+            _git(repo, "commit", "-q", "-am", "moved after verification")
+            client = _cp_client("factonio_test_cp_publish_drift")
+            r = client.post(f"{_CP}/publish-pr", json={**self.OK, "expected_head_sha": head})
+            self.assertEqual(r.status_code, 409, r.text)
+            self.assertIn("drift", r.json()["detail"]["error"].lower())
+            self.assertFalse(r.json()["detail"]["pushed"])
+            row = _trail_rows("publish_pr")[0]
+            self.assertEqual((row["actor"], row["result"]), ("human", "refused"))
+
+
+class TestInvestigationReportApi(unittest.TestCase):
+    def _runs(self, home: Path) -> Path:
+        return home / "plugin-data" / "factonio" / "runs"
+
+    def test_absent_present_truncated_and_scrubbed(self):
+        with isolated_hermes_home() as home:
+            client = _cp_client("factonio_test_cp_report")
+            r = client.get(f"{_CP}/workstreams/ws-inv/report")
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json(), {"ok": True, "exists": False, "tenant": "ws-inv", "filename": "investigation.md",
+                                        "content": None, "updated_at": None, "size_bytes": 0, "truncated": False,
+                                        "redacted": False})
+            self.assertFalse(self._runs(home).exists(), "the viewer never creates runs/ directories")
+            run = self._runs(home) / "ws-inv"
+            run.mkdir(parents=True)
+            (run / "investigation.md").write_text("# Findings\n\nSlow query in `db.py`.\n", encoding="utf-8")
+            body = client.get(f"{_CP}/workstreams/ws-inv/report").json()
+            self.assertEqual((body["exists"], body["content"], body["truncated"], body["redacted"]),
+                             (True, "# Findings\n\nSlow query in `db.py`.\n", False, False))
+            self.assertTrue(body["updated_at"].endswith("Z"))
+            self.assertEqual(body["size_bytes"], len("# Findings\n\nSlow query in `db.py`.\n"))
+            # Mixed-case tenants resolve to the same safe run directory the orchestrator writes.
+            self.assertEqual(client.get(f"{_CP}/workstreams/WS-Inv/report").json()["content"], body["content"])
+            (run / "investigation.md").write_text("ok line\nsee holdout/scenario-1.md\nend\n", encoding="utf-8")
+            scrubbed = client.get(f"{_CP}/workstreams/ws-inv/report")
+            self.assertNotIn("holdout", scrubbed.text.lower())
+            self.assertNotIn("scenario-1", scrubbed.text)
+            self.assertEqual((scrubbed.json()["content"], scrubbed.json()["redacted"]), ("ok line\n[redacted]\nend\n", True))
+            (run / "investigation.md").write_text("a hol\ndout/x\n", encoding="utf-8")
+            self.assertEqual(client.get(f"{_CP}/workstreams/ws-inv/report").json()["content"], "[redacted]")
+            big = "x" * (256 * 1024 + 10)
+            (run / "investigation.md").write_text(big, encoding="utf-8")
+            capped = client.get(f"{_CP}/workstreams/ws-inv/report").json()
+            self.assertEqual((len(capped["content"]), capped["truncated"], capped["size_bytes"]),
+                             (256 * 1024, True, len(big)))
+            for resp in (r, scrubbed, client.get(f"{_CP}/workstreams/ws-inv/report")):
+                self.assertNotIn(str(home), resp.text)
+            (run / "investigation.md").write_bytes(b"PK\x00\x01binary")
+            self.assertEqual(client.get(f"{_CP}/workstreams/ws-inv/report").status_code, 422)
+
+    def test_tenant_validation_and_confinement(self):
+        import os as _os
+
+        with isolated_hermes_home() as home:
+            client = _cp_client("factonio_test_cp_report_confine")
+            for tenant in ("..", ".hidden", "-x", "a..b", "holdout", "ws-holdout-1", "a%00b", "a%0Ab", "a b",
+                           "x" * 129, "%2E%2E", "ws%5Cx", "ws~1"):
+                with self.subTest(tenant=tenant):
+                    r = client.get(f"{_CP}/workstreams/{tenant}/report")
+                    self.assertIn(r.status_code, (404, 422), r.text)
+                    self.assertNotEqual(r.status_code, 200)
+            self.assertEqual(client.get(f"{_CP}/workstreams/a%2Fb/report").status_code, 404)
+            outside = home / "secret.md"
+            outside.write_text("TOP SECRET\n", encoding="utf-8")
+            runs = self._runs(home)
+            (runs / "ws-link").mkdir(parents=True)
+            (runs / "ws-link" / "investigation.md").symlink_to(outside)
+            (runs / "ws-dirlink").symlink_to(home)
+            (home / "investigation.md").write_text("ESCAPED\n", encoding="utf-8")
+            (runs / "ws-dir" / "investigation.md").mkdir(parents=True)
+            (runs / "ws-fifo").mkdir()
+            _os.mkfifo(runs / "ws-fifo" / "investigation.md")
+            for tenant in ("ws-link", "ws-dirlink", "ws-dir", "ws-fifo"):
+                with self.subTest(tenant=tenant):
+                    r = client.get(f"{_CP}/workstreams/{tenant}/report")
+                    self.assertEqual(r.status_code, 403, r.text)
+                    self.assertNotIn("SECRET", r.text)
+                    self.assertNotIn("ESCAPED", r.text)
+
+
+class TestHarnessAuditApi(unittest.TestCase):
+    def test_validation_status_codes_and_read_only_audit(self):
+        from factonio.config import get_repo
+        from factonio.harness import bootstrap_verify_harness
+        from tests.test_verify_harness import _commit_all, _index_fingerprint
+
+        with isolated_hermes_home() as home:
+            client = _cp_client("factonio_test_cp_harness")
+            self.assertEqual(client.post(f"{_CP}/repos/acme-svc/harness/audit").status_code, 404)
+            repo = _cp_register(home, git_repo=True)
+            bootstrap_verify_harness("acme/svc")
+            _commit_all(repo, "harness")
+            for payload in ([], "x", {"base_ref": "-x"}, {"base_ref": "--output=/tmp/x"}, {"base_ref": 5},
+                            {"base_ref": None}, {"base_ref": "main\n"}, {"base_ref": "a b"}, {"force": True}):
+                with self.subTest(payload=payload):
+                    self.assertEqual(client.post(f"{_CP}/repos/acme-svc/harness/audit", json=payload).status_code, 422)
+            index_before = _index_fingerprint(repo)
+            files_before = sorted(p.name for p in repo.rglob("*") if ".git" not in p.parts)
+            r = client.post(f"{_CP}/repos/acme-svc/harness/audit")
+            self.assertEqual(r.status_code, 200, r.text)
+            body = r.json()
+            self.assertEqual((body["ok"], body["slug"], body["repo"], body["present"]), (True, "acme-svc", "acme/svc", True))
+            for key in ("mode", "severity", "drifted", "drift_classification", "stale_invariants", "manifest_errors",
+                        "gate_loosening", "recommendations"):
+                self.assertIn(key, body)
+            self.assertNotIn("repo_path", body)
+            self.assertNotIn(str(repo), r.text)
+            self.assertEqual(client.post(f"{_CP}/repos/acme-svc/harness/audit", json={"base_ref": "HEAD"}).status_code, 200)
+            self.assertEqual(client.post(f"{_CP}/repos/acme-svc/harness/audit", json={"base_ref": "nope"}).status_code, 422)
+            self.assertEqual(_index_fingerprint(repo), index_before)
+            self.assertEqual(sorted(p.name for p in repo.rglob("*") if ".git" not in p.parts), files_before)
+            rows = _trail_rows("harness_audit")
+            self.assertEqual(len(rows), 2)
+            self.assertEqual({(r["actor"], r["phase"], r["repo_slug"]) for r in rows}, {("human", "harness", "acme-svc")})
+            self.assertEqual(rows[0]["result"], body["severity"])
+
+            import shutil
+
+            shutil.rmtree(Path(get_repo("acme-svc")["path"]))
+            self.assertEqual(client.post(f"{_CP}/repos/acme-svc/harness/audit").status_code, 409)
+
+    def test_repos_listing_stays_subprocess_free(self):
+        import subprocess as sp
+        from unittest import mock
+
+        with isolated_hermes_home() as home:
+            _cp_register(home, git_repo=True)
+            client = _cp_client("factonio_test_cp_repos_ro")
+            with mock.patch.object(sp, "run", side_effect=AssertionError("no subprocess")), \
+                    mock.patch.object(sp, "Popen", side_effect=AssertionError("no subprocess")):
+                self.assertEqual(client.get(f"{_CP}/repos").status_code, 200)
+
+
+class TestPanelAndArenaEvaluateApi(unittest.TestCase):
+    def test_panel_evaluate(self):
+        from factonio.orchestrator import spawn_verification_pair
+        from tests.test_local_publish_gate import TWO_VENDORS
+
+        with isolated_hermes_home() as home:
+            _cp_register(home)
+            client = _cp_client("factonio_test_cp_panel")
+            url = f"{_CP}/panels/evaluate"
+            for payload in (None, [], {}, {"pr_number": 3, "branch": "feat/x"}, {"pr_number": True},
+                            {"pr_number": "3"}, {"pr_number": 0}, {"pr_number": 2.0}, {"branch": ""},
+                            {"branch": 5}, {"panel_id": None}, {"tenant": "../x"}, {"record": False},
+                            {"tenant": "ws", "board": "x"}):
+                with self.subTest(payload=payload):
+                    self.assertEqual(client.post(url, json=payload).status_code, 422)
+            self.assertEqual(client.post(url, json={"pr_number": 9}).status_code, 404)
+            res = spawn_verification_pair("acme/svc", "ws-pan", 9, rigor="high", panel_models=TWO_VENDORS)
+            for lane in res["panel"]["lanes"]:
+                _cp_complete(lane["verify_diff_task_id"], "pass", findings=["see holdout/s.md"])
+                _cp_complete(lane["verify_blackbox_task_id"], "pass")
+            r = client.post(url, json={"tenant": "ws-pan", "pr_number": 9})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual((r.json()["consensus"], r.json()["merge_allowed"]), ("pass", True))
+            self.assertNotIn("holdout", r.text.lower())
+            self.assertEqual(len(_trail_rows("verify_panel_consensus")), 1)
+            again = client.post(url, json={"panel_id": res["panel"]["panel_id"]})
+            self.assertEqual((again.status_code, again.json()["recorded"]), (200, False))
+            self.assertEqual(len(_trail_rows("verify_panel_consensus")), 1)
+
+    def test_arena_evaluate_is_read_only_and_path_free(self):
+        with isolated_hermes_home() as home:
+            client = _cp_client("factonio_test_cp_arena")
+            url = f"{_CP}/arenas/evaluate"
+            for payload in (None, [], {}, {"arena_id": "ar_1111111111", "spawn_judge": True}, {"arena_id": 5},
+                            {"arena_id": "../ar_1"}, {"arena_id": "AR_11111111"}, {"tenant": "../x"},
+                            {"tenant": "ws", "judge_model": "x"}):
+                with self.subTest(payload=payload):
+                    self.assertEqual(client.post(url, json=payload).status_code, 422)
+            self.assertEqual(client.post(url, json={"arena_id": "ar_1111111111"}).status_code, 404)
+            aid = "ar_1111111111"
+            _seed_arena_cards(home / "kanban.db", time.time(), {
+                "t_a1": _arena_stamp(aid, "candidate", "define", "anthropic", slot="c1"),
+                "t_a2": _arena_stamp(aid, "candidate", "define", "openai", slot="c2"),
+            })
+            _write_arena_manifest(home, "ws-arena", aid, {
+                "arena_id": aid, "tenant": "ws-arena", "repo": "acme/svc", "target": "define",
+                "title": "Pick a spec", "created_at_ns": 5,
+                "candidates": [
+                    {"slot": "c1", "vendor": "anthropic", "model": "holdout/m", "task_id": "t_a1",
+                     "dir": str(home / "runs" / "c1"), "spec_path": str(home / "holdout" / "spec.md")},
+                    {"slot": "c2", "vendor": "openai", "model": "gpt", "task_id": "t_a2", "dir": str(home / "c2")},
+                ],
+            }, raw=None)
+            data_dir = home / "plugin-data"
+
+            def snapshot() -> list[tuple[str, int]]:
+                return sorted((str(p), p.stat().st_mtime_ns) for p in data_dir.rglob("*"))
+
+            before = snapshot()
+            for payload in ({"arena_id": aid}, {"tenant": "ws-arena"}, {"arena_id": aid, "tenant": "ws-arena"}):
+                with self.subTest(payload=payload):
+                    r = client.post(url, json=payload)
+                    self.assertEqual(r.status_code, 200, r.text)
+                    body = r.json()
+                    self.assertNotIn("holdout", r.text.lower())
+                    self.assertNotIn(str(home), r.text)
+                    self.assertNotIn("manifest_path", body)
+                    self.assertEqual((body["ok"], body["arena_id"], body["tenant"], body["repo"]),
+                                     (True, aid, "ws-arena", "acme/svc"))
+                    self.assertEqual([c["model"] for c in body["candidates"]], [None, "gpt"])
+                    self.assertIsNone(body["judge"])
+            self.assertEqual(snapshot(), before, "never spawns a judge or writes a manifest")
+            from hermes_cli.kanban_db_connect import connect_closing
+
+            with connect_closing(db_path=home / "kanban.db") as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 2)
+            self.assertEqual(_trail_rows("spawn_arena_judge"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

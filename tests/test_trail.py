@@ -1201,5 +1201,250 @@ class TestIsoFormatting(unittest.TestCase):
         self.assertEqual(trail._iso(trail._parse_iso(stamp)), stamp)
 
 
+def _trail_api(name: str):
+    spec = importlib.util.spec_from_file_location(name, PLUGIN_ROOT / "dashboard" / "plugin_api.py")
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    app = FastAPI()
+    app.include_router(mod.router, prefix="/api/plugins/factonio")
+    return TestClient(app)
+
+
+_LEGACY_FILTERS = {"tenant": None, "repo": None, "phase": None, "card_id": None, "limit": 100}
+
+
+class TestTrailSignalFilters(unittest.TestCase):
+    """Additive read-only `GET /trail` filters: actor, q, signal, include_superseded."""
+
+    def _seed(self) -> dict[str, dict[str, Any]]:
+        from factonio import trail
+
+        rows: dict[str, dict[str, Any]] = {}
+        rows["tick1"] = trail.log_decision("pr_gate", tenant="w", phase="gate", why="CI pending",
+                                           evidence={"pr_number": 7}, result="pending")
+        rows["tick2"] = trail.log_decision("bootstrap_verify", tenant="w", phase="harness", why="harness ok",
+                                           evidence={"files": 2}, result="clean")
+        rows["human_gate"] = trail.log_decision("pr_gate", tenant="w", phase="gate", actor="human",
+                                                why="Manual gate check", evidence={"pr_number": 7}, result="ready")
+        rows["gate_err"] = trail.log_decision("pr_gate", tenant="w", phase="gate", why="gh failed",
+                                              evidence={"pr_number": 7}, result="error")
+        rows["spawn"] = trail.log_decision("spawn_verify", tenant="w", phase="verify", card_id="t_v1",
+                                           why="Spawn Webhook Retry checks", evidence={"pr_number": 7})
+        rows["orig"] = trail.log_decision("merge_strategy", tenant="w", phase="merge", why="squash",
+                                          evidence={"pr_number": 7})
+        rows["fix"] = trail.log_decision("merge_strategy", tenant="w", phase="merge", why="rebase instead",
+                                         evidence={"pr_number": 7}, supersedes_id=rows["orig"]["id"])
+        rows["escape"] = trail.log_decision("escape", tenant="w", phase="escape", why="bug escaped",
+                                            evidence={"pr_number": 7})
+        rows["blank"] = trail.log_decision("note", tenant="w", phase="define", why="", evidence={})
+        rows["secret"] = trail.log_decision("arena_synthesis", tenant="w", phase="define", why="read holdout/scenario-9.md",
+                                            evidence={"winner": "c1"})
+        return rows
+
+    def test_legacy_filters_shape_and_read_only_store(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            client = _trail_api("factonio_test_trail_filters_legacy")
+            path = trail.trail_db_path()
+            empty = client.get("/api/plugins/factonio/trail")
+            self.assertEqual(empty.status_code, 200, empty.text)
+            self.assertEqual(empty.json()["filters"], _LEGACY_FILTERS)
+            self.assertFalse(path.exists(), "GET /trail must never create trail.db")
+            self._seed()
+            before = (path.read_bytes(), path.stat().st_mtime_ns)
+            listing = client.get("/api/plugins/factonio/trail").json()
+            self.assertEqual(listing["filters"], _LEGACY_FILTERS)
+            self.assertEqual(len(listing["decisions"]), 10)
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+            explicit = client.get("/api/plugins/factonio/trail?signal=all&include_superseded=true").json()
+            self.assertEqual(explicit["filters"], {**_LEGACY_FILTERS, "signal": "all", "include_superseded": True})
+            self.assertEqual(len(explicit["decisions"]), 10)
+
+    def test_actor_signal_superseded_and_attention(self):
+        with isolated_hermes_home():
+            rows = self._seed()
+            client = _trail_api("factonio_test_trail_filters_signal")
+            base = "/api/plugins/factonio/trail"
+
+            def ids(query: str) -> set[str]:
+                r = client.get(f"{base}?{query}")
+                self.assertEqual(r.status_code, 200, r.text)
+                return {d["id"] for d in r.json()["decisions"]}
+
+            self.assertEqual(ids("actor=human"), {rows["human_gate"]["id"]})
+            key = ids("signal=key")
+            self.assertNotIn(rows["tick1"]["id"], key)
+            self.assertNotIn(rows["tick2"]["id"], key)
+            for name in ("human_gate", "gate_err", "spawn", "orig", "fix", "escape"):
+                self.assertIn(rows[name]["id"], key, name)
+            active = ids("include_superseded=false")
+            self.assertNotIn(rows["orig"]["id"], active)
+            self.assertIn(rows["fix"]["id"], active)
+            attention = ids("signal=attention")
+            self.assertIn(rows["escape"]["id"], attention)
+            self.assertIn(rows["gate_err"]["id"], attention)
+            self.assertIn(rows["blank"]["id"], attention, "missing_evidence audit finding")
+            self.assertNotIn(rows["tick1"]["id"], attention)
+            self.assertNotIn(rows["orig"]["id"], attention)
+            summary = client.get(f"{base}?signal=key").json()["summary"]
+            self.assertEqual(summary["total"], len(key))
+            for bad in ("signal=keys", "signal=", "include_superseded=maybe", f"q={'x' * 201}"):
+                with self.subTest(bad=bad):
+                    self.assertEqual(client.get(f"{base}?{bad}").status_code, 422)
+
+    def test_keyword_search_is_parameterized_and_barrier_safe(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            rows = self._seed()
+            pct = trail.log_decision("note", tenant="w", phase="define", why="coverage at 100% now", evidence={"k": "v"})
+            client = _trail_api("factonio_test_trail_filters_q")
+            base = "/api/plugins/factonio/trail"
+
+            def search(q: str) -> list[str]:
+                r = client.get(base, params={"q": q})
+                self.assertEqual(r.status_code, 200, r.text)
+                self.assertEqual(r.json()["filters"]["q"], q)
+                return [d["id"] for d in r.json()["decisions"]]
+
+            self.assertEqual(search("WEBHOOK retry"), [rows["spawn"]["id"]])
+            self.assertEqual(search("t_v1"), [rows["spawn"]["id"]])
+            self.assertEqual(search("100%"), [pct["id"]])
+            self.assertEqual(search("%"), [pct["id"]], "LIKE wildcards are escaped")
+            underscored = search("_")
+            self.assertIn(rows["tick1"]["id"], underscored)
+            self.assertNotIn(rows["blank"]["id"], underscored)
+            # Barrier oracle guard: no search can reveal which row held redacted holdout text.
+            for probe in ("holdout", "HOLD-OUT/", "scenario-9", "hold\u200bout"):
+                with self.subTest(probe=probe):
+                    r = client.get(base, params={"q": probe})
+                    self.assertEqual(r.status_code, 200)
+                    self.assertEqual(r.json()["decisions"], [])
+                    self.assertEqual(r.json()["summary"]["total"], 0)
+                    self.assertNotIn("holdout", r.text.lower())
+            self.assertEqual(search("c1"), [rows["secret"]["id"]], "unredacted evidence stays searchable")
+
+    def test_non_finite_evidence_is_json_safe(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            row = trail.log_decision("note", tenant="w", phase="eval", why="score", evidence={"score": float("nan"),
+                                                                                              "hi": float("inf")})
+            client = _trail_api("factonio_test_trail_filters_nan")
+            r = client.get("/api/plugins/factonio/trail")
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json()["decisions"][0]["evidence"], {"score": None, "hi": None})
+            self.assertEqual(client.get(f"/api/plugins/factonio/trail/{row['id']}").status_code, 200)
+
+
+class TestTrailAuditApi(unittest.TestCase):
+    def test_audit_route_precedes_detail_and_is_read_only(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            client = _trail_api("factonio_test_trail_audit_api")
+            base = "/api/plugins/factonio/trail/audit"
+            empty = client.get(base)
+            self.assertEqual(empty.status_code, 200, empty.text)
+            self.assertEqual((empty.json()["clean"], empty.json()["inspected"]), (True, 0))
+            self.assertFalse(trail.trail_db_path().exists())
+            bad = trail.log_decision("merge_pr", tenant="w", phase="merge", why="holdout/s1.md said ok",
+                                     evidence={"holdout_files": 3}, result="merged")
+            trail.log_decision("note", tenant="other", phase="define", why="", evidence={})
+            r = client.get(base, params={"tenant": "w"})
+            self.assertEqual(r.status_code, 200, r.text)
+            body = r.json()
+            self.assertEqual(body["filters"], {"tenant": "w", "repo": None, "phase": None, "card_id": None})
+            self.assertFalse(body["clean"])
+            self.assertEqual({f["decision_id"] for f in body["findings"]}, {bad["id"]})
+            self.assertNotIn("holdout", r.text.lower())
+
+    def test_audit_unreadable_store_is_503(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            client = _trail_api("factonio_test_trail_audit_503")
+            path = trail.trail_db_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.mkdir()
+            self.assertEqual(client.get("/api/plugins/factonio/trail/audit").status_code, 503)
+            path.rmdir()
+            path.write_bytes(b"not a sqlite database" * 100)
+            for url in ("/trail/audit", "/trail", "/trail/d_000000000000"):
+                with self.subTest(url=url):
+                    self.assertEqual(client.get(f"/api/plugins/factonio{url}").status_code, 503)
+
+
+class TestHumanDecisionsApi(unittest.TestCase):
+    URL = "/api/plugins/factonio/trail/decisions"
+    OK = {"decision": "approve_design", "phase": "design", "why": "Previews match DESIGN.md", "confirmed": True}
+
+    def test_validation_is_strict(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            client = _trail_api("factonio_test_human_decisions_validation")
+            bad = [
+                [], "x", None,
+                {**self.OK, "actor": "human"},
+                {**self.OK, "actor": "orchestrator"},
+                {**self.OK, "confirmed": False},
+                {**self.OK, "confirmed": "true"},
+                {k: v for k, v in self.OK.items() if k != "confirmed"},
+                {**self.OK, "decision": ""},
+                {**self.OK, "decision": "   "},
+                {**self.OK, "decision": 1},
+                {**self.OK, "decision": True},
+                {**self.OK, "why": None},
+                {**self.OK, "why": {"a": 1}},
+                {**self.OK, "phase": "verify-diff"},
+                {**self.OK, "phase": "DESIGN"},
+                {**self.OK, "tenant": "../x"},
+                {**self.OK, "tenant": 5},
+                {**self.OK, "repo": False},
+                {**self.OK, "card_id": "t\x00x"},
+                {**self.OK, "evidence": ["a"]},
+                {**self.OK, "evidence": "{}"},
+                {**self.OK, "evidence": {"blob": "x" * (17 * 1024)}},
+                {**self.OK, "spawn": True},
+            ]
+            for payload in bad:
+                with self.subTest(payload=payload):
+                    self.assertEqual(client.post(self.URL, json=payload).status_code, 422)
+            self.assertEqual(client.post(self.URL, content=b"[1]", headers={"content-type": "application/json"}).status_code, 422)
+            self.assertFalse(trail.trail_db_path().exists(), "rejected requests never write trail.db")
+            missing = client.post(self.URL, json={**self.OK, "supersedes_id": "d_000000000000"})
+            self.assertEqual(missing.status_code, 404, missing.text)
+
+    def test_append_supersede_and_scrub(self):
+        from factonio import trail
+
+        with isolated_hermes_home():
+            client = _trail_api("factonio_test_human_decisions_ok")
+            first = client.post(self.URL, json={**self.OK, "tenant": "ws-1", "card_id": "t_d1", "result": "approved",
+                                                "evidence": {"design_dir": "runs/ws-1/design", "previews": 2}})
+            self.assertEqual(first.status_code, 201, first.text)
+            row = first.json()["decision"]
+            self.assertTrue(first.json()["ok"])
+            self.assertEqual((row["actor"], row["decision"], row["phase"], row["tenant"], row["result"]),
+                             ("human", "approve_design", "design", "ws-1", "approved"))
+            fix = client.post(self.URL, json={"decision": "request_revision", "phase": "design", "confirmed": True,
+                                              "why": "Contrast too low\nsee holdout/a.md", "supersedes_id": row["id"],
+                                              "evidence": {"holdout_note": "x", "ok": 1}})
+            self.assertEqual(fix.status_code, 201, fix.text)
+            self.assertNotIn("holdout", fix.text.lower())
+            self.assertEqual(fix.json()["decision"]["why"], "[redacted]")
+            self.assertEqual(fix.json()["decision"]["evidence"], {"ok": 1})
+            stored = trail.get_decision(row["id"])
+            self.assertEqual(stored["superseded_by"], [fix.json()["decision"]["id"]])
+            self.assertEqual(stored["result"], "approved", "the original row is never mutated")
+            self.assertEqual(trail.get_decision(fix.json()["decision"]["id"])["actor"], "human")
+
+
 if __name__ == "__main__":
     unittest.main()

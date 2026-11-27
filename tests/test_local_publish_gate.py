@@ -711,7 +711,8 @@ class TestLocalTargetMetrics(unittest.TestCase):
 
         _complete(task_id, None, branch=branch, base_branch="main", head_sha=SHA,
                   pr_title="Fix widget", pr_body="## Why\nx", repo="acme/svc")
-        want = {"repo": "acme/svc", "branch": branch, "base_branch": "main", "head_sha": SHA, "source": "metadata"}
+        want = {"repo": "acme/svc", "branch": branch, "base_branch": "main", "head_sha": SHA, "source": "metadata",
+                "pr_title": "Fix widget", "pr_body": "## Why\nx"}
         card = next(c for c in thread_cards(home / "kanban.db", tenant=tenant)["cards"] if c["id"] == task_id)
         self.assertIsNone(card["pr"])
         self.assertEqual(card["local_target"], want)
@@ -782,7 +783,8 @@ class TestLocalTargetMetrics(unittest.TestCase):
                       pr_title="Add x", pr_body="## Why\nx", repo="acme/svc")
             card = next(c for c in thread_cards(home / "kanban.db", tenant="t-hand")["cards"] if c["id"] == impl["task_id"])
             self.assertEqual(card["local_target"], {"repo": "acme/svc", "branch": "factonio/t_1", "base_branch": "main",
-                                                    "head_sha": SHA, "source": "metadata"})
+                                                    "head_sha": SHA, "source": "metadata",
+                                                    "pr_title": "Add x", "pr_body": "## Why\nx"})
             self.assertIsNone(card["pr"])
             run = _cli()
             code, text, _ = run("status", "--tenant", "t-hand")
