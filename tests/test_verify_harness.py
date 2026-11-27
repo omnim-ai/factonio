@@ -2739,9 +2739,13 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
         "heredoc body": ("python3 - <<'EOF'\nt = 0.01\nEOF", "python3 - <<'EOF'\nt = 0.01 --True\nEOF"),
         "unclosed quote": ("python3 check.py", "python3 check.py 'unclosed"),
         "trailing backslash": ("python3 check.py", "python3 check.py \\"),
+        # quoting is never normalized away: a quote-only edit of any word is an unverifiable rewrite
+        "quoted export argument": (_EXPORTED, "export 'THRESHOLD=0.01'; python3 check.py"),
+        "quoted script argument": (_EXPORTED, "export THRESHOLD=0.01; python3 \"check.py\""),
+        "quote mutations": (_EXPORTED, "export 'THRESHOLD=0.01'; python3 \"check.py\""),
     }
     _UNCHANGED = (
-        _EXPORTED, "env - python3 -u check.py", "env -S '-u FOO python3 -u check.py'",
+        _EXPORTED, "export 'THRESHOLD=0.01'; python3 \"check.py\"", "env - python3 -u check.py", "env -S '-u FOO python3 -u check.py'",
         "bash -c 'export THRESHOLD=0.01; python3 check.py'", "go test -run TestVisual -fuzz=FuzzUI ./...",
         "npx playwright test --project=chromium",
         "timeout 30 python3 -u check.py", "UPDATE_SNAPSHOTS=0 npx playwright test",
@@ -2769,7 +2773,6 @@ class TestFailClosedStructuralVisualHookPolicy(unittest.TestCase):
         "comment + whitespace": (_EXPORTED, "export THRESHOLD=0.01;   python3 check.py  # visual check"),
         "newlines": (_EXPORTED, "export THRESHOLD=0.01\npython3 check.py\n"),
         "line continuation": ("python3 check.py --threshold 0.01", "python3 check.py \\\n  --threshold 0.01"),
-        "harmless quoting": (_EXPORTED, "export 'THRESHOLD=0.01'; python3 \"check.py\""),
         "argv form": ("python3 check.py", ["python3", "check.py"]),
     }
 
@@ -3071,12 +3074,13 @@ class TestFixRound13StructuralGuardHardening(unittest.TestCase):
 
         from factonio.harness import _parse_value
 
-        for raw, value in (("0", "0"), ("0.05", "0.05"), (".01", "0.01"), ("1%", "1"), ("10%", "10"),
-                           ("1e-2", "0.01"), ("5e-3", "0.005"), ("1E+0", "1")):
+        for raw, value in (("0", "0"), ("0.05", "0.05"), ("1.5", "1.5"), ("1%", "1"), ("10%", "10"),
+                           ("0.5%", "0.5"), ("5", "5")):
             with self.subTest(raw=raw):
                 self.assertEqual(_parse_value(raw)[0], Decimal(value))
         for raw in ("0.0_1", "0_1%", "\uff10.\uff10\uff11", "\u0660.\u0660\u0661", "\uff11%", "+0.01", "-0.01",
-                    "NaN", "inf", "1.", "01", " 0.01", "0.01 ", "0x1", "1e", "%", ""):
+                    "NaN", "inf", "1.", "01", " 0.01", "0.01 ", "0x1", "1e", "%", "",
+                    ".01", ".0", "1e-2", "5e-3", "1E+0", "9e-2", "999e-3", "1e0%"):
             with self.subTest(raw=raw):
                 self.assertIsNone(_parse_value(raw)[0])
 
@@ -3094,7 +3098,11 @@ class TestFixRound13StructuralGuardHardening(unittest.TestCase):
         pairs += [("node check.js --threshold 5%", f"node check.js --threshold {v}") for v in ("0_1%", "\uff11%")]
         self._assert_executed_bypasses_rejected(pairs)
         self._assert_clean({v: ("node check.js --threshold 0.05", f"node check.js --threshold {v}")
-                            for v in ("0.01", ".01", "1e-2")})
+                            for v in ("0.01", "0.005", "0")})
+        self._assert_rejected({v: ("node check.js --threshold 0.05", f"node check.js --threshold {v}")
+                               for v in (".01", "1e-2")})
+        self._assert_clean({f"unchanged {v}": (f"node check.js --threshold {v}", f"node check.js --threshold {v}")
+                            for v in (".01", "1e-2")})
         self._assert_clean({"unchanged odd literal": ("node check.js --threshold 0.0_1",
                                                       "node check.js --threshold 0.0_1")})
 
@@ -3530,16 +3538,19 @@ class TestFixRound16IntegerThresholdsAndStrictRunners(unittest.TestCase):
                                "percent": ("node pixels.js --max-diff-pixels=5%", "node pixels.js --max-diff-pixels=1e0%"),
                                "env": ("MAX_DIFF_PIXELS=5 node pixels.js", "MAX_DIFF_PIXELS=.0 node pixels.js")})
         reasons = _visual_hook_loosening({"command": base}, {"command": rewritten["scientific"]})
-        self.assertTrue(any(r.startswith("rewrites integer threshold `--max-diff-pixels` as a non-integer (999e-3")
+        self.assertIn("sets non-finite or unparseable threshold `--max-diff-pixels` (999e-3)", reasons)
+        reasons = _visual_hook_loosening({"command": base}, {"command": rewritten["decimal"]})
+        self.assertTrue(any(r.startswith("rewrites integer threshold `--max-diff-pixels` as a non-integer (0.5")
                             for r in reasons), reasons)
         self.assertFalse(any(r.startswith("loosens threshold") for r in reasons), reasons)
+        self._assert_rejected({"float 0.05 -> 1e-2": ("node check.js --threshold 0.05", "node check.js --threshold 1e-2")})
         self._assert_clean({
             "5 -> 2": (base, "node pixels.js --max-diff-pixels=2"),
             "5 -> 0": (base, "node pixels.js --max-diff-pixels=0"),
             "5% -> 1%": ("node pixels.js --max-diff-pixels=5%", "node pixels.js --max-diff-pixels=1%"),
             "float 0.05 -> 0.01": ("node check.js --threshold 0.05", "node check.js --threshold 0.01"),
             "float 0.05 -> 0": ("node check.js --threshold 0.05", "node check.js --threshold 0"),
-            "float 0.05 -> 1e-2": ("node check.js --threshold 0.05", "node check.js --threshold 1e-2"),
+            "float 0.05 -> 0.005": ("node check.js --threshold 0.05", "node check.js --threshold 0.005"),
         })
 
     @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
@@ -3702,6 +3713,8 @@ class TestFixRound17ExactThresholdsAndRawQuoting(unittest.TestCase):
                                     "if true; then '!' node check.js --threshold 0.05; fi"),
             "quoted assignment after redirection": ("2>/dev/null THRESHOLD=0.05 node check.js",
                                                     "2>/dev/null 'THRESHOLD=0.05' node check.js"),
+            "quoted plain argument": ("node check.js snapshots/home.png", "node check.js 'snapshots/home.png'"),
+            "quoted export argument": ("export THRESHOLD=0.05; node check.js", "export 'THRESHOLD=0.05'; node check.js"),
         })
         self._assert_clean({
             "unchanged quoted assignment word": ("'THRESHOLD=0.05'; node check.js", "'THRESHOLD=0.05'; node check.js"),
@@ -3709,8 +3722,8 @@ class TestFixRound17ExactThresholdsAndRawQuoting(unittest.TestCase):
             "quoted value tightened": ("THRESHOLD='0.05' node check.js", "THRESHOLD='0.01' node check.js"),
             "value quoting added": (assign, "THRESHOLD='0.05'; export THRESHOLD; node check.js"),
             "flag value quoting tightened": ("node check.js --threshold 0.05", "node check.js --threshold '0.01'"),
-            "quoted plain argument": ("node check.js snapshots/home.png", "node check.js 'snapshots/home.png'"),
-            "quoted export argument": ("export THRESHOLD=0.05; node check.js", "export 'THRESHOLD=0.05'; node check.js"),
+            "unchanged quoted export argument": ("export 'THRESHOLD=0.05'; node check.js",
+                                                 "export 'THRESHOLD=0.05'; node check.js"),
         })
 
     @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
@@ -3727,6 +3740,125 @@ class TestFixRound17ExactThresholdsAndRawQuoting(unittest.TestCase):
             ("! node check.js --threshold 0.05 && exit 1; true", "'!' node check.js --threshold 0.05 && exit 1; true"),
             ("bash -c 'if ! node check.js --threshold 0.05; then exit 1; fi'", "bash -c 'if \"!\" node check.js --threshold 0.05; then exit 1; fi'"),
         ])
+
+
+class TestFixRound18RawQuotingAndFixedPointThresholds(unittest.TestCase):
+    """Round 18: words compare by exact source spelling everywhere (quoting changes meaning inside `[[ =~ ]]`,
+    `(( ))` and after `time -p`), and an edited threshold must be plain fixed-point decimal on both sides, so
+    a smaller value is never larger under `parseInt`, `parseFloat`/`Number` or `Decimal`."""
+
+    _set_command = staticmethod(TestFixRound2VisualGuardAndHarnessGaps._set_command)
+    _assert_rejected = TestFailClosedStructuralVisualHookPolicy._assert_rejected
+    _assert_clean = TestFailClosedStructuralVisualHookPolicy._assert_clean
+    _assert_executed_bypasses_rejected = TestFixRound13StructuralGuardHardening._assert_executed_bypasses_rejected
+    # 5 differing pixels against `parseInt(--max-diff-pixels, 10)`, with no NaN guard (`5 > NaN` is false).
+    _PARSEINT_JS = (
+        "const arg = process.argv.slice(2).find((a) => a.startsWith('--max-diff-pixels='));\n"
+        "const limit = parseInt(arg ? arg.slice(18) : '0', 10);\n"
+        "process.exit(5 > limit ? 1 : 0);\n"
+    )
+    _REGEX = "bash -c 'out=$(python3 check.py); [[ ! $out =~ ^FAIL ]]'"
+    _ARITH = "bash -c 'diff=$(python3 check.py); if (( diff != 0 )); then exit 1; fi'"
+    _TIME_NEG = "bash -c 'if time -p ! python3 check.py; then exit 1; fi'"
+    _TIME_ASSIGN = "bash -c 'time -p THRESHOLD=0.05; export THRESHOLD; python3 check.py'"
+    _QUOTE_MUTATIONS = (
+        (_REGEX, "bash -c 'out=$(python3 check.py); [[ ! $out =~ \"^FAIL\" ]]'"),
+        (_ARITH, "bash -c 'diff=$(python3 check.py); if (( diff \\!= 0 )); then exit 1; fi'"),
+        (_TIME_NEG, "bash -c 'if time -p \"!\" python3 check.py; then exit 1; fi'"),
+        (_TIME_ASSIGN, "bash -c 'time -p \"THRESHOLD=0.05\"; export THRESHOLD; python3 check.py'"),
+    )
+    # The `check.py` each committed command runs; every committed command fails its hook.
+    _CHECKS = {
+        _REGEX: "print('FAIL: 100 pixels differ')\n",
+        _ARITH: "print(100)\n",
+        _TIME_NEG: "import sys\nsys.exit(1)\n",
+        _TIME_ASSIGN: ("import os, sys\n"
+                       "sys.exit(0 if 0.25 <= float(os.environ.get('THRESHOLD') or '1.0') else 1)\n"),
+    }
+
+    def _repo(self, home: Path, name: str, command: Any) -> Path:
+        from factonio.harness import bootstrap_verify_harness
+
+        repo = _make_repo(home, name)
+        _write(repo, "snapshots/home.png", "png-v1\n")
+        _write(repo, "check.py", self._CHECKS.get(command, "import sys\nsys.exit(1)\n"))
+        _write(repo, "check.js", self._PARSEINT_JS)
+        _commit_all(repo, "visual checks + baseline")
+        bootstrap_verify_harness(str(repo), hooks=[
+            {"name": "pixels", "kind": "visual_diff", "command": command, "baseline_paths": ["snapshots/**"]},
+        ])
+        _commit_all(repo, "harness")
+        return repo
+
+    def test_quote_only_mutations_are_rejected_statically(self):
+        self._assert_rejected({live: (base, live) for base, live in self._QUOTE_MUTATIONS})
+        self._assert_clean({f"unchanged {live}": (live, live) for _, live in self._QUOTE_MUTATIONS})
+        self._assert_clean({f"unchanged {base}": (base, base) for base, _ in self._QUOTE_MUTATIONS})
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is required for `[[`, `((` and `time -p`")
+    def test_quote_only_mutations_are_rejected_end_to_end(self):
+        """Each quoted word changes bash semantics: a literal `=~` pattern, an arithmetic syntax error, a `!`
+        command instead of negation, a `THRESHOLD=0.05` command instead of an assignment; each turns green."""
+        self._assert_executed_bypasses_rejected(list(self._QUOTE_MUTATIONS))
+
+    def test_edited_thresholds_must_be_plain_fixed_point(self):
+        from factonio.harness import _visual_hook_loosening
+
+        flag = "node check.js --max-diff-pixels={}"
+        self._assert_rejected({
+            "0.5 -> 9e-2": (flag.format("0.5"), flag.format("9e-2")),
+            "0.5 -> .0": (flag.format("0.5"), flag.format(".0")),
+            "1.5 -> 999e-3": (flag.format("1.5"), flag.format("999e-3")),
+            "0.05 -> 1e-2": ("node check.js --threshold 0.05", "node check.js --threshold 1e-2"),
+            "0.05 -> .01": ("node check.js --threshold 0.05", "node check.js --threshold .01"),
+            "1e-1 -> 1e-2": ("node check.js --threshold 1e-1", "node check.js --threshold 1e-2"),
+            ".05 -> 0.01": ("node check.js --threshold .05", "node check.js --threshold 0.01"),
+            "env 0.05 -> 1e-2": ("THRESHOLD=0.05 node check.js", "THRESHOLD=1e-2 node check.js"),
+        })
+        self.assertIn("sets non-finite or unparseable threshold `--max-diff-pixels` (9e-2)",
+                      _visual_hook_loosening({"command": flag.format("0.5")}, {"command": flag.format("9e-2")}))
+        self._assert_clean({
+            "0.5 -> 0.1": (flag.format("0.5"), flag.format("0.1")),
+            "1.5 -> 1.2": (flag.format("1.5"), flag.format("1.2")),
+            "1.5 -> 0.5": (flag.format("1.5"), flag.format("0.5")),
+            "0.05 -> 0": ("node check.js --threshold 0.05", "node check.js --threshold 0"),
+            "5% -> 1%": ("node check.js --threshold 5%", "node check.js --threshold 1%"),
+            "1.5% -> 0.5%": ("node check.js --threshold 1.5%", "node check.js --threshold 0.5%"),
+            "unchanged 1e-2": ("node check.js --threshold 1e-2", "node check.js --threshold 1e-2"),
+            "unchanged .01": ("node check.js --threshold .01", "node check.js --threshold .01"),
+            "quoted value tightened": ("THRESHOLD='0.05' node check.js", "THRESHOLD='0.01' node check.js"),
+        })
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
+    def test_parseint_threshold_rewrites_are_rejected_end_to_end(self):
+        """`parseInt("0.5", 10)` is 0 but `parseInt("9e-2", 10)` is 9, `parseInt(".0", 10)` NaN and
+        `parseInt("999e-3", 10)` 999: each exactly-smaller rewrite raises the effective limit past 5 pixels."""
+        flag = "node check.js --max-diff-pixels={}"
+        self._assert_executed_bypasses_rejected([
+            (flag.format("0.5"), flag.format("9e-2")),
+            (flag.format("0.5"), flag.format(".0")),
+            (flag.format("1.5"), flag.format("999e-3")),
+        ])
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the JS visual checker")
+    def test_fixed_point_tightening_keeps_the_parseint_bar(self):
+        from factonio.harness import audit_harness, check_harness
+
+        flag = "node check.js --max-diff-pixels={}"
+        # unchanged `.01` is `parseInt` NaN (`5 > NaN` passes): committed as such, it is not an edit to judge
+        cases = (("0.5", "0.1", True), ("1.5", "1.2", True), ("1.5", "0.5", True), ("1e-2", "1e-2", True),
+                 (".01", ".01", False))
+        with isolated_hermes_home() as home:
+            for n, (base, live, fails) in enumerate(cases):
+                with self.subTest(base=base, live=live):
+                    repo = self._repo(home, f"svc{n}", flag.format(base))
+                    self._set_command(repo, flag.format(live))
+                    chk = check_harness(str(repo), run_hooks=True)
+                    self.assertEqual(chk["hook_results"]["failed_required"], ["pixels"] if fails else [])
+                    self.assertEqual(chk["errors"], ["Required hook 'pixels' failed"] if fails else [])
+                    self.assertFalse(chk["gate_loosening"]["loosened"], chk["gate_loosening"])
+                    audit = audit_harness(str(repo))
+                    self.assertFalse(audit["gate_loosening"]["loosened"], audit["gate_loosening"])
 
 
 if __name__ == "__main__":
