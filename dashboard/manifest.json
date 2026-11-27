@@ -2,7 +2,7 @@
   "name": "factonio",
   "label": "Factonio",
   "description": "Factonio metrics, models, thread cards, and registered repository settings (view and edit) API for Hermes Desktop",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "tab": { "path": "/factonio", "hidden": true },
   "api": "plugin_api.py"
 }
