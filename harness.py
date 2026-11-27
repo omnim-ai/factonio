@@ -1180,6 +1180,59 @@ def discover_harness(repo_path: str | Path) -> dict[str, Any]:
     }
 
 
+def summarize_harness_readonly(repo_path: Optional[str | Path]) -> dict[str, Any]:
+    """Dashboard-safe `.factonio/` summary from direct file reads only.
+
+    Runs no subprocess, git command, Doctor check or hook. A missing or non-directory path reads as
+    absent; malformed `harness.json` (invalid JSON, non-object, unsupported schema_version, non-list
+    or non-object hooks) sets ``has_manifest_error`` instead of raising.
+    """
+    summary: dict[str, Any] = {
+        "present": False,
+        "mode": "absent",
+        "required_hooks": 0,
+        "optional_hooks": 0,
+        "invariant_hooks": 0,
+        "visual_diff_hooks": 0,
+        "frozen_visual_hooks": 0,
+        "has_manifest_error": False,
+    }
+    if not repo_path or not str(repo_path).strip():
+        return summary
+    try:
+        root = Path(repo_path).expanduser()
+        if not root.is_dir():
+            return summary
+        info = discover_harness(root)
+    except (OSError, ValueError):
+        return {**summary, "has_manifest_error": True}
+    manifest = info.get("manifest")
+    raw_hooks = manifest.get("hooks") if isinstance(manifest, dict) else None
+    error = bool(info.get("manifest_error")) or (
+        isinstance(manifest, dict)
+        and (
+            type(manifest.get("schema_version")) is not int
+            or manifest.get("schema_version") != HARNESS_SCHEMA_VERSION
+            or (raw_hooks is not None and (not isinstance(raw_hooks, list) or not all(isinstance(h, dict) for h in raw_hooks)))
+        )
+    )
+    hooks = [h for h in info.get("hooks") or [] if isinstance(h, dict)]
+    visual = [h for h in hooks if h.get("kind") == "visual_diff"]
+    summary.update({
+        "present": bool(info.get("present")),
+        "mode": str(info.get("mode") or "absent"),
+        "required_hooks": sum(1 for h in hooks if h.get("optional") is not True),
+        "optional_hooks": sum(1 for h in hooks if h.get("optional") is True),
+        "invariant_hooks": sum(1 for h in hooks if h.get("kind") == "invariant"),
+        "visual_diff_hooks": len(visual),
+        "frozen_visual_hooks": sum(
+            1 for h in visual if _is_str_list(h.get("baseline_paths"), non_empty_items=True) and h["baseline_paths"] and h.get("frozen_baseline") is not False
+        ),
+        "has_manifest_error": bool(error),
+    })
+    return summary
+
+
 def show_harness(repo_spec: str) -> dict[str, Any]:
     """Return discovered harness metadata, parsed `harness.json`, and `verify.md` content."""
     target = _resolve_repo(repo_spec)

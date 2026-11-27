@@ -14,6 +14,7 @@ from typing import Any, Optional
 from .config import (
     PLUGIN_ID,
     WORKER_PROFILE,
+    WORKSTREAM_KINDS,
     get_repo,
     get_root_hermes_home_path,
     load_settings,
@@ -39,8 +40,6 @@ from .trail import (
 logger = logging.getLogger("factonio.orchestrator")
 
 _SLUG_RE = re.compile(r"[^a-z0-9-]+")
-
-WORKSTREAM_KINDS: tuple[str, ...] = ("feature", "bug", "quick", "refactor", "perf", "investigate")
 
 BENCHMARK_PRE_OPT_QUESTIONS: tuple[str, ...] = (
     "Which user-visible or SLO metric is too slow or too costly, and what are the current and target numbers?",

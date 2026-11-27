@@ -19,7 +19,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from .config import (
     PLUGIN_ID,
@@ -44,7 +44,7 @@ from .orchestrator import (
     run_data_dir,
     spec_file_path,
 )
-from .trail import record_transition
+from .trail import contains_holdout_reference, record_transition
 
 ARENA_TARGETS: tuple[str, ...] = ("define", "design")
 ARENA_ID_RE = re.compile(r"^ar_[0-9a-f]{6,32}$")
@@ -759,6 +759,138 @@ def _count_files(directory: Path) -> int:
         return 0
 
 
+def _evaluate_manifest_state(
+    manifest: dict[str, Any],
+    tasks_by_id: dict[str, dict[str, Any]],
+    judge_rows: list[dict[str, Any]],
+    db_error: Optional[str],
+    *,
+    include_paths: bool,
+) -> dict[str, Any]:
+    """Pure arena status/synthesis calculation shared by `evaluate_arena` and `list_arena_summaries`.
+
+    With ``include_paths=False`` the result carries no filesystem path, holdout file count, or
+    path-bearing advisory, so it is safe for Dashboard payloads.
+    """
+    target = str(manifest.get("target") or "define")
+    arena_tenant = str(manifest.get("tenant") or "")
+    cand_meta = [c for c in manifest.get("candidates") or [] if isinstance(c, dict)]
+    advisories: list[str] = [db_error] if db_error else []
+
+    candidates: list[dict[str, Any]] = []
+    for c in cand_meta:
+        task = tasks_by_id.get(str(c.get("task_id") or ""))
+        status = str(task["status"]) if task else "missing"
+        extra: dict[str, Any] = {}
+        if target == "define":
+            artifact = _file_info(Path(str(c.get("spec_path") or Path(str(c.get("dir"))) / "spec.md")))
+            if include_paths:
+                extra["holdout_files"] = _count_files(Path(str(c.get("holdout_dir") or Path(str(c.get("dir"))) / "holdout")))
+        else:
+            artifact = _file_info(Path(str(c.get("design_dir") or Path(str(c.get("dir"))) / "design")) / "DESIGN.md")
+        has_artifact = artifact["exists"] and artifact["size_bytes"] > 0
+        if status == "missing":
+            advisories.append(f"Candidate {c.get('slot')} card {c.get('task_id')} is missing from kanban.db.")
+        elif status in _GONE:
+            advisories.append(f"Candidate {c.get('slot')} card {c.get('task_id')} is {status}; the arena cannot be synthesized without it.")
+        elif status in _FAILED:
+            advisories.append(f"Candidate {c.get('slot')} card {c.get('task_id')} ended {status}; re-run or replace it before synthesis.")
+        elif status == _DONE and not has_artifact:
+            where = f" {artifact['path']}" if include_paths else ""
+            advisories.append(f"Candidate {c.get('slot')} is done but its artifact{where} is missing or empty.")
+        entry: dict[str, Any] = {
+            "slot": c.get("slot"),
+            "vendor": c.get("vendor"),
+            "model": c.get("label") or c.get("model"),
+            "task_id": c.get("task_id"),
+            "status": status,
+        }
+        if include_paths:
+            entry["artifact"] = artifact
+        entry["artifact_ready"] = bool(status == _DONE and has_artifact)
+        entry.update(extra)
+        candidates.append(entry)
+
+    raw_judge = manifest.get("judge")
+    manifest_judge: dict[str, Any] = raw_judge if isinstance(raw_judge, dict) else {}
+    judge_row: Optional[dict[str, Any]] = next((r for r in judge_rows if r["id"] == manifest_judge.get("task_id")), None)
+    judge_row = judge_row or (judge_rows[-1] if judge_rows else None)
+
+    all_present = bool(cand_meta) and all(c["status"] not in _GONE for c in candidates)
+    any_failed = any(c["status"] in _FAILED for c in candidates)
+
+    judge_out: Optional[dict[str, Any]] = None
+    if judge_row is not None:
+        same = manifest_judge.get("task_id") == judge_row["id"]
+        judge_out = {
+            "task_id": judge_row["id"],
+            "status": str(judge_row.get("status") or "unknown"),
+            "vendor": manifest_judge.get("vendor") if same else None,
+            "model": (manifest_judge.get("label") or manifest_judge.get("model")) if same else judge_row.get("model_override"),
+            "cross_vendor": manifest_judge.get("cross_vendor") if same else None,
+        }
+    elif manifest_judge.get("task_id"):
+        advisories.append(f"Judge card {manifest_judge['task_id']} is missing from kanban.db.")
+
+    canonical_path = _canonical_artifact_path(arena_tenant, target)
+    canonical_info = _file_info(canonical_path)
+    canonical_exists = bool(canonical_info["exists"] and canonical_info["size_bytes"] > 0)
+    canonical_fresh = canonical_exists and _canonical_changed(canonical_path, manifest)
+    canonical_where = f" {canonical_info['path']}" if include_paths else ""
+
+    ready = bool(candidates) and all(c["artifact_ready"] for c in candidates)
+    judge_done = bool(judge_out and judge_out["status"] == _DONE)
+    synthesized = bool(ready and all_present and not any_failed and not db_error and judge_done and canonical_fresh)
+    if judge_done and not synthesized:
+        if not (ready and all_present and not any_failed):
+            advisories.append("Judge is done but not every candidate finished with a non-empty artifact; the synthesis is not trusted.")
+        if not canonical_exists:
+            advisories.append(f"Judge is done but the canonical artifact{canonical_where} is missing or empty.")
+        elif not canonical_fresh:
+            advisories.append(
+                f"Judge is done but the canonical artifact{canonical_where} is unchanged since before the arena was spawned."
+            )
+
+    judge_failed = bool(judge_out and judge_out["status"] in _FAILED)
+    if judge_failed:
+        advisories.append(
+            f"Judge card {judge_out['task_id']} ended in terminal state '{judge_out['status']}'; "
+            "re-run or replace it before synthesis."
+        )
+
+    if synthesized:
+        status = "synthesized"
+    elif not all_present or db_error:
+        status = "degraded"
+    elif any_failed or judge_failed:
+        status = "needs_attention"
+    elif any(c["status"] in _STUCK for c in candidates) or (judge_out and judge_out["status"] in _STUCK):
+        status = "blocked"
+    elif judge_done:
+        status = "needs_attention"
+    elif not all(c["status"] == _DONE for c in candidates):
+        status = "candidates_in_progress"
+    elif not ready:
+        status = "needs_attention"
+    elif judge_out:
+        status = "judging"
+    else:
+        status = "ready_for_synthesis"
+
+    state: dict[str, Any] = {
+        "status": status,
+        "candidates": candidates,
+        "judge": judge_out,
+        "ready_for_synthesis": ready,
+        "synthesized": synthesized,
+        "canonical_artifact_exists": canonical_exists,
+        "advisories": advisories,
+    }
+    if include_paths:
+        state["canonical_artifact"] = canonical_info
+    return state
+
+
 def evaluate_arena(
     *,
     arena_id: Optional[str] = None,
@@ -789,55 +921,21 @@ def evaluate_arena(
     ids = [str(c["task_id"]) for c in cand_meta if c.get("task_id")]
     db_path = _kanban_db_file(board)
     tasks, judge_rows, db_error = _read_tasks(db_path, ids, aid)
-    advisories: list[str] = []
-    if db_error:
-        advisories.append(db_error)
-
-    candidates: list[dict[str, Any]] = []
-    for c in cand_meta:
-        task = tasks.get(str(c.get("task_id") or ""))
-        status = str(task["status"]) if task else "missing"
-        if target == "define":
-            artifact = _file_info(Path(str(c.get("spec_path") or Path(str(c.get("dir"))) / "spec.md")))
-            extra = {"holdout_files": _count_files(Path(str(c.get("holdout_dir") or Path(str(c.get("dir"))) / "holdout")))}
-        else:
-            artifact = _file_info(Path(str(c.get("design_dir") or Path(str(c.get("dir"))) / "design")) / "DESIGN.md")
-            extra = {}
-        has_artifact = artifact["exists"] and artifact["size_bytes"] > 0
-        if status == "missing":
-            advisories.append(f"Candidate {c.get('slot')} card {c.get('task_id')} is missing from kanban.db.")
-        elif status in _GONE:
-            advisories.append(f"Candidate {c.get('slot')} card {c.get('task_id')} is {status}; the arena cannot be synthesized without it.")
-        elif status in _FAILED:
-            advisories.append(f"Candidate {c.get('slot')} card {c.get('task_id')} ended {status}; re-run or replace it before synthesis.")
-        elif status == _DONE and not has_artifact:
-            advisories.append(f"Candidate {c.get('slot')} is done but its artifact {artifact['path']} is missing or empty.")
-        candidates.append({
-            "slot": c.get("slot"),
-            "vendor": c.get("vendor"),
-            "model": c.get("label") or c.get("model"),
-            "task_id": c.get("task_id"),
-            "status": status,
-            "artifact": artifact,
-            "artifact_ready": bool(status == _DONE and has_artifact),
-            **extra,
-        })
-
-    raw_judge = manifest.get("judge")
-    manifest_judge: dict[str, Any] = raw_judge if isinstance(raw_judge, dict) else {}
-    judge_row: Optional[dict[str, Any]] = next((r for r in judge_rows if r["id"] == manifest_judge.get("task_id")), None)
-    judge_row = judge_row or (judge_rows[-1] if judge_rows else None)
-
-    all_present = bool(cand_meta) and all(c["status"] not in _GONE for c in candidates)
-    any_failed = any(c["status"] in _FAILED for c in candidates)
+    state = _evaluate_manifest_state(manifest, tasks, judge_rows, db_error, include_paths=True)
+    extra_advisories: list[str] = []
+    statuses = [c["status"] for c in state["candidates"]]
+    all_present = bool(cand_meta) and all(s not in _GONE for s in statuses)
+    any_failed = any(s in _FAILED for s in statuses)
 
     spawned_judge = False
-    if spawn_judge and judge_row is None:
+    if spawn_judge and state["judge"] is None:
         if db_error or not all_present or any_failed:
-            advisories.append(
+            extra_advisories.append(
                 "Judge not spawned: every candidate card must exist in kanban.db and none may be archived, failed or cancelled."
             )
         else:
+            raw_judge = manifest.get("judge")
+            manifest_judge: dict[str, Any] = raw_judge if isinstance(raw_judge, dict) else {}
             repo = get_repo(str(manifest.get("repo_slug") or manifest.get("repo") or ""))
             if repo is None:
                 return {"ok": False, "error": f"Repository {manifest.get('repo')!r} is no longer registered.", "arena_id": aid}
@@ -907,10 +1005,10 @@ def evaluate_arena(
                     except OSError:
                         pass
                 raise
-            judge_row = {"id": judge_id, "status": str(row[0]) if row else "unknown", "model_override": row[1] if row else None}
+            judge_rows = [{"id": judge_id, "status": str(row[0]) if row else "unknown", "model_override": row[1] if row else None}]
             if created and updated_manifest is not None:
                 if judge.get("advisory"):
-                    advisories.append(judge["advisory"])
+                    extra_advisories.append(judge["advisory"])
                 manifest = updated_manifest
                 record_transition(
                     "spawn_arena_judge",
@@ -932,68 +1030,11 @@ def evaluate_arena(
                     result="spawned",
                 )
                 spawned_judge = True
-                manifest_judge = manifest["judge"]
             else:
-                advisories.append(f"Judge card {judge_id} already exists; not spawning another.")
+                extra_advisories.append(f"Judge card {judge_id} already exists; not spawning another.")
+            state = _evaluate_manifest_state(manifest, tasks, judge_rows, db_error, include_paths=True)
     elif spawn_judge:
-        advisories.append(f"Judge card {judge_row['id']} already exists; not spawning another.")
-
-    judge_out: Optional[dict[str, Any]] = None
-    if judge_row is not None:
-        same = manifest_judge.get("task_id") == judge_row["id"]
-        judge_out = {
-            "task_id": judge_row["id"],
-            "status": str(judge_row.get("status") or "unknown"),
-            "vendor": manifest_judge.get("vendor") if same else None,
-            "model": (manifest_judge.get("label") or manifest_judge.get("model")) if same else judge_row.get("model_override"),
-            "cross_vendor": manifest_judge.get("cross_vendor") if same else None,
-        }
-    elif manifest_judge.get("task_id"):
-        advisories.append(f"Judge card {manifest_judge['task_id']} is missing from kanban.db.")
-
-    canonical_path = _canonical_artifact_path(arena_tenant, target)
-    canonical_info = _file_info(canonical_path)
-    canonical_exists = bool(canonical_info["exists"] and canonical_info["size_bytes"] > 0)
-    canonical_fresh = canonical_exists and _canonical_changed(canonical_path, manifest)
-
-    ready = bool(candidates) and all(c["artifact_ready"] for c in candidates)
-    judge_done = bool(judge_out and judge_out["status"] == _DONE)
-    synthesized = bool(ready and all_present and not any_failed and not db_error and judge_done and canonical_fresh)
-    if judge_done and not synthesized:
-        if not (ready and all_present and not any_failed):
-            advisories.append("Judge is done but not every candidate finished with a non-empty artifact; the synthesis is not trusted.")
-        if not canonical_exists:
-            advisories.append(f"Judge is done but the canonical artifact {canonical_info['path']} is missing or empty.")
-        elif not canonical_fresh:
-            advisories.append(
-                f"Judge is done but the canonical artifact {canonical_info['path']} is unchanged since before the arena was spawned."
-            )
-
-    judge_failed = bool(judge_out and judge_out["status"] in _FAILED)
-    if judge_failed:
-        advisories.append(
-            f"Judge card {judge_out['task_id']} ended in terminal state '{judge_out['status']}'; "
-            "re-run or replace it before synthesis."
-        )
-
-    if synthesized:
-        status = "synthesized"
-    elif not all_present or db_error:
-        status = "degraded"
-    elif any_failed or judge_failed:
-        status = "needs_attention"
-    elif any(c["status"] in _STUCK for c in candidates) or (judge_out and judge_out["status"] in _STUCK):
-        status = "blocked"
-    elif judge_done:
-        status = "needs_attention"
-    elif not all(c["status"] == _DONE for c in candidates):
-        status = "candidates_in_progress"
-    elif not ready:
-        status = "needs_attention"
-    elif judge_out:
-        status = "judging"
-    else:
-        status = "ready_for_synthesis"
+        extra_advisories.append(f"Judge card {state['judge']['task_id']} already exists; not spawning another.")
 
     return {
         "ok": True,
@@ -1001,14 +1042,143 @@ def evaluate_arena(
         "tenant": arena_tenant,
         "repo": manifest.get("repo"),
         "target": target,
-        "status": status,
-        "candidates": candidates,
-        "judge": judge_out,
-        "ready_for_synthesis": ready,
-        "synthesized": synthesized,
-        "canonical_artifact_exists": canonical_exists,
-        "canonical_artifact": canonical_info,
+        "status": state["status"],
+        "candidates": state["candidates"],
+        "judge": state["judge"],
+        "ready_for_synthesis": state["ready_for_synthesis"],
+        "synthesized": state["synthesized"],
+        "canonical_artifact_exists": state["canonical_artifact_exists"],
+        "canonical_artifact": state["canonical_artifact"],
         "spawned_judge": spawned_judge,
         "manifest_path": str(manifest_path),
-        "advisories": advisories,
+        "advisories": state["advisories"] + extra_advisories,
     }
+
+
+# --- read-only Dashboard summaries ------------------------------------------------------------
+
+_SUMMARY_COLS = "id, title, status, created_at, completed_at, model_override"
+_JUDGE_STAMP_LIKE = "%(role=`judge`%"
+
+
+def _read_arena_tasks(
+    db_path: Path, ids: list[str], arena_ids: list[str]
+) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]], Optional[str]]:
+    """One ``mode=ro`` query for every candidate id and judge stamp across ``arena_ids`` (never writes).
+
+    Error strings carry no filesystem path, so they are safe for Dashboard payloads.
+    """
+    if not db_path.is_file():
+        return {}, {}, "kanban.db not found"
+    clauses = ["(status != 'archived' AND body LIKE ?)"]
+    params: list[Any] = [_JUDGE_STAMP_LIKE]
+    if ids:
+        clauses.append(f"id IN ({','.join('?' for _ in ids)})")
+        params.extend(ids)
+    try:
+        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=3.0)
+    except sqlite3.Error:
+        return {}, {}, "kanban.db unreadable"
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            f"SELECT {_SUMMARY_COLS}, body FROM tasks WHERE {' OR '.join(clauses)} ORDER BY created_at, rowid",
+            params,
+        ).fetchall()
+    except sqlite3.Error:
+        return {}, {}, "kanban.db unreadable"
+    finally:
+        conn.close()
+    wanted = set(ids)
+    tasks: dict[str, dict[str, Any]] = {}
+    judges: dict[str, list[dict[str, Any]]] = {aid: [] for aid in arena_ids}
+    for r in rows:
+        row = {k: r[k] for k in r.keys() if k != "body"}
+        if str(r["id"]) in wanted:
+            tasks[str(r["id"])] = row
+        if str(r["status"]) == "archived":
+            continue
+        body = str(r["body"] or "")
+        for aid in arena_ids:
+            if f"- Arena: `{aid}` (role=`judge`" in body:
+                judges[aid].append(row)
+    return tasks, judges, None
+
+
+def _scrub(text: Any) -> Optional[str]:
+    return None if text is None or contains_holdout_reference(text) else str(text)
+
+
+def _scrub_labels(entry: dict[str, Any]) -> dict[str, Any]:
+    """Fail closed on manifest-sourced free text (slot, vendor, model) that references holdout."""
+    return {**entry, **{k: _scrub(entry.get(k)) for k in ("slot", "vendor", "model") if k in entry}}
+
+
+def list_arena_summaries(
+    *, tenants: Iterable[str], db_path: Optional[Path] = None, board: Optional[str] = None
+) -> list[dict[str, Any]]:
+    """Dashboard-safe summaries of every arena of ``tenants``, newest first.
+
+    Strictly read-only: never creates directories, `kanban.db`, or manifests, and reads `kanban.db`
+    with a single ``mode=ro`` query. Corrupt or unreadable manifests are skipped. Summaries never
+    carry filesystem paths, holdout counts, or any string that references holdout.
+    """
+    root = _runs_root()
+    found: list[tuple[tuple[int, int, str], dict[str, Any]]] = []
+    for name in sorted({_safe_tenant(str(t)) for t in tenants if t}):
+        arena_root = root / name / "arena"
+        try:
+            if not arena_root.is_dir():
+                continue
+            entries = sorted(arena_root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not ARENA_ID_RE.match(entry.name):
+                continue
+            path = entry / MANIFEST_NAME
+            manifest = _load_manifest(path)
+            if manifest is None or str(manifest.get("arena_id")) != entry.name:
+                continue
+            try:
+                mtime_ns = int(path.stat().st_mtime_ns)
+            except OSError:
+                continue
+            found.append(((_created_ns(manifest), mtime_ns, entry.name), manifest))
+    if not found:
+        return []
+    found.sort(key=lambda item: item[0], reverse=True)
+
+    arena_ids = [m["arena_id"] for _, m in found]
+    ids = sorted({
+        str(c["task_id"])
+        for _, m in found
+        for c in (m.get("candidates") if isinstance(m.get("candidates"), list) else [])
+        if isinstance(c, dict) and c.get("task_id")
+    })
+    kanban = Path(db_path) if db_path is not None else _kanban_db_file(board)
+    tasks, judges, db_error = _read_arena_tasks(kanban, ids, arena_ids)
+
+    summaries: list[dict[str, Any]] = []
+    for _, manifest in found:
+        aid = str(manifest["arena_id"])
+        try:
+            state = _evaluate_manifest_state(manifest, tasks, judges.get(aid, []), db_error, include_paths=False)
+        except (TypeError, ValueError, KeyError, AttributeError, OSError):
+            continue
+        summaries.append({
+            "arena_id": aid,
+            "tenant": manifest.get("tenant"),
+            "repo": manifest.get("repo"),
+            "target": manifest.get("target") or "define",
+            "title": _scrub(manifest.get("title")),
+            "status": state["status"],
+            "created_at": _created_ns(manifest) // 1_000_000_000 or None,
+            "candidates": [_scrub_labels(c) for c in state["candidates"]],
+            "judge": _scrub_labels(state["judge"]) if state["judge"] else None,
+            "ready_for_synthesis": state["ready_for_synthesis"],
+            "synthesized": state["synthesized"],
+            "canonical_artifact_exists": state["canonical_artifact_exists"],
+            "advisories": [a for a in state["advisories"] if not contains_holdout_reference(a)],
+        })
+    return summaries

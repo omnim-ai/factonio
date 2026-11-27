@@ -5,7 +5,7 @@ Every user-facing pull request adds an entry under `## Unreleased`.
 
 ## Unreleased
 
-_No unreleased changes yet._
+- Wave 5 Dashboard API parity (read-only): `GET /cards` adds `workstreams` (per-tenant `{kind, read_only, report_path, report_exists}` from `trail.db` `start_workstream` rows and card stamps; legacy workstreams read `kind: null`, only `investigate` exposes a report path), per-card `workstream_kind` and `arena_id` / `arena_role` / `arena_slot` / `arena_vendor` / `arena_target`, and `arenas` from the new `arena.list_arena_summaries` (one `?mode=ro` `kanban.db` query, the same state machine as `evaluate_arena`, no paths or holdout data); `GET /repos` and `PATCH /repos/{slug}` add a per-repo `harness` summary from `harness.summarize_harness_readonly` (file reads only, malformed manifests reported as `has_manifest_error`). None of these create `kanban.db`, `trail.db` or `runs/`. `WORKSTREAM_KINDS` now lives in `config.py` (still re-exported by `orchestrator`).
 
 ## 0.3.0 (2026-11-27)
 

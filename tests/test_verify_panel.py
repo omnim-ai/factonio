@@ -936,7 +936,7 @@ class TestMetricsAndStatus(unittest.TestCase):
 
             db = home / "kanban.db"
             cards = thread_cards(db, tenant="t-m")
-            self.assertEqual(set(cards), {"cards", "counts"})
+            self.assertEqual(set(cards), {"cards", "counts", "workstreams", "arenas"})
             self.assertEqual(cards["counts"]["total"], 10)
             by_id = {c["id"]: c for c in cards["cards"]}
             self.assertIsNone(by_id[std["verify_diff_task_id"]]["panel_id"])

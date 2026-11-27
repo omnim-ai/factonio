@@ -26,6 +26,7 @@ DESIGN_APPROVAL_POLICIES: tuple[str, ...] = ("ask", "auto")
 MERGE_POLICIES: tuple[str, ...] = ("auto", "ask")
 PUBLISH_POLICIES: tuple[str, ...] = ("auto", "ask")
 RIGOR_LEVELS: tuple[str, ...] = ("standard", "high")
+WORKSTREAM_KINDS: tuple[str, ...] = ("feature", "bug", "quick", "refactor", "perf", "investigate")
 
 AUX_TASK_SPECS: tuple[dict[str, str], ...] = (
     {

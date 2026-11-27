@@ -30,6 +30,7 @@ if _PKG_NAME not in sys.modules:
     # Do not call register(); only bind package namespace so submodules import cleanly.
 
 _config = importlib.import_module(f"{_PKG_NAME}.config")
+_harness = importlib.import_module(f"{_PKG_NAME}.harness")
 _metrics = importlib.import_module(f"{_PKG_NAME}.metrics")
 _profile_setup = importlib.import_module(f"{_PKG_NAME}.profile_setup")
 _repos = importlib.import_module(f"{_PKG_NAME}.repos")
@@ -124,6 +125,7 @@ def _serialize_repo(slug: str, info: dict[str, Any], settings: dict[str, Any]) -
         "effective_default_rigor": _safe_rigor(slug),
         "has_required_checks": bool(info.get("has_required_checks")),
         "models": _config.resolve_all_phase_models(repo_slug=slug),
+        "harness": _harness.summarize_harness_readonly(info.get("path")),
     }
 
 
