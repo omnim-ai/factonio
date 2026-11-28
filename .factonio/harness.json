@@ -87,6 +87,29 @@
       ]
     },
     {
+      "id": "foundation",
+      "surface": "Layer 0 foundation & verification projections",
+      "paths": [
+        "vocabulary.py",
+        "validators.py",
+        "git_cli.py",
+        "store_kanban.py",
+        "verification.py"
+      ],
+      "commands": [
+        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; ln -s \"$PWD\" \"$d/factonio\"; env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONPATH=\"$d${PYTHONPATH:+:$PYTHONPATH}\" python3 -m unittest tests.test_foundation_layer tests.test_architecture_invariants -v'",
+        "python3 -S tools/eval_skills.py bloat skills/implement --json"
+      ],
+      "scenarios": [
+        "`vocabulary`, `validators`, `git_cli` and `store_kanban` import only the stdlib and each other (`vocabulary` <- `validators` / `store_kanban`), so `python3 -S tools/eval_skills.py` still runs without site-packages or Hermes",
+        "The combined (top-level + lazy) internal import graph has zero cycles and no module imports another module's `_private` names (tests.test_architecture_invariants)",
+        "`store_kanban.open_kanban_ro` is the only `kanban.db` opener: `Path.resolve().as_uri() + \"?mode=ro\"` keeps paths containing `?` or `#` intact, and `chunked_in_query` splits `IN (...)` lists into <= 500-id chunks",
+        "`validators.FULL_SHA_RE` is the single full-SHA regex (40 or 64 hex); `validate_full_sha` lowercases and refuses abbreviations",
+        "`verification` owns phase classification, panel / arena / mode stamp parsing, card targets and verdicts, panel consensus and local-branch verification status, re-exported unchanged by `metrics` and `orchestrator`",
+        "`watchdog.scan_stuck_cards` reads comments, latest runs and events in batched chunked queries instead of per-card queries"
+      ]
+    },
+    {
       "id": "cli",
       "surface": "CLI",
       "paths": [
@@ -245,7 +268,7 @@
         "Deny labels, a missing `--require-label` opt-in, or a non-allowlisted author/association make an issue skip_denied / skip_not_allowed; stop-the-line issues still escalate (even with a deny label) but never automate over a denied, claimed, duplicate or PR-linked issue; closed issues are skip_closed",
         "Active `<slug>-i<N>` cards, open PRs that Fixes/Closes/Resolves #N (same-repo closingIssuesReferences only), and `duplicate of #M` / older look-alike titles yield in_progress, verify_existing_fix and duplicate; a corrupt, directory or dangling-symlink kanban.db fails closed as blocked_dedup_error; REST issue reads paginate past pull requests",
         "Issue text is untrusted data: never executed, quarantined with injection_signals, and commands come only from the .factonio/ harness committed at HEAD (dirty, staged or untracked working-tree copies are ignored and flagged)",
-        "Reproduction needs >= 2 runs with explicit fresh_state true and distinct non-blank run_ids (1-of-2 is flaky; bare booleans never count); verify_existing_fix needs full 40-char head_sha/base_sha, 2 before-runs on one full base commit SHA (never the PR head; missing, abbreviated or mixed commits are rejected) and 2 after-runs at the exact PR head_sha with no run_id reuse, and any still-reproducing head run after a deterministic base is fix_incomplete, the only verdict that allows a duplicate fix",
+        "Reproduction needs >= 2 runs with explicit fresh_state true and distinct non-blank run_ids (1-of-2 is flaky; bare booleans never count); verify_existing_fix needs full 40-char (or 64-char SHA-256) head_sha/base_sha, 2 before-runs on one full base commit SHA (never the PR head; missing, abbreviated or mixed commits are rejected) and 2 after-runs at the exact PR head_sha with no run_id reuse, and any still-reproducing head run after a deterministic base is fix_incomplete, the only verdict that allows a duplicate fix",
         "issue_intake_triage / issue_intake_verify_fix rows land in trail.db without issue text",
         "Every open issue and PR is enumerated before `--limit`: a newer stop-the-line issue is triaged first even behind 30+ older issues or outside a `--label` filter, and duplicate detection always uses the unfiltered open-issue pool",
         "Linked PRs beyond the first 100 open PRs are found in list and `--issue N` modes; hitting the issue or PR page safety cap sets issues_truncated / pr_dedup_truncated and blocks automation",

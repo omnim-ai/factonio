@@ -9,29 +9,31 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import sqlite3
-import stat
+import subprocess
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
+from .config import get_repo
+from .git_cli import is_git_repo, run_gh, run_git_ro
 from .harness import (
     HARNESS_DIR_NAME,
     HARNESS_JSON_NAME,
     VERIFY_MD_NAME,
-    _effective_hooks_and_phases,
-    _git_ro,
-    _is_git_repo,
-    _split_sections,
     detect_repo_profile,
     discover_harness,
+    effective_hooks_and_phases,
+    split_sections,
 )
-from .metrics import _open_ro
-from .repos import _run_gh, normalize_repo
+from .store_kanban import open_kanban_ro, resolve_kanban_db_path
 from .trail import record_transition
+from .validators import is_full_sha, make_tenant, normalize_repo
+from .vocabulary import FIX_VERDICTS as FIX_VERDICTS  # public re-export
+from .vocabulary import INACTIVE_CARD_STATUSES
+from .vocabulary import TRIAGE_ACTIONS as TRIAGE_ACTIONS  # public re-export
 
 STOP_THE_LINE_LABELS: tuple[str, ...] = (
     "security",
@@ -52,9 +54,7 @@ DEFAULT_DENY_LABELS: tuple[str, ...] = (
     "do-not-automate",
     "factonio-skip",
 )
-TRIAGE_ACTIONS: tuple[str, ...] = ("triage", "verify_existing_fix")
 DEFAULT_ALLOWED_ASSOCIATIONS: tuple[str, ...] = ("OWNER", "MEMBER", "COLLABORATOR")
-FIX_VERDICTS: tuple[str, ...] = ("verified_fix", "fix_incomplete", "not_reproduced", "flaky")
 DISPOSITIONS: tuple[str, ...] = (
     "stop_the_line",
     "skip_closed",
@@ -75,7 +75,7 @@ _MAX_ISSUE_PAGES = 50
 _MAX_PR_PAGES = 50
 _MAX_CLOSING_REF_PAGES = 20
 _EXCERPT_CHARS = 280
-_INACTIVE_CARD_STATUSES = ("done", "archived", "cancelled")
+_INACTIVE_CARD_STATUSES = INACTIVE_CARD_STATUSES
 
 _LINK_RE = re.compile(
     r"\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\b\s*:?\s+(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#(\d+)\b",
@@ -92,7 +92,6 @@ _LABEL_SPLIT_RE = re.compile(r"[/:]")
 _LABEL_SPACE_RE = re.compile(r"[\s_]+")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
-_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _STOPWORDS = frozenset({
     "the", "and", "for", "with", "when", "not", "does", "doesn", "fails", "fail", "error", "bug", "issue",
     "from", "into", "after", "before", "this", "that", "are", "was", "will", "can", "cannot", "should",
@@ -111,6 +110,15 @@ _INJECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 # ---------------------------------------------------------------------------
 # Normalization helpers
 # ---------------------------------------------------------------------------
+
+
+def _run_gh(args: list[str], *, cwd: Optional[Path] = None, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    """`gh` seam (patched by tests as ``factonio.issues._run_gh``)."""
+    return run_gh(args, cwd=cwd, timeout=timeout)
+
+
+def _git_ro(repo_path: Path, args: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    return run_git_ro(args, cwd=repo_path, timeout=timeout, capture_errors=True)
 
 
 def _now_iso() -> str:
@@ -296,17 +304,13 @@ def check_ownership_allowlist(
 
 
 def _default_kanban_db() -> Optional[Path]:
-    from .orchestrator import _kanban_db_file
-
     try:
-        return _kanban_db_file()
+        return resolve_kanban_db_path()
     except Exception:
         return None
 
 
 def issue_tenant(repo_slug: str, issue_number: int) -> str:
-    from .orchestrator import make_tenant
-
     return make_tenant(repo_slug, issue_number=int(issue_number))
 
 
@@ -318,23 +322,11 @@ def _active_workstream_cards(kanban_db_path: Optional[Path], tenant: str) -> tup
         return [], "cannot resolve the Kanban database path"
     path = Path(kanban_db_path)
     try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return [], None
-    except OSError as exc:
-        return [], f"cannot stat {path}: {exc}"
-    try:
-        st = os.stat(path)
-    except OSError as exc:
-        return [], f"cannot stat {path}: {exc}"
-    if not stat.S_ISREG(st.st_mode):
-        return [], f"{path} is not a regular file"
-    try:
-        conn = _open_ro(path)
+        conn = open_kanban_ro(path, strict=True)
     except sqlite3.Error as exc:
-        return [], f"cannot open {path}: {exc}"
+        return [], str(exc)
     if conn is None:
-        return [], f"cannot open {path}"
+        return [], None
     try:
         with closing(conn):
             cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
@@ -511,8 +503,8 @@ def _committed_harness(root: Path) -> dict[str, Any]:
                 manifest_error = "harness.json must contain a JSON object"
         except ValueError as exc:
             manifest_error = f"harness.json is not valid JSON: {exc}"
-    md_sections = _split_sections(md_proc.stdout) if has_md else None
-    _, phases = _effective_hooks_and_phases(manifest, md_sections)
+    md_sections = split_sections(md_proc.stdout) if has_md else None
+    _, phases = effective_hooks_and_phases(manifest, md_sections)
     status = _git_ro(root, ["status", "--porcelain", "--untracked-files=all", "--", f"{HARNESS_DIR_NAME}/"])
     dirty = status.returncode != 0 or bool(status.stdout.strip())
     return {
@@ -537,7 +529,7 @@ def translate_issue_environment(repo_path: str | Path, issue: Mapping[str, Any])
     root = Path(repo_path).expanduser()
     if not root.is_dir():
         raise ValueError(f"Repository path {root} is not a directory")
-    if _is_git_repo(root):
+    if is_git_repo(root):
         info = _committed_harness(root)
     else:
         info = {**discover_harness(root), "source": "working_tree", "worktree_dirty": False}
@@ -763,17 +755,17 @@ def evaluate_reproduction_runs(runs: Sequence[Any], required_passes: int = 2) ->
 
 def _validate_head_sha(value: Any, name: str = "head_sha") -> str:
     sha = value.strip().lower() if isinstance(value, str) else ""
-    if not _FULL_SHA_RE.match(sha):
-        raise ValueError(f"{name} must be a full 40-character hex commit SHA (abbreviated SHAs and refs are rejected)")
+    if not is_full_sha(sha):
+        raise ValueError(f"{name} must be a full 40- or 64-character hex commit SHA (abbreviated SHAs and refs are rejected)")
     return sha
 
 
 def _run_sha_problem(run: Mapping[str, Any]) -> Optional[str]:
-    """`missing_head_sha` / `invalid_head_sha` when a run's commit is not a full 40-char hex SHA."""
+    """`missing_head_sha` / `invalid_head_sha` when a run's commit is not a full 40/64-char hex SHA."""
     sha = run["head_sha"]
     if not sha:
         return "missing_head_sha"
-    return None if _FULL_SHA_RE.match(sha) else "invalid_head_sha"
+    return None if is_full_sha(sha) else "invalid_head_sha"
 
 
 _FIX_RECOMMENDATIONS = {
@@ -1146,8 +1138,6 @@ def _resolve_target(repo_spec: str, repo_path: Optional[str | Path]) -> tuple[st
         raise ValueError("repo is required (registered slug or 'owner/repo')")
     entry = None
     try:
-        from .config import get_repo
-
         entry = get_repo(spec)
     except Exception:
         entry = None

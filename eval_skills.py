@@ -21,7 +21,9 @@ import sys
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator, Mapping, Optional
 
-from .config import _ROUTER_PROVIDERS, _VENDOR_ALIASES, infer_model_vendor
+from .config import infer_model_vendor
+from .vocabulary import ROUTER_PROVIDERS as _ROUTER_PROVIDERS
+from .vocabulary import VENDOR_ALIASES as _VENDOR_ALIASES
 
 PHASES: tuple[str, ...] = ("define", "design", "implement", "verify-diff", "verify-blackbox", "orchestrator")
 EVAL_ACTIONS: tuple[str, ...] = ("ab", "audit", "bloat")

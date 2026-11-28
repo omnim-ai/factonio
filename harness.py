@@ -33,13 +33,15 @@ try:
 except ModuleNotFoundError:  # Python < 3.11: TOML manifests are skipped
     tomllib = None  # type: ignore[assignment]
 
+from .git_cli import is_git_repo, run_git_ro
+from .vocabulary import HOOK_KINDS as HOOK_KINDS  # public re-export
+
 HARNESS_DIR_NAME = ".factonio"
 VERIFY_MD_NAME = "verify.md"
 HARNESS_JSON_NAME = "harness.json"
 HARNESS_SCHEMA_VERSION = 1
 REQUIRED_SECTIONS: tuple[str, ...] = ("Launch", "Doctor", "Drive", "Evidence", "Cleanup")
 EXTRA_SECTIONS: tuple[str, ...] = ("Feature Map", "Hooks")
-HOOK_KINDS: tuple[str, ...] = ("visual_diff", "invariant", "custom")
 PHASE_KEYS: tuple[str, ...] = tuple(s.lower() for s in REQUIRED_SECTIONS)
 
 MAX_FILE_BYTES = 256 * 1024
@@ -132,23 +134,12 @@ def _now_iso() -> str:
 
 
 def _git_ro(repo_path: Path, args: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess[str]:
-    """Read-only git probe: never refreshes/rewrites the index or takes optional locks."""
-    try:
-        return subprocess.run(
-            ["git", "--no-optional-locks", *args],
-            cwd=str(repo_path),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return subprocess.CompletedProcess(["git", *args], 128, "", str(exc))
+    """Read-only git probe: never refreshes/rewrites the index or takes optional locks; never raises."""
+    return run_git_ro(args, cwd=repo_path, timeout=timeout, capture_errors=True)
 
 
 def _is_git_repo(repo_path: Path) -> bool:
-    proc = _git_ro(repo_path, ["rev-parse", "--is-inside-work-tree"])
-    return proc.returncode == 0 and proc.stdout.strip() == "true"
+    return is_git_repo(repo_path)
 
 
 def _head_commit(repo_path: Path) -> Optional[str]:
@@ -1088,7 +1079,7 @@ def bootstrap_verify_harness(
 # ---------------------------------------------------------------------------
 
 
-def _split_sections(md_text: str) -> dict[str, str]:
+def split_sections(md_text: str) -> dict[str, str]:
     sections: dict[str, str] = {}
     matches = list(_H2_RE.finditer(md_text))
     for i, m in enumerate(matches):
@@ -1121,7 +1112,7 @@ def _parse_md_hooks(body: str) -> list[dict[str, Any]]:
     return hooks
 
 
-def _effective_hooks_and_phases(
+def effective_hooks_and_phases(
     manifest: Optional[dict[str, Any]], md_sections: Optional[dict[str, str]]
 ) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
     """Per-field fallback shared by discovery and the gate-loosening baseline: each of `hooks` / `phases`
@@ -1151,7 +1142,7 @@ def discover_harness(repo_path: str | Path) -> dict[str, Any]:
     has_md = verify_md.is_file()
     has_json = harness_json.is_file()
     md_text = _read_text(verify_md) if has_md else ""
-    sections_map = _split_sections(md_text) if has_md else {}
+    sections_map = split_sections(md_text) if has_md else {}
     sections = list(sections_map)
     manifest: Optional[dict[str, Any]] = None
     manifest_error: Optional[str] = None
@@ -1164,7 +1155,7 @@ def discover_harness(repo_path: str | Path) -> dict[str, Any]:
                 manifest_error = "harness.json must contain a JSON object"
         except ValueError as exc:
             manifest_error = f"harness.json is not valid JSON: {exc}"
-    hooks, phases = _effective_hooks_and_phases(manifest, sections_map if has_md else None)
+    hooks, phases = effective_hooks_and_phases(manifest, sections_map if has_md else None)
     return {
         "present": has_md,
         "mode": "full" if (has_md and has_json) else ("verify_md_only" if has_md else ("json_only" if has_json else "absent")),
@@ -2568,10 +2559,10 @@ def _baseline_gates(root: Path, sha: str) -> Optional[dict[str, Any]]:
         if isinstance(loaded, dict):
             manifest = loaded
     md_proc = _git_ro(root, ["show", f"{sha}:{HARNESS_DIR_NAME}/{VERIFY_MD_NAME}"])
-    md_sections = _split_sections(md_proc.stdout) if md_proc.returncode == 0 else None
+    md_sections = split_sections(md_proc.stdout) if md_proc.returncode == 0 else None
     if manifest is None and md_sections is None:
         return None
-    hooks, phases = _effective_hooks_and_phases(manifest, md_sections)
+    hooks, phases = effective_hooks_and_phases(manifest, md_sections)
     return {
         "source": HARNESS_JSON_NAME if manifest is not None else VERIFY_MD_NAME,
         "hooks": hooks,

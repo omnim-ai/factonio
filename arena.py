@@ -13,7 +13,6 @@ import hashlib
 import json
 import math
 import os
-import re
 import shutil
 import sqlite3
 import tempfile
@@ -25,37 +24,31 @@ from typing import Any, Iterable, Optional
 from .config import (
     PLUGIN_ID,
     WORKER_PROFILE,
-    _normalize_panel_entry,
+    design_dir_path,
     get_repo,
     get_root_hermes_home_path,
+    holdout_dir_path,
     infer_model_vendor,
+    normalize_panel_entry,
     resolve_phase_model,
     resolve_verify_panel,
-    single_line,
-)
-from .orchestrator import (
-    _SLUG_RE,
-    _auto_subscribe_task,
-    _kanban_db_file,
-    _resolve_calling_session_id,
-    _stamp_token,
-    design_dir_path,
-    holdout_dir_path,
-    make_tenant,
     run_data_dir,
+    single_line,
     spec_file_path,
 )
+from .store_kanban import auto_subscribe_task, open_kanban_ro, resolve_calling_session_id, resolve_kanban_db_path
 from .trail import contains_holdout_reference, record_transition
+from .validators import ARENA_ID_RE as ARENA_ID_RE  # public re-export
+from .validators import SLUG_RE, make_tenant, safe_tenant_dirname, stamp_token
+from .vocabulary import ARENA_TARGETS as ARENA_TARGETS  # public re-export
 
-ARENA_TARGETS: tuple[str, ...] = ("define", "design")
-ARENA_ID_RE = re.compile(r"^ar_[0-9a-f]{6,32}$")
 MANIFEST_NAME = "manifest.json"
 _DONE = "done"
 _STUCK = frozenset({"blocked", "triage"})
 # Terminal non-done candidate states: cards gone from the board vs. cards that ended without output.
 _GONE = frozenset({"missing", "archived"})
 _FAILED = frozenset({"failed", "cancelled"})
-_SLOT_SAFE_RE = re.compile(r"[^a-z0-9-]+")
+_SLOT_SAFE_RE = SLUG_RE
 
 
 def _runs_root() -> Path:
@@ -63,7 +56,7 @@ def _runs_root() -> Path:
 
 
 def _safe_tenant(tenant: str) -> str:
-    return _SLUG_RE.sub("-", (tenant or "default").lower()).strip("-") or "default"
+    return safe_tenant_dirname(tenant)
 
 
 def _arena_dir(tenant: str, arena_id: str) -> Path:
@@ -71,10 +64,10 @@ def _arena_dir(tenant: str, arena_id: str) -> Path:
 
 
 def _stamp(arena_id: str, *, role: str, target: str, vendor: Any, model: Any, slot: Optional[str] = None) -> str:
-    slot_part = f", slot=`{_stamp_token(slot, 'unknown')}`" if slot else ""
+    slot_part = f", slot=`{stamp_token(slot, 'unknown')}`" if slot else ""
     return (
         f"- Arena: `{arena_id}` (role=`{role}`, target=`{target}`{slot_part}, "
-        f"vendor=`{_stamp_token(vendor, 'unknown')}`, model=`{_stamp_token(model, 'unset')}`)\n"
+        f"vendor=`{stamp_token(vendor, 'unknown')}`, model=`{stamp_token(model, 'unset')}`)\n"
     )
 
 
@@ -136,12 +129,12 @@ def _resolve_judge(
     entry: Optional[dict[str, Any]] = None
     source = "unset"
     if judge_model not in (None, "", {}):
-        entry = _normalize_panel_entry(judge_model, source="override", index=0)
+        entry = normalize_panel_entry(judge_model, source="override", index=0)
         if entry is None:
             raise ValueError(f"judge_model must name a model ('provider/model', 'model', or {{model: ...}}); got {judge_model!r}")
         source = "override"
     elif saved_judge and str(saved_judge.get("model") or "").strip():
-        entry = _normalize_panel_entry(
+        entry = normalize_panel_entry(
             {"provider": saved_judge.get("provider"), "model": saved_judge.get("model")}, source="manifest", index=0
         )
         source = "manifest"
@@ -283,8 +276,8 @@ def _judge_body(
         else:
             artifacts = f"design `{cand['design_dir']}`"
         lines.append(
-            f"- `{cand['slot']}` (vendor `{_stamp_token(cand['vendor'], 'unknown')}`, model "
-            f"`{_stamp_token(cand['label'], 'unset')}`, card `{cand['task_id']}`): {artifacts}"
+            f"- `{cand['slot']}` (vendor `{stamp_token(cand['vendor'], 'unknown')}`, model "
+            f"`{stamp_token(cand['label'], 'unset')}`, card `{cand['task_id']}`): {artifacts}"
         )
     if target == "define":
         outputs = (
@@ -498,7 +491,7 @@ def spawn_arena(
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import write_txn
 
-    effective_session_id = _resolve_calling_session_id(session_id)
+    effective_session_id = resolve_calling_session_id(session_id)
     judge_task_id: Optional[str] = None
     candidates: list[dict[str, Any]] = []
     committed = False
@@ -539,7 +532,7 @@ def spawn_arena(
                         request=request_text,
                         canonical_spec=canonical_spec,
                     )
-                    vendor_tag = _stamp_token(cand["vendor"], "unknown")
+                    vendor_tag = stamp_token(cand["vendor"], "unknown")
                     cand["task_id"] = kb.create_task(
                         conn,
                         title=f"[{canon_target}] [arena:{vendor_tag}] {short_title}"[:120],
@@ -603,7 +596,7 @@ def spawn_arena(
             # after the cards are committed; a failed subscription only reports subscribed=false.
             all_subscribed = True
             for task_id in [c["task_id"] for c in candidates] + ([judge_task_id] if judge_task_id else []):
-                all_subscribed = _auto_subscribe_task(conn, task_id, session_id=effective_session_id) and all_subscribed
+                all_subscribed = auto_subscribe_task(conn, task_id, session_id=effective_session_id) and all_subscribed
     except BaseException:
         if not committed:
             shutil.rmtree(arena_dir, ignore_errors=True)
@@ -721,13 +714,12 @@ def _created_ns(manifest: dict[str, Any]) -> int:
 
 def _read_tasks(db_path: Path, ids: list[str], arena_id: str) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], Optional[str]]:
     """``(tasks_by_id, judge_cards, error)`` from a ``mode=ro`` connection (never creates or writes)."""
-    if not db_path.is_file():
-        return {}, [], f"kanban.db not found at {db_path}"
     try:
-        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=3.0)
+        conn = open_kanban_ro(db_path)
     except sqlite3.Error as exc:
         return {}, [], f"kanban.db unreadable: {exc}"
-    conn.row_factory = sqlite3.Row
+    if conn is None:
+        return {}, [], f"kanban.db not found at {db_path}"
     try:
         cols = "id, title, status, created_at, completed_at, model_override"
         rows: list[Any] = []
@@ -944,7 +936,7 @@ def evaluate_arena(
     arena_tenant = str(manifest.get("tenant") or "")
     cand_meta = _manifest_candidates(manifest)
     ids = [str(c["task_id"]) for c in cand_meta if c.get("task_id")]
-    db_path = _kanban_db_file(board)
+    db_path = resolve_kanban_db_path(board)
     tasks, judge_rows, db_error = _read_tasks(db_path, ids, aid)
     state = _evaluate_manifest_state(manifest, tasks, judge_rows, db_error, include_paths=True)
     extra_advisories: list[str] = []
@@ -977,7 +969,7 @@ def evaluate_arena(
             )
             from hermes_cli.kanban_db_connect import connect_closing, write_txn
 
-            effective_session_id = _resolve_calling_session_id(session_id)
+            effective_session_id = resolve_calling_session_id(session_id)
             judge_key = f"arena:{aid}:judge"
             try:
                 prior_manifest: Optional[bytes] = manifest_path.read_bytes()
@@ -1021,7 +1013,7 @@ def evaluate_arena(
                     committed = True
                     created = existing is None
                     if created:
-                        _auto_subscribe_task(conn, judge_id, session_id=effective_session_id)
+                        auto_subscribe_task(conn, judge_id, session_id=effective_session_id)
             except BaseException:
                 if not committed and updated_manifest is not None and prior_manifest is not None:
                     try:
@@ -1093,18 +1085,17 @@ def _read_arena_tasks(
 
     Error strings carry no filesystem path, so they are safe for Dashboard payloads.
     """
-    if not db_path.is_file():
-        return {}, {}, "kanban.db not found"
     clauses = ["(status != 'archived' AND body LIKE ?)"]
     params: list[Any] = [_JUDGE_STAMP_LIKE]
     if ids:
         clauses.append(f"id IN ({','.join('?' for _ in ids)})")
         params.extend(ids)
     try:
-        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=3.0)
+        conn = open_kanban_ro(db_path)
     except sqlite3.Error:
         return {}, {}, "kanban.db unreadable"
-    conn.row_factory = sqlite3.Row
+    if conn is None:
+        return {}, {}, "kanban.db not found"
     try:
         rows = conn.execute(
             f"SELECT {_SUMMARY_COLS}, body FROM tasks WHERE {' OR '.join(clauses)} ORDER BY created_at, rowid",
@@ -1213,7 +1204,7 @@ def list_arena_summaries(
         for c in (m.get("candidates") if isinstance(m.get("candidates"), list) else [])
         if isinstance(c, dict) and c.get("task_id")
     })
-    kanban = Path(db_path) if db_path is not None else _kanban_db_file(board)
+    kanban = Path(db_path) if db_path is not None else resolve_kanban_db_path(board)
     tasks, judges, db_error = _read_arena_tasks(kanban, ids, arena_ids)
 
     summaries: list[dict[str, Any]] = []
@@ -1269,7 +1260,7 @@ def evaluate_arena_public(
             for c in (manifest.get("candidates") if isinstance(manifest.get("candidates"), list) else [])
             if isinstance(c, dict) and c.get("task_id")
         })
-        tasks, judges, db_error = _read_arena_tasks(_kanban_db_file(board), ids, [aid])
+        tasks, judges, db_error = _read_arena_tasks(resolve_kanban_db_path(board), ids, [aid])
         state = _evaluate_manifest_state(manifest, tasks, judges.get(aid, []), db_error, include_paths=False)
         return {"ok": True, "arena": _public_summary(manifest, state)}
     except _MANIFEST_ERRORS:

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import random
 import re
@@ -19,7 +18,6 @@ import sqlite3
 import stat
 import threading
 import time
-import unicodedata
 import uuid
 from collections import Counter
 from contextlib import closing, contextmanager
@@ -35,6 +33,34 @@ except ImportError:  # non-POSIX: fall back to the in-process lock plus retry
     fcntl = None  # type: ignore[assignment]
 
 from .config import PLUGIN_ID, WORKSTREAM_KINDS, get_root_hermes_home_path
+from .validators import normalize_repo
+from .vocabulary import (  # re-exports: barrier helpers and trail vocabularies live in `vocabulary`
+    AUDIT_FINDING_KINDS as AUDIT_FINDING_KINDS,
+    GATE_LOOSENING_TOKENS,
+    HOLDOUT_RE,
+    HOLDOUT_REDACTED,
+    RECALL_CATEGORIES as RECALL_CATEGORIES,
+    TRAIL_PHASES as TRAIL_PHASES,
+    TRAIL_SIGNALS as TRAIL_SIGNALS,
+    contains_holdout_reference as contains_holdout_reference,
+    fold_text,
+    fold_text_plain,
+    has_holdout_reference,
+    norm_token_text,
+    redact_holdout_text,
+    scrub_loosening_hints as scrub_loosening_hints,
+    scrub_public as scrub_public,
+)
+
+# Legacy private names (tests and older callers import them from `trail`).
+_GATE_LOOSENING_TOKENS = GATE_LOOSENING_TOKENS
+_norm_token_text = norm_token_text
+_HOLDOUT_RE = HOLDOUT_RE
+_HOLDOUT_REDACTED = HOLDOUT_REDACTED
+_recall_fold = fold_text
+_recall_fold_plain = fold_text_plain
+_recall_has_holdout = has_holdout_reference
+_recall_redact_text = redact_holdout_text
 
 logger = logging.getLogger("factonio.trail")
 
@@ -573,7 +599,6 @@ def record_transition(decision: str, **kwargs: Any) -> Optional[dict[str, Any]]:
         return None
 
 
-TRAIL_SIGNALS = ("all", "key", "attention")
 # Routine machine ticks the `key` signal folds away (a human, superseding or failing row is never routine).
 _ROUTINE_DECISIONS = ("pr_gate", "bootstrap_verify")
 _KEY_EXEMPT_PHASES = ("escape", "retro")
@@ -675,22 +700,6 @@ def _filter_sql(
         )
         params.extend([json.dumps(evidence_ids), json.dumps(escalation_ids)])
     return (" WHERE " + " AND ".join(where)) if where else "", params
-
-
-def scrub_public(value: Any) -> Any:
-    """Public serializer: drop holdout-named keys, redact any string referencing holdout, null non-finite floats.
-
-    Strings without a holdout reference pass through byte-for-byte, so ordinary rows are unchanged.
-    """
-    if isinstance(value, str):
-        return _HOLDOUT_REDACTED if contains_holdout_reference(value) else value
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    if isinstance(value, Mapping):
-        return {k: scrub_public(v) for k, v in value.items() if not contains_holdout_reference(str(k))}
-    if isinstance(value, (list, tuple)):
-        return [scrub_public(v) for v in value]
-    return value
 
 
 def _public_texts(value: Any) -> Iterator[str]:
@@ -984,10 +993,8 @@ def render_trail_markdown(rows: list[Mapping[str, Any]]) -> str:
     return header + "\n".join(out) + "\n"
 
 
-
 # --- trail --audit: deterministic, read-only pre-handoff evidence audit ----------------------
 
-AUDIT_FINDING_KINDS = ("missing_evidence", "weak_evidence", "unclosed_escalation", "gate_loosening")
 _HIGH_STAKES_PHASES = frozenset({"verify", "escape", "retro", "merge", "publish"})
 _OVERRIDE_DECISION_TOKENS = ("override", "countersign")
 _ARTIFACT_KEYS = (
@@ -999,23 +1006,10 @@ _ESCALATION_RESULTS = frozenset(
     {"blocked", "escalated", "needs_input", "reject", "inconclusive", "conflict", "proof_failed"}
 )
 _RESOLVING_RESULTS = frozenset({"pass", "merged", "resolved", "adopted", "continuous", "ready", "published"})
-_GATE_LOOSENING_TOKENS = (
-    "gate_loosening", "skip_test", "disable_ci", "continue-on-error", "downgrade_hook",
-    "allow_stacked_merge", "allow_patch_continuity", "force_merge", "bypass_gate", "skip_gate",
-    "weaken_assertion", "raise_timeout",
-)
 # Dispatch rows only *describe* work (a card title may be "fix the gate_loosening detector"), and
 # rejection/refusal rows quote the defect they blocked; neither enacts a loosening, so their prose is
 # not scanned. They are flagged only when evidence carries a truthy override key.
 _NON_ENACTING_DECISIONS = frozenset({"start", "spawn_design", "spawn_implement", "spawn_verify"})
-_TOKEN_SEP_RE = re.compile(r"[\s\-]+")
-
-
-def _norm_token_text(text: str) -> str:
-    # "skip test", "skip-test" and "skip_test" all name the same gate change.
-    return _TOKEN_SEP_RE.sub("_", text.lower())
-
-
 def _phase_family(phase: Any) -> str:
     """``verify-diff`` / ``verify:blackbox`` / ``verify_panel`` all belong to ``verify``."""
     return re.split(r"[-:_./ ]", str(phase or "").strip().lower(), maxsplit=1)[0]
@@ -1716,10 +1710,8 @@ def render_metric_snapshots_text(rows: list[Mapping[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-
 # --- trail --recall: read-only cross-workstream institutional memory ---------------------------
 
-RECALL_CATEGORIES = ("escapes", "superseded", "rejects_and_blocks", "keyword")
 RECALL_DEFAULT_LIMIT = 12
 RECALL_MAX_LIMIT = 100
 # Newest rows considered per sweep; keeps recall O(1) in trail size on long-lived factories.
@@ -1735,15 +1727,6 @@ _RECALL_STOPWORDS = frozenset(
     "factonio".split()
 )
 _RECALL_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_]{3,}")
-# Recall text can be injected into Definition cards: never echo holdout paths or scenario names.
-# Matching runs after NFKC folding with format/control characters removed, so zero-width joiners,
-# full-width letters or "hold-out" spellings cannot smuggle a reference past the barrier.
-# Whitespace-interleaved spellings ("hol\tdout/x") count only when followed by a path separator, so
-# prose such as "hold out for review" stays readable.
-_HOLDOUT_RE = re.compile(
-    r"hold[_./\\-]*outs?|h\s*o\s*l\s*d[\s_./\\-]*o\s*u\s*t\s*s?\s*[/\\]", re.IGNORECASE
-)
-_HOLDOUT_REDACTED = "[redacted]"
 _RECALL_FIELD_CHARS = 240
 
 
@@ -1754,89 +1737,6 @@ def _recall_terms(query: Optional[str]) -> list[str]:
             if len(part) >= 4 and part not in _RECALL_STOPWORDS and part not in seen:
                 seen.append(part)
     return seen[:24]
-
-
-# Default-ignorable code points outside the ``C*`` categories (variation selectors, fillers, joiners).
-_RECALL_INVISIBLE = frozenset(
-    [0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x3164, 0xFFA0, *range(0x180B, 0x1810), *range(0xFE00, 0xFE10),
-     *range(0xE0100, 0xE01F0)]
-)
-
-
-# Complete terminal escape sequences (7-bit ESC and 8-bit C1 forms). Deleting only the ESC byte
-# would leave printable parameters (``ho[31mldout``) splitting the marker the matcher looks for.
-_ANSI_ESCAPE_RE = re.compile(
-    r"\x1b\[[0-?]*[ -/]*[@-~]|\x9b[0-?]*[ -/]*[@-~]"  # CSI
-    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\|$)|\x9d[^\x07\x9c]*(?:\x07|\x9c|$)"  # OSC
-    r"|\x1b[PX^_][^\x1b]*(?:\x1b\\|$)|[\x90\x98\x9e\x9f][^\x9c]*(?:\x9c|$)"  # DCS/SOS/PM/APC
-    r"|\x1b[ -/]*[0-~]"  # other ESC sequences (two-byte Fe/Fp/Fs, nF charset designations)
-)
-# Bytes that introduce or terminate escape sequences; kept until sequences are stripped.
-_ANSI_SYNTAX = frozenset("\x07\x1b\x90\x98\x9b\x9c\x9d\x9e\x9f")
-
-
-def _recall_drop_controls(text: str, keep: frozenset = frozenset()) -> str:
-    out = []
-    for ch in text:
-        if ch in keep:
-            out.append(ch)
-        elif ch in "\t\n\r":
-            out.append(" " if not keep else ch)
-        elif unicodedata.category(ch) in ("Zl", "Zp"):
-            out.append(" ")
-        elif unicodedata.category(ch).startswith("C") or ord(ch) in _RECALL_INVISIBLE:
-            continue
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-def _recall_strip_ansi(text: str) -> str:
-    # Repeat until stable: removing one sequence (or an interleaved NUL) can complete another.
-    prev = None
-    while prev != text:
-        prev = text
-        text = _ANSI_ESCAPE_RE.sub("", _recall_drop_controls(text, _ANSI_SYNTAX))
-    return text
-
-
-def _recall_fold(text: str) -> str:
-    """Strip terminal escape sequences, NFKC-fold, delete control/format/invisible characters, and
-    turn whitespace controls into spaces.
-
-    Deleting (not spacing) ``h\\x00o\\x1bldout`` rejoins the word, and stripping whole sequences
-    rejoins ``ho\\x1b[31mldout``, so the redactor and the barrier both see ``holdout``.
-    """
-    text = _recall_strip_ansi(str(text))
-    text = _recall_strip_ansi(unicodedata.normalize("NFKC", text))
-    return _recall_drop_controls(text)
-
-
-def _recall_fold_plain(text: str) -> str:
-    """Fold without sequence stripping (only deletes ESC/C1 bytes); matched alongside ``_recall_fold``."""
-    return _recall_drop_controls(unicodedata.normalize("NFKC", str(text)))
-
-
-def _recall_has_holdout(text: str, folded: Optional[str] = None) -> bool:
-    # Fail closed if EITHER reading names holdout: stripping a sequence must never hide a marker
-    # that byte-deletion alone would have exposed (e.g. an unterminated OSC swallowing the path).
-    folded = _recall_fold(text) if folded is None else folded
-    return bool(_HOLDOUT_RE.search(folded) or _HOLDOUT_RE.search(_recall_fold_plain(text)))
-
-
-def _recall_redact_text(text: str) -> str:
-    """Fold ``text``; if it references holdout anywhere, replace the WHOLE string.
-
-    Partial substitution cannot know where a path ends (quoted paths may contain spaces), so any
-    trailing fragment could be a scenario name: fail closed on the entire field or line.
-    """
-    folded = _recall_fold(text)
-    return _HOLDOUT_REDACTED if _recall_has_holdout(text, folded) else folded
-
-
-def contains_holdout_reference(text: Any) -> bool:
-    """True when ``text`` mentions a holdout path or name (after the same folding the redactor uses)."""
-    return _recall_has_holdout(str(text or ""))
 
 
 def _recall_is_holdout_key(key: Any) -> bool:
@@ -1906,8 +1806,6 @@ def _recall_repo_keys(aliases: list[str]) -> set[str]:
         if entry:
             keys.update(str(entry.get(k) or "") for k in ("slug", "repo"))
         try:
-            from .repos import normalize_repo
-
             keys.update(normalize_repo(raw))
         except ValueError:  # a bare slug is not an owner/repo spec; already covered above
             pass
