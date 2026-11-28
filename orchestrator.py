@@ -1336,11 +1336,13 @@ def _lane_fingerprint(lanes: list[dict[str, Any]]) -> list[list[Any]]:
     return sorted([str(lane.get("task_id") or ""), lane.get("verdict")] for lane in lanes)
 
 
-def _expected_panel_lane_ids(panel_id: str, lanes: list[dict[str, Any]]) -> Optional[list[str]]:
+def _expected_panel_lane_ids(
+    panel_id: str, lanes: list[dict[str, Any]], *, db_path: Optional[Path] = None
+) -> Optional[list[str]]:
     """Every task id ``spawn_verification_pair`` recorded in `trail.db` for ``panel_id``; ``None`` if unknown."""
     tenant = next((lane.get("tenant") for lane in lanes if lane.get("tenant")), None)
     try:
-        rows = query_decisions(tenant=tenant or None, phase="verify", limit=500)
+        rows = query_decisions(tenant=tenant or None, phase="verify", limit=500, db_path=db_path)
     except (sqlite3.Error, OSError):
         return None
     for row in rows:

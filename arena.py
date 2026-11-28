@@ -695,6 +695,16 @@ def _find_manifest(arena_id: Optional[str], tenant: Optional[str]) -> tuple[Opti
     return newest[1], None
 
 
+def _manifest_candidates(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """Candidate entries of a manifest; a present non-list ``candidates`` is malformed (``ValueError``)."""
+    raw = manifest.get("candidates")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("Arena manifest candidates must be a list.")
+    return [c for c in raw if isinstance(c, dict)]
+
+
 def _created_ns(manifest: dict[str, Any]) -> int:
     for key, scale in (("created_at_ns", 1), ("created_at", 1_000_000_000)):
         raw = manifest.get(key)
@@ -786,7 +796,7 @@ def _evaluate_manifest_state(
     """
     target = str(manifest.get("target") or "define")
     arena_tenant = str(manifest.get("tenant") or "")
-    cand_meta = [c for c in manifest.get("candidates") or [] if isinstance(c, dict)]
+    cand_meta = _manifest_candidates(manifest)
     advisories: list[str] = [db_error] if db_error else []
 
     candidates: list[dict[str, Any]] = []
@@ -925,11 +935,14 @@ def evaluate_arena(
     manifest = _load_manifest(manifest_path)
     if manifest is None:
         return {"ok": False, "error": f"Arena manifest unreadable: {manifest_path}", "arena_id": aid}
+    if not isinstance(manifest.get("candidates", []), (list, type(None))):
+        error = f"Arena manifest malformed (candidates must be a list): {manifest_path}"
+        return {"ok": False, "error": error, "arena_id": aid}
 
     aid = str(manifest["arena_id"])
     target = str(manifest.get("target") or "define")
     arena_tenant = str(manifest.get("tenant") or "")
-    cand_meta = [c for c in manifest.get("candidates") or [] if isinstance(c, dict)]
+    cand_meta = _manifest_candidates(manifest)
     ids = [str(c["task_id"]) for c in cand_meta if c.get("task_id")]
     db_path = _kanban_db_file(board)
     tasks, judge_rows, db_error = _read_tasks(db_path, ids, aid)
@@ -1208,21 +1221,56 @@ def list_arena_summaries(
         aid = str(manifest["arena_id"])
         try:
             state = _evaluate_manifest_state(manifest, tasks, judges.get(aid, []), db_error, include_paths=False)
-            summaries.append({
-                "arena_id": aid,
-                "tenant": str(manifest["tenant"]),
-                "repo": _scrub(manifest.get("repo")),
-                "target": str(manifest.get("target") or "define"),
-                "title": _scrub(manifest.get("title")),
-                "status": str(state["status"]),
-                "created_at": int(_created_ns(manifest) // 1_000_000_000) or None,
-                "candidates": [_public_candidate(c) for c in state["candidates"]],
-                "judge": _public_judge(state["judge"]),
-                "ready_for_synthesis": state["ready_for_synthesis"] is True,
-                "synthesized": state["synthesized"] is True,
-                "canonical_artifact_exists": state["canonical_artifact_exists"] is True,
-                "advisories": [a for a in state["advisories"] if isinstance(a, str) and not contains_holdout_reference(a)],
-            })
+            summaries.append(_public_summary(manifest, state))
         except _MANIFEST_ERRORS:
             continue
     return summaries
+
+
+def _public_summary(manifest: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    """Path-free, strictly typed, holdout-scrubbed arena projection shared by every Dashboard payload."""
+    return {
+        "arena_id": str(manifest["arena_id"]),
+        "tenant": str(manifest["tenant"]),
+        "repo": _scrub(manifest.get("repo")),
+        "target": str(manifest.get("target") or "define"),
+        "title": _scrub(manifest.get("title")),
+        "status": str(state["status"]),
+        "created_at": int(_created_ns(manifest) // 1_000_000_000) or None,
+        "candidates": [_public_candidate(c) for c in state["candidates"]],
+        "judge": _public_judge(state["judge"]),
+        "ready_for_synthesis": state["ready_for_synthesis"] is True,
+        "synthesized": state["synthesized"] is True,
+        "canonical_artifact_exists": state["canonical_artifact_exists"] is True,
+        "advisories": [a for a in state["advisories"] if isinstance(a, str) and not contains_holdout_reference(a)],
+    }
+
+
+def evaluate_arena_public(
+    *, arena_id: Optional[str] = None, tenant: Optional[str] = None, board: Optional[str] = None
+) -> dict[str, Any]:
+    """`evaluate_arena` with ``spawn_judge=False`` (never writes), projected like `list_arena_summaries`.
+
+    Returns ``{ok: True, arena: <public summary>}``, or ``{ok: False, error}`` with a path-free error
+    when the arena is absent, unreadable, or its manifest identity does not match its directory.
+    """
+    not_found = {"ok": False, "error": "No readable arena found for the given selector."}
+    try:
+        res = evaluate_arena(arena_id=arena_id, tenant=tenant, spawn_judge=False, board=board)
+        if not res.get("ok") or not res.get("manifest_path"):
+            return not_found
+        path = Path(str(res["manifest_path"]))
+        manifest = _load_manifest(path)
+        if manifest is None or not _public_manifest_ok(manifest, path.parent.parent.parent.name, path.parent.name):
+            return not_found
+        aid = str(manifest["arena_id"])
+        ids = sorted({
+            str(c["task_id"])
+            for c in (manifest.get("candidates") if isinstance(manifest.get("candidates"), list) else [])
+            if isinstance(c, dict) and c.get("task_id")
+        })
+        tasks, judges, db_error = _read_arena_tasks(_kanban_db_file(board), ids, [aid])
+        state = _evaluate_manifest_state(manifest, tasks, judges.get(aid, []), db_error, include_paths=False)
+        return {"ok": True, "arena": _public_summary(manifest, state)}
+    except _MANIFEST_ERRORS:
+        return not_found

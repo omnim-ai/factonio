@@ -123,6 +123,9 @@ class TestSchemaV2Migration(unittest.TestCase):
 
             rows = trail.query_decisions(db_path=db, limit=1000)
             self.assertEqual(len(rows), 40)
+            self.assertEqual(_meta(db)["schema_version"], "1", "read-only queries never migrate trail.db")
+            with contextlib.closing(trail._connect(db)):
+                pass
             self.assertEqual(_meta(db)["schema_version"], "2")
             with contextlib.closing(sqlite3.connect(str(db))) as conn:
                 self.assertEqual(_dump_decisions(conn), before)

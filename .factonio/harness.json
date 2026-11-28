@@ -181,7 +181,8 @@
         "`list_arena_summaries` (GET /cards `arenas`) shares evaluate_arena's status machine, reads kanban.db with one `?mode=ro` query, skips corrupt or mismatched manifests, sorts newest first, never creates directories, kanban.db or manifests, and never emits paths, manifest_path, holdout_dir, holdout_files or holdout-referencing titles/labels/advisories",
         "`list_arena_summaries` skips (per manifest, never failing GET /cards) a manifest with a non-finite created_at_ns / created_at (`1e309`), an unknown target, or an arena_id / tenant that does not match its runs/<tenant>/arena/<arena_id>/ directory, keeps valid sibling arenas, and nulls repo, title and every candidate / judge slot, vendor, model and task_id that references holdout",
         "`list_arena_summaries` emits a strictly typed projection: string fields (repo, title, candidate / judge slot, vendor, model, task_id, status, advisories) are a real `str` without a holdout reference or null, `judge.cross_vendor` is `true` / `false` / null (a string, number, `1e309`, list or object reads null), and artifact_ready / ready_for_synthesis / synthesized / canonical_artifact_exists are bools, so a malformed manifest can neither leak nor make GET /cards HTTP 500",
-        "The design judge card (only) tells the judge to emit `<canonical design>/preview.html` as a self-contained zero-build static HTML variant switcher toggling every candidate, the Synthesis and a side-by-side comparison alongside `DESIGN.md`; define judge cards never mention it"
+        "The design judge card (only) tells the judge to emit `<canonical design>/preview.html` as a self-contained zero-build static HTML variant switcher toggling every candidate, the Synthesis and a side-by-side comparison alongside `DESIGN.md`; define judge cards never mention it",
+        "Fix round 1: `evaluate_arena` returns `ok: false` and `evaluate_arena_public` the path-free not-found result for a manifest whose `candidates` is present but not a list (`123`, `true`, a string or an object), never raising"
       ]
     },
     {
@@ -308,7 +309,8 @@
         "`contains_holdout_reference` strips complete ANSI CSI/OSC/DCS/C1 escape sequences before matching and also matches the byte-deleted reading, so escape sequences can neither split nor swallow the holdout marker",
         "metrics `_card_targets` surfaces additive `local_target` (repo, branch, base_branch, head_sha) on panel lanes, panel summaries and thread cards from the orchestrator `Local branch target:` stamp (stamped cards never yield a phantom PR ref) or a PR-less full-SHA completion handoff on non-verification cards (a newer PR-publishing run hides earlier local handoffs; a structured local handoff beats `- GitHub Issue:` / `- Stack parent PR:` body refs, which are only a fallback; PR-target lanes never match `branch` filters)",
         "`workstream_modes_from_trail` returns each tenant's newest valid start_workstream kind read-only (`{}` for an absent, directory or corrupt trail.db, never created); `thread_cards` adds `workstreams` `{kind, read_only, report_path, report_exists}` (trail first, then `- Mode:` / `[define] [investigate]` / mode contract headings, else legacy null; only investigate exposes a report path, computed without mkdir and null when it references holdout), per-card workstream_kind and arena_id / arena_role / arena_slot / arena_vendor / arena_target",
-        "`trail._iso` / `_now_iso` format UTC timestamps with explicit 4-digit zero-padded years (`0001`, `0042`, `0999`) and microseconds on every Python 3.11+ platform, converting non-UTC offsets"
+        "`trail._iso` / `_now_iso` format UTC timestamps with explicit 4-digit zero-padded years (`0001`, `0042`, `0999`) and microseconds on every Python 3.11+ platform, converting non-UTC offsets",
+        "Fix round 1: `GET /trail?signal=attention` never lets routine non-human `pr_gate` / `bootstrap_verify` polls (`blocked` included) bury escapes, audit evidence findings or non-routine escalations at `limit=50`; `GET /trail?q=` matches Unicode case-folded decoded public text (decision, why, result, card_id, tenant, repo_slug, evidence keys and scalars, never escaped JSON) in both `decisions` and `summary`, so `q=café` matches `CAFÉ` and `q=alpha\"beta` matches decoded evidence while holdout probes still return nothing"
       ]
     },
     {
@@ -329,11 +331,26 @@
         "`GET /repos` under /api/plugins/factonio responds as documented",
         "`GET /status` under /api/plugins/factonio responds as documented",
         "`GET /trail` under /api/plugins/factonio responds as documented",
+        "`GET /trail/audit` under /api/plugins/factonio responds as documented",
         "`GET /trail/{decision_id}` under /api/plugins/factonio responds as documented",
+        "`GET /workstreams/{tenant}/report` under /api/plugins/factonio responds as documented",
         "`PATCH /repos/{slug}` under /api/plugins/factonio responds as documented",
+        "`POST /arenas/evaluate` under /api/plugins/factonio responds as documented",
+        "`POST /panels/evaluate` under /api/plugins/factonio responds as documented",
+        "`POST /publish-pr` under /api/plugins/factonio responds as documented",
+        "`POST /repos/{slug}/harness/audit` under /api/plugins/factonio responds as documented",
+        "`POST /trail/decisions` under /api/plugins/factonio responds as documented",
         "`GET /repos` returns defaults.publish_policy and per-repo publish_policy (legacy records inherit the global default; invalid stored values read as null, never auto); `PATCH /repos/{slug}` persists publish_policy auto/ask and answers 422 for any other value including null and \"\"",
         "`GET /cards` adds `workstreams`, `arenas`, per-card `workstream_kind` and `arena_*` fields without creating kanban.db, trail.db or runs/; `GET /repos` and `PATCH /repos/{slug}` responses add a per-repo read-only `harness` summary (malformed manifests read has_manifest_error, never HTTP 500) and `PATCH /repos/{slug}` with `harness` is 422",
-        "`GET /trail` and `GET /trail/{decision_id}` drop every holdout-named key at any depth (holdout_path, holdout_files) and replace holdout-referencing strings with [redacted], leaving other rows unchanged; `GET /cards` per-card arena_role / arena_target outside their enums and any holdout-referencing arena_* field read null"
+        "`GET /trail` and `GET /trail/{decision_id}` drop every holdout-named key at any depth (holdout_path, holdout_files) and replace holdout-referencing strings with [redacted], leaving other rows unchanged; `GET /cards` per-card arena_role / arena_target outside their enums and any holdout-referencing arena_* field read null",
+        "`POST /publish-pr` answers 422 for unknown keys (`body_file`, `remote`, `actor`), non-string/non-bool coercions, short or non-hex SHAs, blank titles and `confirmed` not `true`, 404 for an unregistered repo, and 409 plus a `refused` `publish_pr` trail row (actor human, no git/gh call) unless `metrics.local_branch_verification_status` proves the exact `(repo, branch, expected_head_sha)` passed local verification; a verified target calls `repos.publish_pr(remote=\"origin\", actor=\"human\")` and maps readback 200 / refusal or drift 409 / push-create-readback failure 502",
+        "`GET /workstreams/{tenant}/report` returns `exists: false` without creating runs/, serves only `<runs>/<safe_tenant>/investigation.md` capped at 256 KiB (`truncated`) with holdout lines redacted (`redacted`) and no filesystem path, answers 422 for invalid tenants or NUL content and 403 for symlinks or non-regular files",
+        "`POST /repos/{slug}/harness/audit` is 404 unregistered / 409 missing checkout / 422 for unknown keys or flag-like `base_ref`, never changes repo files or `.git/index`, logs `harness_audit` (phase harness, actor human) and omits `repo_path`; `GET /repos` stays subprocess-free",
+        "`POST /panels/evaluate` (`pr_number` XOR `branch`, strict types) and `POST /arenas/evaluate` (`spawn_judge` is 422; never writes) return 404 when absent or a scrubbed, path-free summary; `POST /trail/decisions` rejects a client `actor`, requires `confirmed: true`, an allowlisted phase and <= 16 KiB object evidence, 404s an unknown `supersedes_id` and returns 201 with an `actor: human` row",
+        "`GET /trail/audit` (registered before `GET /trail/{decision_id}`) is read-only and 503 when trail.db is unreadable; `GET /trail` keeps its legacy `filters` keys and adds `actor`, `q` (matches public scrubbed text only; holdout probes return nothing), `signal` (all/key/attention) and `include_superseded`, all read with `mode=ro`; non-finite evidence floats serialize as null",
+        "Fix round 1: `GET /workstreams/{tenant}/report` walks pinned `O_NOFOLLOW` directory fds from the Hermes home and re-checks each inode, so a symlinked `runs/` or Factonio ancestor, a symlinked tenant directory, or a tenant directory swapped mid-walk is 403 and never returns outside content; content has absolute OS paths (`/home/...`, `/Users/...`, `/tmp/...`, `C:\\...`) replaced with `[REDACTED]` (`redacted: true`; relative paths and URLs kept) and is trimmed on a UTF-8 boundary after redaction, so it is always <= 262144 UTF-8 bytes with no stray U+FFFD",
+        "Fix round 1: every `POST /publish-pr` 409 detail carries `ok: false, published: false, pushed: false, created: false, refused: true`; `POST /arenas/evaluate` is 404 (never 500) when a manifest's `candidates` is not a list; harness-audit 422 details never contain the raw, `~`-expanded or resolved checkout path",
+        "Fix round 4 (decision `d_fc009afdf6ad`): `GET /workstreams/{tenant}/report` withholds as `[redacted]` (`redacted: true`) every whole line that references holdout (plain or ANSI/space-obfuscated), contains a raw terminal control character (`\\x1b[31m`, C1 `\\x9b`, BEL `\\x07`; `\\t` and `\\r\\n` stay allowed) or echoes the raw or symlink-resolved Hermes home or `plugin-data/factonio/runs`; ordinary Markdown prose (`|https://github.com/org/repo|/api/plugins/factonio/cards|`, stack traces, `src/app.py`, `https://github.com/omnim-ai/factonio/pull/47`, `/factonio`, `We should hold out for review`) is returned unchanged with `redacted: false`, and the envelope carries only `filename: \"investigation.md\"`"
       ]
     },
     {
@@ -490,8 +507,15 @@
       "GET /repos",
       "GET /status",
       "GET /trail",
+      "GET /trail/audit",
       "GET /trail/{decision_id}",
-      "PATCH /repos/{slug}"
+      "GET /workstreams/{tenant}/report",
+      "PATCH /repos/{slug}",
+      "POST /arenas/evaluate",
+      "POST /panels/evaluate",
+      "POST /publish-pr",
+      "POST /repos/{slug}/harness/audit",
+      "POST /trail/decisions"
     ],
     "cli_commands": [
       "add",
