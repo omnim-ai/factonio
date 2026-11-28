@@ -63,7 +63,8 @@ const STUBS = {
     export function useState(init) { return globalThis.__fcHooks.useState(init) }
     export function useRef(init) { return globalThis.__fcHooks.useRef(init) }
     export function useEffect(fn, deps) { return globalThis.__fcHooks.useEffect(fn, deps) }
-    export default { useState, useRef, useEffect }
+    export function useMemo(fn, deps) { return globalThis.__fcHooks.useMemo(fn, deps) }
+    export default { useState, useRef, useEffect, useMemo }
   `,
   'react/jsx-runtime': `
     export function jsx(type, props, key) { return { type, props: props || {}, key } }
@@ -107,12 +108,14 @@ Object.defineProperty(globalThis, 'navigator', { value: { clipboard: { writeText
 function makeHooks() {
   const store = new Map()
   const visited = new Set()
+  const memoRuns = new Map()
   let pending = []
   let path = 'root'
   let idx = 0
   return {
     store,
     visited,
+    memoRuns,
     useState(init) {
       const k = path + '#' + (idx++)
       if (!store.has(k)) store.set(k, typeof init === 'function' ? init() : init)
@@ -129,6 +132,17 @@ function makeHooks() {
       const changed = !prev || !deps || !prev.deps || deps.length !== prev.deps.length || deps.some((d, i) => !Object.is(d, prev.deps[i]))
       store.set(k, { deps })
       if (changed) pending.push(fn)
+    },
+    // React semantics: recompute when deps are missing, change length, or any dep fails Object.is.
+    useMemo(fn, deps) {
+      const k = path + '#' + (idx++)
+      const prev = store.get(k)
+      const same = prev && deps && prev.deps && deps.length === prev.deps.length && deps.every((d, i) => Object.is(d, prev.deps[i]))
+      if (same) return prev.value
+      const value = fn()
+      store.set(k, { deps, value })
+      memoRuns.set(k, (memoRuns.get(k) || 0) + 1)
+      return value
     },
     // Run queued effects (after refs are attached), like React's commit phase.
     flush() { const q = pending; pending = []; q.forEach(fn => fn()) },
@@ -199,6 +213,7 @@ function expand(node, p = 'root') {
   if (typeof node.type === 'function') {
     const myPath = p + '/' + (node.type.name || 'anon')
     const prev = globalThis.__fcHooks.enter(myPath)
+    globalThis.__fcOnRender?.(node.type, node.props || {}, myPath)
     let out
     try { out = node.type(node.props || {}) } finally { globalThis.__fcHooks.leave(prev) }
     return expand(out, myPath)
@@ -1717,6 +1732,86 @@ async function runTrailScenarios(report) {
 
 // Supersession chains whose prior decision is outside the loaded window / server scope, fed by
 // real trail.db payloads that the Python side writes to FC_LINEAGE_FIXTURE.
+// useMemo stub semantics + TrailSection decomposition / memoization of derived ledger transforms.
+async function runTrailMemoScenarios(report) {
+  const M = report.trailMemo = {}
+  const memoRunsFor = depsSeq => {
+    const h = makeHooks()
+    let runs = 0
+    for (const deps of depsSeq) {
+      const prev = h.enter('probe')
+      h.useMemo(() => ++runs, deps)
+      h.leave(prev)
+    }
+    return runs
+  }
+  const obj = {}
+  M.stub = {
+    sameDeps: memoRunsFor([[1, 'a'], [1, 'a'], [1, 'a']]),
+    nan: memoRunsFor([[NaN], [NaN]]),
+    signedZero: memoRunsFor([[0], [-0]]),
+    noDeps: memoRunsFor([undefined, undefined, undefined]),
+    lengthChange: memoRunsFor([[1], [1, 2]]),
+    emptyDeps: memoRunsFor([[], [], []]),
+    sameObject: memoRunsFor([[obj], [obj]]),
+    freshObject: memoRunsFor([[{}], [{}]])
+  }
+
+  const client = { invalidated: [], invalidateQueries(o) { this.invalidated.push(o.queryKey); return Promise.resolve() } }
+  const mountDash = () => mountRepos({ data: { repos: TRAIL_REPOS, defaults: REPO_DEFAULTS }, client })
+  const rendered = new Set()
+  let rowProps = {}
+  globalThis.__fcOnRender = (type, props, path) => {
+    if (path.includes('/TrailSection')) rendered.add(type.name)
+    if (type.name === 'DecisionRow') rowProps[props.d.id] = props
+  }
+  const runs = () => new Map([...globalThis.__fcHooks.memoRuns].filter(([k]) => k.includes('/TrailSection')))
+  const delta = before => [...runs()].filter(([k, n]) => n !== (before.get(k) || 0)).length
+  const CHAINED = 'd_c4f08e2a91b7'
+  try {
+    trailState = routeTrail(TRAIL_DATA, AUDIT_FINDINGS)
+    trailQueries.length = 0
+    const m = mountDash()
+    let tree = m.render()
+    trailPreset(tree, 'all'); tree = m.render()
+    const chain0 = rowProps[CHAINED].chain
+    const row0 = rowProps[CHAINED].d
+    let snap = runs()
+    M.slots = snap.size
+    rowProps = {}; tree = m.render()
+    M.rerender = delta(snap)
+    snap = runs()
+    trailAction(tree, 'log-decision'); rowProps = {}; tree = m.render()
+    M.modal = { recomputed: delta(snap), open: readTrail(tree).modal, chainSame: rowProps[CHAINED].chain === chain0 }
+    snap = runs()
+    trailAction(tree, 'cancel-modal')
+    rowProps = {}; tree = m.render()
+    M.modalClosed = { recomputed: delta(snap), open: readTrail(tree).modal }
+    snap = runs()
+    trailAction(tree, 'toggle-audit'); rowProps = {}; tree = m.render()
+    M.audit = { recomputed: delta(snap), expanded: readTrail(tree).audit.expanded, chainSame: rowProps[CHAINED].chain === chain0 }
+    snap = runs()
+    rowAction(tree, CHAINED, 'toggle-row'); rowProps = {}; tree = m.render()
+    M.rowOpen = { recomputed: delta(snap), expanded: readTrail(tree).rows.find(r => r.id === CHAINED).expanded }
+    snap = runs()
+    trailPhase(tree, 'verify'); rowProps = {}; tree = m.render()
+    M.phase = {
+      recomputed: delta(snap),
+      rows: readTrail(tree).rows.map(r => r.id),
+      chainSame: rowProps[CHAINED].chain === chain0,
+      rowSame: rowProps[CHAINED].d === row0
+    }
+    // A new base-poll payload (fresh reference) recomputes the ledger transforms.
+    snap = runs()
+    trailState = routeTrail({ ...TRAIL_DATA, decisions: [...TRAIL] }, AUDIT_FINDINGS)
+    rowProps = {}; tree = m.render()
+    M.poll = { recomputed: delta(snap), chainSame: rowProps[CHAINED].chain === chain0, chainPriors: rowProps[CHAINED].chain.priors.map(p => p.id) }
+  } finally {
+    globalThis.__fcOnRender = undefined
+  }
+  M.components = [...rendered].filter(n => /^Trail/.test(n)).sort()
+}
+
 async function runTrailLineageScenarios(report) {
   const L = report.trail.lineage = {}
   const fx = JSON.parse(readFileSync(process.env.FC_LINEAGE_FIXTURE, 'utf8'))
@@ -3113,6 +3208,7 @@ await runSidebarScenarios(report, registered, oldRegistered)
 await runReposScenarios(report)
 await runTrailScenarios(report)
 await runTrailLineageScenarios(report)
+await runTrailMemoScenarios(report)
 
 // Tri-state verification verdicts: additive `inconclusive` fields from /metrics and /cards.
 {
@@ -4183,6 +4279,46 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual(err["retry"], {"refetches": 1, "stopped": True})
         self.assertEqual(err["drawer"]["dt"], "Decisions")
         self.assertEqual(err["drawer"]["text"], "Unavailable")
+
+    # --- TrailSection decomposition + useMemo --------------------------------
+    def test_react_stub_use_memo_matches_react_dependency_semantics(self):
+        stub = self.report["trailMemo"]["stub"]
+        self.assertEqual(
+            stub,
+            {"sameDeps": 1, "nan": 1, "signedZero": 2, "noDeps": 3, "lengthChange": 2, "emptyDeps": 1, "sameObject": 1, "freshObject": 2},
+        )
+
+    def test_trail_section_decomposed_into_focused_units(self):
+        memo = self.report["trailMemo"]
+        self.assertEqual(memo["components"], ["TrailAuditBanner", "TrailFilterBar", "TrailHeader", "TrailLedger", "TrailSection"])
+        source = PLUGIN_JS.read_text(encoding="utf-8")
+        self.assertIn("import { useEffect, useMemo, useRef, useState } from 'react'", source)
+        self.assertIn("function useTrailState(routeTenant) {", source)
+        start = source.index("function TrailSection(")
+        body = source[start : source.index("\n}\n", start)]
+        self.assertNotIn("useState(", body, "TrailSection view state lives in useTrailState")
+        self.assertGreaterEqual(body.count("useMemo("), 8)
+
+    def test_trail_derived_transforms_memoized_across_unrelated_state(self):
+        memo = self.report["trailMemo"]
+        self.assertGreaterEqual(memo["slots"], 10)
+        self.assertEqual(memo["rerender"], 0)
+        # Opening/closing the modal, toggling the audit banner or a row recompute nothing.
+        self.assertEqual(memo["modal"], {"recomputed": 0, "open": "fc-hd", "chainSame": True})
+        self.assertEqual(memo["modalClosed"], {"recomputed": 0, "open": None})
+        self.assertEqual(memo["audit"], {"recomputed": 0, "expanded": "true", "chainSame": True})
+        self.assertEqual(memo["rowOpen"], {"recomputed": 0, "expanded": "true"})
+        # A filter change only recomputes the filter-dependent slots; decisions + chains are reused.
+        phase = memo["phase"]
+        self.assertEqual(phase["rows"], ["d_c4f08e2a91b7"])
+        self.assertTrue(phase["chainSame"] and phase["rowSame"])
+        self.assertGreater(phase["recomputed"], 0)
+        self.assertLess(phase["recomputed"], memo["slots"] // 2)
+        # A fresh base-poll payload invalidates the ledger transforms and rebuilds the chain.
+        poll = memo["poll"]
+        self.assertFalse(poll["chainSame"])
+        self.assertGreater(poll["recomputed"], phase["recomputed"])
+        self.assertEqual(poll["chainPriors"], ["d_9a1e4c0b2f31"])
 
     def test_trail_styles_use_theme_tokens_only(self):
         source = PLUGIN_JS.read_text(encoding="utf-8")

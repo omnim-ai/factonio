@@ -382,6 +382,7 @@
         "`report ready` pill and drawer Report row open GET /workstreams/{tenant}/report in a read-only modal: Markdown rendered as React elements only (no innerHTML, https-only links, HTML as text), Truncated / Redacted notices, missing and error states",
         "Design cards awaiting approval show Approve Design / Request Revision confirm groups that only POST approve_design / request_design_revision trail decisions; panel and arena strips Re-evaluate via POST /panels/evaluate / POST /arenas/evaluate with busy, Updated just now and Retry states; no new polling (zero setInterval)",
         "Registered Repositories Audit runs POST /repos/{slug}/harness/audit into a colSpan=9 drawer (severity, mode, drift_classification, drifted files, stale invariants, gate loosening, manifest errors, recommendations; unknown payloads never read clean) while highlighting the row and active Audit button; repo_path is never rendered",
+        "Decision History TrailSection is split into useTrailState, TrailHeader, TrailAuditBanner, TrailFilterBar and TrailLedger with useMemo-memoized ledger transforms; unrelated state (modal, audit disclosure, row toggles) recomputes no derived transform",
         "No evidence pill, arena chip, callout, tooltip or report label renders holdout text (keys, values, nested, fullwidth, ANSI-split, zero-width or control-char spellings)"
       ]
     },
