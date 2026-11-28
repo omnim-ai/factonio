@@ -461,7 +461,8 @@
         "Malformed GraphQL open-PR and closing-reference nodes (inline and follow-up pages) fail closed across triage, CLI and tool entrypoints in tests.test_issue_intake.TestMalformedGraphqlNodes",
         "Rule-to-Enforcer ledger, orchestrator/design skill budgets and the design arena switcher contract are covered in tests.test_plugin_registration and tests.test_arena; sub-1000-year `_iso` / `resolve_since` / `_now_iso` formatting in tests.test_trail; the required `skill-bloat` hook in tests.test_verify_harness",
         "Unit 2 fix round 1 regressions (Show decision to row 90 of 100 and to a row fetched beyond the 200-row window, base-poll audit/signal refetch without timers or loops, 409 drift verified/observed heads with scrubbed detail and kept edits) are covered in tests.test_desktop_plugin",
-        "Unit 2 fix round 2 regressions (ConfirmModal start/end guards and Tab on the dialog skip a disabled Confirm to Cancel / Close, and fall back to the dialog when busy) are covered in tests.test_desktop_plugin"
+        "Unit 2 fix round 2 regressions (ConfirmModal start/end guards and Tab on the dialog skip a disabled Confirm to Cancel / Close, and fall back to the dialog when busy) are covered in tests.test_desktop_plugin",
+        "The Decision History CSS coverage gate in tests.test_desktop_plugin keeps `assertGreater(len(trail_rules), 60)` (Unit 2 fix round 3 restores the base threshold)"
       ]
     }
   ],
