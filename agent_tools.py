@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from typing import Any, Optional
 
 from .arena import ARENA_TARGETS, evaluate_arena, spawn_arena
@@ -44,7 +43,8 @@ from .repos import (
     restack_stack,
     update_repo,
 )
-from .trail import _GATE_LOOSENING_TOKENS, _norm_token_text, log_decision, record_transition
+from .trail import log_decision, record_transition
+from .vocabulary import scrub_loosening_hints
 
 
 def _json_ok(payload: dict[str, Any]) -> str:
@@ -80,16 +80,7 @@ def _strict_int(value: Any, name: str, *, default: Optional[int] = None, minimum
     return value
 
 
-def _scrub_loosening_hints(why: str, fallback: str) -> str:
-    """Drop clauses that merely *mention* a gate-loosening knob (e.g. a refusal's override hint).
-
-    `trail.audit_trail_evidence` flags `_GATE_LOOSENING_TOKENS` anywhere in `why`; real overrides are
-    recorded in `evidence`, so a hint in refusal prose would be a permanent false positive.
-    """
-    tokens = [_norm_token_text(t) for t in _GATE_LOOSENING_TOKENS]
-    clauses = re.split(r"\s*;\s*|,\s+or\s+", why)
-    kept = [c for c in clauses if c and not any(t in _norm_token_text(c) for t in tokens)]
-    return "; ".join(kept) or fallback
+_scrub_loosening_hints = scrub_loosening_hints
 
 
 def _gate_result(gate: dict[str, Any]) -> str:
@@ -1220,11 +1211,11 @@ def register_tools(ctx: Any) -> None:
                     "allowed_labels": {"type": "array", "items": {"type": "string"}, "description": "triage: maintainer labels that pass the author gate."},
                     "limit": {"type": "integer", "minimum": 1, "default": 30, "description": "triage: total issue budget (<= 100). Every stop-the-line issue is always included, even beyond the limit; the remaining max(0, limit - stop_the_line) slots go to the oldest non-urgent issues."},
                     "pr_number": {"type": "integer", "minimum": 1, "description": "verify_existing_fix: the existing open PR."},
-                    "head_sha": {"type": "string", "description": "verify_existing_fix: the PR's exact full 40-char head SHA (from factonio_pr_gate); abbreviated SHAs are rejected."},
+                    "head_sha": {"type": "string", "description": "verify_existing_fix: the PR's exact full 40-char (or 64-char SHA-256) head SHA (from factonio_pr_gate); abbreviated SHAs are rejected."},
                     "base_sha": {
                         "type": "string",
                         "description": (
-                            "verify_existing_fix: full 40-char base commit SHA every before-run must carry as head_sha. "
+                            "verify_existing_fix: full 40-char (or 64-char SHA-256) base commit SHA every before-run must carry as head_sha. "
                             "When omitted, all counted before-runs must share one full commit SHA (mixed commits are rejected)."
                         ),
                     },

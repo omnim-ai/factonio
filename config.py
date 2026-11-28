@@ -16,17 +16,23 @@ try:  # POSIX cross-process advisory locking; absent on Windows.
 except ImportError:  # pragma: no cover - non-POSIX fallback (in-process lock only)
     _fcntl = None  # type: ignore[assignment]
 
-PLUGIN_ID = "factonio"
-WORKER_PROFILE = "factonio"
-
-PHASES: tuple[str, ...] = ("define", "design", "implement", "verify", "watchdog")
-
-DESIGN_PROVIDERS: tuple[str, ...] = ("auto", "claude-design", "hermes", "off")
-DESIGN_APPROVAL_POLICIES: tuple[str, ...] = ("ask", "auto")
-MERGE_POLICIES: tuple[str, ...] = ("auto", "ask")
-PUBLISH_POLICIES: tuple[str, ...] = ("auto", "ask")
-RIGOR_LEVELS: tuple[str, ...] = ("standard", "high")
-WORKSTREAM_KINDS: tuple[str, ...] = ("feature", "bug", "quick", "refactor", "perf", "investigate")
+from .store_kanban import get_hermes_home_path as get_hermes_home_path  # re-export
+from .store_kanban import get_root_hermes_home_path as get_root_hermes_home_path  # re-export
+from .validators import safe_tenant_dirname
+from .validators import single_line as single_line  # re-export
+from .vocabulary import (  # re-exports: canonical vocabularies live in `vocabulary`
+    DESIGN_APPROVAL_POLICIES as DESIGN_APPROVAL_POLICIES,
+    DESIGN_PROVIDERS as DESIGN_PROVIDERS,
+    MERGE_POLICIES as MERGE_POLICIES,
+    PHASES as PHASES,
+    PLUGIN_ID as PLUGIN_ID,
+    PUBLISH_POLICIES as PUBLISH_POLICIES,
+    RIGOR_LEVELS as RIGOR_LEVELS,
+    ROUTER_PROVIDERS,
+    VENDOR_ALIASES,
+    WORKER_PROFILE as WORKER_PROFILE,
+    WORKSTREAM_KINDS as WORKSTREAM_KINDS,
+)
 
 AUX_TASK_SPECS: tuple[dict[str, str], ...] = (
     {
@@ -156,19 +162,32 @@ def resolve_initial_progress_minutes(
     return min(window, threshold)
 
 
-def get_hermes_home_path() -> Path:
-    """Resolve the active HERMES_HOME path via Hermes core."""
-    from hermes_constants import get_hermes_home
+def run_data_dir(tenant: str) -> Path:
+    """Durable plugin-owned run directory holding `spec.md` and `holdout/`."""
+    path = get_root_hermes_home_path() / "plugin-data" / PLUGIN_ID / "runs" / safe_tenant_dirname(tenant)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
-    return Path(get_hermes_home())
+
+def spec_file_path(tenant: str) -> Path:
+    return run_data_dir(tenant) / "spec.md"
 
 
-def get_root_hermes_home_path() -> Path:
-    """Resolve the root (default) HERMES_HOME even when running inside a named profile."""
-    active = get_hermes_home_path()
-    if active.parent.name == "profiles":
-        return active.parent.parent
-    return active
+def holdout_dir_path(tenant: str) -> Path:
+    path = run_data_dir(tenant) / "holdout"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def design_dir_path(tenant: str) -> Path:
+    path = run_data_dir(tenant) / "design"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def investigation_report_path(tenant: str) -> Path:
+    """Output path of a read-only `investigate` workstream's forensic report."""
+    return run_data_dir(tenant) / "investigation.md"
 
 
 def load_settings(*, use_root: bool = False) -> dict[str, Any]:
@@ -642,116 +661,9 @@ def check_cross_model_warning(*, repo_slug: Optional[str] = None) -> Optional[st
     return None
 
 
-# Vendor families keyed by canonical vendor; values are model-name / provider prefixes.
-_VENDOR_ALIASES: dict[str, str] = {
-    "anthropic": "anthropic",
-    "claude": "anthropic",
-    "openai": "openai",
-    "gpt": "openai",
-    "chatgpt": "openai",
-    "codex": "openai",
-    "o1": "openai",
-    "o3": "openai",
-    "o4": "openai",
-    "azure": "openai",
-    "google": "google",
-    "gemini": "google",
-    "gemma": "google",
-    "palm": "google",
-    "meta": "meta",
-    "llama": "meta",
-    "mistral": "mistral",
-    "mistralai": "mistral",
-    "mixtral": "mistral",
-    "codestral": "mistral",
-    "devstral": "mistral",
-    "magistral": "mistral",
-    "ministral": "mistral",
-    "pixtral": "mistral",
-    "xai": "xai",
-    "x-ai": "xai",
-    "grok": "xai",
-    "deepseek": "deepseek",
-    "qwen": "qwen",
-    "qwq": "qwen",
-    "alibaba": "qwen",
-    "dashscope": "qwen",
-    "moonshot": "moonshot",
-    "moonshotai": "moonshot",
-    "kimi": "moonshot",
-    "zai": "zhipu",
-    "z-ai": "zhipu",
-    "zhipu": "zhipu",
-    "glm": "zhipu",
-    "cohere": "cohere",
-    "command": "cohere",
-    "amazon": "amazon",
-    "nova": "amazon",
-    "nous": "nous",
-    "nousresearch": "nous",
-    "hermes": "nous",
-    "minimax": "minimax",
-    "microsoft": "microsoft",
-    "phi": "microsoft",
-    "xiaomi": "xiaomi",
-    "mimo": "xiaomi",
-    "tencent": "tencent",
-    "hunyuan": "tencent",
-    "hy3": "tencent",
-    "hy4": "tencent",
-    "stepfun": "stepfun",
-    "step": "stepfun",
-    "nvidia": "nvidia",
-    "nemotron": "nvidia",
-    "sakana": "sakana",
-    "fugu": "sakana",
-    "upstage": "upstage",
-    "solar": "upstage",
-    "arcee": "arcee",
-    "trinity": "arcee",
-}
-
-# Providers that front many vendors; the model id (not the provider) identifies the family.
-_ROUTER_PROVIDERS: frozenset[str] = frozenset(
-    {
-        "nous",
-        "nous-portal",
-        "openrouter",
-        "vertex",
-        "vertex-ai",
-        "vertexai",
-        "google-vertex",
-        "bedrock",
-        "aws-bedrock",
-        "azure-foundry",
-        "together",
-        "fireworks",
-        "groq",
-        "deepinfra",
-        "huggingface",
-        "nebius",
-        "nvidia",
-        "kilocode",
-        "gmi",
-        "novita",
-        "opencode-go",
-        "opencode-zen",
-        "chutes",
-        "cerebras",
-        "sambanova",
-        "siliconflow",
-        "portkey",
-        "ollama",
-        "lmstudio",
-        "litellm",
-        "requesty",
-        "copilot",
-        "github-copilot",
-        "ai-gateway",
-        "vercel",
-        "custom",
-    }
-)
+# Vendor families / router providers live in `vocabulary`; legacy private aliases kept for callers.
+_VENDOR_ALIASES = VENDOR_ALIASES
+_ROUTER_PROVIDERS = ROUTER_PROVIDERS
 
 _TOKEN_SPLIT = re.compile(r"[/.:@\s]+")
 
@@ -877,15 +789,7 @@ def resolve_publish_policy(
     return resolve_default_publish_policy()
 
 
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
-
-
-def single_line(text: Any) -> str:
-    """Collapse newlines/control characters to single spaces so a value fits one Markdown line."""
-    return " ".join(_CONTROL_CHARS_RE.sub(" ", str(text or "")).split())
-
-
-def _normalize_panel_entry(raw: Any, *, source: str, index: int) -> Optional[dict[str, Any]]:
+def normalize_panel_entry(raw: Any, *, source: str, index: int) -> Optional[dict[str, Any]]:
     """Normalize one panel member: ``{"provider", "model", "label"}``, ``"provider/model"`` or ``"model"``.
 
     ``"openrouter/anthropic/claude-opus-4-6"`` splits at the first ``/`` into provider
@@ -920,6 +824,9 @@ def _normalize_panel_entry(raw: Any, *, source: str, index: int) -> Optional[dic
         "source": source,
         "index": int(index),
     }
+
+
+_normalize_panel_entry = normalize_panel_entry
 
 
 def _coerce_panel_list(raw: Any) -> Optional[list[Any]]:
@@ -971,7 +878,7 @@ def validate_verify_panel(raw_entries: Any, *, source: str = "override") -> dict
     entries: list[dict[str, Any]] = []
     invalid: list[Any] = []
     for idx, raw in enumerate(raw_list):
-        entry = _normalize_panel_entry(raw, source=source, index=idx)
+        entry = normalize_panel_entry(raw, source=source, index=idx)
         if entry is None:
             invalid.append(raw)
         else:

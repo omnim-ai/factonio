@@ -9,6 +9,11 @@ __init__.py                  Plugin entrypoint: registers aux models, skills, to
 plugin.yaml                  Hermes plugin manifest (v2) and config_schema
 agent_tools.py               15 agent-callable tools (`factonio_*`), including `factonio_log_decision`, `factonio_bootstrap_verify`, `factonio_restack_pr`, `factonio_evaluate_panel` and `factonio_spawn_arena` / `factonio_evaluate_arena`
 commands.py                  CLI subcommands (`hermes factonio init|add|update|remove|list|models|status|panel|pr-gate|restack|worktrees|harness|trail|metrics|arena|doctor`)
+vocabulary.py                Layer 0 canonical vocabularies + holdout barrier / gate-loosening text helpers (stdlib only)
+validators.py                Layer 0 validators: single `FULL_SHA_RE`, repo/tenant/branch/PR checks, `normalize_repo`, `make_tenant`
+git_cli.py                   Layer 0 `git` / `gh` subprocess seam (`run_git`, `run_git_ro`, `run_gh`, injectable runner)
+store_kanban.py              Layer 0 read-only `kanban.db` access: path resolution, `mode=ro` opener, chunked `IN (...)` queries
+verification.py              Phase classification, panel/arena/mode stamps, card targets, panel consensus, local-branch verification
 config.py                    Settings, durable repos.json store (atomic writes + flock), phase model & design resolution
 orchestrator.py              Workstream lifecycle, Kanban DAG creation, holdout/ isolation, session notify+wake subscriptions
 arena.py                     Opt-in arena: cross-vendor define/design candidate fan-out, dependent judge, read-only progress
@@ -32,6 +37,8 @@ skills/
   verify-blackbox/SKILL.md   Phase 3b: live artifact & holdout/ execution (blind to git diff)
 tests/
   _env.py                    Clean-room `isolated_hermes_home()` context manager
+  test_architecture_invariants.py  AST-checked acyclic import graph, no cross-module private imports, single kanban.db opener and SHA regex
+  test_foundation_layer.py   vocabulary / validators / git_cli / store_kanban / verification units, batched watchdog queries
   test_plugin_registration.py
   test_profile_and_models.py
   test_orchestrator_and_repos.py

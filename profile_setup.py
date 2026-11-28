@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Optional
@@ -22,6 +21,7 @@ from .config import (
     resolve_verify_panel,
     save_settings,
 )
+from .git_cli import run_command
 
 WORKER_SOUL_MD = """# Factonio Worker
 
@@ -289,13 +289,7 @@ def _cmd_check(name: str, args: list[str]) -> dict[str, Any]:
     if not exe:
         return {"name": name, "ok": False, "detail": f"{name} not found on PATH"}
     try:
-        proc = subprocess.run(
-            [exe, *args],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
+        proc = run_command([exe, *args], timeout=15)
         ok = proc.returncode == 0
         out = (proc.stdout or proc.stderr or "").strip().splitlines()
         detail = out[0] if out else ("ok" if ok else f"exit {proc.returncode}")

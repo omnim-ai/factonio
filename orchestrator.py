@@ -5,8 +5,6 @@ from __future__ import annotations
 import logging
 import re
 import shlex
-import sqlite3
-import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -16,7 +14,6 @@ from .config import (
     WORKER_PROFILE,
     WORKSTREAM_KINDS,
     get_repo,
-    get_root_hermes_home_path,
     load_settings,
     resolve_design_provider,
     resolve_default_publish_policy,
@@ -24,11 +21,18 @@ from .config import (
     resolve_publish_policy,
     resolve_rigor,
     resolve_verify_panel,
-    single_line,
 )
+from .config import (  # public re-exports: run-dir helpers live in `config`
+    design_dir_path as design_dir_path,
+    holdout_dir_path as holdout_dir_path,
+    investigation_report_path as investigation_report_path,
+    run_data_dir as run_data_dir,
+    spec_file_path as spec_file_path,
+)
+from .git_cli import run_git
 from .harness import HARNESS_DIR_NAME, HOOK_KINDS, REQUIRED_SECTIONS, VERIFY_MD_NAME, discover_harness
-from .metrics import aggregate_panel_verdicts as aggregate_panel_verdicts  # public re-export
-from .metrics import capture_metrics_snapshot, load_panel_lanes, summarize_panel, thread_cards
+from .metrics import capture_metrics_snapshot, thread_cards
+from .store_kanban import auto_subscribe_task, resolve_calling_session_id, resolve_kanban_db_path
 from .trail import (
     contains_holdout_reference,
     query_decisions,
@@ -36,10 +40,14 @@ from .trail import (
     record_transition,
     render_recall_markdown,
 )
+from .validators import stamp_token, validate_branch_field, validate_default_branch, validate_full_sha
+from .validators import make_tenant as make_tenant  # public re-export
+from .validators import require_clean_str, validate_git_ref_name, validate_pr_number
+from .verification import aggregate_panel_verdicts as aggregate_panel_verdicts  # public re-export
+from .verification import expected_panel_lane_ids, load_panel_lanes, summarize_panel
 
 logger = logging.getLogger("factonio.orchestrator")
 
-_SLUG_RE = re.compile(r"[^a-z0-9-]+")
 
 BENCHMARK_PRE_OPT_QUESTIONS: tuple[str, ...] = (
     "Which user-visible or SLO metric is too slow or too costly, and what are the current and target numbers?",
@@ -60,47 +68,6 @@ BENCHMARK_MEASUREMENT_MANTRAS: tuple[str, ...] = (
     "A faster wrong answer is a regression: correctness tests pass before and after.",
     "Record the exact benchmark command, environment, and raw numbers so anyone can reproduce them.",
 )
-
-
-def make_tenant(repo_slug: str, *, issue_number: Optional[int] = None, label: Optional[str] = None) -> str:
-    """Generate a clean kebab-case Kanban tenant slug for a workstream."""
-    base = _SLUG_RE.sub("-", repo_slug.lower()).strip("-")
-    if issue_number is not None:
-        return f"{base}-i{int(issue_number)}"[:64]
-    if label:
-        tail = _SLUG_RE.sub("-", label.lower()).strip("-")[:24]
-        if tail:
-            return f"{base}-{tail}"[:64]
-    return f"{base}-{int(time.time()) % 100000}"[:64]
-
-
-def run_data_dir(tenant: str) -> Path:
-    """Durable plugin-owned run directory holding `spec.md` and `holdout/`."""
-    safe = _SLUG_RE.sub("-", (tenant or "default").lower()).strip("-") or "default"
-    path = get_root_hermes_home_path() / "plugin-data" / PLUGIN_ID / "runs" / safe
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def spec_file_path(tenant: str) -> Path:
-    return run_data_dir(tenant) / "spec.md"
-
-
-def holdout_dir_path(tenant: str) -> Path:
-    path = run_data_dir(tenant) / "holdout"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def design_dir_path(tenant: str) -> Path:
-    path = run_data_dir(tenant) / "design"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def investigation_report_path(tenant: str) -> Path:
-    """Output path of a read-only `investigate` workstream's forensic report."""
-    return run_data_dir(tenant) / "investigation.md"
 
 
 def _has_design_artifacts(tenant: str) -> Optional[Path]:
@@ -126,59 +93,6 @@ def _phase_model_kwargs(phase: str, repo_slug: str, subphase: Optional[str] = No
         "provider_override": provider or None,
         "resolved": resolved,
     }
-
-
-def _resolve_calling_session_id(explicit: Optional[str] = None) -> Optional[str]:
-    """Resolve the active chat session id from explicit kwargs or Hermes session context."""
-    if explicit and str(explicit).strip():
-        return str(explicit).strip()
-    try:
-        from gateway.session_context import get_session_env
-
-        for key in ("HERMES_SESSION_CHAT_ID", "HERMES_SESSION_KEY"):
-            val = (get_session_env(key, "") or "").strip()
-            if val:
-                return val
-    except Exception:
-        pass
-    return None
-
-
-def _auto_subscribe_task(conn: Any, task_id: str, *, session_id: Optional[str] = None) -> bool:
-    """Subscribe the calling chat session to completion/block wakes (matches `kanban_create`)."""
-    try:
-        from tools.kanban_tools import _maybe_auto_subscribe
-
-        if _maybe_auto_subscribe(conn, task_id):
-            return True
-    except Exception:
-        pass
-
-    # Fallback when called with an explicit session_id outside gateway ContextVars (e.g. API/tests).
-    if not session_id:
-        return False
-    try:
-        from hermes_cli import kanban_db_notify as kbn
-
-        chat_id = str(session_id).strip()
-        if not chat_id:
-            return False
-        if any(
-            sub["platform"] == "local" and sub["chat_id"] == chat_id
-            for sub in kbn.list_notify_subs(conn, task_id)
-        ):
-            return True
-        kbn.add_notify_sub(
-            conn,
-            task_id=task_id,
-            platform="local",
-            chat_id=chat_id,
-            notifier_profile="default",
-            delivery_mode="notify+wake",
-        )
-        return True
-    except Exception:
-        return False
 
 
 def verification_gap_section(escaped_from: str) -> str:
@@ -440,7 +354,7 @@ def start_workstream(
         workspace_path = repo_path
         contract = "local-only"
 
-    effective_session_id = _resolve_calling_session_id(session_id)
+    effective_session_id = resolve_calling_session_id(session_id)
     with connect_closing(board=board) as conn:
         task_id = kb.create_task(
             conn,
@@ -460,7 +374,7 @@ def start_workstream(
             board=board,
             completion_contract=contract,
         )
-        subscribed = _auto_subscribe_task(conn, task_id, session_id=effective_session_id)
+        subscribed = auto_subscribe_task(conn, task_id, session_id=effective_session_id)
 
     record_transition(
         "start_workstream",
@@ -588,7 +502,7 @@ def spawn_design_card(
         f"Do not edit repository production code or open a PR from this card.\n"
     )
 
-    effective_session_id = _resolve_calling_session_id(session_id)
+    effective_session_id = resolve_calling_session_id(session_id)
     with connect_closing(board=board) as conn:
         task_id = kb.create_task(
             conn,
@@ -610,7 +524,7 @@ def spawn_design_card(
             board=board,
             completion_contract="local-only",
         )
-        subscribed = _auto_subscribe_task(conn, task_id, session_id=effective_session_id)
+        subscribed = auto_subscribe_task(conn, task_id, session_id=effective_session_id)
 
     record_transition(
         "spawn_design",
@@ -663,12 +577,12 @@ def spawn_implementation_card(
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
 
-    from .repos import _validate_default_branch, _validate_pr_number, seed_stacked_branch
+    from .repos import seed_stacked_branch
 
     if base_branch is not None:
-        base_branch = _validate_default_branch(base_branch)
+        base_branch = validate_default_branch(base_branch)
     if stack_parent_pr is not None:
-        stack_parent_pr = _validate_pr_number(stack_parent_pr, "stack_parent_pr")
+        stack_parent_pr = validate_pr_number(stack_parent_pr, "stack_parent_pr")
 
     repo = get_repo(repo_spec)
     if repo is None:
@@ -737,7 +651,7 @@ def spawn_implementation_card(
             branch_kwargs["branch_name"] = candidate
     branch_seeded = bool(branch_kwargs)
 
-    effective_session_id = _resolve_calling_session_id(session_id)
+    effective_session_id = resolve_calling_session_id(session_id)
     with connect_closing(board=board) as conn:
         task_id = kb.create_task(
             conn,
@@ -760,7 +674,7 @@ def spawn_implementation_card(
             completion_contract=contract,
             **branch_kwargs,
         )
-        subscribed = _auto_subscribe_task(conn, task_id, session_id=effective_session_id)
+        subscribed = auto_subscribe_task(conn, task_id, session_id=effective_session_id)
 
     record_transition(
         "spawn_implement",
@@ -986,7 +900,7 @@ def _shell_block(command: str) -> str:
 
 
 def _local_target_lines(local: dict[str, str]) -> str:
-    # The `Local branch target:` stamp is parsed by metrics._local_target_from_body; keep the format stable.
+    # The `Local branch target:` stamp is parsed by verification.local_target_from_body; keep the format stable.
     return (
         f"- Local branch target: `{local['branch']}` (base=`{local['base_branch']}`, head=`{local['head_sha']}`)\n"
         f"- Pull Request: none (unpublished local branch; publish later with `factonio_publish_pr`)\n"
@@ -995,13 +909,11 @@ def _local_target_lines(local: dict[str, str]) -> str:
 
 def _validate_local_branch(value: Any, field: str, cwd: Path) -> str:
     """Strict plain-branch validation for a local verification target (mirrors `repos.publish_pr`)."""
-    from .repos import _require_clean_str, _validate_branch_field, _validate_git_ref_name
-
-    _require_clean_str(value, field)
-    name = _validate_branch_field(value, field)
+    require_clean_str(value, field)
+    name = validate_branch_field(value, field)
     if "`" in name:
         raise ValueError(f"{field} must not contain backticks; got {value!r}")
-    _validate_git_ref_name(cwd, name, field)
+    validate_git_ref_name(cwd, name, field, run_git=run_git)
     return name
 
 
@@ -1015,8 +927,6 @@ def _resolve_verify_target(
     """Validate the PR-XOR-local-branch verification target; raises ``ValueError`` (fail closed)."""
     import tempfile
 
-    from .repos import _validate_full_sha, _validate_pr_number
-
     if pr_number is not None and branch is not None:
         raise ValueError("Pass either pr_number (PR target) or branch + head_sha (local target), not both.")
     if pr_number is None and branch is None:
@@ -1024,12 +934,12 @@ def _resolve_verify_target(
     if pr_number is not None:
         if base_branch is not None:
             raise ValueError("base_branch applies only to a local branch target; the PR defines its own base.")
-        return _validate_pr_number(pr_number), None
+        return validate_pr_number(pr_number), None
 
     repo_dir = Path(str(repo.get("path") or "")).expanduser()
     cwd = repo_dir if str(repo.get("path") or "") and repo_dir.is_dir() else Path(tempfile.gettempdir())
     clean_branch = _validate_local_branch(branch, "branch", cwd)
-    sha = _validate_full_sha(head_sha, "head_sha")
+    sha = validate_full_sha(head_sha, "head_sha")
     if base_branch is not None:
         target_base = _validate_local_branch(base_branch, "base_branch", cwd)
     else:
@@ -1047,14 +957,9 @@ _PANEL_LANE_NOTE = (
 )
 
 
-def _stamp_token(value: Any, default: str) -> str:
-    """Single-line, backtick-free rendering of a stamp field so it cannot break the panel stamp parser."""
-    return single_line(str(value or "").replace("`", "'")) or default
-
-
 def _panel_card_line(panel_id: str, entry: dict[str, Any]) -> str:
-    vendor = _stamp_token(entry.get("vendor"), "unknown")
-    model = _stamp_token(entry.get("label") or entry.get("model"), "unknown")
+    vendor = stamp_token(entry.get("vendor"), "unknown")
+    model = stamp_token(entry.get("label") or entry.get("model"), "unknown")
     return f"- Verification panel: `{panel_id}` (rigor=`high`, vendor=`{vendor}`, model=`{model}`)\n"
 
 
@@ -1147,7 +1052,7 @@ def spawn_verification_pair(
     if harness_section:
         hint_section += f"\n{harness_section}"
 
-    effective_session_id = _resolve_calling_session_id(session_id)
+    effective_session_id = resolve_calling_session_id(session_id)
 
     def _create(conn: Any, *, title: str, body: str, skill: str, model: dict[str, Any]) -> str:
         return kb.create_task(
@@ -1185,8 +1090,8 @@ def spawn_verification_pair(
                 skill="factonio:verify-blackbox",
                 model=bb_model,
             )
-            diff_sub = _auto_subscribe_task(conn, diff_id, session_id=effective_session_id)
-            bb_sub = _auto_subscribe_task(conn, bb_id, session_id=effective_session_id)
+            diff_sub = auto_subscribe_task(conn, diff_id, session_id=effective_session_id)
+            bb_sub = auto_subscribe_task(conn, bb_id, session_id=effective_session_id)
 
         record_transition(
             "spawn_verify",
@@ -1259,8 +1164,8 @@ def spawn_verification_pair(
                 skill="factonio:verify-blackbox",
                 model=model,
             )
-            all_subscribed = _auto_subscribe_task(conn, diff_id, session_id=effective_session_id) and all_subscribed
-            all_subscribed = _auto_subscribe_task(conn, bb_id, session_id=effective_session_id) and all_subscribed
+            all_subscribed = auto_subscribe_task(conn, diff_id, session_id=effective_session_id) and all_subscribed
+            all_subscribed = auto_subscribe_task(conn, bb_id, session_id=effective_session_id) and all_subscribed
             lanes.append({
                 "vendor": entry.get("vendor"),
                 "provider": entry.get("provider"),
@@ -1320,44 +1225,11 @@ def spawn_verification_pair(
     }
 
 
-def _kanban_db_file(board: Optional[str] = None) -> Path:
-    try:
-        from hermes_cli.kanban_db import kanban_db_path
-
-        return Path(kanban_db_path(board=board))
-    except Exception:
-        return get_root_hermes_home_path() / "kanban.db"
-
-
 _TERMINAL_CONSENSUS = frozenset({"pass", "reject", "inconclusive"})
 
 
 def _lane_fingerprint(lanes: list[dict[str, Any]]) -> list[list[Any]]:
     return sorted([str(lane.get("task_id") or ""), lane.get("verdict")] for lane in lanes)
-
-
-def _expected_panel_lane_ids(
-    panel_id: str, lanes: list[dict[str, Any]], *, db_path: Optional[Path] = None
-) -> Optional[list[str]]:
-    """Every task id ``spawn_verification_pair`` recorded in `trail.db` for ``panel_id``; ``None`` if unknown."""
-    tenant = next((lane.get("tenant") for lane in lanes if lane.get("tenant")), None)
-    try:
-        rows = query_decisions(tenant=tenant or None, phase="verify", limit=500, db_path=db_path)
-    except (sqlite3.Error, OSError):
-        return None
-    for row in rows:
-        ev = row.get("evidence") or {}
-        if row.get("decision") != "spawn_verify" or ev.get("panel_id") != panel_id:
-            continue
-        ids = [
-            str(lane[key])
-            for lane in ev.get("panel_lanes") or []
-            if isinstance(lane, dict)
-            for key in ("verify_diff_task_id", "verify_blackbox_task_id")
-            if lane.get(key)
-        ]
-        return ids or None
-    return None
 
 
 def _already_recorded(panel_id: str, tenant: Optional[str], consensus: str, fingerprint: list[list[Any]]) -> Optional[str]:
@@ -1402,7 +1274,7 @@ def evaluate_verification_panel(
     if pid is None and not tenant and pr_number is None and branch_filter is None:
         raise ValueError("Pass panel_id, or tenant, pr_number and/or branch, to select a verification panel.")
     grouped = load_panel_lanes(
-        _kanban_db_file(board),
+        resolve_kanban_db_path(board),
         panel_ids=[pid] if pid else None,
         tenant=tenant or None,
         pr_number=int(pr_number) if pr_number is not None else None,
@@ -1422,7 +1294,7 @@ def evaluate_verification_panel(
 
     candidates = sorted(
         (
-            summarize_panel(key, lanes, expected_lane_ids=_expected_panel_lane_ids(key, lanes))
+            summarize_panel(key, lanes, expected_lane_ids=expected_panel_lane_ids(key, lanes))
             for key, lanes in grouped.items()
         ),
         key=lambda p: (p.get("created_at") or 0, p.get("seq") or 0),
@@ -1473,7 +1345,7 @@ def evaluate_verification_panel(
         pr = summary.get("pr") or {}
         local = summary.get("local_target") or {}
         snapshot = capture_metrics_snapshot(
-            _kanban_db_file(board),
+            resolve_kanban_db_path(board),
             source="panel_consensus",
             repo_slug=str(pr.get("repo") or local.get("repo") or ""),
             tenant=summary.get("tenant") or tenant or "",
@@ -1513,7 +1385,7 @@ def workstream_status(
     board: Optional[str] = None,
 ) -> dict[str, Any]:
     """Return current Kanban cards, phase counts, and live high-rigor panel consensus for a workstream."""
-    db_path = _kanban_db_file(board)
+    db_path = resolve_kanban_db_path(board)
     data = thread_cards(db_path, session_id=session_id, tenant=tenant)
     panel_ids = sorted({str(c["panel_id"]) for c in data.get("cards", []) if c.get("panel_id")})
     panels: list[dict[str, Any]] = []
@@ -1521,7 +1393,7 @@ def workstream_status(
         grouped = load_panel_lanes(db_path, panel_ids=panel_ids)
         panels = sorted(
             (
-                summarize_panel(pid, lanes, expected_lane_ids=_expected_panel_lane_ids(pid, lanes))
+                summarize_panel(pid, lanes, expected_lane_ids=expected_panel_lane_ids(pid, lanes))
                 for pid, lanes in grouped.items()
             ),
             key=lambda p: (p.get("created_at") or 0, p.get("seq") or 0),

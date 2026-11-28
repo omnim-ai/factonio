@@ -29,13 +29,22 @@ from .config import (
     save_settings,
     single_line,
 )
+from .git_cli import git_err, run_gh, run_git
+from .git_cli import parse_status_z as parse_status_z  # public re-export
 from .metrics import capture_metrics_snapshot
-
-_GITHUB_URL_RE = re.compile(
-    r"^(?:https?://github\.com/|git@github\.com:)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$"
+from .store_kanban import open_kanban_ro, resolve_kanban_db_path
+from .validators import (
+    OWNER_REPO_RE,
+    require_clean_str,
+    validate_branch_field,
+    validate_default_branch,
+    validate_full_sha,
+    validate_git_ref_name,
+    validate_pr_number,
 )
-_OWNER_REPO_RE = re.compile(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)$")
-_SLUG_SAFE_RE = re.compile(r"[^a-z0-9-]+")
+from .validators import normalize_repo as normalize_repo  # public re-export
+from .vocabulary import INACTIVE_CARD_STATUSES
+from .vocabulary import WORKTREE_BUCKETS as WORKTREE_BUCKETS  # public re-export
 
 
 class RepoNotFoundError(LookupError):
@@ -84,19 +93,7 @@ def _validate_max_fix_rounds(value: Any) -> int:
     return int(value)
 
 
-def _validate_default_branch(value: Any) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"default_branch must be a non-empty branch name; got {value!r}")
-    branch = value.strip()
-    if branch.startswith("-"):
-        raise ValueError(f"default_branch must not start with '-'; got {value!r}")
-    if ".." in branch:
-        raise ValueError(f"default_branch must not contain '..'; got {value!r}")
-    if any(ch.isspace() for ch in branch):
-        raise ValueError(f"default_branch must not contain whitespace; got {value!r}")
-    if any(ord(ch) < 32 or ord(ch) == 127 for ch in branch):
-        raise ValueError(f"default_branch must not contain control characters; got {value!r}")
-    return branch
+_validate_default_branch = validate_default_branch
 
 
 def _validate_design_override(field: str, value: Any, allowed: tuple[str, ...]) -> Optional[str]:
@@ -142,29 +139,9 @@ def _validate_editable_fields(fields: dict[str, Any]) -> dict[str, Any]:
     return validated
 
 
-def normalize_repo(repo_spec: str) -> tuple[str, str]:
-    """Normalize `owner/repo` or GitHub URL into (`owner/repo`, `slug`)."""
-    raw = (repo_spec or "").strip()
-    m = _GITHUB_URL_RE.match(raw) or _OWNER_REPO_RE.match(raw)
-    if not m:
-        raise ValueError(
-            f"Invalid GitHub repository {repo_spec!r}; expected 'owner/repo' or a GitHub HTTPS/SSH URL."
-        )
-    owner, name = m.group(1), m.group(2)
-    full = f"{owner}/{name}"
-    slug = _SLUG_SAFE_RE.sub("-", f"{owner}-{name}".lower()).strip("-")[:64]
-    return full, slug
-
-
 def _run_gh(args: list[str], *, cwd: Optional[Path] = None, timeout: int = 30) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["gh", *args],
-        cwd=str(cwd) if cwd else None,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
+    """`gh` seam: every repos call goes through this name (patched by tests as ``factonio.repos._run_gh``)."""
+    return run_gh(args, cwd=cwd, timeout=timeout)
 
 
 def inspect_github_repo(full_repo: str) -> dict[str, Any]:
@@ -1251,15 +1228,8 @@ def _run_git(
     input_text: Optional[str] = None,
     timeout: int = 30,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args],
-        cwd=str(cwd),
-        input=input_text,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
+    """`git` seam: every repos call goes through this name (patched by tests as ``factonio.repos._run_git``)."""
+    return run_git(args, cwd=cwd, input_text=input_text, timeout=timeout)
 
 
 def _run_git_ro(args: list[str], *, cwd: Path, timeout: int = 30) -> subprocess.CompletedProcess[str]:
@@ -1267,9 +1237,7 @@ def _run_git_ro(args: list[str], *, cwd: Path, timeout: int = 30) -> subprocess.
     return _run_git(["--no-optional-locks", *args], cwd=cwd, timeout=timeout)
 
 
-def _git_err(proc: subprocess.CompletedProcess[str], what: str) -> str:
-    detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
-    return f"git {what} failed: {detail}"
+_git_err = git_err
 
 
 def _validate_git_ref(value: Any, field: str = "ref") -> str:
@@ -1474,9 +1442,8 @@ def assess_trunk_drift(
         def _names(rng: str) -> set[bytes]:
             # -z + bytes: Git paths are arbitrary bytes (not necessarily UTF-8); classify them raw so one
             # undecodable filename can never make the drift gate unavailable (fail open).
-            out = subprocess.run(
-                ["git", "--no-optional-locks", "diff", "--name-only", "-z", rng, "--"],
-                cwd=str(cwd), capture_output=True, timeout=60, check=False,
+            out = run_git(
+                ["--no-optional-locks", "diff", "--name-only", "-z", rng, "--"], cwd=cwd, timeout=60, text=False
             )
             if out.returncode != 0:
                 detail = out.stderr.decode("utf-8", "replace").strip() or f"exit {out.returncode}"
@@ -1706,19 +1673,13 @@ def merge_pr(
 # Explicit, fail-closed publish of a verified local branch (publish_policy: ask)
 # ---------------------------------------------------------------------------
 
-_FULL_SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _PR_URL_RE = re.compile(r"https://\S+/pull/(\d+)\b")
 _PUBLISH_EVIDENCE_KEYS = (
     "repo", "branch", "base_branch", "head_sha", "expected_head_sha", "pr_number", "url", "draft",
 )
 
 
-def _validate_full_sha(value: Any, field: str = "expected_head_sha") -> str:
-    """Accept only a full 40/64-hex commit id (lowercased); abbreviations and refs are refused."""
-    sha = value.strip().lower() if isinstance(value, str) else ""
-    if not _FULL_SHA_RE.fullmatch(sha):
-        raise ValueError(f"{field} must be a full 40- or 64-character hex commit SHA; got {value!r}")
-    return sha
+_validate_full_sha = validate_full_sha
 
 
 def _echo(value: Any) -> Optional[str]:
@@ -1736,38 +1697,13 @@ def _trail_safe(value: Any) -> str:
     return value.encode("utf-8", "replace").decode("utf-8").replace("\x00", "")
 
 
-def _validate_branch_field(value: Any, field: str) -> str:
-    try:
-        return _validate_default_branch(value)
-    except ValueError as exc:
-        raise ValueError(str(exc).replace("default_branch", field, 1)) from None
+_validate_branch_field = validate_branch_field
+_require_clean_str = require_clean_str  # patch seam: publish_pr resolves this name at call time
 
 
 def _validate_git_ref_name(cwd: Path, name: str, field: str) -> None:
-    """Refuse anything git would not accept as a plain branch name (``@``, ``main~1``, ``@{-1}``, ``HEAD``...)."""
-    if name == "@":
-        raise ValueError(f"{field} {name!r} is not a valid branch name")
-    for args in (["check-ref-format", f"refs/heads/{name}"], ["check-ref-format", "--branch", name]):
-        if _run_git(args, cwd=cwd).returncode != 0:
-            raise ValueError(f"{field} {name!r} is not a valid branch name")
-    if name == "HEAD":
-        raise ValueError(f"{field} {name!r} is not a valid branch name")
-
-
-def _require_clean_str(value: Any, field: str, *, optional: bool = False, non_empty: bool = False) -> None:
-    """The one preflight check for every caller string that can reach git, gh, a UTF-8 file or trail.db."""
-    if value is None and optional:
-        return
-    if not isinstance(value, str):
-        raise ValueError(f"{field} must be a string; got {type(value).__name__}")
-    try:
-        value.encode("utf-8")
-    except UnicodeError:
-        raise ValueError(f"{field} is not valid UTF-8 (contains unencodable characters)") from None
-    if "\x00" in value:
-        raise ValueError(f"{field} must not contain NUL (\\x00) characters")
-    if non_empty and not value.strip():
-        raise ValueError(f"{field} must be a non-empty string")
+    """Refuse anything git would not accept as a plain branch name (via the ``_run_git`` seam)."""
+    validate_git_ref_name(cwd, name, field, run_git=_run_git)
 
 
 def _record_publish(result: dict[str, Any], *, outcome: str, reason: str, repo_slug: str,
@@ -1903,7 +1839,7 @@ def publish_pr(
         return finish("refused", "unregistered_repo", f"Repository {spec!r} is not registered with Factonio")
     repo_slug = str(entry.get("slug") or "")
     full_repo = str(entry.get("repo") or "")
-    if not _OWNER_REPO_RE.match(full_repo):
+    if not OWNER_REPO_RE.match(full_repo):
         return finish("refused", "unregistered_repo", f"Registered entry for {spec!r} has no valid owner/repo")
     result["repo"] = full_repo
     if cwd is None:
@@ -2054,16 +1990,7 @@ def _registered_checkout(repo_spec: str) -> tuple[Optional[dict[str, Any]], Opti
     return entry, None
 
 
-def _validate_pr_number(value: Any, field: str = "pr_number") -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"{field} must be a positive integer; got {value!r}")
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"{field} must be a positive integer; got {value!r}") from None
-    if number < 1 or (isinstance(value, float) and value != number):
-        raise ValueError(f"{field} must be a positive integer; got {value!r}")
-    return number
+_validate_pr_number = validate_pr_number
 
 
 def seed_stacked_branch(
@@ -2475,8 +2402,7 @@ def restack_stack(
 # Worktree audit & safety-gated cleanup
 # ---------------------------------------------------------------------------
 
-WORKTREE_BUCKETS: tuple[str, ...] = ("hold-wip", "hold-active-card", "hold-open-pr", "safe", "review")
-_INACTIVE_CARD_STATUSES = ("done", "archived", "cancelled")
+_INACTIVE_CARD_STATUSES = INACTIVE_CARD_STATUSES
 # Ignored paths that tooling regenerates on demand. Any other ignored file (``.env``, local
 # databases, data dumps) is unique local data and holds the worktree like a tracked edit.
 _REGENERABLE_IGNORED_DIRS: tuple[str, ...] = (
@@ -2542,23 +2468,6 @@ def _parse_worktree_porcelain(text: str) -> list[dict[str, Any]]:
     if current:
         entries.append(current)
     return entries
-
-
-def parse_status_z(text: str) -> list[tuple[str, str]]:
-    """Parse ``git status --porcelain=v1 -z`` into ``(XY, path)`` pairs (rename sources skipped)."""
-    out: list[tuple[str, str]] = []
-    records = text.split("\0")
-    i = 0
-    while i < len(records):
-        rec = records[i]
-        i += 1
-        if len(rec) < 4:
-            continue
-        code, path = rec[:2], rec[3:]
-        out.append((code, path))
-        if "R" in code or "C" in code:
-            i += 1  # the next record is the rename/copy source path
-    return out
 
 
 def _is_regenerable_ignored(rel: str) -> bool:
@@ -2657,15 +2566,7 @@ def _worktree_age_days(wt_path: Path, now_ts: float) -> Optional[float]:
 
 def _default_kanban_db_path() -> Optional[Path]:
     try:
-        from hermes_cli.kanban_db import kanban_db_path
-
-        return Path(kanban_db_path())
-    except Exception:
-        pass
-    try:
-        from .config import get_root_hermes_home_path
-
-        return get_root_hermes_home_path() / "kanban.db"
+        return resolve_kanban_db_path()
     except Exception:
         return None
 
@@ -2689,10 +2590,11 @@ def _query_active_cards(
             return [], f"{kanban_db_path} is missing or not a regular file"
         return [], None
     try:
-        conn = sqlite3.connect(f"file:{Path(kanban_db_path)}?mode=ro", uri=True, timeout=3.0)
+        conn = open_kanban_ro(kanban_db_path)
     except sqlite3.Error as exc:
         return [], f"cannot open {kanban_db_path}: {exc}"
-    conn.row_factory = sqlite3.Row
+    if conn is None:  # vanished between the check above and the open
+        return [], (f"{kanban_db_path} is missing or not a regular file" if required else None)
     try:
         with closing(conn):
             cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}

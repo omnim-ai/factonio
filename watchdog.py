@@ -9,7 +9,6 @@ import os
 import re
 import socket
 import sqlite3
-import subprocess
 import threading
 import time
 from contextlib import closing
@@ -27,8 +26,9 @@ from .config import (
     resolve_phase_model,
     resolve_stale_heartbeat_minutes,
 )
-from .metrics import classify_phase
-from .repos import parse_status_z
+from .git_cli import parse_status_z, run_git_ro
+from .store_kanban import chunked_in_query, open_kanban_ro, resolve_kanban_db_path, select_list, table_columns
+from .verification import classify_phase
 
 logger = logging.getLogger("factonio.watchdog")
 
@@ -51,25 +51,6 @@ _STATUS_MTIME_LIMIT = 2000
 _GIT_TIMEOUT_S = 5
 
 TriageFn = Callable[[dict[str, Any]], Any]
-
-
-def _open_kanban_ro(db_path: Path) -> Optional[sqlite3.Connection]:
-    if not db_path.is_file():
-        return None
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3.0)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    try:
-        return {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-    except sqlite3.Error:
-        return set()
-
-
-def _select_list(wanted: tuple[str, ...], available: set[str]) -> str:
-    return ", ".join(c if c in available else f"NULL AS {c}" for c in wanted)
 
 
 def _card_revision_digest(task: dict[str, Any], comments: list[dict[str, Any]]) -> str:
@@ -173,18 +154,8 @@ def _walk_max_mtime(root: Path, *, skip_dirs: tuple[str, ...] = ()) -> Optional[
 
 
 def _git(args: list[str], cwd: Path) -> Optional[str]:
-    try:
-        # --no-optional-locks: never refresh/lock the worker's index from a read-only probe.
-        proc = subprocess.run(
-            ["git", "--no-optional-locks", *args],
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_S,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
+    # --no-optional-locks (run_git_ro): never refresh/lock the worker's index from a read-only probe.
+    proc = run_git_ro(args, cwd=cwd, timeout=_GIT_TIMEOUT_S, capture_errors=True)
     return proc.stdout if proc.returncode == 0 else None
 
 
@@ -371,6 +342,74 @@ def _triage_ambiguous_stall(
     return verdict
 
 
+def _batched_card_activity(
+    conn: sqlite3.Connection,
+    task_ids: list[Any],
+    *,
+    running_ids: list[Any],
+    comment_cols: Optional[set[str]],
+    run_select: Optional[str],
+    event_cols: Optional[set[str]],
+) -> dict[str, dict[Any, Any]]:
+    """Per-card side-effect inputs for `scan_stuck_cards` in a bounded number of chunked queries.
+
+    Returns ``comments`` (newest 8 per card), ``runs`` (latest run), ``last_event`` (``created_at`` of
+    the newest event), and, for ``running_ids`` only, ``event_ts`` / ``progress_event_ts`` (latest
+    non-heartbeat event, and latest event that is neither a heartbeat nor startup bookkeeping).
+    A ``None`` column set / select skips that table, matching boards without it.
+    """
+    out: dict[str, dict[Any, Any]] = {
+        "comments": {}, "runs": {}, "last_event": {}, "event_ts": {}, "progress_event_ts": {},
+    }
+    if not task_ids:
+        return out
+    if comment_cols is not None:
+        author_col = "author" if "author" in comment_cols else "NULL AS author"
+        body_col = "body" if "body" in comment_cols else "NULL AS body"
+        # rowid DESC breaks created_at ties like Hermes's (task_id, created_at) index scan does.
+        for c in chunked_in_query(
+            conn,
+            "SELECT task_id, author, body, created_at FROM ("
+            f"SELECT task_id, {author_col}, {body_col}, created_at, ROW_NUMBER() OVER ("
+            "PARTITION BY task_id ORDER BY created_at DESC, rowid DESC) AS rn_ FROM task_comments"
+            " WHERE task_id IN ({placeholders})) WHERE rn_ <= 8 ORDER BY task_id, rn_",
+            task_ids,
+        ):
+            out["comments"].setdefault(c["task_id"], []).append(
+                {"author": c["author"], "body": c["body"], "created_at": c["created_at"]}
+            )
+    if run_select is not None:
+        for r in chunked_in_query(
+            conn,
+            f"SELECT task_id AS task_id_, {run_select} FROM task_runs WHERE id IN ("
+            "SELECT MAX(id) FROM task_runs WHERE task_id IN ({placeholders}) GROUP BY task_id)",
+            task_ids,
+        ):
+            run = dict(r)
+            out["runs"][run.pop("task_id_")] = run
+    if event_cols is not None:
+        for e in chunked_in_query(
+            conn,
+            "SELECT task_id, created_at FROM task_events WHERE id IN ("
+            "SELECT MAX(id) FROM task_events WHERE task_id IN ({placeholders}) GROUP BY task_id)",
+            task_ids,
+        ):
+            out["last_event"][e["task_id"]] = e["created_at"]
+        if "kind" in event_cols and running_ids:
+            excluded = (*_NON_PROGRESS_EVENT_KINDS, *_STARTUP_EVENT_KINDS)
+            for key, kinds in (("event_ts", _NON_PROGRESS_EVENT_KINDS), ("progress_event_ts", excluded)):
+                marks = ", ".join("?" for _ in kinds)
+                for e in chunked_in_query(
+                    conn,
+                    "SELECT task_id, MAX(created_at) AS ts FROM task_events WHERE task_id IN ({placeholders})"
+                    f" AND (kind IS NULL OR kind NOT IN ({marks})) GROUP BY task_id",
+                    running_ids,
+                    suffix_params=kinds,
+                ):
+                    out[key][e["task_id"]] = e["ts"]
+    return out
+
+
 def scan_stuck_cards(
     db_path: Path,
     *,
@@ -397,7 +436,7 @@ def scan_stuck_cards(
     ``triage_cooldowns`` is mutated in place so callers can persist it between ticks.
     """
     now_ts = float(now if now is not None else time.time())
-    conn = _open_kanban_ro(db_path)
+    conn = open_kanban_ro(db_path)
     if conn is None:
         return []
 
@@ -409,12 +448,12 @@ def scan_stuck_cards(
 
     try:
         with closing(conn):
-            task_cols = _table_columns(conn, "tasks")
-            run_cols = _table_columns(conn, "task_runs")
-            event_cols = _table_columns(conn, "task_events")
-            comment_cols = _table_columns(conn, "task_comments")
+            task_cols = table_columns(conn, "tasks")
+            run_cols = table_columns(conn, "task_runs")
+            event_cols = table_columns(conn, "task_events")
+            comment_cols = table_columns(conn, "task_comments")
 
-            task_select = _select_list(
+            task_select = select_list(
                 (
                     "id", "title", "assignee", "status", "tenant", "session_id", "skills",
                     "block_kind", "result", "consecutive_failures", "block_recurrences",
@@ -435,7 +474,7 @@ def scan_stuck_cards(
                 (assignee,),
             ).fetchall()
 
-            run_select = _select_list(
+            run_select = select_list(
                 (
                     "id", "status", "worker_pid", "claim_lock", "max_runtime_seconds", "started_at",
                     "ended_at", "last_heartbeat_at", "outcome", "error",
@@ -444,40 +483,24 @@ def scan_stuck_cards(
             )
             has_comments = {"task_id", "created_at"} <= comment_cols
             has_events = {"task_id", "created_at"} <= event_cols
+            activity = _batched_card_activity(
+                conn,
+                [row["id"] for row in rows],
+                running_ids=[row["id"] for row in rows if row["status"] == "running"],
+                comment_cols=comment_cols if has_comments else None,
+                run_select=run_select if run_cols else None,
+                event_cols=event_cols if has_events else None,
+            )
 
             for row in rows:
                 task = dict(row)
                 tid = task["id"]
                 status = task["status"]
-                comments: list[dict[str, Any]] = []
-                if has_comments:
-                    author_col = "author" if "author" in comment_cols else "NULL AS author"
-                    body_col = "body" if "body" in comment_cols else "NULL AS body"
-                    comments = [
-                        dict(c)
-                        for c in conn.execute(
-                            f"SELECT {author_col}, {body_col}, created_at FROM task_comments"
-                            " WHERE task_id = ? ORDER BY created_at DESC LIMIT 8",
-                            (tid,),
-                        ).fetchall()
-                    ]
-                run: Optional[dict[str, Any]] = None
-                if run_cols:
-                    run_row = conn.execute(
-                        f"SELECT {run_select} FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
-                        (tid,),
-                    ).fetchone()
-                    run = dict(run_row) if run_row else None
-                last_ev = (
-                    conn.execute(
-                        "SELECT created_at FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
-                        (tid,),
-                    ).fetchone()
-                    if has_events
-                    else None
-                )
+                comments = activity["comments"].get(tid, [])
+                run: Optional[dict[str, Any]] = activity["runs"].get(tid)
+                last_ev_ts = activity["last_event"].get(tid)
                 last_activity = (
-                    (last_ev["created_at"] if last_ev else None)
+                    last_ev_ts
                     or (run or {}).get("ended_at")
                     or (run or {}).get("started_at")
                     or task.get("started_at")
@@ -565,24 +588,8 @@ def scan_stuck_cards(
                     })
                     continue
 
-                event_ts = None
-                progress_event_ts = None
-                if has_events and "kind" in event_cols:
-                    placeholders = ", ".join("?" for _ in _NON_PROGRESS_EVENT_KINDS)
-                    ev = conn.execute(
-                        f"SELECT MAX(created_at) AS ts FROM task_events WHERE task_id = ?"
-                        f" AND (kind IS NULL OR kind NOT IN ({placeholders}))",
-                        (tid, *_NON_PROGRESS_EVENT_KINDS),
-                    ).fetchone()
-                    event_ts = ev["ts"] if ev else None
-                    excluded = (*_NON_PROGRESS_EVENT_KINDS, *_STARTUP_EVENT_KINDS)
-                    placeholders = ", ".join("?" for _ in excluded)
-                    ev = conn.execute(
-                        f"SELECT MAX(created_at) AS ts FROM task_events WHERE task_id = ?"
-                        f" AND (kind IS NULL OR kind NOT IN ({placeholders}))",
-                        (tid, *excluded),
-                    ).fetchone()
-                    progress_event_ts = _float_or_none(ev["ts"]) if ev else None
+                event_ts = activity["event_ts"].get(tid)
+                progress_event_ts = _float_or_none(activity["progress_event_ts"].get(tid))
                 comment_ts = _max_ts(*(c.get("created_at") for c in comments if c.get("author") != WATCHDOG_AUTHOR))
                 workspace_ts = _workspace_activity_ts(task.get("workspace_path"))
                 run_dir_ts = _run_dir_activity_ts(runs_root, task.get("tenant"))
@@ -788,14 +795,7 @@ def run_watchdog_tick(
 
     ctx.state.set(STATE_KEY_LAST_SCAN, now_ts)
 
-    db_path = db_path_override
-    if db_path is None:
-        try:
-            from hermes_cli.kanban_db import kanban_db_path
-
-            db_path = Path(kanban_db_path(board=board))
-        except Exception:
-            db_path = get_root_hermes_home_path() / "kanban.db"
+    db_path = db_path_override if db_path_override is not None else resolve_kanban_db_path(board)
 
     phase_overrides = settings.get("phase_stale_heartbeat_minutes")
     cooldowns: dict[str, Any] = dict(ctx.state.get(STATE_KEY_TRIAGE_COOLDOWNS, {}) or {})

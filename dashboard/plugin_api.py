@@ -6,7 +6,6 @@ import codecs
 import importlib
 import json
 import os
-import re
 import sqlite3
 import stat
 import sys
@@ -43,6 +42,8 @@ _orchestrator = importlib.import_module(f"{_PKG_NAME}.orchestrator")
 _profile_setup = importlib.import_module(f"{_PKG_NAME}.profile_setup")
 _repos = importlib.import_module(f"{_PKG_NAME}.repos")
 _trail = importlib.import_module(f"{_PKG_NAME}.trail")
+_validators = importlib.import_module(f"{_PKG_NAME}.validators")
+_vocabulary = importlib.import_module(f"{_PKG_NAME}.vocabulary")
 
 router = APIRouter()
 Range = Literal["7d", "30d", "90d", "all"]
@@ -54,8 +55,6 @@ def _kanban_db() -> Path:
 
 # --- small fail-closed request validators (never coerce bools/ints/nulls/objects to strings) -----
 
-_TENANT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-_SHA_RE = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
 _MULTILINE_OK = frozenset("\n\r\t")
 
 
@@ -131,14 +130,10 @@ def _require_strict_pos_int(payload: dict[str, Any], key: str) -> Optional[int]:
 
 def _validate_tenant_slug(value: Any, field: str = "tenant") -> str:
     """A workstream tenant usable as one path component: no separators, ``..``, controls or holdout."""
-    if (
-        not isinstance(value, str)
-        or not _TENANT_RE.fullmatch(value)
-        or ".." in value
-        or _trail.contains_holdout_reference(value)
-    ):
-        raise _unprocessable(f"{field} must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,127}}$ (no '..').")
-    return value
+    try:
+        return _validators.validate_tenant_slug(value, field)
+    except ValueError as exc:
+        raise _unprocessable(str(exc)) from None
 
 
 def _require_confirmed(payload: dict[str, Any]) -> None:
@@ -390,10 +385,7 @@ def trail_decision(decision_id: str, profile: Optional[str] = Query(None)):
     return {"decision": _scrub_public(row)}
 
 
-_HUMAN_DECISION_PHASES = (
-    "define", "design", "implement", "verify", "publish", "gate", "merge", "intake", "harness", "eval",
-    "escape", "watchdog", "retro",
-)
+_HUMAN_DECISION_PHASES = _vocabulary.TRAIL_PHASES
 _HUMAN_DECISION_FIELDS = (
     "decision", "phase", "why", "confirmed", "tenant", "repo", "card_id", "result", "supersedes_id", "evidence",
 )
@@ -541,7 +533,7 @@ def _read_confined_report(tenant_dir: str) -> Optional[tuple[bytes, os.stat_resu
 @router.get("/workstreams/{tenant}/report")
 def workstream_report(tenant: str, profile: Optional[str] = Query(None)):
     """`<runs>/<tenant>/investigation.md` as bounded, holdout-scrubbed text; never a path, never a write."""
-    safe = _metrics._SAFE_TENANT_RE.sub("-", _validate_tenant_slug(tenant).lower()).strip("-") or "default"
+    safe = _validators.safe_tenant_dirname(_validate_tenant_slug(tenant))
     result: dict[str, Any] = {
         "ok": True, "exists": False, "tenant": tenant, "filename": _REPORT_NAME, "content": None,
         "updated_at": None, "size_bytes": 0, "truncated": False, "redacted": False,
@@ -631,7 +623,7 @@ def publish_pr_route(payload: Any = Body(None), profile: Optional[str] = Query(N
     repo = _require_clean_str(body, "repo", required=True)
     branch = _require_clean_str(body, "branch", required=True)
     sha_raw = _require_clean_str(body, "expected_head_sha", required=True)
-    if not _SHA_RE.fullmatch(sha_raw or ""):
+    if not _validators.is_full_sha(sha_raw or ""):
         raise _unprocessable("expected_head_sha must be a full 40- or 64-character hex commit SHA.")
     sha = str(sha_raw).lower()
     title = _require_clean_str(body, "title", required=True, max_len=256)
