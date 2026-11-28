@@ -1805,6 +1805,61 @@ async function runTrailLineageScenarios(report) {
     L.race = { loadingMsg, rests: m.rests.map(r => r.path), rows: t.rows.map(r => [r.id, r.flash, r.expanded]), live: t.live, scroll: JSON.parse(JSON.stringify(scrollLog)), focus: [...m.focusLog] }
   }
 
+  // Show decision beyond the first rendered page: (a) loaded row 90 of 100; (b) an old row fetched by id
+  // outside the 200-row window. The page grows to include it, then it is scrolled to and focused.
+  {
+    const mk = (n, extra = {}) => dec({ id: `d_probe_${String(n).padStart(3, '0')}`, ts: new Date(Date.UTC(2026, 10, 25, 12) - n * 60000).toISOString(), phase: 'verify', actor: 'orchestrator', decision: 'design_approved', result: 'approved', ...extra })
+    const deep = async (count, total, target, rest) => {
+      const rows = Array.from({ length: count }, (_, i) => mk(i))
+      const audit = { ok: true, clean: false, inspected: total, findings: [{ kind: 'missing_evidence', decision_id: target, message: 'No proof.' }] }
+      const m = mount(opts => (opts.queryKey[2] === 'audit' ? { data: audit, isLoading: false, isError: false } : { data: { decisions: rows, summary: { total, active: total, superseded: 0, by_tenant: { [W2]: total } }, filters: {} }, isLoading: false, isError: false }), mockRest(rest))
+      let tree = m.render()
+      const before = readTrail(tree).rows.length
+      trailAction(tree, 'toggle-audit'); tree = m.render()
+      m.rests.length = 0; scrollLog.length = 0; m.focusLog.length = 0
+      await Promise.all(fire(find(dhSection(tree).node, n => n.props['data-action'] === 'show-decision' && n.props['data-id'] === target)).results); await tick()
+      for (let i = 0; i < 3; i++) tree = m.render()
+      const t = readTrail(tree)
+      const row = t.rows.find(r => r.id === target)
+      return { before, rendered: t.rows.length, targetIndex: t.rows.findIndex(r => r.id === target), row: row ? [row.id, row.flash, row.expanded] : null, rests: m.rests.map(r => r.path), scroll: JSON.parse(JSON.stringify(scrollLog)), focus: [...m.focusLog], live: t.live }
+    }
+    L.deepLoaded = await deep(100, 100, 'd_probe_090', {})
+    L.deepFetched = await deep(200, 500, 'd_probe_450', { '/trail/d_probe_450': { decision: mk(450) } })
+  }
+
+  // The 30s base poll also refreshes the audit and the active server-filtered page; no new timers, no loop.
+  {
+    const rows = TRAIL.slice(0, 4)
+    let stamp = 1000
+    let auditData = AUDIT_CLEAN
+    let sigRows = [rows[0]]
+    const refetched = []
+    const intervals = []
+    const realSetInterval = globalThis.setInterval
+    globalThis.setInterval = (...a) => { intervals.push(a[1]); return realSetInterval(...a) }
+    const newRow = dec({ id: 'd_sig_new0001', ts: '2026-11-25T17:00:00.000000Z', phase: 'verify', actor: 'orchestrator', decision: 'pr_merged', why: 'GraphQL readback after the poll.', result: 'merged' })
+    const state = opts => {
+      if (opts.queryKey[2] === 'audit') return { data: auditData, isLoading: false, isError: false, refetch: () => { refetched.push('audit'); auditData = AUDIT_FINDINGS } }
+      if (opts.queryKey.includes('signal')) return { data: { decisions: sigRows, summary: {}, filters: {} }, isLoading: false, isError: false, refetch: () => { refetched.push(opts.queryKey.slice(3).join('/')); sigRows = [newRow, rows[0]] } }
+      return { data: { decisions: rows, summary: { total: 4, active: 4, superseded: 0, by_tenant: { [W2]: 4 } }, filters: {} }, isLoading: false, isError: false, dataUpdatedAt: stamp }
+    }
+    const m = mount(state, mockRest({}))
+    let tree = m.render()
+    trailQ(tree, 'graphql'); tree = m.render()
+    await settle(); tree = m.render(); tree = m.render()
+    const P = L.poll = { before: { auditClean: readTrail(tree).auditClean, audit: readTrail(tree).audit, rows: readTrail(tree).rows.map(r => r.id) }, refetchedBefore: [...refetched] }
+    stamp = 31000
+    tree = m.render()
+    tree = m.render()
+    const t = readTrail(tree)
+    P.after = { auditClean: t.auditClean, audit: t.audit ? t.audit.head : null, rows: t.rows.map(r => r.id) }
+    for (let i = 0; i < 4; i++) tree = m.render()
+    P.refetched = [...refetched]
+    P.intervals = [...intervals]
+    P.queryIntervals = [...new Set(trailQueries.filter(x => x.interval).map(x => `${x.key.join('/')}=${x.interval}`))]
+    globalThis.setInterval = realSetInterval
+  }
+
   trailState = { data: undefined, isLoading: true, isError: false }
   globalThis.__fcReposState = undefined
   globalThis.__fcQueryClient = undefined
@@ -2812,10 +2867,26 @@ async function runControlPlaneScenarios(report) {
   S.publishOpen = { stopped: pf.stopped, modal: readModal(tree), focus: [...m.focusLog] }
   // Edit title, then a 409 drift refusal keeps the edits.
   find(modalOf(tree).node, n => n.props.id === 'fc-pp-title').node.props.onChange({ target: { value: 'feat(desktop): control plane' } })
+  find(modalOf(tree).node, n => n.props.id === 'fc-pp-body').node.props.onChange({ target: { value: 'Verified locally.\n\nEdited body.' } })
   find(modalOf(tree).node, n => n.props['data-field'] === 'draft' && n.type === 'input').node.props.onChange({ target: { checked: true } }); tree = m.render()
   pubImplRest = async () => { throw new Error(`409: ${JSON.stringify({ detail: { ok: false, refused: true, error: `Not locally verified at ${SHA}: head drifted` } })}`) }
   await Promise.all(fire(find(modalOf(tree).node, byAttr('data-action', 'publish-go'))).results); tree = m.render()
   S.publish409 = readModal(tree)
+  // 409 drift carrying the observed head: verified vs observed SHA (12 chars) plus the server detail.
+  const NEW_SHA = 'b'.repeat(40)
+  const drift409 = error => async () => { throw new Error(`409: ${JSON.stringify({ detail: { ok: false, refused: true, pushed: false, head_sha: NEW_SHA, expected_head_sha: SHA, verification: { verified: true }, error } })}`) }
+  const readDrift = t => {
+    const b = find(modalOf(t).node, hasCls('fc-banner')).node
+    const f = k => { const h = find(b, byAttr('data-field', k)); return h ? { text: norm(h.node), title: h.node.props.title ?? null } : null }
+    return { modal: readModal(t), observed: f('observed-head'), verified: f('verified-head'), detail: f('server-detail') }
+  }
+  pubImplRest = drift409(`HEAD drifted from ${SHA} to ${NEW_SHA}; re-verify before publishing.`)
+  await Promise.all(fire(find(modalOf(tree).node, byAttr('data-action', 'publish-go'))).results); tree = m.render()
+  S.publishDrift = readDrift(tree)
+  // A server message that names the holdout barrier is scrubbed; the SHAs still show.
+  pubImplRest = drift409('HEAD drifted; see holdout/scenario-1.md')
+  await Promise.all(fire(find(modalOf(tree).node, byAttr('data-action', 'publish-go'))).results); tree = m.render()
+  S.publishDriftScrubbed = readDrift(tree)
   // Retry succeeds -> live PR link; caches invalidated; exact SHA pinned.
   let releasePub
   pubImplRest = () => new Promise(res => { releasePub = () => res({ ok: true, published: true, pr_number: 47, url: 'https://github.com/omnim-ai/factonio/pull/47', head_sha: SHA }) })
@@ -3920,6 +3991,38 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertIsNone(m["threw"])
         self.assertEqual(m["rests"], ["/trail/d_missing00000"])
         self.assertEqual(m["chain"]["items"], [{"id": None, "missing": "d_missing00000", "text": "Prior decision d_missing00000 could not be loaded."}])
+
+    def test_trail_show_decision_beyond_first_page_renders_scrolls_and_focuses(self):
+        lin = self.report["trail"]["lineage"]
+        a = lin["deepLoaded"]
+        self.assertEqual(a["before"], 60, "only the first page renders initially")
+        self.assertEqual(a["rests"], [], "a loaded target needs no fetch")
+        self.assertEqual(a["rendered"], 91, "the page grows to include row 90")
+        self.assertEqual(a["targetIndex"], 90)
+        self.assertEqual(a["row"], ["d_probe_090", "true", "true"])
+        self.assertEqual(a["scroll"], [["trail-d_probe_090", {"block": "center", "behavior": "smooth"}]])
+        self.assertEqual(a["focus"], ["Collapse evidence for Design approved"], "the row's open chevron takes focus")
+        self.assertEqual(a["live"], "Filters cleared · showing the flagged decision")
+        b = lin["deepFetched"]
+        self.assertEqual(b["before"], 60)
+        self.assertEqual(b["rests"], ["/trail/d_probe_450"])
+        self.assertEqual((b["rendered"], b["targetIndex"]), (201, 200), "the fetched row renders after the 200 loaded ones")
+        self.assertEqual(b["row"], ["d_probe_450", "true", "true"])
+        self.assertEqual(b["scroll"], [["trail-d_probe_450", {"block": "center", "behavior": "smooth"}]])
+        self.assertEqual(b["focus"], ["Collapse evidence for Design approved"], "the row's open chevron takes focus")
+
+    def test_trail_base_poll_refreshes_audit_and_filtered_page_without_timers(self):
+        p = self.report["trail"]["lineage"]["poll"]
+        self.assertEqual(p["before"]["auditClean"], "Audit clean")
+        self.assertIsNone(p["before"]["audit"])
+        self.assertEqual(p["before"]["rows"], ["d_f012c8a47b99"])
+        self.assertEqual(p["refetchedBefore"], [], "the first load triggers no extra refresh")
+        self.assertIsNone(p["after"]["auditClean"])
+        self.assertIn("audit findings need attention", p["after"]["audit"])
+        self.assertEqual(p["after"]["rows"], ["d_sig_new0001", "d_f012c8a47b99"])
+        self.assertEqual(sorted(p["refetched"]), ["audit", "signal/key/q/graphql"], "exactly one refresh each; no loop")
+        self.assertEqual(p["intervals"], [], "no setInterval")
+        self.assertEqual(p["queryIntervals"], ["factonio/trail/200=30000"], "the base query keeps the only interval")
 
     def test_trail_show_decision_drops_stale_lookup(self):
         r = self.report["trail"]["lineage"]["race"]
@@ -5353,18 +5456,30 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual(m["go"], {"text": "Publish to GitHub", "disabled": False, "action": "publish-go"})
         self.assertEqual(o["focus"], ["fc-pp-title"])
         e = s["publish409"]
-        self.assertEqual(e["banners"], [{"tone": "bad", "role": "alert", "text": "409 · Publish refused Nothing was pushed: aaaaaaaaaaaa is no longer the verified head, or its verification changed. Re-verify before publishing. Your title and body are kept."}])
-        self.assertEqual((e["title_input"], e["draft"]), ("feat(desktop): control plane", True), "edits survive a 409")
+        self.assertEqual(e["banners"], [{"tone": "bad", "role": "alert", "text": "409 · Publish refused Nothing was pushed: aaaaaaaaaaaa is no longer the verified head, or its verification changed. Re-verify before publishing. Your title and body are kept. Not locally verified at " + "a" * 40 + ": head drifted"}])
+        self.assertEqual((e["title_input"], e["body_input"], e["draft"]), ("feat(desktop): control plane", "Verified locally.\n\nEdited body.", True), "edits survive a 409")
         self.assertEqual(e["go"]["text"], "Retry publish")
+        # 409 head drift: observed and verified heads (same 12-char truncation as the modal) plus the server detail.
+        dr = s["publishDrift"]
+        self.assertEqual(dr["observed"], {"text": "b" * 12, "title": "b" * 40})
+        self.assertEqual(dr["verified"], {"text": "a" * 12, "title": "a" * 40})
+        self.assertEqual(dr["detail"], {"text": f"HEAD drifted from {'a' * 40} to {'b' * 40}; re-verify before publishing.", "title": None})
+        self.assertEqual(dr["modal"]["banners"], [{"tone": "bad", "role": "alert", "text": f"409 · Head drifted The branch is now at {'b' * 12} , not the verified {'a' * 12} . Re-verify before publishing. Your title and body are kept. HEAD drifted from {'a' * 40} to {'b' * 40}; re-verify before publishing."}])
+        self.assertEqual((dr["modal"]["title_input"], dr["modal"]["body_input"], dr["modal"]["draft"]), ("feat(desktop): control plane", "Verified locally.\n\nEdited body.", True))
+        self.assertEqual(dr["modal"]["facts"][2], "a" * 12, "the verified-head fact is unchanged")
+        self.assertEqual(dr["modal"]["go"]["text"], "Retry publish")
+        sc = s["publishDriftScrubbed"]
+        self.assertEqual((sc["observed"]["text"], sc["verified"]["text"], sc["detail"]), ("b" * 12, "a" * 12, None))
+        self.assertNotIn("holdout", json.dumps(sc["modal"]))
         b = s["publishBusy"]
         self.assertEqual((b["busy"], b["go"]["text"], b["go"]["disabled"]), ("true", "Publishing…", True))
         self.assertTrue(s["publishEscBusy"])
         d = s["publishDone"]
         self.assertEqual(d["title"], "PR published")
         self.assertEqual(d["facts"], ["github.com/omnim-ai/factonio/pull/47", "aaaaaaaaaaaa (unchanged)", "publish_pr · actor human"])
-        self.assertEqual(len(s["publishBodies"]), 2)
+        self.assertEqual(len(s["publishBodies"]), 4)
         for body in s["publishBodies"]:
-            self.assertEqual(body, {"repo": "omnim-ai/factonio", "branch": "feat/x", "expected_head_sha": "a" * 40, "title": "feat(desktop): control plane", "draft": True, "confirmed": True, "body": "Verified locally.", "base_branch": "main", "tenant": "omnim-ai-factonio-local-publish", "card_id": "t_pimpl"})
+            self.assertEqual(body, {"repo": "omnim-ai/factonio", "branch": "feat/x", "expected_head_sha": "a" * 40, "title": "feat(desktop): control plane", "draft": True, "confirmed": True, "body": "Verified locally.\n\nEdited body.", "base_branch": "main", "tenant": "omnim-ai-factonio-local-publish", "card_id": "t_pimpl"})
         self.assertEqual(s["publishInvalidated"], ["factonio/cards", "factonio/trail"])
         self.assertEqual(s["publishOpened"], ["https://github.com/omnim-ai/factonio/pull/47"])
         self.assertTrue(s["publishClosed"])

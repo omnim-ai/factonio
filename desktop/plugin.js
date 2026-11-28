@@ -561,6 +561,7 @@ a.fc-chip:hover, button.fc-chip:hover { border-color: var(--ui-stroke-primary, v
 .fc-banner[data-tone="info"] { background: color-mix(in srgb, var(--ui-accent) 9%, transparent); border: 1px solid color-mix(in srgb, var(--ui-accent) 30%, transparent); color: var(--fc-info-text); }
 .fc-banner b { font-weight: 600; }
 .fc-banner-body { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.fc-banner-detail { display: block; margin-top: 4px; font-family: var(--dt-font-mono, ui-monospace, monospace); font-size: 11px; opacity: .9; }
 
 .fc-dh .fc-sec-head { align-items: flex-end; }
 .fc-dh-status { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
@@ -2807,6 +2808,18 @@ function TrailSection({ ctx, reposQ }) {
   })
   const audit = summarizeTrailAudit(auditQ?.data, auditQ?.isError)
 
+  // Each successful refresh of the polled base page also refreshes the audit and an active server-filtered
+  // page, so they never stay cached behind a newer ledger. No timer of their own; a key change only re-arms.
+  const baseMark = useRef(null)
+  const baseStamp = Number(query?.dataUpdatedAt) || query?.data || null
+  const baseKeyStr = JSON.stringify(queryKey)
+  useEffect(() => {
+    const prev = baseMark.current
+    baseMark.current = { key: baseKeyStr, stamp: baseStamp }
+    if (!prev || prev.key !== baseKeyStr || prev.stamp == null || baseStamp == null || Object.is(prev.stamp, baseStamp)) return
+    auditQ?.refetch?.()
+    if (signalOn) signalQ?.refetch?.()
+  }, [baseKeyStr, baseStamp])
   useEffect(() => {
     if (!routeTenant) return
     setTenant(routeTenant)
@@ -2865,10 +2878,17 @@ function TrailSection({ ctx, reposQ }) {
   const anyFilter = !!(repo || tenant || phase || q || preset !== 'all')
   const controlsOff = !hasData
 
+  // Keep a pending jump until its row mounts: grow the rendered page to reach it first, and drop it only
+  // once loading settled and the target is neither visible nor mountable.
   useEffect(() => {
     const id = pendingJump.current
     if (!id) return
-    const row = visible.some(d => d.id === id) ? rowEls.current[id] : null
+    const idx = visible.findIndex(d => d.id === id)
+    if (idx >= shown) {
+      setShown(idx + 1)
+      return
+    }
+    const row = idx >= 0 ? rowEls.current[id] : null
     if (!row) {
       if (!loading) pendingJump.current = null
       return
@@ -3662,11 +3682,35 @@ function publishErrorText(err, sha) {
   return err?.status ? err.detail : 'Network error. Nothing was pushed.'
 }
 
+// Innermost structured object of a rejected ctx.rest call (FastAPI nests refusals as {detail: {...}}),
+// or null when the server sent no JSON object.
+function errorDetailObject(err) {
+  const e = err && typeof err === 'object' ? err : {}
+  let body = e.detail ?? e.body ?? e.data ?? e.response?.data
+  if (body == null) body = /(?:^|[^0-9])[1-5][0-9]{2}:\s?([\s\S]*)$/.exec(String(e.message ?? ''))?.[1]
+  if (typeof body === 'string') {
+    try { body = JSON.parse(body.trim()) } catch { return null }
+  }
+  for (let i = 0; i < 3 && body?.detail && typeof body.detail === 'object' && !Array.isArray(body.detail); i++) body = body.detail
+  return body && typeof body === 'object' && !Array.isArray(body) ? body : null
+}
+
+const HEX_SHA = /^[0-9a-f]{7,40}$/i
+// 409 drift facts: the observed head (when it differs from the verified one) and the scrubbed server message.
+function publishDrift(info, verifiedSha) {
+  if (!info) return null
+  const expected = HEX_SHA.test(String(info.expected_head_sha || '')) ? info.expected_head_sha : verifiedSha
+  const observed = HEX_SHA.test(String(info.head_sha || '')) && String(info.head_sha).toLowerCase() !== String(expected || '').toLowerCase() ? info.head_sha : null
+  const message = barrierStr(info.error) || barrierStr(info.message)
+  return observed || message ? { expected, observed, message } : null
+}
+
 function PublishModal({ ctx, card, target, verification, onClose }) {
   const queryClient = useQueryClient()
   const [form, setForm] = useState(() => publishDefaults(card, target, verification))
   const [tried, setTried] = useState(false)
   const [state, run] = useAction()
+  const [errInfo, setErrInfo] = useState(null)
   const titleRef = useRef(null)
   const goRef = useRef(null)
   const busy = state.status === 'busy'
@@ -3679,7 +3723,15 @@ function PublishModal({ ctx, card, target, verification, onClose }) {
     if (busy) return
     setTried(true)
     if (!String(form.title).trim()) return
-    const res = await run(() => ctx.rest('/publish-pr', { method: 'POST', body: publishRequestBody(target, form, card) }))
+    setErrInfo(null)
+    const res = await run(async () => {
+      try {
+        return await ctx.rest('/publish-pr', { method: 'POST', body: publishRequestBody(target, form, card) })
+      } catch (error) {
+        setErrInfo(errorDetailObject(error))
+        throw error
+      }
+    })
     if (res.ok) {
       const n = res.result?.pr_number
       host.notify?.({ kind: 'info', message: n ? `Published PR #${n}` : 'Published the PR' })
@@ -3687,6 +3739,7 @@ function PublishModal({ ctx, card, target, verification, onClose }) {
     }
   }
   const sha = shortSha(target.head_sha)
+  const drift = err?.status === 409 ? publishDrift(errInfo, target.head_sha) : null
   const facts = [
     ['Repository', jsx('code', { children: target.repo })],
     ['Branch', [jsx('code', { key: 'b', children: target.branch }), ' → ', jsx('code', { key: 'base', children: target.base_branch || 'default branch' })]],
@@ -3756,8 +3809,16 @@ function PublishModal({ ctx, card, target, verification, onClose }) {
           ? jsx(Banner, {
               key: 'err',
               tone: 'bad',
-              title: err.status ? `${err.status} · ${PUBLISH_ERROR_TITLES[err.status] || 'Publish failed'}` : 'Publish failed',
-              children: `${publishErrorText(err, sha)} Your title and body are kept.`
+              title: err.status ? `${err.status} · ${drift?.observed ? 'Head drifted' : PUBLISH_ERROR_TITLES[err.status] || 'Publish failed'}` : 'Publish failed',
+              children: drift
+                ? [
+                    drift.observed
+                      ? jsxs('span', { key: 'h', 'data-field': 'drift', children: ['The branch is now at ', jsx('code', { key: 'o', 'data-field': 'observed-head', title: drift.observed, children: shortSha(drift.observed) }), ', not the verified ', jsx('code', { key: 'v', 'data-field': 'verified-head', title: drift.expected, children: shortSha(drift.expected) }), '. Re-verify before publishing.'] })
+                      : publishErrorText(err, sha),
+                    ' Your title and body are kept.',
+                    drift.message ? jsx('span', { key: 'd', className: 'fc-banner-detail', 'data-field': 'server-detail', children: drift.message }) : null
+                  ]
+                : `${publishErrorText(err, sha)} Your title and body are kept.`
             })
           : null,
         jsx('dl', { key: 'facts', className: 'fc-m-facts', children: facts.flatMap(([k, v]) => [jsx('dt', { key: `${k}-t`, children: k }), jsx('dd', { key: `${k}-d`, children: v })]) }),
