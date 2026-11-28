@@ -23,7 +23,7 @@ import {
   useValue
 } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 const ROUTE_PATH = '/factonio'
 // Contribution-scoped pane id (`<pluginId>:<paneId>`) used by host.revealPane / host.paneVisibility.
@@ -2765,8 +2765,9 @@ function DhSkeleton() {
   return [row(0, 40, 82), row(1, 34, 70), row(2, 46, 88), row(3, 30, 64), row(4, 38, 76), jsx('span', { key: 'sr', className: 'fc-trail-sr', children: 'Loading decision history…' })]
 }
 
-function TrailSection({ ctx, reposQ }) {
-  const routeTenant = routeQueryParam('tenant')
+// Decision History view state: filters, pagination, per-row disclosure, supersession chains, deep
+// jumps and the Log Human Decision modal. State-only actions live here; data-dependent ones in TrailSection.
+function useTrailState(routeTenant) {
   const [preset, setPreset] = useState('key')
   const [q, setQ] = useState('')
   const [qServer, setQServer] = useState('')
@@ -2796,6 +2797,308 @@ function TrailSection({ ctx, reposQ }) {
   const flashTimer = useRef(null)
   const qTimer = useRef(null)
   const jumpSeq = useRef(0)
+
+  useEffect(() => {
+    if (!routeTenant) return
+    setTenant(routeTenant)
+    setScoped(routeTenant)
+    setRepo('')
+    setPhase('')
+    headingRef.current?.scrollIntoView?.({ block: 'start', behavior: prefersReducedMotion() ? 'auto' : 'smooth' })
+  }, [routeTenant])
+
+  const resetFilters = () => {
+    setRepo(''); setTenant(''); setPhase(''); setQ(''); setQServer(''); setScoped(null)
+  }
+  const clearAll = () => {
+    resetFilters()
+    setShowSup(false)
+    setPreset('all')
+    setMsg('Filters cleared.')
+  }
+  const onQuery = v => {
+    const next = String(v ?? '')
+    setQ(next)
+    clearTimeout(qTimer.current)
+    qTimer.current = setTimeout(() => setQServer(next.trim()), 250)
+  }
+  const onShowSup = v => {
+    setShowSup(v)
+    setMsg(v ? 'Superseded decisions shown in place.' : 'Superseded decisions hidden; open a chain to see them.')
+  }
+
+  return {
+    preset, setPreset, q, qServer, repo, setRepo, tenant, setTenant, phase, setPhase, showSup, setShowSup,
+    scoped, setScoped, limit, setLimit, shown, setShown, open, setOpen, tabs, setTabs, folds, setFolds,
+    chains, setChains, chainLoading, setChainLoading, chainFailed, setChainFailed, auditOpen, setAuditOpen,
+    reveal, setReveal, flash, setFlash, msg, setMsg, pinned, setPinned, modal, setModal,
+    headingRef, rowEls, chevEls, pendingJump, flashTimer, jumpSeq,
+    resetFilters, clearAll, onQuery, onShowSup
+  }
+}
+
+// (decision, filters) -> shown? for one superseded-id set and audit-flagged id set.
+function trailFilterPredicate(supersededIds, auditIds) {
+  const isSup = d => supersededIds.has(d.id)
+  const presetOk = (d, p) => (p === 'all' ? true : p === 'key' ? !isRoutineDecision(d) : isAttentionDecision({ ...d, is_superseded: isSup(d) }, auditIds))
+  return (d, f) => (!f.repo || d.repo_slug === f.repo) && (!f.tenant || d.tenant === f.tenant) && (!f.phase || d.phase === f.phase) &&
+    (f.showSup || !isSup(d)) && presetOk(d, f.preset) && decisionMatchesQuery(d, f.q)
+}
+
+function TrailHeader({ headingRef, hasData, loading, audit, total, onLog }) {
+  return jsxs('div', {
+    className: 'fc-sec-head',
+    children: [
+      jsxs('div', {
+        className: 'fc-trail-head-l',
+        children: [
+          jsx('h2', { id: 'fc-trail-h', ref: headingRef, children: 'Decision History' }),
+          jsxs('p', { className: 'fc-sec-sub', children: ['Append-only ledger from ', jsx('span', { className: 'fc-mono', children: 'trail.db' }), '. Key decisions by default; routine gate ticks are folded.'] })
+        ]
+      }),
+      jsxs('div', {
+        className: 'fc-dh-status',
+        children: [
+          hasData && audit.available && audit.clean
+            ? jsxs('span', { key: 'clean', className: 'fc-chip', 'data-tone': 'ok', 'data-field': 'audit-clean', title: 'trail --audit: 0 findings', children: [jsx(Icon, { name: 'shieldOk', size: 12 }), 'Audit clean'] })
+            : null,
+          jsxs('span', { key: 'n', className: 'fc-chip', 'data-field': 'total', children: [jsx('b', { className: 'fc-mono', children: hasData ? String(total) : '–' }), ' decisions'] }),
+          jsxs('button', {
+            key: 'log',
+            type: 'button',
+            className: 'fc-btn fc-btn--primary',
+            'data-action': 'log-decision',
+            disabled: loading,
+            onClick: onLog,
+            children: [jsx(Icon, { name: 'plus', size: 12 }), 'Log Human Decision']
+          })
+        ]
+      })
+    ]
+  })
+}
+
+// Attention banner for GET /trail/audit findings; each "Show decision ›" deep-jumps to its row.
+function TrailAuditBanner({ audit, hasData, open, onToggle, onShow }) {
+  if (!hasData || !audit.available || audit.clean) return null
+  return jsxs('div', {
+    className: 'fc-dh-audit',
+    role: 'region',
+    'aria-label': 'Trail audit findings',
+    children: [
+      jsxs('button', {
+        key: 'h',
+        type: 'button',
+        className: 'fc-dh-audit-head',
+        'data-action': 'toggle-audit',
+        'aria-expanded': String(open),
+        'aria-controls': 'fc-dh-audit-list',
+        onClick: onToggle,
+        children: [
+          jsx(Icon, { key: 'i', name: 'attention', size: 13 }),
+          jsx('b', { key: 't', children: `${plural(audit.findings.length, 'audit finding needs', 'audit findings need')} attention` }),
+          jsx('span', {
+            key: 'c',
+            className: 'fc-dh-audit-cats',
+            children: audit.counts.map(([k, n]) => jsx('span', { key: k, className: 'fc-chip', 'data-tone': k === 'gate_loosening' ? 'bad' : 'warn', 'data-kind': k, children: `${AUDIT_KIND_LABEL[k]} ${n}` }))
+          }),
+          jsx('span', { key: 'm', className: 'fc-m-note', children: `trail --audit${audit.inspected != null ? ` · ${audit.inspected.toLocaleString('en-US')} inspected` : ''}` }),
+          jsx(Icon, { key: 'chev', name: 'chev', size: 12, className: 'fc-dh-audit-chev' })
+        ]
+      }),
+      open
+        ? jsx('ul', {
+            key: 'l',
+            className: 'fc-dh-audit-list',
+            id: 'fc-dh-audit-list',
+            children: audit.findings.map((f, i) => jsxs('li', {
+              key: `${f.decisionId}:${f.kind}:${i}`,
+              className: 'fc-dh-audit-item',
+              'data-id': f.decisionId,
+              children: [
+                jsx('span', { className: 'fc-chip', 'data-tone': f.severity === 'high' ? 'bad' : 'warn', children: f.severity }),
+                jsxs('div', { children: [jsx('p', { children: f.message }), jsxs('small', { children: [`${f.label} · `, jsx('code', { children: f.decisionId })] })] }),
+                jsxs('button', { type: 'button', className: 'fc-btn fc-btn--s', 'data-action': 'show-decision', 'data-id': f.decisionId, onClick: () => onShow(f.decisionId), children: ['Show decision', jsx(Icon, { key: 'c', name: 'chev', size: 10 })] })
+              ]
+            }))
+          })
+        : null
+    ]
+  })
+}
+
+// Signal presets, keyword search, repo / workstream / phase selects and the Show superseded toggle.
+function TrailFilterBar({ filters, controlsOff, hasData, loading, counts, facets, wsOptionLabel, onPreset, onQuery, onFilter, onShowSup }) {
+  const { preset, q, repo, tenant, phase, showSup } = filters
+  const { visible, routineHidden, attnN, scopeN, phaseN } = counts
+  const select = (id, key, label, children, value) => jsxs('span', {
+    key,
+    className: 'fc-trail-sel',
+    children: [
+      jsx('label', { htmlFor: id, children: label }),
+      jsx('select', { id, className: 'fc-input', 'data-filter': key, 'data-set': String(!!value), disabled: controlsOff, value, onChange: ev => onFilter(key, ev?.target?.value), children })
+    ]
+  })
+  const opt = (v, l, extra) => jsx('option', { key: v || '__all', value: v, ...extra, children: l })
+  return jsxs('div', {
+    className: 'fc-dh-bar fc-trail-bar',
+    role: 'search',
+    'aria-label': 'Filter decisions',
+    'data-disabled': String(controlsOff),
+    children: [
+      jsxs('div', {
+        key: 'r1',
+        className: 'fc-dh-row1',
+        children: [
+          jsx('span', {
+            className: 'fc-seg',
+            role: 'group',
+            'aria-label': 'Signal preset',
+            children: SIGNAL_PRESETS.map(([v, l]) => jsxs('button', {
+              key: v,
+              type: 'button',
+              'data-action': 'preset',
+              'data-value': v,
+              'aria-pressed': String(preset === v),
+              disabled: controlsOff,
+              onClick: () => onPreset(v),
+              children: [l, v === 'attention' && hasData && attnN > 0 ? jsx('span', { key: 'n', className: 'fc-count', 'aria-label': `${attnN} need attention`, children: String(attnN) }) : null]
+            }))
+          }),
+          jsxs('div', {
+            className: 'fc-dh-search',
+            children: [
+              jsx(Icon, { key: 'i', name: 'search', size: 13 }),
+              jsx('label', { key: 'l', className: 'fc-trail-sr', htmlFor: 'fc-dh-q', children: 'Search decisions' }),
+              jsx('input', {
+                key: 'q',
+                id: 'fc-dh-q',
+                type: 'search',
+                className: 'fc-input',
+                'data-filter': 'q',
+                'data-set': String(!!q),
+                placeholder: 'Search decision, why, card, PR, sha…',
+                autoComplete: 'off',
+                spellCheck: false,
+                disabled: controlsOff,
+                value: q,
+                onChange: ev => onQuery(ev?.target?.value)
+              }),
+              q ? jsx('button', { key: 'x', type: 'button', 'data-action': 'clear-q', 'aria-label': 'Clear search', onClick: () => onQuery(''), children: jsx(Icon, { name: 'x', size: 11 }) }) : null
+            ]
+          })
+        ]
+      }),
+      jsxs('div', {
+        key: 'r2',
+        className: 'fc-dh-row2',
+        children: [
+          select('fc-trail-repo', 'repo', 'Repository', [opt('', 'All repos'), ...facets.repoOpts.map(r => opt(r, r))], repo),
+          select('fc-trail-ws', 'tenant', 'Workstream', [opt('', 'All workstreams'), ...facets.tenantOpts.map(t => opt(t, wsOptionLabel(t)))], tenant),
+          select('fc-trail-phase', 'phase', 'Phase', [
+            opt('', `All phases (${scopeN})`),
+            ...[...TRAIL_PHASE_OPTGROUPS, ...(facets.extraPhases.length ? [['Other', facets.extraPhases]] : [])].map(([g, ps]) => jsx('optgroup', {
+              key: g,
+              label: g,
+              children: ps.map(p => {
+                const n = hasData ? phaseN(p) : 0
+                return opt(p, `${p} (${n})`, { disabled: n === 0 && phase !== p })
+              })
+            }))
+          ], phase),
+          jsxs('label', {
+            key: 'sup',
+            className: 'fc-chk',
+            children: [
+              jsx('input', { type: 'checkbox', 'data-filter': 'sup', checked: showSup, disabled: controlsOff, onChange: ev => onShowSup(!!ev?.target?.checked) }),
+              'Show superseded'
+            ]
+          }),
+          jsx('span', {
+            key: 'meta',
+            className: 'fc-dh-meta',
+            'aria-live': 'polite',
+            'data-field': 'shown',
+            children: loading ? 'Loading…' : hasData ? `${visible} shown${preset === 'key' && routineHidden ? ` · ${plural(routineHidden, 'routine tick', 'routine ticks')} hidden` : ''}` : ''
+          })
+        ]
+      })
+    ]
+  })
+}
+
+// Contents of the .fc-dh-scroll ledger: skeleton, empty / filtered states, or sticky day blocks of
+// folded routine rows and decision rows (inspector + supersession chain) with "Load 50 older".
+function TrailLedger({ state, visible, shown, limit, total, loadedN, allN, folds, reveal, chips, rowProps, onFold, onMore, onClear }) {
+  const page = useMemo(() => visible.slice(0, shown), [visible, shown])
+  const today = dayKeyOfMs(Date.now())
+  const days = useMemo(() => (state === 'populated' ? groupTrailRows(page) : []), [state, page, today])
+  if (state === 'loading') return jsx(DhSkeleton, {})
+  if (state === 'empty') {
+    return jsxs('div', {
+      className: 'fc-trail-state',
+      'data-state': 'empty',
+      children: [
+        jsx('span', { className: 'fc-trail-state-ico', children: jsx(Icon, { name: 'trail', size: 16 }) }),
+        jsx('h3', { children: 'No decisions yet' }),
+        jsx('p', { children: 'Gates, pivots and overrides are appended to trail.db as workstreams run. You can log a human decision now, or inspect the ledger from a terminal:' }),
+        jsx('div', { className: 'fc-step-cmd', children: 'hermes factonio trail --limit 20' })
+      ]
+    })
+  }
+  if (state === 'filtered') {
+    return jsxs('div', {
+      className: 'fc-trail-state',
+      'data-state': 'filtered',
+      children: [
+        jsx('span', { className: 'fc-trail-state-ico', children: jsx(Icon, { name: 'filter', size: 16 }) }),
+        jsx('h3', { children: 'No decisions match' }),
+        jsx('div', { className: 'fc-trail-active', children: chips.map(([k, t]) => jsx('span', { key: k, className: 'fc-chip', children: t })) }),
+        jsx('p', { children: `${plural(allN, 'decision is', 'decisions are')} loaded outside this view.` }),
+        jsx('button', { type: 'button', className: 'fc-btn fc-btn--primary', 'data-action': 'clear', onClick: onClear, children: 'Clear filters' })
+      ]
+    })
+  }
+  const moreLocal = visible.length > shown
+  const moreServer = !moreLocal && total > loadedN && limit < DH_MAX_LIMIT
+  const renderRow = d => jsx(DecisionRow, { key: d.id, ...rowProps(d) })
+  return [
+    ...days.map(day => jsxs('section', {
+      key: day.key,
+      className: 'fc-dh-dayblock',
+      'aria-label': day.label,
+      children: [
+        jsxs('div', { key: 'h', className: 'fc-dh-day', role: 'heading', 'aria-level': 3, children: [jsx('span', { children: day.label }), jsx('span', { children: plural(day.count, 'decision', 'decisions') })] }),
+        jsx('ol', {
+          key: 'l',
+          className: 'fc-dh-list',
+          'aria-label': 'Decisions, newest first',
+          children: day.items.map(item => (item.kind === 'row'
+            ? renderRow(item.d)
+            : jsx(FoldChip, {
+                key: item.key,
+                fold: item,
+                open: !!folds[item.key] || item.rows.some(r => r.id === reveal),
+                onToggle: () => onFold(item),
+                children: item.rows.map(renderRow)
+              })))
+        })
+      ]
+    })),
+    jsx('div', {
+      key: 'more',
+      className: 'fc-dh-more',
+      children: moreLocal || moreServer
+        ? jsx('button', { type: 'button', className: 'fc-btn', 'data-action': 'load-more', onClick: () => onMore(moreServer), children: 'Load 50 older' })
+        : jsx('span', { className: 'fc-m-note', children: `Start of loaded window · server limit ${limit}` })
+    })
+  ]
+}
+
+function TrailSection({ ctx, reposQ }) {
+  const routeTenant = routeQueryParam('tenant')
+  const s = useTrailState(routeTenant)
+  const { preset, q, qServer, repo, tenant, phase, showSup, scoped, limit, shown, pinned, modal } = s
   const queryClient = useQueryClient()
 
   const baseKey = scoped ? [...TRAIL_QUERY_KEY, 'tenant', scoped] : TRAIL_QUERY_KEY
@@ -2823,7 +3126,9 @@ function TrailSection({ ctx, reposQ }) {
     staleTime: 30000,
     retry: false
   })
-  const audit = summarizeTrailAudit(auditQ?.data, auditQ?.isError)
+  const auditData = auditQ?.data
+  const auditErr = auditQ?.isError
+  const audit = useMemo(() => summarizeTrailAudit(auditData, auditErr), [auditData, auditErr])
 
   // Each successful refresh of the polled base page also refreshes the audit and an active server-filtered
   // page, so they never stay cached behind a newer ledger. No timer of their own; a key change only re-arms.
@@ -2837,121 +3142,114 @@ function TrailSection({ ctx, reposQ }) {
     auditQ?.refetch?.()
     if (signalOn) signalQ?.refetch?.()
   }, [baseKeyStr, baseStamp])
-  useEffect(() => {
-    if (!routeTenant) return
-    setTenant(routeTenant)
-    setScoped(routeTenant)
-    setRepo('')
-    setPhase('')
-    headingRef.current?.scrollIntoView?.({ block: 'start', behavior: prefersReducedMotion() ? 'auto' : 'smooth' })
-  }, [routeTenant])
 
+  // Derived ledger transforms are memoized on their inputs, so unrelated UI state (modal, audit
+  // disclosure, row tabs, flash) re-renders without re-sorting, re-chaining or re-filtering the ledger.
   const data = query.data
   const isError = !!query.isError
   const hasData = data != null
   const loading = !hasData && !isError
-  const signalRows = signalOn && signalQ?.data && !signalQ?.isError ? trailDecisions(signalQ.data) : []
-  const loaded = trailDecisions(data)
-  const known = new Map()
-  for (const d of [...loaded, ...signalRows, ...Object.values(pinned)]) if (d && d.id && !known.has(d.id)) known.set(d.id, d)
-  const all = trailDecisions({ decisions: [...known.values()] })
-  const supersededIds = new Set([...all.filter(d => d.is_superseded).map(d => d.id), ...all.map(d => d.supersedes_id).filter(Boolean)])
+  const signalData = (signalOn && !signalQ?.isError && signalQ?.data) || null
+  const signalRows = useMemo(() => (signalData ? trailDecisions(signalData) : []), [signalData])
+  const loaded = useMemo(() => trailDecisions(data), [data])
+  const all = useMemo(() => {
+    const known = new Map()
+    for (const d of [...loaded, ...signalRows, ...Object.values(pinned)]) if (d && d.id && !known.has(d.id)) known.set(d.id, d)
+    return trailDecisions({ decisions: [...known.values()] })
+  }, [loaded, signalRows, pinned])
+  const supersededIds = useMemo(() => new Set([...all.filter(d => d.is_superseded).map(d => d.id), ...all.map(d => d.supersedes_id).filter(Boolean)]), [all])
   const isSup = d => supersededIds.has(d.id)
-  const chainMap = buildSupersessionChains(all)
+  const chainMap = useMemo(() => buildSupersessionChains(all), [all])
   const empty = hasData && loaded.length === 0 && !scoped && !signalRows.length
 
-  const registered = Array.isArray(reposQ?.data?.repos) ? reposQ.data.repos : []
-  const ghBySlug = Object.fromEntries(registered.filter(r => r?.slug && r?.repo).map(r => [r.slug, r.repo]))
-  const ghRepos = [...new Set([...registered.map(r => r?.repo).filter(Boolean), ...all.map(d => trailGithubRepo(d.repo_slug, ghBySlug)).filter(Boolean)])]
+  const repoList = reposQ?.data?.repos
+  const { registered, ghBySlug, ghRepos } = useMemo(() => {
+    const regs = Array.isArray(repoList) ? repoList : []
+    const bySlug = Object.fromEntries(regs.filter(r => r?.slug && r?.repo).map(r => [r.slug, r.repo]))
+    const repos = [...new Set([...regs.map(r => r?.repo).filter(Boolean), ...all.map(d => trailGithubRepo(d.repo_slug, bySlug)).filter(Boolean)])]
+    return { registered: regs, ghBySlug: bySlug, ghRepos: repos }
+  }, [repoList, all])
   const summary = data?.summary && typeof data.summary === 'object' ? data.summary : {}
   const total = Number.isFinite(summary.total) ? summary.total : all.length
 
-  const repoOpts = [...new Set([...all.map(d => d.repo_slug).filter(Boolean), ...registered.map(r => r?.slug).filter(Boolean), ...(repo ? [repo] : [])])].sort()
-  const tenantOpts = [...new Set([
-    ...Object.keys(summary.by_tenant && typeof summary.by_tenant === 'object' ? summary.by_tenant : {}).filter(t => t && t !== 'unknown'),
-    ...all.map(d => d.tenant).filter(Boolean),
-    ...(tenant ? [tenant] : [])
-  ])].filter(t => !mentionsHoldout(t)).sort()
-  const byTenantRows = groupBy(all.filter(d => d.tenant), d => d.tenant)
-  const modeKind = t => workstreamMode(t, null, [], byTenantRows.get(t) || []).kind
+  const facets = useMemo(() => {
+    const repoOpts = [...new Set([...all.map(d => d.repo_slug).filter(Boolean), ...registered.map(r => r?.slug).filter(Boolean), ...(repo ? [repo] : [])])].sort()
+    const tenantOpts = [...new Set([
+      ...Object.keys(summary.by_tenant && typeof summary.by_tenant === 'object' ? summary.by_tenant : {}).filter(t => t && t !== 'unknown'),
+      ...all.map(d => d.tenant).filter(Boolean),
+      ...(tenant ? [tenant] : [])
+    ])].filter(t => !mentionsHoldout(t)).sort()
+    const knownPhases = new Set(TRAIL_PHASE_ORDER)
+    const extraPhases = [...new Set([...all.map(d => d.phase).filter(Boolean), ...(phase ? [phase] : [])])].filter(p => !knownPhases.has(p) && !mentionsHoldout(p)).sort()
+    return { repoOpts, tenantOpts, extraPhases }
+  }, [all, registered, summary.by_tenant, repo, tenant, phase])
+  const byTenantRows = useMemo(() => groupBy(all.filter(d => d.tenant), d => d.tenant), [all])
+  const modeKind = useMemo(() => {
+    const cache = new Map()
+    return t => {
+      if (!cache.has(t)) cache.set(t, workstreamMode(t, null, [], byTenantRows.get(t) || []).kind)
+      return cache.get(t)
+    }
+  }, [byTenantRows])
   const wsOptionLabel = t => {
     const k = modeKind(t)
     const slug = trailWsLabel(t, ghRepos)
     if (!BADGED_MODES.has(k)) return slug
     return k === 'investigate' ? `${slug} · investigate · read-only` : `${slug} · ${k}`
   }
-  const inScope = d => (!repo || d.repo_slug === repo) && (!tenant || d.tenant === tenant)
-  const scopeRows = all.filter(inScope)
-  const presetOk = (d, p) => (p === 'all' ? true : p === 'key' ? !isRoutineDecision(d) : isAttentionDecision({ ...d, is_superseded: isSup(d) }, audit.ids))
-  const passes = (d, f) => (!f.repo || d.repo_slug === f.repo) && (!f.tenant || d.tenant === f.tenant) && (!f.phase || d.phase === f.phase) &&
-    (f.showSup || !isSup(d)) && presetOk(d, f.preset) && decisionMatchesQuery(d, f.q)
+  const passes = useMemo(() => trailFilterPredicate(supersededIds, audit.ids), [supersededIds, audit])
   const filters = { repo, tenant, phase, showSup, preset, q }
-  const visible = all.filter(d => passes(d, filters))
-  const routineHidden = preset === 'key' ? scopeRows.filter(d => isRoutineDecision(d) && (showSup || !isSup(d))).length : 0
-  const attnN = scopeRows.filter(d => isAttentionDecision({ ...d, is_superseded: isSup(d) }, audit.ids)).length
-  const phaseN = p => scopeRows.filter(d => d.phase === p).length
-  const knownPhases = new Set(TRAIL_PHASE_ORDER)
-  const extraPhases = [...new Set([...all.map(d => d.phase).filter(Boolean), ...(phase ? [phase] : [])])].filter(p => !knownPhases.has(p) && !mentionsHoldout(p)).sort()
-  const anyFilter = !!(repo || tenant || phase || q || preset !== 'all')
+  const visible = useMemo(() => all.filter(d => passes(d, { repo, tenant, phase, showSup, preset, q })), [all, passes, repo, tenant, phase, showSup, preset, q])
+  const scope = useMemo(() => {
+    const rows = all.filter(d => (!repo || d.repo_slug === repo) && (!tenant || d.tenant === tenant))
+    const phases = new Map()
+    for (const d of rows) phases.set(d.phase, (phases.get(d.phase) || 0) + 1)
+    return {
+      n: rows.length,
+      phases,
+      routineHidden: preset === 'key' ? rows.filter(d => isRoutineDecision(d) && (showSup || !supersededIds.has(d.id))).length : 0,
+      attnN: rows.filter(d => isAttentionDecision({ ...d, is_superseded: supersededIds.has(d.id) }, audit.ids)).length
+    }
+  }, [all, repo, tenant, preset, showSup, supersededIds, audit])
   const controlsOff = !hasData
 
   // Keep a pending jump until its row mounts: grow the rendered page to reach it first, and drop it only
   // once loading settled and the target is neither visible nor mountable.
   useEffect(() => {
-    const id = pendingJump.current
+    const id = s.pendingJump.current
     if (!id) return
     const idx = visible.findIndex(d => d.id === id)
     if (idx >= shown) {
-      setShown(idx + 1)
+      s.setShown(idx + 1)
       return
     }
-    const row = idx >= 0 ? rowEls.current[id] : null
+    const row = idx >= 0 ? s.rowEls.current[id] : null
     if (!row) {
-      if (!loading) pendingJump.current = null
+      if (!loading) s.pendingJump.current = null
       return
     }
-    pendingJump.current = null
+    s.pendingJump.current = null
     row.scrollIntoView?.({ block: 'center', behavior: prefersReducedMotion() ? 'auto' : 'smooth' })
-    ;(chevEls.current[id] || row).focus?.({ preventScroll: true })
-    clearTimeout(flashTimer.current)
-    flashTimer.current = setTimeout(() => setFlash(cur => (cur === id ? null : cur)), 1600)
+    ;(s.chevEls.current[id] || row).focus?.({ preventScroll: true })
+    clearTimeout(s.flashTimer.current)
+    s.flashTimer.current = setTimeout(() => s.setFlash(cur => (cur === id ? null : cur)), 1600)
   })
 
-  const resetFilters = () => {
-    setRepo(''); setTenant(''); setPhase(''); setQ(''); setQServer(''); setScoped(null)
-  }
-  const clearAll = () => {
-    resetFilters()
-    setShowSup(false)
-    setPreset('all')
-    setMsg('Filters cleared.')
-  }
-  const onQuery = v => {
-    const next = String(v ?? '')
-    setQ(next)
-    clearTimeout(qTimer.current)
-    qTimer.current = setTimeout(() => setQServer(next.trim()), 250)
-  }
+  const shownMsg = next => plural(all.filter(d => passes(d, next)).length, 'decision', 'decisions')
   const onFilter = (key, value) => {
     const v = value || ''
-    if (key === 'repo') setRepo(v)
-    if (key === 'phase') setPhase(v)
+    if (key === 'repo') s.setRepo(v)
+    if (key === 'phase') s.setPhase(v)
     if (key === 'tenant') {
-      setTenant(v)
-      if (scoped && v !== scoped) setScoped(null)
+      s.setTenant(v)
+      if (scoped && v !== scoped) s.setScoped(null)
     }
-    const next = { ...filters, [key]: v }
-    setMsg(`${plural(all.filter(d => passes(d, next)).length, 'decision', 'decisions')} shown.`)
+    s.setMsg(`${shownMsg({ ...filters, [key]: v })} shown.`)
   }
   const onPreset = p => {
-    setPreset(p)
-    setShown(DH_PAGE)
-    const next = { ...filters, preset: p }
-    setMsg(`${SIGNAL_PRESETS.find(x => x[0] === p)?.[1] || p}: ${plural(all.filter(d => passes(d, next)).length, 'decision', 'decisions')} shown.`)
-  }
-  const onShowSup = v => {
-    setShowSup(v)
-    setMsg(v ? 'Superseded decisions shown in place.' : 'Superseded decisions hidden; open a chain to see them.')
+    s.setPreset(p)
+    s.setShown(DH_PAGE)
+    s.setMsg(`${SIGNAL_PRESETS.find(x => x[0] === p)?.[1] || p}: ${shownMsg({ ...filters, preset: p })} shown.`)
   }
 
   // Single-row lookup; older hosts without GET /trail/{id} fall back to one wide unscoped /trail page.
@@ -2967,249 +3265,70 @@ function TrailSection({ ctx, reposQ }) {
   }
   // Clear the filters (Show decision), unfold and open the row, then scroll, focus and flash it.
   const jumpTo = async (id, announce) => {
-    const seq = ++jumpSeq.current
+    const seq = ++s.jumpSeq.current
     const hadFilters = !visible.some(d => d.id === id)
-    resetFilters()
-    setPreset('all')
-    setReveal(id)
-    setOpen(cur => ({ ...cur, [id]: true }))
+    s.resetFilters()
+    s.setPreset('all')
+    s.setReveal(id)
+    s.setOpen(cur => ({ ...cur, [id]: true }))
     let target = all.find(d => d.id === id) || null
     if (!target) {
-      pendingJump.current = null
-      setMsg(`Loading ${id}…`)
+      s.pendingJump.current = null
+      s.setMsg(`Loading ${id}…`)
       target = await fetchDecision(id, true).catch(() => null)
-      if (seq !== jumpSeq.current) return
+      if (seq !== s.jumpSeq.current) return
       if (!target) {
-        setMsg(`Could not load decision ${id}.`)
+        s.setMsg(`Could not load decision ${id}.`)
         return
       }
       const row = target
-      setPinned(cur => ({ ...cur, [row.id]: row }))
+      s.setPinned(cur => ({ ...cur, [row.id]: row }))
     }
-    if (target.is_superseded || isSup(target)) setShowSup(true)
-    pendingJump.current = id
-    setFlash(id)
-    setMsg(announce || (hadFilters ? `Filters cleared to show ${id}.` : `Jumped to ${id}.`))
+    if (target.is_superseded || isSup(target)) s.setShowSup(true)
+    s.pendingJump.current = id
+    s.setFlash(id)
+    s.setMsg(announce || (hadFilters ? `Filters cleared to show ${id}.` : `Jumped to ${id}.`))
   }
   const loadChain = async rootId => {
     let map = new Map(all.map(d => [d.id, d]))
     const found = {}
-    setChainLoading(cur => ({ ...cur, [rootId]: true }))
+    s.setChainLoading(cur => ({ ...cur, [rootId]: true }))
     for (let hop = 0; hop < 10; hop++) {
       const missing = buildSupersessionChains([...map.values()])[rootId]?.missing || []
       if (!missing.length) break
       const row = await fetchDecision(missing[0], true).catch(() => null)
       if (!row) {
-        setChainFailed(cur => ({ ...cur, [rootId]: true }))
+        s.setChainFailed(cur => ({ ...cur, [rootId]: true }))
         break
       }
       found[row.id] = row
       map = new Map([...map, [row.id, row]])
     }
-    setChainLoading(cur => ({ ...cur, [rootId]: false }))
-    if (Object.keys(found).length) setPinned(cur => ({ ...cur, ...found }))
+    s.setChainLoading(cur => ({ ...cur, [rootId]: false }))
+    if (Object.keys(found).length) s.setPinned(cur => ({ ...cur, ...found }))
   }
   const toggleChain = id => {
-    const next = !(chains[id] ?? showSup)
-    setChains(cur => ({ ...cur, [id]: next }))
+    const next = !(s.chains[id] ?? showSup)
+    s.setChains(cur => ({ ...cur, [id]: next }))
     if (next && chainMap[id]?.missing.length) return loadChain(id)
     return null
   }
   const onAppended = (row, target) => {
-    setModal(null)
-    resetFilters()
-    setPreset('key')
+    s.setModal(null)
+    s.resetFilters()
+    s.setPreset('key')
     if (row?.id) {
-      setPinned(cur => ({ ...cur, [row.id]: row }))
-      if (target) setChains(cur => ({ ...cur, [row.id]: true }))
-      pendingJump.current = row.id
-      setFlash(row.id)
-      setMsg(`Appended ${row.decision || 'decision'} (actor: human)`)
+      s.setPinned(cur => ({ ...cur, [row.id]: row }))
+      if (target) s.setChains(cur => ({ ...cur, [row.id]: true }))
+      s.pendingJump.current = row.id
+      s.setFlash(row.id)
+      s.setMsg(`Appended ${row.decision || 'decision'} (actor: human)`)
     } else {
-      setMsg('Decision appended (actor: human)')
+      s.setMsg('Decision appended (actor: human)')
     }
     host.notify?.({ kind: 'info', message: `Appended ${row?.decision || 'decision'} to trail.db` })
     invalidateKeys(queryClient, [['factonio', 'trail']])
   }
-
-  const select = (id, key, label, children, value) => jsxs('span', {
-    key,
-    className: 'fc-trail-sel',
-    children: [
-      jsx('label', { htmlFor: id, children: label }),
-      jsx('select', { id, className: 'fc-input', 'data-filter': key, 'data-set': String(!!value), disabled: controlsOff, value, onChange: ev => onFilter(key, ev?.target?.value), children })
-    ]
-  })
-  const opt = (v, l, extra) => jsx('option', { key: v || '__all', value: v, ...extra, children: l })
-  const logBtn = jsxs('button', {
-    key: 'log',
-    type: 'button',
-    className: 'fc-btn fc-btn--primary',
-    'data-action': 'log-decision',
-    disabled: loading,
-    onClick: () => setModal({ target: null }),
-    children: [jsx(Icon, { name: 'plus', size: 12 }), 'Log Human Decision']
-  })
-  const head = jsxs('div', {
-    key: 'head',
-    className: 'fc-sec-head',
-    children: [
-      jsxs('div', {
-        className: 'fc-trail-head-l',
-        children: [
-          jsx('h2', { id: 'fc-trail-h', ref: headingRef, children: 'Decision History' }),
-          jsxs('p', { className: 'fc-sec-sub', children: ['Append-only ledger from ', jsx('span', { className: 'fc-mono', children: 'trail.db' }), '. Key decisions by default; routine gate ticks are folded.'] })
-        ]
-      }),
-      jsxs('div', {
-        className: 'fc-dh-status',
-        children: [
-          hasData && audit.available && audit.clean
-            ? jsxs('span', { key: 'clean', className: 'fc-chip', 'data-tone': 'ok', 'data-field': 'audit-clean', title: 'trail --audit: 0 findings', children: [jsx(Icon, { name: 'shieldOk', size: 12 }), 'Audit clean'] })
-            : null,
-          jsxs('span', { key: 'n', className: 'fc-chip', 'data-field': 'total', children: [jsx('b', { className: 'fc-mono', children: hasData ? String(total) : '–' }), ' decisions'] }),
-          logBtn
-        ]
-      })
-    ]
-  })
-
-  const auditBanner = hasData && audit.available && !audit.clean
-    ? jsxs('div', {
-        key: 'audit',
-        className: 'fc-dh-audit',
-        role: 'region',
-        'aria-label': 'Trail audit findings',
-        children: [
-          jsxs('button', {
-            key: 'h',
-            type: 'button',
-            className: 'fc-dh-audit-head',
-            'data-action': 'toggle-audit',
-            'aria-expanded': String(auditOpen),
-            'aria-controls': 'fc-dh-audit-list',
-            onClick: () => setAuditOpen(!auditOpen),
-            children: [
-              jsx(Icon, { key: 'i', name: 'attention', size: 13 }),
-              jsx('b', { key: 't', children: `${plural(audit.findings.length, 'audit finding needs', 'audit findings need')} attention` }),
-              jsx('span', {
-                key: 'c',
-                className: 'fc-dh-audit-cats',
-                children: audit.counts.map(([k, n]) => jsx('span', { key: k, className: 'fc-chip', 'data-tone': k === 'gate_loosening' ? 'bad' : 'warn', 'data-kind': k, children: `${AUDIT_KIND_LABEL[k]} ${n}` }))
-              }),
-              jsx('span', { key: 'm', className: 'fc-m-note', children: `trail --audit${audit.inspected != null ? ` · ${audit.inspected.toLocaleString('en-US')} inspected` : ''}` }),
-              jsx(Icon, { key: 'chev', name: 'chev', size: 12, className: 'fc-dh-audit-chev' })
-            ]
-          }),
-          auditOpen
-            ? jsx('ul', {
-                key: 'l',
-                className: 'fc-dh-audit-list',
-                id: 'fc-dh-audit-list',
-                children: audit.findings.map((f, i) => jsxs('li', {
-                  key: `${f.decisionId}:${f.kind}:${i}`,
-                  className: 'fc-dh-audit-item',
-                  'data-id': f.decisionId,
-                  children: [
-                    jsx('span', { className: 'fc-chip', 'data-tone': f.severity === 'high' ? 'bad' : 'warn', children: f.severity }),
-                    jsxs('div', { children: [jsx('p', { children: f.message }), jsxs('small', { children: [`${f.label} · `, jsx('code', { children: f.decisionId })] })] }),
-                    jsxs('button', { type: 'button', className: 'fc-btn fc-btn--s', 'data-action': 'show-decision', 'data-id': f.decisionId, onClick: () => jumpTo(f.decisionId, 'Filters cleared · showing the flagged decision'), children: ['Show decision', jsx(Icon, { key: 'c', name: 'chev', size: 10 })] })
-                  ]
-                }))
-              })
-            : null
-        ]
-      })
-    : null
-
-  const bar = empty
-    ? null
-    : jsxs('div', {
-        key: 'bar',
-        className: 'fc-dh-bar fc-trail-bar',
-        role: 'search',
-        'aria-label': 'Filter decisions',
-        'data-disabled': String(controlsOff),
-        children: [
-          jsxs('div', {
-            key: 'r1',
-            className: 'fc-dh-row1',
-            children: [
-              jsx('span', {
-                className: 'fc-seg',
-                role: 'group',
-                'aria-label': 'Signal preset',
-                children: SIGNAL_PRESETS.map(([v, l]) => jsxs('button', {
-                  key: v,
-                  type: 'button',
-                  'data-action': 'preset',
-                  'data-value': v,
-                  'aria-pressed': String(preset === v),
-                  disabled: controlsOff,
-                  onClick: () => onPreset(v),
-                  children: [l, v === 'attention' && hasData && attnN > 0 ? jsx('span', { key: 'n', className: 'fc-count', 'aria-label': `${attnN} need attention`, children: String(attnN) }) : null]
-                }))
-              }),
-              jsxs('div', {
-                className: 'fc-dh-search',
-                children: [
-                  jsx(Icon, { key: 'i', name: 'search', size: 13 }),
-                  jsx('label', { key: 'l', className: 'fc-trail-sr', htmlFor: 'fc-dh-q', children: 'Search decisions' }),
-                  jsx('input', {
-                    key: 'q',
-                    id: 'fc-dh-q',
-                    type: 'search',
-                    className: 'fc-input',
-                    'data-filter': 'q',
-                    'data-set': String(!!q),
-                    placeholder: 'Search decision, why, card, PR, sha…',
-                    autoComplete: 'off',
-                    spellCheck: false,
-                    disabled: controlsOff,
-                    value: q,
-                    onChange: ev => onQuery(ev?.target?.value)
-                  }),
-                  q ? jsx('button', { key: 'x', type: 'button', 'data-action': 'clear-q', 'aria-label': 'Clear search', onClick: () => onQuery(''), children: jsx(Icon, { name: 'x', size: 11 }) }) : null
-                ]
-              })
-            ]
-          }),
-          jsxs('div', {
-            key: 'r2',
-            className: 'fc-dh-row2',
-            children: [
-              select('fc-trail-repo', 'repo', 'Repository', [opt('', 'All repos'), ...repoOpts.map(r => opt(r, r))], repo),
-              select('fc-trail-ws', 'tenant', 'Workstream', [opt('', 'All workstreams'), ...tenantOpts.map(t => opt(t, wsOptionLabel(t)))], tenant),
-              select('fc-trail-phase', 'phase', 'Phase', [
-                opt('', `All phases (${scopeRows.length})`),
-                ...[...TRAIL_PHASE_OPTGROUPS, ...(extraPhases.length ? [['Other', extraPhases]] : [])].map(([g, ps]) => jsx('optgroup', {
-                  key: g,
-                  label: g,
-                  children: ps.map(p => {
-                    const n = hasData ? phaseN(p) : 0
-                    return opt(p, `${p} (${n})`, { disabled: n === 0 && phase !== p })
-                  })
-                }))
-              ], phase),
-              jsxs('label', {
-                key: 'sup',
-                className: 'fc-chk',
-                children: [
-                  jsx('input', { type: 'checkbox', 'data-filter': 'sup', checked: showSup, disabled: controlsOff, onChange: ev => onShowSup(!!ev?.target?.checked) }),
-                  'Show superseded'
-                ]
-              }),
-              jsx('span', {
-                key: 'meta',
-                className: 'fc-dh-meta',
-                'aria-live': 'polite',
-                'data-field': 'shown',
-                children: loading ? 'Loading…' : hasData ? `${visible.length} shown${preset === 'key' && routineHidden ? ` · ${plural(routineHidden, 'routine tick', 'routine ticks')} hidden` : ''}` : ''
-              })
-            ]
-          })
-        ]
-      })
 
   let errStatus = null
   if (isError) errStatus = describeSaveError(query.error).status
@@ -3237,126 +3356,68 @@ function TrailSection({ ctx, reposQ }) {
       })
     : null
 
-  const renderRow = d => jsx(DecisionRow, {
-    key: d.id,
+  const rowProps = d => ({
     ctx,
     d,
     gh: trailGithubRepo(d.repo_slug, ghBySlug),
     tier: trailTier(d, audit.ids),
     findings: audit.byId.get(d.id) || [],
-    open: !!open[d.id],
-    tab: tabs[d.id] || 'fields',
-    flash: flash === d.id,
+    open: !!s.open[d.id],
+    tab: s.tabs[d.id] || 'fields',
+    flash: s.flash === d.id,
     superseded: isSup(d),
     chain: chainMap[d.id] || null,
-    chainOpen: chains[d.id] ?? showSup,
-    chainLoading: !!chainLoading[d.id],
-    chainFailed: !!chainFailed[d.id],
+    chainOpen: s.chains[d.id] ?? showSup,
+    chainLoading: !!s.chainLoading[d.id],
+    chainFailed: !!s.chainFailed[d.id],
     showWs: !tenant && (!!repo || !!phase || !!q),
     wsLabel: trailWsLabel(d.tenant, ghRepos),
     wsKind: d.tenant ? modeKind(d.tenant) : null,
-    onToggle: id => setOpen(cur => ({ ...cur, [id]: !cur[id] })),
-    onTab: (id, v) => setTabs(cur => ({ ...cur, [id]: v })),
-    onSupersede: t => setModal({ target: t }),
+    onToggle: id => s.setOpen(cur => ({ ...cur, [id]: !cur[id] })),
+    onTab: (id, v) => s.setTabs(cur => ({ ...cur, [id]: v })),
+    onSupersede: t => s.setModal({ target: t }),
     onChain: toggleChain,
     onJump: id => jumpTo(id),
-    rowRef: el => { rowEls.current[d.id] = el },
-    chevRef: el => { chevEls.current[d.id] = el }
+    rowRef: el => { s.rowEls.current[d.id] = el },
+    chevRef: el => { s.chevEls.current[d.id] = el }
   })
 
-  let body
-  if (loading) {
-    body = jsx('div', { key: 'body', className: 'fc-dh-scroll', 'aria-busy': 'true', 'aria-label': 'Loading decisions', children: jsx(DhSkeleton, {}) })
-  } else if (!hasData) {
-    body = null
-  } else if (empty) {
-    body = jsx('div', {
-      key: 'body',
-      className: 'fc-dh-scroll',
-      children: jsxs('div', {
-        className: 'fc-trail-state',
-        'data-state': 'empty',
-        children: [
-          jsx('span', { className: 'fc-trail-state-ico', children: jsx(Icon, { name: 'trail', size: 16 }) }),
-          jsx('h3', { children: 'No decisions yet' }),
-          jsx('p', { children: 'Gates, pivots and overrides are appended to trail.db as workstreams run. You can log a human decision now, or inspect the ledger from a terminal:' }),
-          jsx('div', { className: 'fc-step-cmd', children: 'hermes factonio trail --limit 20' })
-        ]
-      })
-    })
-  } else if (!visible.length) {
-    const chips = [
-      preset !== 'all' ? ['preset', `preset: ${SIGNAL_PRESETS.find(x => x[0] === preset)?.[1]}`] : null,
-      q ? ['q', `“${mentionsHoldout(q) ? '[redacted]' : q}”`] : null,
-      repo ? ['repo', `repo ${repo}`] : null,
-      tenant ? ['ws', [`workstream ${trailWsLabel(tenant, ghRepos)}`, BADGED_MODES.has(modeKind(tenant)) ? jsx('span', { key: 'm', className: 'fc-dh-mode', children: modeKind(tenant) }) : null]] : null,
-      phase ? ['phase', `phase ${phase}`] : null
-    ].filter(Boolean)
-    body = jsx('div', {
-      key: 'body',
-      className: 'fc-dh-scroll',
-      children: jsxs('div', {
-        className: 'fc-trail-state',
-        'data-state': 'filtered',
-        children: [
-          jsx('span', { className: 'fc-trail-state-ico', children: jsx(Icon, { name: 'filter', size: 16 }) }),
-          jsx('h3', { children: 'No decisions match' }),
-          jsx('div', { className: 'fc-trail-active', children: chips.map(([k, t]) => jsx('span', { key: k, className: 'fc-chip', children: t })) }),
-          jsx('p', { children: `${plural(all.length, 'decision is', 'decisions are')} loaded outside this view.` }),
-          jsx('button', { type: 'button', className: 'fc-btn fc-btn--primary', 'data-action': 'clear', onClick: clearAll, children: 'Clear filters' })
-        ]
-      })
-    })
-  } else {
-    const page = visible.slice(0, shown)
-    const moreLocal = visible.length > shown
-    const moreServer = !moreLocal && total > loaded.length && limit < DH_MAX_LIMIT
-    const days = groupTrailRows(page)
-    body = jsxs('div', {
-      key: 'body',
-      className: 'fc-dh-scroll',
-      children: [
-        ...days.map(day => jsxs('section', {
-          key: day.key,
-          className: 'fc-dh-dayblock',
-          'aria-label': day.label,
-          children: [
-            jsxs('div', { key: 'h', className: 'fc-dh-day', role: 'heading', 'aria-level': 3, children: [jsx('span', { children: day.label }), jsx('span', { children: plural(day.count, 'decision', 'decisions') })] }),
-            jsx('ol', {
-              key: 'l',
-              className: 'fc-dh-list',
-              'aria-label': 'Decisions, newest first',
-              children: day.items.map(item => (item.kind === 'row'
-                ? renderRow(item.d)
-                : jsx(FoldChip, {
-                    key: item.key,
-                    fold: item,
-                    open: !!folds[item.key] || item.rows.some(r => r.id === reveal),
-                    onToggle: () => setFolds(cur => ({ ...cur, [item.key]: !(cur[item.key] || item.rows.some(r => r.id === reveal)) })),
-                    children: item.rows.map(renderRow)
-                  })))
-            })
-          ]
-        })),
-        jsx('div', {
-          key: 'more',
-          className: 'fc-dh-more',
-          children: moreLocal || moreServer
-            ? jsx('button', {
-                type: 'button',
-                className: 'fc-btn',
-                'data-action': 'load-more',
-                onClick: () => {
-                  setShown(shown + 50)
-                  if (moreServer) setLimit(Math.min(DH_MAX_LIMIT, limit + 50))
-                },
-                children: 'Load 50 older'
-              })
-            : jsx('span', { className: 'fc-m-note', children: `Start of loaded window · server limit ${limit}` })
+  const ledgerState = loading ? 'loading' : !hasData ? null : empty ? 'empty' : !visible.length ? 'filtered' : 'populated'
+  const chips = ledgerState === 'filtered'
+    ? [
+        preset !== 'all' ? ['preset', `preset: ${SIGNAL_PRESETS.find(x => x[0] === preset)?.[1]}`] : null,
+        q ? ['q', `“${mentionsHoldout(q) ? '[redacted]' : q}”`] : null,
+        repo ? ['repo', `repo ${repo}`] : null,
+        tenant ? ['ws', [`workstream ${trailWsLabel(tenant, ghRepos)}`, BADGED_MODES.has(modeKind(tenant)) ? jsx('span', { key: 'm', className: 'fc-dh-mode', children: modeKind(tenant) }) : null]] : null,
+        phase ? ['phase', `phase ${phase}`] : null
+      ].filter(Boolean)
+    : []
+  const body = ledgerState
+    ? jsx('div', {
+        key: 'body',
+        className: 'fc-dh-scroll',
+        ...(loading ? { 'aria-busy': 'true', 'aria-label': 'Loading decisions' } : {}),
+        children: jsx(TrailLedger, {
+          state: ledgerState,
+          visible,
+          shown,
+          limit,
+          total,
+          loadedN: loaded.length,
+          allN: all.length,
+          folds: s.folds,
+          reveal: s.reveal,
+          chips,
+          rowProps,
+          onFold: item => s.setFolds(cur => ({ ...cur, [item.key]: !(cur[item.key] || item.rows.some(r => r.id === s.reveal)) })),
+          onMore: moreServer => {
+            s.setShown(shown + 50)
+            if (moreServer) s.setLimit(Math.min(DH_MAX_LIMIT, limit + 50))
+          },
+          onClear: s.clearAll
         })
-      ]
-    })
-  }
+      })
+    : null
 
   return jsxs('section', {
     className: 'fc-sec fc-trail fc-dh',
@@ -3365,13 +3426,35 @@ function TrailSection({ ctx, reposQ }) {
     'data-state': loading ? 'loading' : isError && !hasData ? 'error' : empty ? 'empty' : hasData && !visible.length ? 'filtered' : 'populated',
     'data-preset': preset,
     children: [
-      head,
-      auditBanner,
+      jsx(TrailHeader, { key: 'head', headingRef: s.headingRef, hasData, loading, audit, total, onLog: () => s.setModal({ target: null }) }),
+      jsx(TrailAuditBanner, {
+        key: 'audit',
+        audit,
+        hasData,
+        open: s.auditOpen,
+        onToggle: () => s.setAuditOpen(!s.auditOpen),
+        onShow: id => jumpTo(id, 'Filters cleared · showing the flagged decision')
+      }),
       alert,
-      bar,
+      empty
+        ? null
+        : jsx(TrailFilterBar, {
+            key: 'bar',
+            filters,
+            controlsOff,
+            hasData,
+            loading,
+            counts: { visible: visible.length, routineHidden: scope.routineHidden, attnN: scope.attnN, scopeN: scope.n, phaseN: p => scope.phases.get(p) || 0 },
+            facets,
+            wsOptionLabel,
+            onPreset,
+            onQuery: s.onQuery,
+            onFilter,
+            onShowSup: s.onShowSup
+          }),
       body,
-      jsx('p', { key: 'live', className: 'fc-trail-sr', 'aria-live': 'polite', children: msg }),
-      modal ? jsx(LogDecisionModal, { key: 'modal', ctx, target: modal.target, tenant: tenant || scoped || '', onClose: () => setModal(null), onAppended }) : null
+      jsx('p', { key: 'live', className: 'fc-trail-sr', 'aria-live': 'polite', children: s.msg }),
+      modal ? jsx(LogDecisionModal, { key: 'modal', ctx, target: modal.target, tenant: tenant || scoped || '', onClose: () => s.setModal(null), onAppended }) : null
     ]
   })
 }
