@@ -712,8 +712,8 @@ function attachRefs(tree, focusLog) {
   walk(tree, n => {
     const ref = n.props.ref
     if (!ref) return
-    const name = n.props.id || n.props['aria-label'] || text(n).trim()
-    const el = { tag: n.type, name, focus: () => focusLog.push(name), scrollIntoView: opts => scrollLog.push([name, opts || null]) }
+    const name = n.props.role === 'dialog' ? 'dialog' : n.props.id || n.props['aria-label'] || text(n).trim()
+    const el = { tag: n.type, name, disabled: !!n.props.disabled, focus: () => focusLog.push(name), scrollIntoView: opts => scrollLog.push([name, opts || null]) }
     if (typeof ref === 'function') ref(el)
     else ref.current = el
   })
@@ -752,7 +752,7 @@ function readRepos(tree) {
     const tr = h.node
     const tds = tr.props.children.filter(Boolean)
     const tag = td => { const t = find(td, n => String(n.props.className || '').startsWith('fc-tag fc-tag--')); return t ? { cls: t.node.props.className, text: text(t.node).replace(/\s+/g, ' ').trim(), title: t.node.props.title } : null }
-    const btn = find(tr, n => n.type === 'button').node
+    const btn = find(tr, n => n.type === 'button' && n.props['data-action'] === 'edit-repo').node
     const pol = td => { const p = find(td, n => n.props.className === 'fc-pol'); return { field: td.props['data-field'], text: text(td).trim(), pol: p ? p.node.props['data-pol'] ?? null : null, title: p ? p.node.props.title : null, tag: !!find(td, n => String(n.props.className || '').includes('fc-tag')) } }
     return {
       slug: tr.props['data-slug'],
@@ -1190,143 +1190,361 @@ const TRAIL_REPOS = [
   { ...REPOS[1], slug: 'acme-api', repo: 'acme/api' }
 ]
 const norm = n => text(n).replace(/\s+/g, ' ').trim()
+const dhSection = tree => find(tree, n => n.type === 'section' && n.props['aria-labelledby'] === 'fc-trail-h')
+function readDhRow(h) {
+  const r = h.node
+  const main = find(r, hasCls('fc-dh-main')).node
+  const res = find(main, hasCls('fc-dh-result')).node
+  const why = find(main, hasCls('fc-dh-why'))
+  const chain = find(r, hasCls('fc-dh-chain'))
+  const insp = find(r, hasCls('fc-dh-insp'))
+  return {
+    id: r.props['data-id'],
+    domId: r.props.id,
+    tier: r.props['data-tier'],
+    accent: r.props['data-accent'] ?? null,
+    human: r.props['data-human'] ?? null,
+    superseded: r.props['data-superseded'],
+    flash: r.props['data-flash'],
+    expanded: r.props['aria-expanded'],
+    inFold: h.anc.some(hasCls('fc-dh-foldrows')),
+    datetime: find(main, n => n.type === 'time').node.props.dateTime,
+    clock: norm(find(main, hasCls('fc-dh-time')).node),
+    phase: norm(find(main, hasCls('fc-dh-phase')).node),
+    actor: find(main, hasCls('fc-dh-actor')).node.props['data-actor'],
+    title: norm(find(main, n => n.type === 'h3').node.props.children.filter(c => !(c && typeof c === 'object' && hasCls('fc-dh-actor')(c)))),
+    rawTitle: find(main, n => n.type === 'h3').node.props.title,
+    result: norm(res),
+    tone: res.props['data-tone'] ?? null,
+    why: why ? norm(why.node) : null,
+    chev: (() => { const c = find(main, byAttr('data-action', 'toggle-row')).node; return { expanded: c.props['aria-expanded'], controls: c.props['aria-controls'], label: c.props['aria-label'] } })(),
+    pills: findAll(main, n => hasCls('fc-chip')(n) && n.props['data-ev']).map(pl => ({ ev: pl.node.props['data-ev'], text: norm(pl.node), tone: pl.node.props['data-tone'] ?? null, href: pl.node.props.href ?? null, title: pl.node.props.title ?? null, type: pl.node.type })),
+    chain: chain ? {
+      text: norm(find(chain.node, byAttr('data-action', 'toggle-chain')).node),
+      expanded: find(chain.node, byAttr('data-action', 'toggle-chain')).node.props['aria-expanded'],
+      items: findAll(chain.node, hasCls('fc-dh-chain-item')).map(i => ({ id: i.node.props['data-id'] ?? null, missing: i.node.props['data-missing'] ?? null, text: norm(i.node) }))
+    } : null,
+    insp: insp ? {
+      id: insp.node.props.id,
+      tabs: findAll(insp.node, n => n.type === 'button' && n.props['data-tab']).map(b => [b.node.props['data-tab'], b.node.props['aria-pressed']]),
+      kv: (() => { const dl = find(insp.node, hasCls('fc-dh-kv')); if (!dl) return null; const out = {}; for (const dd of findAll(dl.node, n => n.type === 'dd')) out[dd.node.props['data-k']] = norm(dd.node); return out })(),
+      json: (() => { const j = find(insp.node, hasCls('fc-dh-json')); return j ? text(j.node) : null })(),
+      supersede: !!find(insp.node, byAttr('data-action', 'supersede'))
+    } : null
+  }
+}
 function readTrail(tree) {
-  const sec = find(tree, n => n.type === 'section' && n.props.className === 'fc-sec fc-trail')
+  const sec = dhSection(tree)
   if (!sec) return null
   const s = sec.node
   const q = pred => find(s, pred)
-  const bar = q(n => n.props.className === 'fc-trail-bar')
+  const bar = q(hasCls('fc-dh-bar'))
   const stateBox = q(n => n.props.className === 'fc-trail-state')
-  const alert = q(n => n.props.role === 'alert')
+  const alert = q(n => n.props.role === 'alert' && hasCls('fc-trail-alert')(n))
   const live = q(n => n.props.className === 'fc-trail-sr' && n.props['aria-live'] === 'polite')
-  const list = q(n => n.type === 'ol')
+  const auditBox = q(hasCls('fc-dh-audit'))
+  const logBtn = q(byAttr('data-action', 'log-decision'))
   return {
     state: s.props['data-state'],
+    preset: s.props['data-preset'],
     busy: s.props['aria-busy'],
     labelledBy: s.props['aria-labelledby'],
     heading: { text: norm(q(n => n.type === 'h2').node), id: q(n => n.type === 'h2').node.props.id },
-    stats: findAll(s, n => n.props.className === 'fc-trail-stat').map(h => ({ stat: h.node.props['data-stat'] || null, type: h.node.type, text: norm(h.node), pressed: h.node.props['aria-pressed'] ?? null })),
+    sub: norm(q(hasCls('fc-sec-sub')).node),
+    total: norm(q(byAttr('data-field', 'total')).node),
+    auditClean: (() => { const c = q(byAttr('data-field', 'audit-clean')); return c ? norm(c.node) : null })(),
+    logBtn: logBtn ? { text: norm(logBtn.node), disabled: !!logBtn.node.props.disabled } : null,
+    audit: auditBox ? {
+      head: norm(find(auditBox.node, byAttr('data-action', 'toggle-audit')).node),
+      expanded: find(auditBox.node, byAttr('data-action', 'toggle-audit')).node.props['aria-expanded'],
+      cats: findAll(auditBox.node, n => n.props['data-kind']).map(h => [h.node.props['data-kind'], norm(h.node), h.node.props['data-tone']]),
+      items: findAll(auditBox.node, hasCls('fc-dh-audit-item')).map(h => ({ id: h.node.props['data-id'], text: norm(h.node) }))
+    } : null,
     bar: bar ? {
       disabled: bar.node.props['data-disabled'],
       role: bar.node.props.role,
-      selects: Object.fromEntries(findAll(bar.node, n => n.type === 'select').map(h => [h.node.props['data-filter'], { value: h.node.props.value, set: h.node.props['data-set'], disabled: !!h.node.props.disabled, options: findAll(h.node, n => n.type === 'option').map(o => [o.node.props.value, norm(o.node)]) }])),
-      phases: findAll(find(bar.node, n => n.props.className === 'fc-trail-phases').node, n => n.type === 'button').map(h => ({ phase: h.node.props['data-phase'], pressed: h.node.props['aria-pressed'], disabled: !!h.node.props.disabled, text: norm(h.node) })),
-      end: norm(find(bar.node, n => n.props.className === 'fc-trail-bar-end').node),
-      clear: !!find(bar.node, byAttr('data-action', 'clear'))
+      presets: findAll(bar.node, byAttr('data-action', 'preset')).map(h => ({ value: h.node.props['data-value'], pressed: h.node.props['aria-pressed'], disabled: !!h.node.props.disabled, text: norm(h.node) })),
+      q: (() => { const i = find(bar.node, byAttr('data-filter', 'q')).node; return { value: i.props.value, placeholder: i.props.placeholder, disabled: !!i.props.disabled } })(),
+      selects: Object.fromEntries(findAll(bar.node, n => n.type === 'select').map(h => [h.node.props['data-filter'], {
+        value: h.node.props.value, set: h.node.props['data-set'], disabled: !!h.node.props.disabled,
+        options: findAll(h.node, n => n.type === 'option').map(o => [o.node.props.value, norm(o.node)]),
+        groups: findAll(h.node, n => n.type === 'optgroup').map(g => [g.node.props.label, findAll(g.node, n => n.type === 'option').map(o => [o.node.props.value, norm(o.node), !!o.node.props.disabled])])
+      }])),
+      sup: (() => { const c = find(bar.node, byAttr('data-filter', 'sup')).node; return { checked: c.props.checked, disabled: !!c.props.disabled } })(),
+      meta: norm(find(bar.node, byAttr('data-field', 'shown')).node)
     } : null,
-    list: list ? { label: list.node.props['aria-label'] } : null,
-    rows: findAll(s, n => n.props.className === 'fc-trail-row').map(h => {
-      const r = h.node
-      const res = find(r, n => n.props.className === 'fc-trail-result').node
-      const why = find(r, n => n.props.className === 'fc-trail-why')
-      return {
-        id: r.props['data-id'],
-        domId: r.props.id,
-        tabIndex: r.props.tabIndex,
-        superseded: r.props['data-superseded'],
-        flash: r.props['data-flash'],
-        datetime: find(r, n => n.type === 'time').node.props.dateTime,
-        phase: norm(find(r, n => n.props.className === 'fc-trail-phase').node),
-        actor: find(r, n => n.props.className === 'fc-trail-actor').node.props['data-actor'],
-        title: norm(find(r, n => n.type === 'h3').node),
-        rawTitle: find(r, n => n.type === 'h3').node.props.title,
-        result: norm(res),
-        tone: res.props['data-tone'] ?? null,
-        why: why ? norm(why.node) : null,
-        links: findAll(r, n => n.props.className === 'fc-trail-link').map(l => ({ kind: l.node.props['data-kind'], jump: l.node.props['data-jump'], label: l.node.props['aria-label'], text: norm(l.node) })),
-        pills: findAll(r, n => n.props.className === 'fc-trail-pill').map(pl => ({ ev: pl.node.props['data-ev'], text: norm(pl.node), tone: pl.node.props['data-tone'] ?? null, href: pl.node.props.href ?? null, title: pl.node.props.title }))
-      }
+    scroll: !!q(hasCls('fc-dh-scroll')),
+    days: findAll(s, hasCls('fc-dh-day')).map(h => norm(h.node)),
+    folds: findAll(s, hasCls('fc-dh-foldwrap')).map(h => {
+      const b = find(h.node, byAttr('data-action', 'toggle-fold')).node
+      return { key: h.node.props['data-fold'], expanded: b.props['aria-expanded'], text: norm(b), phase: norm(find(b, hasCls('fc-dh-phase')).node), rows: findAll(h.node, hasCls('fc-dh-row')).map(r => r.node.props['data-id']) }
     }),
-    skeletons: findAll(s, n => n.props.className === 'fc-trail-skel').length,
-    srLoading: !!q(n => n.props.className === 'fc-trail-sr' && norm(n) === 'Loading decision trail…'),
+    rows: findAll(s, hasCls('fc-dh-row')).map(readDhRow),
+    skeletons: findAll(s, hasCls('fc-dh-skel')).length,
+    srLoading: !!q(n => n.props.className === 'fc-trail-sr' && norm(n) === 'Loading decision history…'),
     alert: alert ? { text: norm(alert.node), retry: !!find(alert.node, byAttr('data-action', 'retry')) } : null,
     box: stateBox ? {
       kind: stateBox.node.props['data-state'],
       title: norm(find(stateBox.node, n => n.type === 'h3').node),
       text: norm(stateBox.node),
-      chips: findAll(stateBox.node, n => n.props.className === 'fc-trail-pill').map(h => norm(h.node)),
+      chips: findAll(stateBox.node, hasCls('fc-chip')).map(h => norm(h.node)),
       cmd: (() => { const c = find(stateBox.node, n => n.props.className === 'fc-step-cmd'); return c ? norm(c.node) : null })(),
       clear: (() => { const b = find(stateBox.node, byAttr('data-action', 'clear')); return b ? { cls: b.node.props.className, text: norm(b.node) } : null })()
     } : null,
-    live: live ? norm(live.node) : null
+    more: (() => { const mo = q(hasCls('fc-dh-more')); return mo ? norm(mo.node) : null })(),
+    live: live ? norm(live.node) : null,
+    modal: (() => { const md = q(hasCls('fc-m')); return md ? md.node.props['data-modal'] : null })()
   }
 }
-const lastTrailQuery = () => { const q = trailQueries[trailQueries.length - 1]; return q ? { key: q.key, interval: q.interval } : null }
-const trailSelect = (tree, filter, value) => find(find(tree, n => n.props.className === 'fc-sec fc-trail').node, n => n.type === 'select' && n.props['data-filter'] === filter).node.props.onChange({ target: { value } })
-const trailPhase = (tree, phase) => fire(find(find(tree, n => n.props.className === 'fc-trail-phases').node, n => n.type === 'button' && n.props['data-phase'] === phase))
-const trailAction = (tree, action) => fire(find(find(tree, n => n.props.className === 'fc-sec fc-trail').node, n => n.type === 'button' && n.props['data-action'] === action))
-const trailLink = (tree, rowId, kind) => fire(find(find(tree, n => n.props.className === 'fc-trail-row' && n.props['data-id'] === rowId).node, n => n.props.className === 'fc-trail-link' && n.props['data-kind'] === kind))
+const trailQueryBy = (...key) => { const k = JSON.stringify(key); const hits = trailQueries.filter(x => JSON.stringify(x.key) === k); const qq = hits[hits.length - 1]; return qq ? { key: qq.key, interval: qq.interval ?? null, fn: qq.fn } : null }
+const lastTrailQuery = () => { const q = trailQueryBy('factonio', 'trail', 200) || trailQueries.filter(x => x.key[2] !== 'audit' && !x.key.includes('signal')).slice(-1).map(x => ({ key: x.key, interval: x.interval, fn: x.fn }))[0]; return q ? { key: q.key, interval: q.interval } : null }
+const baseTrailQuery = () => { const qs = trailQueries.filter(x => x.key[2] !== 'audit' && !x.key.includes('signal')); const q = qs[qs.length - 1]; return q ? { key: q.key, interval: q.interval ?? null } : null }
+const trailSelect = (tree, filter, value) => find(dhSection(tree).node, n => n.type === 'select' && n.props['data-filter'] === filter).node.props.onChange({ target: { value } })
+const trailPhase = (tree, phase) => trailSelect(tree, 'phase', phase)
+const trailAction = (tree, action) => fire(find(dhSection(tree).node, n => n.type === 'button' && n.props['data-action'] === action))
+const trailPreset = (tree, v) => fire(find(dhSection(tree).node, n => n.props['data-action'] === 'preset' && n.props['data-value'] === v))
+const trailSup = (tree, checked) => find(dhSection(tree).node, byAttr('data-filter', 'sup')).node.props.onChange({ target: { checked } })
+const trailQ = (tree, value) => find(dhSection(tree).node, byAttr('data-filter', 'q')).node.props.onChange({ target: { value } })
+const dhRowHit = (tree, id) => find(dhSection(tree).node, n => hasCls('fc-dh-row')(n) && n.props['data-id'] === id)
+const rowAction = (tree, id, action) => fire(find(dhRowHit(tree, id).node, byAttr('data-action', action)))
+const settle = () => new Promise(r => setTimeout(r, 300))
+const AUDIT_CLEAN = { ok: true, clean: true, inspected: 8, active_inspected: 7, counts: {}, findings: [], filters: {} }
+const AUDIT_FINDINGS = {
+  ok: true, clean: false, inspected: 8, active_inspected: 7, counts: { gate_loosening: 1, missing_evidence: 1, weak_evidence: 1 }, filters: {},
+  findings: [
+    { kind: 'gate_loosening', decision_id: 'd_f012c8a47b99', severity: 'high', message: 'A required hook was removed without a human countersign.' },
+    { kind: 'missing_evidence', decision_id: 'd_9a1e4c0b2f31', message: 'pr_gate_wait carries no head_sha proof.' },
+    { kind: 'weak_evidence', decision_id: 'd_6f19b3d28e45', message: 'See holdout/scenario-3.md for the proof.' },
+    { kind: 'unknown_kind', decision_id: 'd_4b81e2c0a119', message: 'dropped' }
+  ]
+}
+const routeTrail = (trail, audit) => opts => (opts.queryKey[2] === 'audit'
+  ? (audit instanceof Error ? { data: undefined, isLoading: false, isError: true, error: audit } : { data: audit, isLoading: false, isError: false })
+  : { data: trail, isLoading: false, isError: false })
 
 async function runTrailScenarios(report) {
   const T = report.trail = {}
-  const client = { invalidateQueries: () => Promise.resolve() }
+  const client = { invalidated: [], invalidateQueries(o) { this.invalidated.push(o.queryKey); return Promise.resolve() } }
   const mountDash = () => mountRepos({ data: { repos: TRAIL_REPOS, defaults: REPO_DEFAULTS }, client })
   const dash = T.dashboard = {}
 
-  // Loading (first load): skeletons, dashed stats, disabled filter bar.
+  // Loading (first load): skeletons, disabled controls; base query polls, signal + audit queries never do.
   trailState = { data: undefined, isLoading: true, isError: false }
   trailQueries.length = 0
   let m = mountDash()
   let tree = m.render()
   dash.loading = readTrail(tree)
   dash.query = lastTrailQuery()
-  dash.restPath = (await trailQueries[trailQueries.length - 1].fn(), m.rests[m.rests.length - 1].path)
+  const sig = trailQueryBy('factonio', 'trail', 200, 'signal', 'key')
+  const aud = trailQueryBy('factonio', 'trail', 'audit', 'all')
+  dash.queries = { signal: sig && { key: sig.key, interval: sig.interval }, audit: aud && { key: aud.key, interval: aud.interval }, polling: [...new Set(trailQueries.filter(x => x.interval).map(x => x.key.join('/')))] }
+  m.rests.length = 0
+  await trailQueryBy('factonio', 'trail', 200).fn(); await sig.fn(); await aud.fn()
+  dash.restPaths = m.rests.map(r => r.path)
+  dash.restPath = dash.restPaths[0]
   dash.sectionOrder = findAll(tree, n => n.type === 'h2').map(h => norm(h.node))
 
-  // Populated.
-  trailState = { data: TRAIL_DATA, isLoading: false, isError: false }
+  // Populated, audit clean.
+  trailState = routeTrail(TRAIL_DATA, AUDIT_CLEAN)
   m = mountDash()
   tree = m.render()
   dash.populated = readTrail(tree)
   windowOpens.length = 0
-  const prPill = find(tree, n => n.props.className === 'fc-trail-pill' && n.type === 'a')
+  const prPill = find(dhSection(tree).node, n => hasCls('fc-chip')(n) && n.type === 'a')
   const prFire = fire(prPill)
   await tick()
-  dash.prClick = { prevented: prFire.prevented, windowOpens: windowOpens.map(a => a[0]) }
+  dash.prClick = { prevented: prFire.prevented, stopped: prFire.stopped, windowOpens: windowOpens.map(a => a[0]) }
   windowOpens.length = 0
+  // Row expand -> Fields inspector; JSON tab; chain disclosure.
+  rowAction(tree, 'd_f012c8a47b99', 'toggle-row'); tree = m.render()
+  dash.expanded = readTrail(tree).rows.find(r => r.id === 'd_f012c8a47b99')
+  fire(find(dhRowHit(tree, 'd_f012c8a47b99').node, n => n.props['data-tab'] === 'json')); tree = m.render()
+  dash.expandedJson = readTrail(tree).rows.find(r => r.id === 'd_f012c8a47b99').insp
+  rowAction(tree, 'd_c4f08e2a91b7', 'toggle-chain'); tree = m.render()
+  dash.chainOpen = readTrail(tree).rows.find(r => r.id === 'd_c4f08e2a91b7').chain
+  // Selecting text inside a row never toggles it.
+  globalThis.getSelection = () => ({ toString: () => 'selected' })
+  fire(find(dhRowHit(tree, 'd_7e30f91b5c04').node, hasCls('fc-dh-main'))); tree = m.render()
+  dash.selectNoToggle = readTrail(tree).rows.find(r => r.id === 'd_7e30f91b5c04').expanded
+  delete globalThis.getSelection
 
-  // Filter: repo -> one row (ws pill shown), then + phase merge -> no match, then Clear.
+  // Presets, search and filters.
+  m = mountDash(); tree = m.render()
+  trailPreset(tree, 'attention'); tree = m.render()
+  dash.attention = readTrail(tree)
+  trailPreset(tree, 'all'); tree = m.render()
+  dash.all = readTrail(tree)
+  trailSup(tree, true); tree = m.render()
+  dash.supShown = readTrail(tree)
+  trailSup(tree, false); tree = m.render()
+  trailQ(tree, 'graphql'); tree = m.render()
+  dash.search = readTrail(tree)
+  await settle()
+  tree = m.render()
+  const sq = trailQueryBy('factonio', 'trail', 200, 'signal', 'all', 'q', 'graphql')
+  m.rests.length = 0
+  if (sq) await sq.fn()
+  dash.searchServer = { key: sq ? sq.key : null, interval: sq ? sq.interval : null, rest: m.rests.map(r => r.path) }
+  trailQ(tree, 'holdout'); tree = m.render()
+  dash.searchBarrier = readTrail(tree)
+  trailQ(tree, ''); tree = m.render()
   trailSelect(tree, 'repo', 'acme-api'); tree = m.render()
   dash.repoFiltered = readTrail(tree)
   trailPhase(tree, 'merge'); tree = m.render()
   dash.noMatch = readTrail(tree)
   fire(find(find(tree, n => n.props.className === 'fc-trail-state').node, byAttr('data-action', 'clear'))); tree = m.render()
   dash.cleared = readTrail(tree)
-  // Tenant filter + phase counts that respect it.
   trailSelect(tree, 'tenant', W2); tree = m.render()
   dash.tenantFiltered = readTrail(tree)
-  trailAction(tree, 'clear'); tree = m.render()
 
-  // Hide superseded, then jump from the superseding row to its hidden target.
-  trailAction(tree, 'toggle-sup'); tree = m.render()
-  dash.supHidden = readTrail(tree)
-  trailPhase(tree, 'verify'); tree = m.render()
-  dash.verifyOnly = readTrail(tree)
-  scrollLog.length = 0; m.focusLog.length = 0
-  trailLink(tree, 'd_c4f08e2a91b7', 'supersedes'); tree = m.render()
-  dash.jumpHidden = { trail: readTrail(tree), scroll: JSON.parse(JSON.stringify(scrollLog)), focus: [...m.focusLog] }
-  scrollLog.length = 0; m.focusLog.length = 0
-  trailLink(tree, 'd_9a1e4c0b2f31', 'superseded-by'); tree = m.render()
-  dash.jumpVisible = { trail: readTrail(tree), scroll: JSON.parse(JSON.stringify(scrollLog)), focus: [...m.focusLog] }
-  trailAction(tree, 'toggle-sup'); tree = m.render()
-  dash.supShownAgain = readTrail(tree).stats
-
-  // Publish phase: published/refused rows, combined branch pill, draft only when true.
-  const PUB = [
-    dec({ id: 'dec_9a8c4f10b2', ts: '2026-11-25T17:10:00.000000Z', phase: 'publish', card_id: 't_pub1', actor: 'human', decision: 'publish_pr', why: 'Published the verified branch.', evidence: { pr_number: 42, head_sha: '8f2c1a9e77', branch: 'feat/publish-policy', base_branch: 'main', draft: false }, result: 'published', supersedes_id: 'dec_7f2e1d84c1' }),
-    dec({ id: 'dec_7f2e1d84c1', ts: '2026-11-25T17:00:00.000000Z', phase: 'publish', card_id: 't_pub1', actor: 'orchestrator', decision: 'publish_pr', why: 'Refused: publish_policy is ask.', evidence: { head_sha: '3b9e014c2d', branch: 'feat/publish-policy', base_branch: 'main' }, result: 'refused', superseded_by: ['dec_9a8c4f10b2'], is_superseded: true }),
-    dec({ id: 'dec_draftlong01', ts: '2026-11-25T16:55:00.000000Z', phase: 'publish', card_id: 't_pub2', actor: 'orchestrator', decision: 'publish_pr', why: 'Draft PR.', evidence: { branch: 'b'.repeat(60), base_branch: 'develop', draft: true }, result: 'published' }),
-    dec({ id: 'dec_baseonly01', ts: '2026-11-25T16:50:00.000000Z', phase: 'publish', card_id: 't_pub3', actor: 'orchestrator', decision: 'publish_pr', why: 'Base only.', evidence: { base_branch: 'main', draft: 'yes' }, result: 'error' }),
-    TRAIL[0], TRAIL[2]
-  ]
-  trailState = { data: { decisions: PUB, summary: { total: PUB.length, active: PUB.length - 1, superseded: 1, by_tenant: { [W2]: PUB.length } }, filters: {} }, isLoading: false, isError: false }
+  // Superseded-by chip on a shown superseded row jumps to the correction.
   m = mountDash(); tree = m.render()
-  dash.publish = readTrail(tree)
-  trailPhase(tree, 'publish'); tree = m.render()
-  dash.publishOnly = readTrail(tree)
+  trailSup(tree, true); tree = m.render()
+  scrollLog.length = 0; m.focusLog.length = 0
+  await Promise.all(fire(find(dhRowHit(tree, 'd_9a1e4c0b2f31').node, byAttr('data-action', 'jump-correction'))).results)
+  tree = m.render()
+  dash.jumpCorrection = { trail: readTrail(tree), scroll: JSON.parse(JSON.stringify(scrollLog)), focus: [...m.focusLog] }
+
+  // Attention banner with findings: collapsed by default, counts per kind, Show decision deep-link.
+  trailState = routeTrail(TRAIL_DATA, AUDIT_FINDINGS)
+  m = mountDash(); tree = m.render()
+  dash.auditCollapsed = readTrail(tree)
+  trailAction(tree, 'toggle-audit'); tree = m.render()
+  dash.auditOpen = readTrail(tree)
+  trailSelect(tree, 'repo', 'acme-api'); tree = m.render()
+  scrollLog.length = 0; m.focusLog.length = 0
+  await Promise.all(fire(find(dhSection(tree).node, n => n.props['data-action'] === 'show-decision' && n.props['data-id'] === 'd_9a1e4c0b2f31')).results)
+  tree = m.render()
+  dash.showDecision = { trail: readTrail(tree), scroll: JSON.parse(JSON.stringify(scrollLog)), focus: [...m.focusLog] }
+  dash.auditBarrier = allStrings(dhSection(tree).node).filter(x => /holdout/i.test(x))
+  // Older backend: /trail/audit 404 -> no banner, no clean pill; ledger unaffected.
+  trailState = routeTrail(TRAIL_DATA, new Error('404: {"detail":"Not Found"}'))
+  m = mountDash(); tree = m.render()
+  dash.audit404 = readTrail(tree)
+
+  // Routine folding: consecutive pr_gate / bootstrap_verify ticks fold under All; Key hides them.
+  const tick_ = (i, o = {}) => dec({ id: `d_rt${String(i).padStart(2, '0')}`, ts: `2026-11-25T17:${String(58 - i * 6).padStart(2, '0')}:00.000000Z`, phase: 'gate', actor: 'orchestrator', decision: 'pr_gate', why: 'Gate tick.', result: 'pass', evidence: { pr_number: 12 }, ...o })
+  const ROUTINE = [
+    dec({ id: 'd_rk01', ts: '2026-11-25T17:59:00.000000Z', phase: 'merge', actor: 'orchestrator', decision: 'merge_pr', why: 'Merged.', result: 'merged', evidence: { pr_number: 12 } }),
+    tick_(1), tick_(2, { result: 'blocked' }), tick_(3), tick_(4),
+    dec({ id: 'd_rk02', ts: '2026-11-25T17:30:00.000000Z', phase: 'gate', actor: 'human', decision: 'override_gate', why: 'Accepted the flake.', result: 'approved' }),
+    tick_(7, { decision: 'bootstrap_verify', phase: 'verify' }),
+    tick_(8, { result: 'proof_failed' })
+  ]
+  trailState = routeTrail({ decisions: ROUTINE, summary: { total: ROUTINE.length, active: ROUTINE.length, superseded: 0, by_tenant: { [W2]: ROUTINE.length } } }, AUDIT_CLEAN)
+  m = mountDash(); tree = m.render()
+  dash.routineKey = readTrail(tree)
+  trailPreset(tree, 'all'); tree = m.render()
+  dash.routineAll = readTrail(tree)
+  fire(find(dhSection(tree).node, byAttr('data-action', 'toggle-fold'))); tree = m.render()
+  dash.routineUnfolded = readTrail(tree)
+
+  // Log Human Decision modal: validation, explicit confirmation, POST body without actor.
+  trailState = routeTrail(TRAIL_DATA, AUDIT_CLEAN)
+  m = mountDash(); tree = m.render()
+  m.focusLog.length = 0
+  trailAction(tree, 'log-decision'); tree = m.render()
+  const modalOf = t => find(t, hasCls('fc-m'))
+  const readModal = t => {
+    const md = modalOf(t)
+    if (!md) return null
+    const go = find(md.node, n => n.type === 'button' && hasCls('fc-btn--primary')(n))
+    return {
+      id: md.node.props['data-modal'], role: md.node.props.role, modal: md.node.props['aria-modal'], labelledBy: md.node.props['aria-labelledby'],
+      title: norm(find(md.node, n => n.type === 'h2').node), busy: md.node.props['aria-busy'] ?? null,
+      fields: Object.fromEntries(findAll(md.node, n => n.props['data-field'] && (n.type === 'div')).map(h => {
+        const ctl = find(h.node, n => ['input', 'select', 'textarea'].includes(n.type)).node
+        const err = find(h.node, hasCls('fc-field-err'))
+        return [h.node.props['data-field'], { value: ctl.props.value, invalid: ctl.props['aria-invalid'] ?? null, err: err ? norm(err.node) : null, label: norm(find(h.node, n => n.type === 'label').node) }]
+      })),
+      confirm: (() => { const c = find(md.node, n => n.type === 'input' && n.props['data-field'] === 'confirm'); return c ? c.node.props.checked : null })(),
+      quote: (() => { const qn = find(md.node, hasCls('fc-m-quote')); return qn ? { target: qn.node.props['data-target'], text: norm(qn.node) } : null })(),
+      banner: (() => { const b = find(md.node, hasCls('fc-banner')); return b ? { tone: b.node.props['data-tone'], text: norm(b.node) } : null })(),
+      go: go ? { text: norm(go.node), disabled: !!go.node.props.disabled, action: go.node.props['data-action'] } : null,
+      text: norm(md.node)
+    }
+  }
+  const setField = (t, name, value) => {
+    const md = modalOf(t).node
+    const ctl = find(md, n => n.props.name === name || (n.type === 'input' && n.props['data-field'] === name))
+    if (name === 'confirm' || name === 'draft') return ctl.node.props.onChange({ target: { checked: value } })
+    return ctl.node.props.onChange({ target: { value } })
+  }
+  const modalAction = (t, action) => fire(find(modalOf(t).node, n => n.type === 'button' && n.props['data-action'] === action))
+  const lg = dash.logModal = {}
+  lg.open = readModal(tree)
+  lg.initialFocus = [...m.focusLog]
+  // Focus guards: Shift+Tab past the first control lands on the last ENABLED one; Tab past the last on the
+  // first; with every control disabled (busy) the dialog itself takes focus. Native focus() ignores disabled.
+  const trapProbe = t => {
+    const md = modalOf(t).node
+    const out = {}
+    for (const edge of ['start', 'end']) {
+      m.focusLog.length = 0
+      find(md, n => n.props['data-focus-guard'] === edge).node.props.onFocus()
+      out[edge] = [...m.focusLog]
+    }
+    for (const shiftKey of [false, true]) {
+      m.focusLog.length = 0
+      let prevented = false
+      md.props.onKeyDown({ key: 'Tab', shiftKey, target: md.props.ref.current, preventDefault() { prevented = true }, stopPropagation() {} })
+      out[shiftKey ? 'shiftTabOnDialog' : 'tabOnDialog'] = { focus: [...m.focusLog], prevented }
+    }
+    return out
+  }
+  lg.trapUnchecked = trapProbe(tree)
+  modalAction(tree, 'append-decision'); tree = m.render()
+  lg.unconfirmed = readModal(tree)
+  setField(tree, 'confirm', true); tree = m.render()
+  lg.trapChecked = trapProbe(tree)
+  setField(tree, 'evidence', '[1, 2]'); tree = m.render()
+  await Promise.all(modalAction(tree, 'append-decision').results); tree = m.render()
+  lg.invalid = readModal(tree)
+  lg.restsInvalid = m.rests.filter(r => r.path === '/trail/decisions').length
+  setField(tree, 'decision', 'override_gate'); setField(tree, 'why', 'Flaky e2e accepted by owner.'); setField(tree, 'evidence', '{"pr_number": 12}'); setField(tree, 'card_id', 't_bcf5502a'); tree = m.render()
+  let release
+  m.setRest(async (p, opts) => {
+    if (p === '/trail/decisions') {
+      await new Promise(r => { release = r })
+      return { ok: true, decision: dec({ id: 'd_human00001', ts: '2026-11-25T18:00:00.000000Z', phase: opts.body.phase, actor: 'human', decision: opts.body.decision, why: opts.body.why, result: 'approved', card_id: opts.body.card_id, evidence: opts.body.evidence }) }
+    }
+    return { ok: true }
+  })
+  m.focusLog.length = 0
+  const pend = Promise.all(modalAction(tree, 'append-decision').results); tree = m.render()
+  lg.busy = readModal(tree)
+  lg.busyFocus = [...m.focusLog]
+  lg.trapBusy = trapProbe(tree)
+  const esc = { key: 'Escape', preventDefault() {}, stopPropagation() {} }
+  modalOf(tree).node.props.onKeyDown(esc); tree = m.render()
+  lg.escWhileBusy = !!modalOf(tree)
+  release(); await pend; tree = m.render()
+  lg.body = m.rests.filter(r => r.path === '/trail/decisions').map(r => r.opts)
+  lg.after = readTrail(tree)
+  lg.notified = notifications.slice(-1)
+  lg.invalidated = client.invalidated.map(k => k.join('/'))
+  // Error keeps entries; Escape closes and restores focus.
+  m = mountDash(); tree = m.render()
+  trailAction(tree, 'log-decision'); tree = m.render()
+  setField(tree, 'decision', 'note'); setField(tree, 'why', 'Context.'); setField(tree, 'confirm', true); tree = m.render()
+  m.setRest(async p => { if (p === '/trail/decisions') throw new Error('422: {"detail":"phase is not allowed"}'); return {} })
+  await Promise.all(modalAction(tree, 'append-decision').results); tree = m.render()
+  lg.error = readModal(tree)
+  modalOf(tree).node.props.onKeyDown(esc); tree = m.render()
+  lg.closed = readTrail(tree).modal
+  // Supersede… from the inspector prefills supersedes_id and quotes the target.
+  m = mountDash(); tree = m.render()
+  rowAction(tree, 'd_2d67a4e8f012', 'toggle-row'); tree = m.render()
+  rowAction(tree, 'd_2d67a4e8f012', 'supersede'); tree = m.render()
+  lg.supersede = readModal(tree)
+  setField(tree, 'why', 'Worker was paused on purpose.'); setField(tree, 'confirm', true); tree = m.render()
+  m.setRest(async (p, opts) => (p === '/trail/decisions' ? { ok: true, decision: dec({ id: 'd_human00002', ts: '2026-11-25T18:01:00.000000Z', phase: opts.body.phase, actor: 'human', decision: opts.body.decision, why: opts.body.why, result: 'overridden', supersedes_id: opts.body.supersedes_id }) } : {}))
+  await Promise.all(modalAction(tree, 'append-decision').results); tree = m.render()
+  lg.supersedeBody = m.rests.filter(r => r.path === '/trail/decisions').map(r => r.opts.body)
+  lg.supersedeAfter = readTrail(tree)
 
   // Empty.
-  trailState = { data: { decisions: [], summary: { total: 0, active: 0, superseded: 0, by_tenant: {} }, filters: {} }, isLoading: false, isError: false }
+  trailState = routeTrail({ decisions: [], summary: { total: 0, active: 0, superseded: 0, by_tenant: {} }, filters: {} }, AUDIT_CLEAN)
   m = mountDash(); tree = m.render()
   dash.empty = readTrail(tree)
 
@@ -1337,22 +1555,37 @@ async function runTrailScenarios(report) {
   dash.error = readTrail(tree)
   trailAction(tree, 'retry')
   dash.errorRetry = [...refetches]
-  trailState = { data: TRAIL_DATA, isLoading: false, isError: true, error: new Error('fetch failed') }
+  trailState = opts => (opts.queryKey[2] === 'audit' ? { data: AUDIT_CLEAN, isLoading: false, isError: false } : { data: TRAIL_DATA, isLoading: false, isError: true, error: new Error('fetch failed') })
   m = mountDash(); tree = m.render()
   dash.errorStale = readTrail(tree)
 
+  // Publish rows keep the branch / sha pills (max 3 + "+N in inspector").
+  const PUB = [
+    dec({ id: 'dec_9a8c4f10b2', ts: '2026-11-25T17:10:00.000000Z', phase: 'publish', card_id: 't_pub1', actor: 'human', decision: 'publish_pr', why: 'Published the verified branch.', evidence: { pr_number: 42, head_sha: '8f2c1a9e77', branch: 'feat/publish-policy', base_branch: 'main', draft: false }, result: 'published', supersedes_id: 'dec_7f2e1d84c1' }),
+    dec({ id: 'dec_7f2e1d84c1', ts: '2026-11-25T17:00:00.000000Z', phase: 'publish', card_id: 't_pub1', actor: 'orchestrator', decision: 'publish_pr', why: 'Refused: publish_policy is ask.', evidence: { head_sha: '3b9e014c2d', branch: 'feat/publish-policy', base_branch: 'main' }, result: 'refused', superseded_by: ['dec_9a8c4f10b2'], is_superseded: true }),
+    dec({ id: 'dec_draftlong01', ts: '2026-11-25T16:55:00.000000Z', phase: 'publish', card_id: 't_pub2', actor: 'orchestrator', decision: 'publish_pr', why: 'Draft PR.', evidence: { branch: 'b'.repeat(60), base_branch: 'develop', draft: true }, result: 'published' }),
+    TRAIL[0]
+  ]
+  trailState = routeTrail({ decisions: PUB, summary: { total: PUB.length, active: PUB.length - 1, superseded: 1, by_tenant: { [W2]: PUB.length } }, filters: {} }, AUDIT_CLEAN)
+  m = mountDash(); tree = m.render()
+  dash.publish = readTrail(tree)
+  trailPhase(tree, 'publish'); tree = m.render()
+  dash.publishOnly = readTrail(tree)
+
   // Deep link from the sidebar: /factonio?tenant=… scopes the fetch and the filter.
   trailQueries.length = 0
-  trailState = opts => (opts.queryKey.includes('tenant') ? { data: { ...TRAIL_DATA, decisions: TRAIL.filter(d => d.tenant === ACME_T), summary: { total: 1, active: 1, superseded: 0, by_tenant: { [ACME_T]: 1 } }, filters: { tenant: ACME_T } }, isLoading: false, isError: false } : { data: TRAIL_DATA, isLoading: false, isError: false })
+  trailState = opts => (opts.queryKey[2] === 'audit' ? { data: AUDIT_CLEAN, isLoading: false, isError: false } : opts.queryKey.includes('tenant') ? { data: { ...TRAIL_DATA, decisions: TRAIL.filter(d => d.tenant === ACME_T), summary: { total: 1, active: 1, superseded: 0, by_tenant: { [ACME_T]: 1 } }, filters: { tenant: ACME_T } }, isLoading: false, isError: false } : { data: TRAIL_DATA, isLoading: false, isError: false })
   globalThis.location = { hash: `#/factonio?tenant=${encodeURIComponent(ACME_T)}`, search: '' }
   scrollLog.length = 0
   m = mountDash(); tree = m.render()
-  const scopedQuery = lastTrailQuery()
-  await trailQueries[trailQueries.length - 1].fn()
-  dash.deepLink = { query: scopedQuery, rest: m.rests[m.rests.length - 1].path, trail: readTrail(tree), scroll: JSON.parse(JSON.stringify(scrollLog)) }
+  const scopedQuery = baseTrailQuery()
+  m.rests.length = 0
+  await trailQueries.filter(x => x.key[2] !== 'audit' && !x.key.includes('signal')).slice(-1)[0].fn()
+  await trailQueries.filter(x => x.key[2] === 'audit').slice(-1)[0].fn()
+  dash.deepLink = { query: scopedQuery, rests: m.rests.map(r => r.path), trail: readTrail(tree), scroll: JSON.parse(JSON.stringify(scrollLog)) }
   delete globalThis.location
   trailSelect(tree, 'tenant', ''); tree = m.render()
-  dash.deepLinkCleared = { query: lastTrailQuery(), rows: readTrail(tree).rows.length }
+  dash.deepLinkCleared = { query: baseTrailQuery(), rows: readTrail(tree).rows.length }
 
   // ---- sidebar -------------------------------------------------------------
   const sb = T.sidebar = {}
@@ -1482,8 +1715,8 @@ async function runTrailScenarios(report) {
   globalThis.__fcQueryClient = undefined
 }
 
-// Lineage targets outside the loaded window / server scope, fed by real trail.db
-// payloads that the Python side writes to FC_LINEAGE_FIXTURE.
+// Supersession chains whose prior decision is outside the loaded window / server scope, fed by
+// real trail.db payloads that the Python side writes to FC_LINEAGE_FIXTURE.
 async function runTrailLineageScenarios(report) {
   const L = report.trail.lineage = {}
   const fx = JSON.parse(readFileSync(process.env.FC_LINEAGE_FIXTURE, 'utf8'))
@@ -1502,35 +1735,28 @@ async function runTrailLineageScenarios(report) {
     m.setRest(rest)
     return m
   }
-  // The link's onClick returns the jump promise; awaiting it settles any lookup.
-  const clickLink = (tree, rowId, kind) => Promise.all(trailLink(tree, rowId, kind).results)
-  const snap = (m, tree) => ({
-    trail: readTrail(tree),
-    scroll: JSON.parse(JSON.stringify(scrollLog)),
-    focus: [...m.focusLog],
-    rests: m.rests.map(r => r.path),
-    query: lastTrailQuery()
-  })
-  const reset = m => { scrollLog.length = 0; m.focusLog.length = 0; m.rests.length = 0 }
+  const chainOf = (tree, id) => readTrail(tree).rows.find(r => r.id === id)?.chain ?? null
+  const toggleChain = (tree, id) => Promise.all(rowAction(tree, id, 'toggle-chain').results.filter(Boolean))
+  const snap = (m, tree, id) => ({ chain: chainOf(tree, id), rows: readTrail(tree).rows.length, rests: m.rests.map(r => r.path), query: baseTrailQuery() })
 
-  // >200 rows: the original is not in /trail?limit=200; the Supersedes link loads it by id.
+  // >200 rows: the original is not in /trail?limit=200; opening the chain loads it by id.
   {
     const w = fx.window
     const m = mount({ data: w.responses['/trail?limit=200'], isLoading: false, isError: false }, mockRest(w.responses))
     let tree = m.render()
-    const before = readTrail(tree)
-    reset(m)
-    const pending = clickLink(tree, w.correction, 'supersedes')
+    const before = chainOf(tree, w.correction)
+    m.rests.length = 0
+    const pending = toggleChain(tree, w.correction)
     tree = m.render()
-    const loadingMsg = readTrail(tree).live
+    const loading = chainOf(tree, w.correction)
     await pending; await tick()
     tree = m.render()
-    L.window = { api: w.api, before: { rows: before.rows.length, hasTarget: before.rows.some(r => r.id === w.original), link: before.rows.find(r => r.id === w.correction).links }, loadingMsg, after: snap(m, tree) }
-    // A second jump to the now-pinned row needs no refetch.
-    reset(m)
-    await clickLink(tree, w.correction, 'supersedes')
-    tree = m.render()
-    L.windowAgain = snap(m, tree)
+    L.window = { api: w.api, original: w.original, before, loading, after: snap(m, tree, w.correction) }
+    // Closing and reopening needs no refetch: the prior is pinned.
+    rowAction(tree, w.correction, 'toggle-chain'); tree = m.render()
+    m.rests.length = 0
+    await toggleChain(tree, w.correction); tree = m.render()
+    L.windowAgain = snap(m, tree, w.correction)
   }
 
   // Older host / capture mock: /trail/{id} answers with a list payload -> one wide unscoped page.
@@ -1539,14 +1765,13 @@ async function runTrailLineageScenarios(report) {
     const m = mount({ data: w.responses['/trail?limit=200'], isLoading: false, isError: false },
       mockRest(w.responses, { [`/trail/${w.original}`]: () => w.responses['/trail?limit=200'] }))
     let tree = m.render()
-    reset(m)
-    await clickLink(tree, w.correction, 'supersedes')
-    await tick()
+    m.rests.length = 0
+    await toggleChain(tree, w.correction); await tick()
     tree = m.render()
-    L.fallback = snap(m, tree)
+    L.fallback = snap(m, tree, w.correction)
   }
 
-  // Server scope: /factonio?tenant=<b> deep link; the superseded original lives in another tenant.
+  // Server scope: /factonio?tenant=<b>; the superseded original lives in another tenant.
   {
     const s = fx.scope
     const state = opts => (opts.queryKey.includes('tenant')
@@ -1555,50 +1780,107 @@ async function runTrailLineageScenarios(report) {
     globalThis.location = { hash: `#/factonio?tenant=${encodeURIComponent(s.tenant)}`, search: '' }
     const m = mount(state, mockRest(s.responses))
     let tree = m.render()
-    const before = { trail: readTrail(tree), query: lastTrailQuery() }
+    const before = { chain: chainOf(tree, s.correction), rows: readTrail(tree).rows.map(r => r.id), tenant: readTrail(tree).bar.selects.tenant.value, query: baseTrailQuery() }
     delete globalThis.location
-    reset(m)
-    await clickLink(tree, s.correction, 'supersedes')
-    await tick()
+    m.rests.length = 0
+    await toggleChain(tree, s.correction); await tick()
     tree = m.render()
-    L.scope = { api: s.api, original: s.original, before: { rows: before.trail.rows.map(r => r.id), tenant: before.trail.bar.selects.tenant.value, query: before.query }, after: snap(m, tree) }
+    L.scope = { api: s.api, original: s.original, before, after: { ...snap(m, tree, s.correction), tenant: readTrail(tree).bar.selects.tenant.value } }
   }
 
-  // Genuinely missing target (404): announced, nothing thrown, no scroll/focus, no wide refetch.
+  // Genuinely missing prior (404): stays listed as outside the window; nothing thrown, no wide refetch.
   {
     const rows = [dec({ id: 'd_dangling0001', ts: '2026-11-25T16:40:00.000000Z', phase: 'verify', actor: 'orchestrator', decision: 'verify_carryover', result: 'pass', supersedes_id: 'd_missing00000' })]
     const m = mount({ data: { decisions: rows, summary: { total: 1, active: 1, superseded: 0, by_tenant: { [W2]: 1 } }, filters: {} }, isLoading: false, isError: false }, mockRest({}))
     let tree = m.render()
-    reset(m)
+    m.rests.length = 0
     let threw = null
-    try { await clickLink(tree, 'd_dangling0001', 'supersedes') } catch (e) { threw = String(e) }
+    try { await toggleChain(tree, 'd_dangling0001') } catch (e) { threw = String(e) }
     await tick()
     tree = m.render()
-    L.missing = { threw, ...snap(m, tree) }
+    L.missing = { threw, ...snap(m, tree, 'd_dangling0001') }
   }
 
-  // Race: link A is still loading when link B is followed; A's late answer is dropped.
+  // Race: Show decision A is still loading when B is followed; A's late answer is dropped.
   {
-    const rows = [
-      dec({ id: 'd_corr_a00001', ts: '2026-11-25T16:40:00.000000Z', phase: 'verify', actor: 'orchestrator', decision: 'retry_a', result: 'pass', supersedes_id: 'd_orig_a00001' }),
-      dec({ id: 'd_corr_b00001', ts: '2026-11-25T16:30:00.000000Z', phase: 'gate', actor: 'orchestrator', decision: 'retry_b', result: 'pass', supersedes_id: 'd_orig_b00001' })
-    ]
-    const orig = (id, ts, by) => dec({ id, ts, phase: 'verify', actor: 'orchestrator', decision: 'first_try', result: 'reject', superseded_by: [by], is_superseded: true })
+    const rows = [dec({ id: 'd_live_000001', ts: '2026-11-25T16:40:00.000000Z', phase: 'verify', actor: 'orchestrator', decision: 'retry_a', result: 'pass' })]
+    const orig = (id, ts) => dec({ id, ts, phase: 'verify', actor: 'orchestrator', decision: 'first_try', result: 'reject' })
+    const audit = { ok: true, clean: false, inspected: 3, findings: [
+      { kind: 'missing_evidence', decision_id: 'd_orig_a00001', message: 'A has no proof.' },
+      { kind: 'weak_evidence', decision_id: 'd_orig_b00001', message: 'B is weak.' }
+    ] }
     const slowA = deferred()
-    const m = mount({ data: { decisions: rows, summary: { total: 4, active: 2, superseded: 2, by_tenant: { [W2]: 4 } }, filters: {} }, isLoading: false, isError: false },
-      mockRest({ '/trail/d_orig_b00001': { decision: orig('d_orig_b00001', '2026-11-20T10:00:00.000000Z', 'd_corr_b00001') } },
-        { '/trail/d_orig_a00001': () => slowA.promise }))
+    const state = opts => (opts.queryKey[2] === 'audit' ? { data: audit, isLoading: false, isError: false } : { data: { decisions: rows, summary: { total: 3, active: 3, superseded: 0, by_tenant: { [W2]: 3 } }, filters: {} }, isLoading: false, isError: false })
+    const m = mount(state, mockRest({ '/trail/d_orig_b00001': { decision: orig('d_orig_b00001', '2026-11-20T10:00:00.000000Z') } }, { '/trail/d_orig_a00001': () => slowA.promise }))
     let tree = m.render()
-    reset(m)
-    const a = clickLink(tree, 'd_corr_a00001', 'supersedes')
+    trailAction(tree, 'toggle-audit'); tree = m.render()
+    m.rests.length = 0; scrollLog.length = 0; m.focusLog.length = 0
+    const show = id => Promise.all(fire(find(dhSection(tree).node, n => n.props['data-action'] === 'show-decision' && n.props['data-id'] === id)).results)
+    const a = show('d_orig_a00001')
     tree = m.render()
-    await clickLink(tree, 'd_corr_b00001', 'supersedes')
-    await tick()
+    const loadingMsg = readTrail(tree).live
+    await show('d_orig_b00001'); await tick()
     tree = m.render()
-    slowA.resolve({ decision: orig('d_orig_a00001', '2026-11-21T10:00:00.000000Z', 'd_corr_a00001') })
+    slowA.resolve({ decision: orig('d_orig_a00001', '2026-11-21T10:00:00.000000Z') })
     await a; await tick()
     tree = m.render()
-    L.race = snap(m, tree)
+    const t = readTrail(tree)
+    L.race = { loadingMsg, rests: m.rests.map(r => r.path), rows: t.rows.map(r => [r.id, r.flash, r.expanded]), live: t.live, scroll: JSON.parse(JSON.stringify(scrollLog)), focus: [...m.focusLog] }
+  }
+
+  // Show decision beyond the first rendered page: (a) loaded row 90 of 100; (b) an old row fetched by id
+  // outside the 200-row window. The page grows to include it, then it is scrolled to and focused.
+  {
+    const mk = (n, extra = {}) => dec({ id: `d_probe_${String(n).padStart(3, '0')}`, ts: new Date(Date.UTC(2026, 10, 25, 12) - n * 60000).toISOString(), phase: 'verify', actor: 'orchestrator', decision: 'design_approved', result: 'approved', ...extra })
+    const deep = async (count, total, target, rest) => {
+      const rows = Array.from({ length: count }, (_, i) => mk(i))
+      const audit = { ok: true, clean: false, inspected: total, findings: [{ kind: 'missing_evidence', decision_id: target, message: 'No proof.' }] }
+      const m = mount(opts => (opts.queryKey[2] === 'audit' ? { data: audit, isLoading: false, isError: false } : { data: { decisions: rows, summary: { total, active: total, superseded: 0, by_tenant: { [W2]: total } }, filters: {} }, isLoading: false, isError: false }), mockRest(rest))
+      let tree = m.render()
+      const before = readTrail(tree).rows.length
+      trailAction(tree, 'toggle-audit'); tree = m.render()
+      m.rests.length = 0; scrollLog.length = 0; m.focusLog.length = 0
+      await Promise.all(fire(find(dhSection(tree).node, n => n.props['data-action'] === 'show-decision' && n.props['data-id'] === target)).results); await tick()
+      for (let i = 0; i < 3; i++) tree = m.render()
+      const t = readTrail(tree)
+      const row = t.rows.find(r => r.id === target)
+      return { before, rendered: t.rows.length, targetIndex: t.rows.findIndex(r => r.id === target), row: row ? [row.id, row.flash, row.expanded] : null, rests: m.rests.map(r => r.path), scroll: JSON.parse(JSON.stringify(scrollLog)), focus: [...m.focusLog], live: t.live }
+    }
+    L.deepLoaded = await deep(100, 100, 'd_probe_090', {})
+    L.deepFetched = await deep(200, 500, 'd_probe_450', { '/trail/d_probe_450': { decision: mk(450) } })
+  }
+
+  // The 30s base poll also refreshes the audit and the active server-filtered page; no new timers, no loop.
+  {
+    const rows = TRAIL.slice(0, 4)
+    let stamp = 1000
+    let auditData = AUDIT_CLEAN
+    let sigRows = [rows[0]]
+    const refetched = []
+    const intervals = []
+    const realSetInterval = globalThis.setInterval
+    globalThis.setInterval = (...a) => { intervals.push(a[1]); return realSetInterval(...a) }
+    const newRow = dec({ id: 'd_sig_new0001', ts: '2026-11-25T17:00:00.000000Z', phase: 'verify', actor: 'orchestrator', decision: 'pr_merged', why: 'GraphQL readback after the poll.', result: 'merged' })
+    const state = opts => {
+      if (opts.queryKey[2] === 'audit') return { data: auditData, isLoading: false, isError: false, refetch: () => { refetched.push('audit'); auditData = AUDIT_FINDINGS } }
+      if (opts.queryKey.includes('signal')) return { data: { decisions: sigRows, summary: {}, filters: {} }, isLoading: false, isError: false, refetch: () => { refetched.push(opts.queryKey.slice(3).join('/')); sigRows = [newRow, rows[0]] } }
+      return { data: { decisions: rows, summary: { total: 4, active: 4, superseded: 0, by_tenant: { [W2]: 4 } }, filters: {} }, isLoading: false, isError: false, dataUpdatedAt: stamp }
+    }
+    const m = mount(state, mockRest({}))
+    let tree = m.render()
+    trailQ(tree, 'graphql'); tree = m.render()
+    await settle(); tree = m.render(); tree = m.render()
+    const P = L.poll = { before: { auditClean: readTrail(tree).auditClean, audit: readTrail(tree).audit, rows: readTrail(tree).rows.map(r => r.id) }, refetchedBefore: [...refetched] }
+    stamp = 31000
+    tree = m.render()
+    tree = m.render()
+    const t = readTrail(tree)
+    P.after = { auditClean: t.auditClean, audit: t.audit ? t.audit.head : null, rows: t.rows.map(r => r.id) }
+    for (let i = 0; i < 4; i++) tree = m.render()
+    P.refetched = [...refetched]
+    P.intervals = [...intervals]
+    P.queryIntervals = [...new Set(trailQueries.filter(x => x.interval).map(x => `${x.key.join('/')}=${x.interval}`))]
+    globalThis.setInterval = realSetInterval
   }
 
   trailState = { data: undefined, isLoading: true, isError: false }
@@ -2008,7 +2290,8 @@ const ICON_SIG = [
   ['attention', 'M6 1.6 10.8 10H1.2z'], ['check', 'M2.5 6.3 5 8.7l4.5-5.2'], ['x', 'M3.5 3.5l5 5M8.5 3.5l-5 5'],
   ['queued', 'M6 3.6V6l1.6 1.1'], ['trend', 'M1.8 8.6l2.7-2.7 1.9 1.9 3.8-3.8'], ['retry', 'M9.6 5.2A3.8 3.8 0 1 0 9 8'],
   ['eye', 'M1.2 6S3 2.8 6 2.8 10.8 6 10.8 6 9 9.2 6 9.2 1.2 6 1.2 6z'], ['arena', 'M1.8 2.6 5 6 1.8 9.4'],
-  ['shieldOk', 'M4.4 6.1 5.5 7.2 7.6 4.9'], ['shield', 'M6 1.5 9.8 3v3c0 2.2-1.6 3.8-3.8 4.5C3.8 9.8 2.2 8.2 2.2 6V3z']
+  ['shieldOk', 'M4.4 6.1 5.5 7.2 7.6 4.9'], ['shield', 'M6 1.5 9.8 3v3c0 2.2-1.6 3.8-3.8 4.5C3.8 9.8 2.2 8.2 2.2 6V3z'],
+  ['doc', 'M3 1.6h4l2 2v6.8H3z']
 ]
 function iconOf(node) {
   const svg = node && node.type === 'svg' ? node : find(node, n => n.type === 'svg')?.node
@@ -2327,18 +2610,16 @@ async function runWave5Scenarios(report) {
     D.headers = findAll(tbl, n => n.type === 'th').length
     D.repos = Object.fromEntries(findAll(tbl, n => n.type === 'tr' && n.props['data-slug']).map(h => {
       const tds = h.node.props.children.filter(Boolean)
-      const b = find(tds[0], hasCls('fc-harness'))
+      const b = find(tds[tds.length - 1], hasCls('fc-harness'))
       return [h.node.props['data-slug'], {
         cells: tds.length,
         firstCell: tds[0].props.children.filter(Boolean).map(n => classOf(n)),
+        actions: find(tds[tds.length - 1], hasCls('fc-act-btns')).node.props.children.filter(Boolean).map(n => classOf(n)),
         badge: b ? { state: b.node.props['data-state'], text: norm(find(b.node, hasCls('fc-harness-t')).node), key: (() => { const k = find(b.node, hasCls('fc-harness-k')); return k ? norm(k.node) : null })(), title: b.node.props.title, sr: norm(find(b.node, hasCls('fc-sr')).node), icon: iconOf(b.node) } : null
       }]
     }))
     const t = readTrail(tree)
-    D.trail = { phases: t.bar.phases, tenantOptions: t.bar.selects.tenant.options, rows: Object.fromEntries(t.rows.map(r => [r.id, r])) }
-    const bar = find(tree, n => n.props.className === 'fc-trail-phases').node
-    D.phaseBar = bar.props.children.flat(Infinity).filter(Boolean).map(n => n.type === 'span' ? 'sep' : `${n.props['data-phase']}${n.props['data-empty'] ? '·empty' : ''}`)
-    D.sepHidden = find(bar, hasCls('fc-trail-phase-sep'))?.node.props['aria-hidden'] ?? null
+    D.trail = { phases: t.bar.selects.phase.groups, phaseAll: t.bar.selects.phase.options[0], tenantOptions: t.bar.selects.tenant.options, rows: Object.fromEntries(t.rows.map(r => [r.id, r])) }
     // Phase filter "eval" then rows show the ws pill with its mode annotation.
     trailPhase(tree, 'eval'); tree = m.render()
     const te = readTrail(tree)
@@ -2360,6 +2641,420 @@ async function runWave5Scenarios(report) {
   } catch (e) { D.error = String(e && e.stack || e) }
   trailState = { data: undefined, isLoading: true, isError: false }
   cardsState = { data: undefined, isLoading: true, isError: false }
+  globalThis.__fcReposState = undefined
+  globalThis.__fcQueryClient = undefined
+}
+
+// ---------------------------------------------------------------------------
+// Control plane (Unit 2): pure helpers, Publish PR, report viewer, harness audit,
+// design approval and panel / arena Re-evaluate.
+// ---------------------------------------------------------------------------
+async function runControlPlaneScenarios(report) {
+  const C = report.cp = {}
+  const J = v => JSON.parse(JSON.stringify(v, (k, x) => (x instanceof Set ? [...x] : x instanceof Map ? Object.fromEntries(x) : x)))
+  const NOWMS = Date.parse('2026-11-27T18:00:00Z')
+
+  // --- pure helpers ---------------------------------------------------------
+  const r = (id, ts, o = {}) => ({ id, ts, phase: 'gate', actor: 'orchestrator', decision: 'pr_gate', result: 'pass', supersedes_id: null, evidence: {}, ...o })
+  const rows = [
+    r('a', '2026-11-27T17:00:00Z', { decision: 'merge_pr', phase: 'merge', result: 'merged' }),
+    r('b', '2026-11-27T16:55:00Z'), r('c', '2026-11-27T16:50:00Z', { result: 'blocked' }), r('d', '2026-11-27T16:45:00Z'),
+    r('e', '2026-11-27T16:40:00Z', { decision: 'bootstrap_verify', phase: 'verify' }),
+    r('f', '2026-11-27T16:35:00Z', { actor: 'human' }),
+    r('g', '2026-11-27T00:10:00Z'), r('h', '2026-11-26T23:50:00Z'),
+    r('i', '2026-11-26T23:40:00Z', { result: 'proof_failed' })
+  ]
+  const fold = items => items.map(x => (x.kind === 'row' ? x.d.id : `[${x.count}:${x.rows.map(y => y.id).join('')}|${x.passed}/${x.blocked}/${x.other}|${x.decision}]`))
+  C.fold = fold(mod.foldRoutineDecisions(rows))
+  C.foldEmpty = J(mod.foldRoutineDecisions(null))
+  C.groups = mod.groupTrailRows(rows, NOWMS).map(g => ({ key: g.key, label: g.label, count: g.count, items: fold(g.items) }))
+  C.routine = {
+    gate: mod.isRoutineDecision(r('x', 'z')),
+    human: mod.isRoutineDecision(r('x', 'z', { actor: 'human' })),
+    supersedes: mod.isRoutineDecision(r('x', 'z', { supersedes_id: 'y' })),
+    escape: mod.isRoutineDecision(r('x', 'z', { phase: 'escape' })),
+    proofFailed: mod.isRoutineDecision(r('x', 'z', { result: 'proof_failed' })),
+    blocked: mod.isRoutineDecision(r('x', 'z', { result: 'blocked' })),
+    merge: mod.isRoutineDecision(r('x', 'z', { decision: 'merge_pr' }))
+  }
+  const ids = new Set(['flagged'])
+  C.attention = {
+    watchdog: mod.isAttentionDecision(r('x', 'z', { decision: 'stall_detected', phase: 'watchdog', result: 'stalled' })),
+    superseded: mod.isAttentionDecision(r('x', 'z', { decision: 'x', result: 'reject', is_superseded: true })),
+    audit: mod.isAttentionDecision(r('flagged', 'z'), ids),
+    routineBlocked: mod.isAttentionDecision(r('x', 'z', { result: 'blocked' })),
+    reject: mod.isAttentionDecision(r('x', 'z', { decision: 'verify', result: 'reject' })),
+    pass: mod.isAttentionDecision(r('x', 'z', { decision: 'verify', result: 'pass' }))
+  }
+  C.tiers = [r('x', 'z', { phase: 'escape', decision: 'escape_detected' }), r('flagged', 'z', { decision: 'merge_pr' }), r('x', 'z', { decision: 'override_gate', actor: 'human' }), r('x', 'z'), r('x', 'z', { decision: 'merge_pr' })].map(d => mod.trailTier(d, ids))
+  const chainRows = [
+    r('c3', 'z', { decision: 'fix2', supersedes_id: 'c2' }), r('c2', 'z', { decision: 'fix1', supersedes_id: 'c1' }), r('c1', 'z', { decision: 'orig' }),
+    r('m1', 'z', { decision: 'x', supersedes_id: 'gone' }),
+    r('y1', 'z', { decision: 'x', supersedes_id: 'y2' }), r('y2', 'z', { decision: 'x', supersedes_id: 'y1' })
+  ]
+  C.chains = Object.fromEntries(Object.entries(mod.buildSupersessionChains(chainRows)).map(([k, v]) => [k, { priors: v.priors.map(p => p.id), missing: v.missing }]))
+  const qd = { id: 'd_1', decision: 'pr_gate', why: 'Flaky E2E', result: 'pass', card_id: 't_9', tenant: 'ws-a', repo_slug: 'acme', evidence: { head_sha: 'abc1234', note: 'see holdout/x.md' } }
+  C.query = ['flaky', 'ABC1234', 't_9', 'PR gate check', 'holdout', 'nothing', '', 'see holdout'].map(q => mod.decisionMatchesQuery(qd, q))
+  C.strip = J(mod.stripHoldout({ a: 1, holdout_files: 2, b: ['ok', 'holdout/x'], c: { d: 'HOLDOUT', e: 'fine' } }))
+  C.audit = {
+    unavailable404: J(mod.summarizeTrailAudit(undefined, true)),
+    notAudit: mod.summarizeTrailAudit({ decisions: [] }).available,
+    clean: J(mod.summarizeTrailAudit({ ok: true, clean: true, findings: [], inspected: 1167 })),
+    findings: J(mod.summarizeTrailAudit({ ok: true, findings: [
+      { kind: 'gate_loosening', decision_id: 'd_1', message: 'Removed a hook' },
+      { kind: 'weak_evidence', decision_id: 'd_2', message: 'Read holdout/s1.md' },
+      { kind: 'bogus', decision_id: 'd_3', message: 'x' },
+      { kind: 'missing_evidence', decision_id: 'holdout_d', message: 'y' },
+      { kind: 'unclosed_escalation', decision_id: 'd_2', severity: 'high', message: 'Open' }
+    ] }))
+  }
+  C.scan = J(mod.scanEvidence({ decision: 'publish_pr', evidence: { tests_passed: 4, head_sha: '8f2c1a9e77', pr_number: 42, branch: 'feat/x', base_branch: 'main', patch_id: '91e4f0a2c7', note: 'n' } }, 'omnim-ai/factonio')).top.map(p => p.key)
+  C.scanMore = mod.scanEvidence({ decision: 'publish_pr', evidence: { tests_passed: 4, head_sha: '8f2c1a9e77', pr_number: 42, branch: 'feat/x', base_branch: 'main', patch_id: '91e4f0a2c7', note: 'n', holdout_x: 1 } }, 'omnim-ai/factonio').more
+  C.draft = {
+    empty: mod.validateDecisionDraft({}),
+    spaces: mod.validateDecisionDraft({ decision: 'two words', why: 'w', phase: 'gate' }),
+    badTenant: mod.validateDecisionDraft({ decision: 'x', why: 'w', phase: 'gate', tenant: '../etc' }),
+    array: mod.validateDecisionDraft({ decision: 'x', why: 'w', phase: 'gate', evidence: '[1]' }),
+    big: mod.validateDecisionDraft({ decision: 'x', why: 'w', phase: 'gate', evidence: JSON.stringify({ a: 'x'.repeat(17000) }) }),
+    ok: mod.validateDecisionDraft({ decision: 'override_gate', why: 'w', phase: 'retro', evidence: '{"a":1}' })
+  }
+  C.body = mod.humanDecisionBody({ decision: ' override_gate ', why: ' because ', phase: 'gate', result: '', repo: 'acme', tenant: '', card_id: 't_1', evidence: '{"pr_number":1}', actor: 'robot' }, { id: 'd_old' })
+  C.paths = [mod.trailPath({}), mod.trailPath({ tenant: 'a b', limit: 250, signal: 'key', q: 'x&y' }), mod.trailPath({ signal: 'all' })]
+
+  // Markdown: plain elements only, https links only.
+  C.href = ['https://github.com/o/r/pull/1', 'http://x.test', 'javascript:alert(1)', 'JAVASCRIPT:alert(1)', 'data:text/html,x', '/etc/passwd', 'file:///etc/passwd', 'https://user:pw@x.test', 'https://x.test/holdout/a', ' https://ok.test/a '].map(mod.safeMarkdownHref)
+  C.inline = J(mod.parseInlineMarkdown('Use `code` and **bold** and *em* [ok](https://a.test/x) [bad](javascript:alert(1)) <img src=x onerror=alert(1)>'))
+  C.blocks = J(mod.parseMarkdownBlocks([
+    '# Cache misses', '', 'Para one', 'continues here.', '', '- item a', '- item b', '1. first', '2. second', '',
+    '> quoted **text**', '', '```js', 'const x = "<script>"', '```', '', '| key | value |', '|---|:--:|', '| a | `b` |', '| c | d |', '', '---', '#### Deep', '<b>raw html</b>'
+  ].join('\n')))
+  C.report = {
+    missing: J(mod.reportView({ ok: true, exists: false, content: null })),
+    junk: J(mod.reportView(null)),
+    view: J(mod.reportView({ ok: true, exists: true, content: '# R\nline holdout/a.md\nok', truncated: true, redacted: false, size_bytes: 300000, updated_at: '2026-11-27T10:00:00Z', filename: '/abs/path/investigation.md' }))
+  }
+
+  // Publish eligibility + request body.
+  const SHA = 'a'.repeat(40)
+  const LT = { repo: 'omnim-ai/factonio', branch: 'feat/x', base_branch: 'main', head_sha: SHA, source: 'metadata', pr_title: 'Add X', pr_body: 'Body' }
+  const impl = card({ id: 't_impl', tenant: 'ws-pub', phase: 'implement', status: 'done', title: '[implement] X', local_target: LT, created_at: 10 })
+  const vd = (o = {}) => card({ id: 't_vd', tenant: 'ws-pub', phase: 'verify-diff', status: 'done', verdict: 'pass', local_target: { ...LT }, created_at: 20, ...o })
+  const vb = (o = {}) => card({ id: 't_vb', tenant: 'ws-pub', phase: 'verify-blackbox', status: 'done', verdict: 'pass', local_target: { ...LT }, created_at: 21, ...o })
+  const el = (c, ws, panels) => { const e = mod.publishEligibility(c, ws, panels); return { eligible: e.eligible, reason: e.reason, label: e.verification?.label ?? null } }
+  C.publish = {
+    ok: el(impl, [impl, vd(), vb()]),
+    noTarget: el({ ...impl, local_target: null }, []),
+    hasPr: el({ ...impl, pr: PR42 }, [impl, vd(), vb()]),
+    verifyCard: el(vd(), [impl, vd(), vb()]),
+    shortSha: el({ ...impl, local_target: { ...LT, head_sha: 'abc1234' } }, []),
+    noRepo: el({ ...impl, local_target: { ...LT, repo: null } }, []),
+    onlyDiff: el(impl, [impl, vd()]),
+    reject: el(impl, [impl, vd(), vb({ verdict: 'reject' })]),
+    otherSha: el(impl, [impl, vd({ local_target: { ...LT, head_sha: 'b'.repeat(40) } }), vb()]),
+    running: el(impl, [impl, vd(), vb({ status: 'running', verdict: null })]),
+    panelPass: el(impl, [impl, vd({ panel_id: 'vp_1' }), vb({ panel_id: 'vp_1' })], [{ id: 'vp_1', consensus: 'pass', vendors: ['openai', 'google'], lanes: [] }]),
+    panelPending: el(impl, [impl, vd({ panel_id: 'vp_1' })], [{ id: 'vp_1', consensus: 'pending', vendors: [], lanes: [] }])
+  }
+  C.publishBody = mod.publishRequestBody({ repo: 'omnim-ai/factonio', branch: 'feat/x', base_branch: 'main', head_sha: SHA }, { title: ' T ', body: '', draft: true }, { id: 't_impl', tenant: 'ws-pub' })
+
+  // Harness audit drawer view model.
+  C.harness = {
+    stale: J(mod.formatHarnessAudit({ ok: true, repo_path: '/home/u/dev/x', severity: 'stale', mode: 'advisory', drifted: true, drift_classification: { classification: 'harness_gap' },
+      uncovered_changed_files: ['desktop/plugin.js', 'holdout/s.md'], visual_baseline_changes: ['docs/images/dashboard.png'], stale_invariants: [{ name: 'skill-bloat', changed_files: ['skills/a/SKILL.md'] }],
+      gate_loosening: { checked: true, loosened: true, findings: [{ message: 'Required hook desktop-syntax removed' }] }, manifest_errors: [], recommendations: ['Run hermes factonio harness sync', 'Run hermes factonio harness sync'] })),
+    clean: J(mod.formatHarnessAudit({ ok: true, severity: 'clean', mode: 'enforced', drifted: false, drift_classification: { classification: 'clean' }, head_commit: '9c4e1a2f60', gate_loosening: { checked: true, loosened: false, findings: [] } })),
+    missing: J(mod.formatHarnessAudit({ ok: false, present: false, severity: 'missing', manifest_errors: ['.factonio/harness.json missing'] })),
+    junk: J(mod.formatHarnessAudit(null))
+  }
+
+  // Design approval state.
+  const des = card({ id: 't_des', tenant: 'ws-d', phase: 'design', status: 'done', title: '[design] Previews', created_at: 50 })
+  const appr = (decision, o = {}) => ({ id: `d_${decision}`, ts: '2026-11-27T10:00:00Z', tenant: 'ws-d', phase: 'design', card_id: 't_des', decision, actor: 'human', is_superseded: false, ...o })
+  C.design = {
+    awaiting: mod.designApprovalState(des, [des], []),
+    running: mod.designApprovalState({ ...des, status: 'running' }, [des], []),
+    approved: mod.designApprovalState(des, [des], [appr('approve_design')]),
+    revising: mod.designApprovalState(des, [des], [appr('approve_design', { ts: '2026-11-27T09:00:00Z' }), appr('request_design_revision')]),
+    supersededRevision: mod.designApprovalState(des, [des], [appr('request_design_revision', { is_superseded: true })]),
+    implementExists: mod.designApprovalState(des, [des, card({ id: 't_i', phase: 'implement', status: 'running', created_at: 60 })], []),
+    candidate: mod.designApprovalState({ ...des, arena_role: 'candidate' }, [des], []),
+    notDesign: mod.designApprovalState({ ...des, phase: 'define' }, [des], [])
+  }
+
+  // --- rendered: sidebar ------------------------------------------------------
+  const INV = 'omnim-ai-factonio-cache-miss-spike'
+  const PUBT = 'omnim-ai-factonio-local-publish'
+  const DEST = 'omnim-ai-factonio-design-review'
+  const pubImpl = card({ id: 't_pimpl', tenant: PUBT, phase: 'implement', status: 'done', title: '[implement] Control-plane desktop UI', local_target: { ...LT, pr_title: 'feat(desktop): control-plane actions', pr_body: 'Verified locally.' }, created_at: 100 })
+  const pubVd = card({ id: 't_pvd', tenant: PUBT, phase: 'verify-diff', status: 'done', verdict: 'pass', local_target: { ...LT }, panel_id: 'vp_9a1', panel_vendor: 'openai', created_at: 110 })
+  const pubVb = card({ id: 't_pvb', tenant: PUBT, phase: 'verify-blackbox', status: 'done', verdict: 'pass', local_target: { ...LT }, panel_id: 'vp_9a1', panel_vendor: 'google', created_at: 111 })
+  const desCard = card({ id: 't_dsg', tenant: DEST, phase: 'design', status: 'done', title: '[design] Decision History redesign', created_at: 200 })
+  const desDef = card({ id: 't_dsd', tenant: DEST, phase: 'define', status: 'done', title: '[define] Spec', created_at: 150 })
+  const invCard = card({ id: 't_inv', tenant: INV, phase: 'define', status: 'done', title: '[define] [investigate] Why do cache misses spike?', created_at: 300, workstream_kind: 'investigate' })
+  const arenaCards = [
+    card({ id: 't_ac1', tenant: DEST, phase: 'design', status: 'done', title: '[design] Candidate', created_at: 160, arena_id: 'ar_7f2c9a10', arena_role: 'candidate', arena_slot: 'c1-anthropic', arena_vendor: 'anthropic', arena_target: 'design' })
+  ]
+  const ARENAS = [{ arena_id: 'ar_7f2c9a10', tenant: DEST, repo: 'omnim-ai/factonio', target: 'design', title: 'Decision History', status: 'judging', created_at: 100,
+    candidates: [{ slot: 'c1-anthropic', vendor: 'anthropic', model: 'm', task_id: 't_ac1', status: 'done', artifact_ready: true }],
+    judge: { task_id: 't_j', status: 'running', vendor: 'google', model: 'g', cross_vendor: true }, ready_for_synthesis: false, synthesized: false, canonical_artifact_exists: false, advisories: [] }]
+  const CP_CARDS = { cards: [pubImpl, pubVd, pubVb, desDef, desCard, ...arenaCards, invCard], counts: {}, arenas: ARENAS,
+    workstreams: { [INV]: { kind: 'investigate', read_only: true, report_path: '/home/u/.hermes/plugin-data/factonio/runs/x/investigation.md', report_exists: true } } }
+  const REPORT = { ok: true, exists: true, tenant: INV, filename: 'investigation.md', updated_at: '2026-11-27T10:00:00Z', size_bytes: 262144 + 4000, truncated: true, redacted: true,
+    content: '# Cache-miss spike\n\n## Findings\n- Misses follow deploys\n- See [run](https://github.com/omnim-ai/factonio/actions/runs/1) and [bad](javascript:alert(1))\n\n| metric | value |\n|---|---|\n| p95 | `41ms` |\n\n```\n<script>alert(1)</script>\n```\n\n> Root cause: cold cache\n\nSee holdout/s1.md for proof\n<img src=x onerror=alert(1)>' }
+  const mountCp = (rest) => {
+    const regs = []
+    const rests = []
+    const ctx = { rest: async (p, opts) => { rests.push({ path: p, opts: opts ? J(opts) : null }); return rest(p, opts) }, onDispose: () => {}, registerMany: items => regs.push(...items), os: makeOs() }
+    plugin.register(ctx)
+    const pane = regs.find(x => x.id === 'pane')
+    const hooks = makeHooks()
+    const focusLog = []
+    const client = { invalidated: [], invalidateQueries(o) { this.invalidated.push(o.queryKey.join('/')); return Promise.resolve() } }
+    const render = () => {
+      globalThis.__fcHooks = hooks
+      globalThis.__fcQueryClient = client
+      cardsQueries.length = 0
+      const tree = expand(pane.render())
+      hooks.gc()
+      attachRefs(tree, focusLog)
+      hooks.flush()
+      return tree
+    }
+    return { ctx, rests, render, focusLog, client }
+  }
+  const secOf = (tree, t) => find(tree, n => n.type === 'section' && n.props['data-tenant'] === t)
+  const artOf = (tree, id) => find(tree, n => n.type === 'article' && n.props['data-id'] === id)
+  const modalOf = tree => find(tree, hasCls('fc-m'))
+  const readModal = tree => {
+    const md = modalOf(tree)
+    if (!md) return null
+    return {
+      id: md.node.props['data-modal'], role: md.node.props.role, modal: md.node.props['aria-modal'], size: md.node.props['data-size'] ?? null, busy: md.node.props['aria-busy'] ?? null,
+      title: norm(find(md.node, n => n.type === 'h2').node),
+      state: (() => { const s = find(md.node, hasCls('fc-m-report')); return s ? s.node.props['data-state'] : null })(),
+      facts: (() => { const f = find(md.node, hasCls('fc-m-facts')); return f ? findAll(f.node, n => n.type === 'dd').map(h => norm(h.node)) : null })(),
+      banners: findAll(md.node, hasCls('fc-banner')).map(h => ({ tone: h.node.props['data-tone'], role: h.node.props.role, text: norm(h.node) })),
+      title_input: (() => { const i = find(md.node, n => n.props.id === 'fc-pp-title'); return i ? i.node.props.value : null })(),
+      body_input: (() => { const i = find(md.node, n => n.props.id === 'fc-pp-body'); return i ? i.node.props.value : null })(),
+      draft: (() => { const i = find(md.node, n => n.props['data-field'] === 'draft' && n.type === 'input'); return i ? i.node.props.checked : null })(),
+      shield: (() => { const s = find(md.node, hasCls('fc-m-shield')); return s ? norm(s.node) : null })(),
+      go: (() => { const g = find(md.node, n => n.type === 'button' && hasCls('fc-btn--primary')(n)); return g ? { text: norm(g.node), disabled: !!g.node.props.disabled, action: g.node.props['data-action'] } : null })(),
+      md: (() => {
+        const a = find(md.node, hasCls('fc-md'))
+        if (!a) return null
+        const tags = []
+        walk(a.node, n => tags.push(n.type))
+        return {
+          tags: [...new Set(tags)].sort(),
+          links: findAll(a.node, n => n.type === 'a').map(h => ({ href: h.node.props.href, rel: h.node.props.rel, text: norm(h.node) })),
+          text: norm(a.node),
+          dangerous: findAll(a.node, n => Object.keys(n.props).some(k => /dangerously|^on(?!Click$)/i.test(k))).length,
+          code: findAll(a.node, n => n.type === 'pre').map(h => text(h.node))
+        }
+      })(),
+      text: norm(md.node)
+    }
+  }
+  const S = C.sidebar = {}
+  cardsState = { data: CP_CARDS, isLoading: false, isError: false }
+  let pubBodies = []
+  let pubImplRest = async () => ({ ok: true, published: true, pr_number: 47, url: 'https://github.com/omnim-ai/factonio/pull/47', head_sha: SHA })
+  const restFor = async (p, opts) => {
+    if (p === `/workstreams/${INV}/report`) return J(REPORT)
+    if (p === '/publish-pr') { pubBodies.push(opts.body); return pubImplRest(p, opts) }
+    if (p === '/panels/evaluate') throw new Error('404: {"detail":"panel not found"}')
+    if (p === '/arenas/evaluate') return { ok: true, arena_id: 'ar_7f2c9a10', status: 'judging' }
+    if (p === '/trail/decisions') return { ok: true, decision: { id: 'd_appr0001', decision: opts.body.decision, actor: 'human' } }
+    return { cards: [] }
+  }
+  trailState = { data: { decisions: [consensusRow(PUBT, 'vp_9a1', 'pass')], summary: {} }, isLoading: false, isError: false }
+  let m = mountCp(restFor)
+  let tree = m.render()
+  // Expand every collapsed workstream and done group so finished cards render.
+  for (const w of findAll(tree, n => n.props['data-action'] === 'toggle-ws' && n.props['aria-expanded'] === 'false')) {
+    const ws = w.anc.find(a => a.type === 'section')
+    fire(find(secOf(tree, ws.props['data-tenant']).node, byAttr('data-action', 'toggle-ws'))); tree = m.render()
+  }
+  for (const d of findAll(tree, n => n.props.className === 'fc-sb-done-toggle' && n.props['aria-expanded'] === 'false')) {
+    const ws = d.anc.find(a => a.type === 'section')
+    fire(find(secOf(tree, ws.props['data-tenant']).node, n => n.props.className === 'fc-sb-done-toggle')); tree = m.render()
+  }
+  const pubBtn = t => find(artOf(t, 't_pimpl').node, byAttr('data-action', 'publish-pr'))
+  S.publishButtons = findAll(tree, byAttr('data-action', 'publish-pr')).map(h => h.anc.find(a => a.type === 'article').props['data-id'])
+  S.mainCards = findAll(secOf(tree, PUBT).node, n => n.type === 'article' && !n.props.className?.includes?.('done')).map(h => h.node.props['data-id'])
+  S.publishBtn = { text: norm(pubBtn(tree).node), title: pubBtn(tree).node.props.title, popup: pubBtn(tree).node.props['aria-haspopup'] }
+  fire(find(artOf(tree, 't_pimpl').node, byAttr('data-action', 'toggle-card'))); tree = m.render()
+  S.localRows = (() => { const dl = find(artOf(tree, 't_pimpl').node, n => n.type === 'dl'); return Object.fromEntries(findAll(dl.node, n => n.type === 'dd' && ['branch', 'head', 'verify', 'pr'].includes(n.props['data-field'])).map(h => [h.node.props['data-field'], norm(h.node)])) })()
+  m.focusLog.length = 0
+  const pf = fire(pubBtn(tree)); tree = m.render()
+  S.publishOpen = { stopped: pf.stopped, modal: readModal(tree), focus: [...m.focusLog] }
+  // Edit title, then a 409 drift refusal keeps the edits.
+  find(modalOf(tree).node, n => n.props.id === 'fc-pp-title').node.props.onChange({ target: { value: 'feat(desktop): control plane' } })
+  find(modalOf(tree).node, n => n.props.id === 'fc-pp-body').node.props.onChange({ target: { value: 'Verified locally.\n\nEdited body.' } })
+  find(modalOf(tree).node, n => n.props['data-field'] === 'draft' && n.type === 'input').node.props.onChange({ target: { checked: true } }); tree = m.render()
+  pubImplRest = async () => { throw new Error(`409: ${JSON.stringify({ detail: { ok: false, refused: true, error: `Not locally verified at ${SHA}: head drifted` } })}`) }
+  await Promise.all(fire(find(modalOf(tree).node, byAttr('data-action', 'publish-go'))).results); tree = m.render()
+  S.publish409 = readModal(tree)
+  // 409 drift carrying the observed head: verified vs observed SHA (12 chars) plus the server detail.
+  const NEW_SHA = 'b'.repeat(40)
+  const drift409 = error => async () => { throw new Error(`409: ${JSON.stringify({ detail: { ok: false, refused: true, pushed: false, head_sha: NEW_SHA, expected_head_sha: SHA, verification: { verified: true }, error } })}`) }
+  const readDrift = t => {
+    const b = find(modalOf(t).node, hasCls('fc-banner')).node
+    const f = k => { const h = find(b, byAttr('data-field', k)); return h ? { text: norm(h.node), title: h.node.props.title ?? null } : null }
+    return { modal: readModal(t), observed: f('observed-head'), verified: f('verified-head'), detail: f('server-detail') }
+  }
+  pubImplRest = drift409(`HEAD drifted from ${SHA} to ${NEW_SHA}; re-verify before publishing.`)
+  await Promise.all(fire(find(modalOf(tree).node, byAttr('data-action', 'publish-go'))).results); tree = m.render()
+  S.publishDrift = readDrift(tree)
+  // A server message that names the holdout barrier is scrubbed; the SHAs still show.
+  pubImplRest = drift409('HEAD drifted; see holdout/scenario-1.md')
+  await Promise.all(fire(find(modalOf(tree).node, byAttr('data-action', 'publish-go'))).results); tree = m.render()
+  S.publishDriftScrubbed = readDrift(tree)
+  // Retry succeeds -> live PR link; caches invalidated; exact SHA pinned.
+  let releasePub
+  pubImplRest = () => new Promise(res => { releasePub = () => res({ ok: true, published: true, pr_number: 47, url: 'https://github.com/omnim-ai/factonio/pull/47', head_sha: SHA }) })
+  const pubPending = Promise.all(fire(find(modalOf(tree).node, byAttr('data-action', 'publish-go'))).results); tree = m.render()
+  S.publishBusy = readModal(tree)
+  modalOf(tree).node.props.onKeyDown({ key: 'Escape', preventDefault() {}, stopPropagation() {} }); tree = m.render()
+  S.publishEscBusy = !!modalOf(tree)
+  releasePub(); await pubPending; tree = m.render()
+  S.publishDone = readModal(tree)
+  S.publishBodies = J(pubBodies)
+  S.publishInvalidated = [...m.client.invalidated]
+  windowOpens.length = 0
+  fire(find(modalOf(tree).node, byAttr('data-action', 'open-pr'))); await tick()
+  S.publishOpened = [...m.ctx.os.opened]
+  fire(find(modalOf(tree).node, byAttr('data-action', 'close-modal'))); tree = m.render()
+  S.publishClosed = !modalOf(tree)
+
+  // report ready -> inline Markdown viewer (safe elements only).
+  const repBtn = find(secOf(tree, INV).node, n => n.type === 'button' && n.props['data-action'] === 'open-report')
+  S.reportBtn = repBtn ? { text: norm(repBtn.node), cls: repBtn.node.props.className, popup: repBtn.node.props['aria-haspopup'], title: repBtn.node.props.title } : null
+  m.rests.length = 0
+  fire(repBtn); tree = m.render()
+  otherQueries.length = 0
+  S.reportQueryLoading = readModal(tree)
+  // The report query goes through the stubbed useQuery (other bucket): resolve it via the queryFn.
+  const reportQ = []
+  const prevUseQuery = globalThis.__fcUseQuery
+  globalThis.__fcUseQuery = opts => {
+    if (opts.queryKey[1] === 'report') { reportQ.push({ key: opts.queryKey, interval: opts.refetchInterval ?? null, fn: opts.queryFn }); return globalThis.__fcReportState || { data: undefined, isLoading: true, isError: false } }
+    return prevUseQuery(opts)
+  }
+  tree = m.render()
+  const rq = reportQ[reportQ.length - 1]
+  const reportData = await rq.fn()
+  globalThis.__fcReportState = { data: reportData, isLoading: false, isError: false }
+  tree = m.render()
+  S.report = { query: { key: rq.key, interval: rq.interval }, rests: m.rests.map(x => x.path), modal: readModal(tree) }
+  const mdLink = find(find(modalOf(tree).node, hasCls('fc-md')).node, n => n.type === 'a')
+  fire(mdLink); await tick()
+  S.reportLinkOpened = [...m.ctx.os.opened].slice(-1)
+  S.reportBarrier = allStrings(modalOf(tree).node).filter(x => /holdout/i.test(x))
+  fire(find(modalOf(tree).node, byAttr('data-action', 'close-report'))); tree = m.render()
+  globalThis.__fcReportState = { data: { ok: true, exists: false, content: null, filename: 'investigation.md' }, isLoading: false, isError: false }
+  fire(find(secOf(tree, INV).node, byAttr('data-action', 'open-report'))); tree = m.render()
+  S.reportMissing = readModal(tree)
+  fire(find(modalOf(tree).node, byAttr('data-action', 'close-report'))); tree = m.render()
+  globalThis.__fcReportState = { data: undefined, isLoading: false, isError: true, error: new Error('403: {"detail":"not a regular file"}'), refetch: () => {} }
+  fire(find(secOf(tree, INV).node, byAttr('data-action', 'open-report'))); tree = m.render()
+  S.reportError = readModal(tree)
+  fire(find(modalOf(tree).node, byAttr('data-action', 'close-report'))); tree = m.render()
+  delete globalThis.__fcReportState
+  // Drawer Report row also opens it.
+  fire(find(artOf(tree, 't_inv').node, byAttr('data-action', 'toggle-card'))); tree = m.render()
+  const drawerRep = find(artOf(tree, 't_inv').node, n => n.type === 'button' && n.props['data-action'] === 'open-report')
+  S.drawerReport = drawerRep ? norm(drawerRep.node) : null
+  fire(drawerRep); tree = m.render()
+  S.drawerReportOpens = readModal(tree)?.id ?? null
+  fire(find(modalOf(tree).node, byAttr('data-action', 'close-report'))); tree = m.render()
+  globalThis.__fcUseQuery = prevUseQuery
+
+  // Design approval strip: Approve -> confirm group -> POST /trail/decisions (no actor).
+  const strip = t => find(artOf(t, 't_dsg').node, hasCls('fc-sb-appr'))
+  S.designStrip = { state: strip(tree).node.props['data-state'], text: norm(strip(tree).node) }
+  S.designOnlyDesign = findAll(tree, hasCls('fc-sb-appr')).map(h => h.anc.find(a => a.type === 'article').props['data-id'])
+  fire(find(strip(tree).node, byAttr('data-action', 'design-revise'))); tree = m.render()
+  S.reviseOpen = { text: norm(strip(tree).node), confirmDisabled: !!find(strip(tree).node, byAttr('data-action', 'design-confirm')).node.props.disabled }
+  fire(find(strip(tree).node, byAttr('data-action', 'design-cancel'))); tree = m.render()
+  fire(find(strip(tree).node, byAttr('data-action', 'design-approve'))); tree = m.render()
+  S.approveOpen = norm(strip(tree).node)
+  find(strip(tree).node, byAttr('data-field', 'design-note')).node.props.onChange({ target: { value: 'Ship it.' } }); tree = m.render()
+  m.rests.length = 0
+  await Promise.all(fire(find(strip(tree).node, byAttr('data-action', 'design-confirm'))).results); tree = m.render()
+  S.approved = { state: strip(tree).node.props['data-state'], text: norm(strip(tree).node), rests: m.rests.filter(x => x.path === '/trail/decisions').map(x => x.opts.body), invalidated: m.client.invalidated.slice(-1) }
+
+  // Re-evaluate: arena ok -> "Updated just now"; panel 404 -> inline error with Retry.
+  const arenaStrip = t => find(secOf(t, DEST).node, hasCls('fc-sb-arena'))
+  const reBtn = h => find(h.node, byAttr('data-action', 're-evaluate'))
+  S.arenaReeval = { label: reBtn(arenaStrip(tree)).node.props['aria-label'], text: norm(reBtn(arenaStrip(tree)).node), inTop: !!find(find(arenaStrip(tree).node, hasCls('fc-sb-panel-top')).node, byAttr('data-action', 're-evaluate')) }
+  m.rests.length = 0
+  const ra = fire(reBtn(arenaStrip(tree)))
+  tree = m.render()
+  S.arenaBusy = { text: norm(reBtn(arenaStrip(tree)).node), disabled: !!reBtn(arenaStrip(tree)).node.props.disabled, stopped: ra.stopped }
+  await Promise.all(ra.results); tree = m.render()
+  S.arenaDone = { msg: norm(find(arenaStrip(tree).node, hasCls('fc-sb-strip-msg')).node), rests: m.rests.map(x => ({ path: x.path, body: x.opts?.body })) }
+  const panelStrip = t => find(secOf(t, PUBT).node, n => hasCls('fc-sb-panel')(n) && !hasCls('fc-sb-arena')(n))
+  m.rests.length = 0
+  await Promise.all(fire(reBtn(panelStrip(tree))).results); tree = m.render()
+  const pmsg = find(panelStrip(tree).node, hasCls('fc-sb-strip-msg'))
+  S.panelError = { text: norm(pmsg.node), role: pmsg.node.props.role, retry: !!find(pmsg.node, byAttr('data-action', 're-evaluate-retry')), rests: m.rests.map(x => ({ path: x.path, body: x.opts?.body })) }
+  S.queries = { other: [...new Set(otherQueries)], polling: [...new Set(cardsQueries.filter(x => x.interval).map(x => x.key.join('/')))] }
+  S.barrier = allStrings(tree).filter(x => /holdout/i.test(x))
+
+  // Older host without design approval / local_target support: nothing extra renders.
+  cardsState = { data: { cards: [card({ id: 't_old', tenant: 'old-ws', phase: 'implement', status: 'running', title: '[implement] old' })], counts: {} }, isLoading: false, isError: false }
+  m = mountCp(async () => ({ cards: [] })); tree = m.render()
+  S.oldHost = { publish: findAll(tree, byAttr('data-action', 'publish-pr')).length, appr: findAll(tree, hasCls('fc-sb-appr')).length }
+
+  // --- rendered: repo harness audit drawer -----------------------------------
+  const A = C.repoAudit = {}
+  const client = { invalidated: [], invalidateQueries(o) { this.invalidated.push(o.queryKey.join('/')); return Promise.resolve() } }
+  trailState = { data: { decisions: [], summary: {} }, isLoading: false, isError: false }
+  const rm = mountRepos({ data: { repos: REPOS, defaults: REPO_DEFAULTS }, client })
+  let auditRelease
+  const STALE = { ok: true, repo: 'tozes/factonio', repo_path: '/home/tozes/dev/factonio', severity: 'stale', mode: 'advisory', drifted: true, drift_classification: { classification: 'harness_gap' },
+    uncovered_changed_files: ['desktop/plugin.js'], stale_invariants: ['skill-bloat'], gate_loosening: { checked: true, loosened: false, findings: [] }, manifest_errors: [], recommendations: ['Run `hermes factonio harness sync`.'], head_commit: '9c4e1a2f60' }
+  rm.setRest(async p => {
+    if (p === '/repos/tozes-factonio/harness/audit') return new Promise(res => { auditRelease = () => res(J(STALE)) })
+    if (p === '/repos/acme-cli-tools/harness/audit') throw new Error('409: {"detail":"Local checkout missing"}')
+    return { ok: true }
+  })
+  let rt = rm.render()
+  const auditHit = (t, slug) => find(reposSec(t).node, n => n.type === 'button' && n.props['aria-label'] === `Audit harness for ${REPOS.find(x => x.slug === slug).repo}`)
+  const rowOf = (t, slug) => find(reposSec(t).node, n => n.type === 'tr' && n.props['data-slug'] === slug && !hasCls('fc-au-row')(n))
+  const drawerOf = (t, slug) => find(reposSec(t).node, n => n.type === 'tr' && hasCls('fc-au-row')(n) && n.props['data-slug'] === slug)
+  const readAu = (t, slug) => {
+    const d = drawerOf(t, slug)
+    if (!d) return null
+    const td = find(d.node, n => n.type === 'td').node
+    const box = find(td, hasCls('fc-au')).node
+    return {
+      colSpan: td.props.colSpan, status: box.props['data-status'], id: box.props.id, label: box.props['aria-label'],
+      chips: findAll(box, n => n.props['data-field']).map(h => [h.node.props['data-field'], norm(h.node), h.node.props['data-tone'] ?? null]),
+      sections: Object.fromEntries(findAll(box, n => n.type === 'section').map(h => [h.node.props['data-section'], { title: norm(find(h.node, n => n.type === 'h4').node), items: findAll(h.node, n => n.type === 'li').map(x => norm(x.node)) }])),
+      banner: (() => { const b = find(box, hasCls('fc-banner')); return b ? norm(b.node) : null })(),
+      text: norm(box)
+    }
+  }
+  A.headers = findAll(reposSec(rt).node, n => n.type === 'th').map(h => norm(h.node)).slice(-1)
+  A.actions = findAll(rowOf(rt, 'tozes-factonio').node, n => n.type === 'td' && hasCls('fc-act')(n)).map(h => findAll(h.node, n => n.type === 'button').map(b => b.node.props['data-action']))
+  A.note = norm(find(rt, byAttr('data-field', 'audit-note')).node)
+  fire(auditHit(rt, 'tozes-factonio')); rt = rm.render()
+  A.busy = { drawer: readAu(rt, 'tozes-factonio'), btn: { disabled: !!auditHit(rt, 'tozes-factonio').node.props.disabled, expanded: auditHit(rt, 'tozes-factonio').node.props['aria-expanded'], controls: auditHit(rt, 'tozes-factonio').node.props['aria-controls'] }, rowAudit: rowOf(rt, 'tozes-factonio').node.props['data-audit'] }
+  auditRelease(); await tick(); await tick(); rt = rm.render()
+  A.stale = readAu(rt, 'tozes-factonio')
+  A.rests = rm.rests.map(x => ({ path: x.path, method: x.opts?.method, body: x.opts?.body }))
+  A.invalidated = [...client.invalidated]
+  A.barrierPath = allStrings(drawerOf(rt, 'tozes-factonio').node).filter(x => x.includes('/home/tozes'))
+  fire(auditHit(rt, 'acme-cli-tools')); await tick(); await tick(); rt = rm.render()
+  A.missing = readAu(rt, 'acme-cli-tools')
+  A.rowOrder = findAll(reposSec(rt).node, n => n.type === 'tr' && n.props['data-slug']).map(h => `${h.node.props['data-slug']}${hasCls('fc-au-row')(h.node) ? ':audit' : ''}`)
+  fire(find(drawerOf(rt, 'tozes-factonio').node, byAttr('data-action', 'close-audit'))); rt = rm.render()
+  A.closed = { drawer: !!drawerOf(rt, 'tozes-factonio'), expanded: auditHit(rt, 'tozes-factonio').node.props['aria-expanded'] }
+
+  cardsState = { data: undefined, isLoading: true, isError: false }
+  trailState = { data: undefined, isLoading: true, isError: false }
   globalThis.__fcReposState = undefined
   globalThis.__fcQueryClient = undefined
 }
@@ -2465,6 +3160,7 @@ await runTrailLineageScenarios(report)
 
 await runPolishScenarios(report)
 await runWave5Scenarios(report)
+await runControlPlaneScenarios(report)
 
 process.stdout.write(JSON.stringify(report))
 """
@@ -3022,247 +3718,379 @@ class TestDesktopPlugin(unittest.TestCase):
             self.assertIn(imp, ("@hermes/plugin-sdk", "react", "react/jsx-runtime"))
 
 
-    # --- Decision Trail: /factonio TrailSection ---------------------------------
+    # --- Decision History: /factonio TrailSection --------------------------------
     def _rows(self, t):
         return [r["id"] for r in t["rows"]]
+
+    def _row(self, t, rid):
+        return next(r for r in t["rows"] if r["id"] == rid)
 
     def test_trail_dashboard_query_and_placement(self):
         d = self.report["trail"]["dashboard"]
         self.assertEqual(d["query"], {"key": ["factonio", "trail", 200], "interval": 30000})
-        self.assertEqual(d["restPath"], "/trail?limit=200")
-        self.assertEqual(d["sectionOrder"], ["Trends", "Phase Durations", "Decision Trail", "Phase Model Configuration", "Registered Repositories"])
+        # Zero extra polling: the signal page and the audit summary refresh only on key change / invalidation.
+        self.assertEqual(d["queries"]["signal"], {"key": ["factonio", "trail", 200, "signal", "key"], "interval": None})
+        self.assertEqual(d["queries"]["audit"], {"key": ["factonio", "trail", "audit", "all"], "interval": None})
+        self.assertEqual(d["queries"]["polling"], ["factonio/trail/200"])
+        self.assertEqual(d["restPaths"], ["/trail?limit=200", "/trail?limit=200&signal=key", "/trail/audit"])
+        self.assertEqual(d["sectionOrder"], ["Trends", "Phase Durations", "Decision History", "Phase Model Configuration", "Registered Repositories"])
 
     def test_trail_dashboard_loading_state(self):
         t = self.report["trail"]["dashboard"]["loading"]
-        self.assertEqual(t["state"], "loading")
-        self.assertEqual(t["busy"], "true")
+        self.assertEqual((t["state"], t["busy"], t["preset"]), ("loading", "true", "key"))
         self.assertEqual(t["labelledBy"], "fc-trail-h")
-        self.assertEqual(t["heading"], {"text": "Decision Trail", "id": "fc-trail-h"})
-        self.assertEqual(t["skeletons"], 3)
+        self.assertEqual(t["heading"], {"text": "Decision History", "id": "fc-trail-h"})
+        self.assertEqual(t["sub"], "Append-only ledger from trail.db . Key decisions by default; routine gate ticks are folded.")
+        self.assertEqual(t["skeletons"], 5)
         self.assertTrue(t["srLoading"])
-        self.assertEqual([s["text"] for s in t["stats"]], ["– total", "– active", "– superseded"])
-        self.assertEqual(t["bar"]["disabled"], "true")
-        self.assertTrue(all(s["disabled"] for s in t["bar"]["selects"].values()))
-        self.assertTrue(all(p["disabled"] for p in t["bar"]["phases"]))
-        self.assertEqual([p["phase"] for p in t["bar"]["phases"]][1:], ["define", "design", "implement", "verify", "publish", "gate", "merge", "intake", "harness", "eval", "escape", "watchdog"])
+        self.assertTrue(t["scroll"])
+        self.assertEqual(t["total"], "– decisions")
+        self.assertIsNone(t["auditClean"])
+        self.assertTrue(t["logBtn"]["disabled"])
+        bar = t["bar"]
+        self.assertEqual(bar["disabled"], "true")
+        self.assertTrue(all(p["disabled"] for p in bar["presets"]))
+        self.assertTrue(bar["q"]["disabled"])
+        self.assertTrue(all(s["disabled"] for s in bar["selects"].values()))
+        self.assertTrue(bar["sup"]["disabled"])
+        self.assertEqual(bar["meta"], "Loading…")
         self.assertEqual(t["rows"], [])
         self.assertIsNone(t["alert"])
 
-    def test_trail_dashboard_populated_rows_and_evidence(self):
+    def test_trail_dashboard_signal_presets_search_and_grouped_phase_filter(self):
         t = self.report["trail"]["dashboard"]["populated"]
-        self.assertEqual(t["state"], "populated")
-        self.assertEqual(t["busy"], "false")
-        self.assertEqual(t["list"], {"label": "Decisions, newest first"})
-        self.assertEqual([s["text"] for s in t["stats"]], ["8 total", "7 active", "1 superseded"])
-        self.assertEqual(t["stats"][2]["type"], "button")
-        self.assertEqual(t["stats"][2]["pressed"], "false")
-        self.assertEqual(t["bar"]["end"], "8 of 8")
-        self.assertFalse(t["bar"]["clear"])
-        self.assertEqual(
-            [p["text"] for p in t["bar"]["phases"]],
-            ["All", "define 1", "design 1", "implement 1", "verify 2", "publish 0", "gate 0", "merge 1", "intake 0", "harness 0", "eval 0", "escape 1", "watchdog 1"],
-        )
-        self.assertEqual(t["bar"]["selects"]["repo"]["options"][0], ["", "All repos"])
-        self.assertIn(["omnim-ai-factonio-wave-2-watchdog-liveness", "wave-2-watchdog-liveness"], t["bar"]["selects"]["tenant"]["options"])
-        self.assertEqual(
-            self._rows(t),
-            ["d_f012c8a47b99", "d_7e30f91b5c04", "d_c4f08e2a91b7", "d_2d67a4e8f012", "d_9a1e4c0b2f31", "d_11aa82b90c3e", "d_6f19b3d28e45", "d_4b81e2c0a119"],
-        )
-        rows = {r["id"]: r for r in t["rows"]}
-        merged = rows["d_f012c8a47b99"]
+        bar = t["bar"]
+        self.assertEqual(bar["role"], "search")
+        self.assertEqual([(p["value"], p["pressed"], p["text"]) for p in bar["presets"]], [("key", "true", "Key Decisions"), ("attention", "false", "Attention 2"), ("all", "false", "All")])
+        self.assertEqual(bar["q"]["placeholder"], "Search decision, why, card, PR, sha…")
+        # 12 phases grouped into a compact <select>, never a 12-button wall; empty phases are disabled.
+        groups = bar["selects"]["phase"]["groups"]
+        self.assertEqual([g[0] for g in groups], ["Delivery", "Factory", "Signals"])
+        self.assertEqual([o[0] for g in groups for o in g[1]], ["define", "design", "implement", "verify", "publish", "gate", "merge", "intake", "harness", "eval", "escape", "watchdog"])
+        self.assertIn(["verify", "verify (2)", False], groups[0][1])
+        self.assertIn(["publish", "publish (0)", True], groups[0][1])
+        self.assertEqual(bar["selects"]["phase"]["options"][0], ["", "All phases (8)"])
+        self.assertEqual(bar["sup"], {"checked": False, "disabled": False})
+        self.assertEqual(bar["meta"], "7 shown")
+        d = self.report["trail"]["dashboard"]
+        self.assertEqual(self._rows(d["attention"]), ["d_7e30f91b5c04", "d_2d67a4e8f012"])
+        self.assertEqual(d["attention"]["live"], "Attention: 2 decisions shown.")
+        self.assertEqual(len(d["all"]["rows"]), 7)
+        self.assertEqual(d["all"]["preset"], "all")
+        sup = d["supShown"]
+        self.assertIn("d_9a1e4c0b2f31", self._rows(sup))
+        self.assertEqual(self._row(sup, "d_9a1e4c0b2f31")["superseded"], "true")
+        self.assertEqual(self._row(sup, "d_9a1e4c0b2f31")["title"], "PR gate wait (superseded)")
+        self.assertEqual(self._row(sup, "d_c4f08e2a91b7")["chain"]["expanded"], "true", "Show superseded opens chains")
+        self.assertEqual(self._rows(d["search"]), ["d_f012c8a47b99"])
+        self.assertEqual(d["searchServer"]["key"], ["factonio", "trail", 200, "signal", "all", "q", "graphql"])
+        self.assertIsNone(d["searchServer"]["interval"])
+        self.assertEqual(d["searchServer"]["rest"], ["/trail?limit=200&q=graphql"])  # signal=all is the server default
+        # A query naming holdout never matches and is not echoed back.
+        sb = d["searchBarrier"]
+        self.assertEqual((sb["state"], sb["rows"]), ("filtered", []))
+        self.assertEqual(sb["box"]["chips"], ["“[redacted]”"])
+
+    def test_trail_dashboard_populated_rows_tiers_and_evidence(self):
+        t = self.report["trail"]["dashboard"]["populated"]
+        self.assertEqual((t["state"], t["busy"]), ("populated", "false"))
+        self.assertEqual(t["total"], "8 decisions")
+        self.assertEqual(t["auditClean"], "Audit clean")
+        self.assertIsNone(t["audit"])
+        self.assertEqual(t["logBtn"], {"text": "Log Human Decision", "disabled": False})
+        self.assertEqual(len(t["days"]), 1)
+        self.assertRegex(t["days"][0], r"^(2026-11-25|Today · Nov 25|Yesterday · Nov 25) 7 decisions$")
+        self.assertEqual(t["more"], "Start of loaded window · server limit 200")
+        # Superseded rows are hidden by default and nested under their correction instead.
+        self.assertEqual(self._rows(t), ["d_f012c8a47b99", "d_7e30f91b5c04", "d_c4f08e2a91b7", "d_2d67a4e8f012", "d_11aa82b90c3e", "d_6f19b3d28e45", "d_4b81e2c0a119"])
+        merged = self._row(t, "d_f012c8a47b99")
         self.assertEqual((merged["phase"], merged["actor"], merged["title"], merged["rawTitle"]), ("merge", "orchestrator", "PR merged", "pr_merged"))
-        self.assertEqual((merged["result"], merged["tone"]), ("merged", "ok"))
+        self.assertEqual((merged["result"], merged["tone"], merged["tier"]), ("merged", "ok", "2"))
         self.assertEqual(merged["domId"], "trail-d_f012c8a47b99")
-        self.assertEqual(merged["tabIndex"], -1)
         self.assertEqual(merged["datetime"], "2026-11-25T16:40:00.000000Z")
         self.assertEqual(
             [(p["ev"], p["text"], p["tone"], p["href"]) for p in merged["pills"]],
-            [
-                ("pr_number", "PR #12", None, "https://github.com/omnim-ai/factonio/pull/12"),
-                ("head_sha", "5d17830", None, None),
-                ("tests_passed", "114 pass", "ok", None),
-            ],
+            [("pr_number", "PR #12", None, "https://github.com/omnim-ai/factonio/pull/12"), ("head_sha", "5d17830", None, None), ("tests_passed", "114 pass", "ok", None)],
         )
-        carry = rows["d_c4f08e2a91b7"]
-        # tests_failed: 0 is omitted; patch-id shows 7 chars.
-        self.assertEqual([p["text"] for p in carry["pills"]], ["PR #12", "5d17830", "patch-id 91e4f0a", "114 pass"])
-        stall = rows["d_2d67a4e8f012"]
-        self.assertEqual((stall["result"], stall["tone"]), ("stalled", "bad"))
-        self.assertEqual([(p["text"], p["tone"]) for p in stall["pills"]], [("idle 27m", "bad"), ("pid 48219", None), ("t_caf57a3b", None)])
-        self.assertEqual(rows["d_7e30f91b5c04"]["tone"], "info")
-        self.assertEqual(rows["d_7e30f91b5c04"]["pills"][0]["text"], "escaped from omnim-ai/factonio#9")
-        self.assertEqual(rows["d_4b81e2c0a119"]["tone"], "warn")
-        self.assertEqual(rows["d_4b81e2c0a119"]["title"], "Attack the premise pivot")
-        self.assertEqual(rows["d_6f19b3d28e45"]["actor"], "human")
-        self.assertIn("design provider claude-design", [p["text"] for p in rows["d_6f19b3d28e45"]["pills"]])
-        # acme-api maps to its registered GitHub repo; objects/arrays in evidence are skipped.
-        self.assertEqual(rows["d_11aa82b90c3e"]["pills"][0]["href"], "https://github.com/acme/api/pull/7")
-        self.assertNotIn("nested", [p["ev"] for p in rows["d_9a1e4c0b2f31"]["pills"]])
+        self.assertEqual(merged["chev"], {"expanded": "false", "controls": "insp-d_f012c8a47b99", "label": "Expand evidence for PR merged"})
+        # At most 3 scan pills, the rest counted for the inspector.
+        carry = self._row(t, "d_c4f08e2a91b7")
+        self.assertEqual([p["text"] for p in carry["pills"]], ["PR #12", "5d17830", "patch-id 91e4f0a", "+2 in inspector"])
         for r in t["rows"]:
+            self.assertLessEqual(len([p for p in r["pills"] if p["ev"] not in ("more", "audit", "superseded-by")]), 3, r["id"])
             self.assertNotIn("tenant", [p["ev"] for p in r["pills"]])  # no ws pill without a filter
+        # Tier 1: escape and watchdog stalls carry the destructive accent; humans get the accent rail.
+        self.assertEqual((self._row(t, "d_7e30f91b5c04")["tier"], self._row(t, "d_7e30f91b5c04")["accent"]), ("1", "bad"))
+        self.assertEqual((self._row(t, "d_2d67a4e8f012")["tier"], self._row(t, "d_2d67a4e8f012")["tone"]), ("1", "bad"))
+        self.assertEqual(self._row(t, "d_6f19b3d28e45")["human"], "true")
+        self.assertEqual(self._row(t, "d_4b81e2c0a119")["tone"], "warn")
+        self.assertEqual(self._row(t, "d_11aa82b90c3e")["title"], "Spawn implementation")
+        self.assertEqual(self._row(t, "d_11aa82b90c3e")["pills"][0]["href"], "https://github.com/acme/api/pull/7")
         pr = self.report["trail"]["dashboard"]["prClick"]
         self.assertTrue(pr["prevented"])
+        self.assertTrue(pr["stopped"], "PR link never toggles the row")
         self.assertEqual(pr["windowOpens"], ["https://github.com/omnim-ai/factonio/pull/12"])
 
-    def test_trail_dashboard_superseded_and_superseding_lineage(self):
-        rows = {r["id"]: r for r in self.report["trail"]["dashboard"]["populated"]["rows"]}
-        old, new = rows["d_9a1e4c0b2f31"], rows["d_c4f08e2a91b7"]
-        self.assertEqual(old["superseded"], "true")
-        self.assertEqual(new["superseded"], "false")
-        self.assertEqual(old["title"], "PR gate wait (superseded)")
-        self.assertEqual((old["result"], old["tone"]), ("inconclusive", "warn"))
-        self.assertEqual(old["links"], [{"kind": "superseded-by", "jump": "d_c4f08e2a91b7", "label": "Superseded by d_c4f08e2a91b7, jump to it", "text": "Superseded by d_c4f08e2a"}])
-        self.assertEqual(new["links"], [{"kind": "supersedes", "jump": "d_9a1e4c0b2f31", "label": "Supersedes d_9a1e4c0b2f31, jump to it", "text": "Supersedes d_9a1e4c0b"}])
-        for rid, r in rows.items():
-            if rid not in ("d_9a1e4c0b2f31", "d_c4f08e2a91b7"):
-                self.assertEqual(r["links"], [], rid)
+    def test_trail_dashboard_evidence_inspector_and_chain(self):
+        d = self.report["trail"]["dashboard"]
+        e = d["expanded"]
+        self.assertEqual(e["expanded"], "true")
+        self.assertEqual(e["chev"]["label"], "Collapse evidence for PR merged")
+        insp = e["insp"]
+        self.assertEqual(insp["id"], "insp-d_f012c8a47b99")
+        self.assertEqual(insp["tabs"], [["fields", "true"], ["json", "false"]])
+        self.assertEqual(insp["kv"]["why"], "Squash-merged PR #12 after GraphQL readback confirmed all four gate tiers green.")
+        self.assertEqual(insp["kv"]["evidence.tests_passed"], "114")
+        self.assertEqual(insp["kv"]["decision"], "pr_merged")
+        self.assertTrue(insp["supersede"])
+        self.assertEqual(d["expandedJson"]["tabs"], [["fields", "false"], ["json", "true"]])
+        self.assertIn('"id": "d_f012c8a47b99"', d["expandedJson"]["json"])
+        self.assertIsNone(d["expandedJson"]["kv"])
+        chain = d["chainOpen"]
+        self.assertEqual((chain["text"], chain["expanded"]), ("Supersedes 1 prior decision · original → corrected", "true"))
+        self.assertEqual([i["id"] for i in chain["items"]], ["d_9a1e4c0b2f31"])
+        self.assertIn("PR gate wait — inconclusive (superseded)", chain["items"][0]["text"])
+        self.assertIn("→ corrected: pass at 5d17830", chain["items"][0]["text"])
+        self.assertEqual(d["populated"]["rows"][2]["chain"]["expanded"], "false")
+        self.assertEqual(d["selectNoToggle"], "false", "selecting text in a row never toggles it")
 
     def test_trail_dashboard_filters_and_no_match(self):
         d = self.report["trail"]["dashboard"]
         f = d["repoFiltered"]
         self.assertEqual(self._rows(f), ["d_11aa82b90c3e"])
-        self.assertEqual(f["bar"]["selects"]["repo"]["value"], "acme-api")
-        self.assertEqual(f["bar"]["selects"]["repo"]["set"], "true")
-        self.assertEqual(f["bar"]["end"], "1 of 8 Clear filters")
-        self.assertIn("implement 1", [p["text"] for p in f["bar"]["phases"]])
-        self.assertIn("verify 0", [p["text"] for p in f["bar"]["phases"]])  # counts respect the repo filter
+        self.assertEqual((f["bar"]["selects"]["repo"]["value"], f["bar"]["selects"]["repo"]["set"]), ("acme-api", "true"))
+        self.assertEqual(f["bar"]["selects"]["phase"]["options"][0], ["", "All phases (1)"])  # counts respect the repo filter
         self.assertEqual([p["text"] for p in f["rows"][0]["pills"] if p["ev"] == "tenant"], ["ws i42"])
         self.assertEqual(f["live"], "1 decision shown.")
         nm = d["noMatch"]
-        self.assertEqual(nm["state"], "filtered")
-        self.assertEqual(nm["rows"], [])
-        self.assertIsNotNone(nm["bar"])  # filter bar stays live
-        self.assertTrue(nm["bar"]["clear"])
-        self.assertEqual(nm["box"]["title"], "No decisions match these filters")
+        self.assertEqual((nm["state"], nm["rows"]), ("filtered", []))
+        self.assertIsNotNone(nm["bar"])
+        self.assertEqual(nm["box"]["title"], "No decisions match")
         self.assertEqual(nm["box"]["chips"], ["repo acme-api", "phase merge"])
-        self.assertIn("8 decisions exist outside this view.", nm["box"]["text"])
+        self.assertIn("8 decisions are loaded outside this view.", nm["box"]["text"])
         self.assertEqual(nm["box"]["clear"], {"cls": "fc-btn fc-btn--primary", "text": "Clear filters"})
         c = d["cleared"]
-        self.assertEqual(len(c["rows"]), 8)
-        self.assertEqual(c["bar"]["selects"]["repo"]["value"], "")
-        self.assertEqual(c["live"], "Filters cleared.")
+        self.assertEqual((len(c["rows"]), c["preset"], c["bar"]["selects"]["repo"]["value"], c["live"]), (7, "all", "", "Filters cleared."))
         tf = d["tenantFiltered"]
-        self.assertEqual(len(tf["rows"]), 7)
+        self.assertEqual(len(tf["rows"]), 6)
         self.assertNotIn("d_11aa82b90c3e", self._rows(tf))
-        self.assertIn("implement 0", [p["text"] for p in tf["bar"]["phases"]])
 
-    def test_trail_dashboard_hide_superseded_and_jump(self):
+    def test_trail_dashboard_jump_to_correction(self):
+        j = self.report["trail"]["dashboard"]["jumpCorrection"]
+        flashed = [(r["id"], r["expanded"]) for r in j["trail"]["rows"] if r["flash"] == "true"]
+        self.assertEqual(flashed, [("d_c4f08e2a91b7", "true")])
+        self.assertEqual(j["trail"]["bar"]["sup"]["checked"], True, "jumping keeps superseded rows visible")
+        self.assertEqual(j["scroll"], [["trail-d_c4f08e2a91b7", {"block": "center", "behavior": "smooth"}]])
+        self.assertEqual(j["focus"], ["Collapse evidence for Verify carryover"])
+        self.assertEqual(j["trail"]["live"], "Jumped to d_c4f08e2a91b7.")
+
+    def test_trail_dashboard_attention_banner_and_show_decision(self):
         d = self.report["trail"]["dashboard"]
-        h = d["supHidden"]
-        self.assertNotIn("d_9a1e4c0b2f31", self._rows(h))
-        self.assertEqual(h["stats"][2], {"stat": "superseded", "type": "button", "text": "1 superseded · hidden", "pressed": "true"})
-        self.assertEqual(h["live"], "Superseded decisions hidden.")
-        self.assertEqual(self._rows(d["verifyOnly"]), ["d_c4f08e2a91b7"])
-        # Jumping to a filtered-out row clears every filter, shows superseded, flashes, scrolls and focuses it.
-        j = d["jumpHidden"]
-        self.assertEqual(len(j["trail"]["rows"]), 8)
-        self.assertEqual(j["trail"]["live"], "Filters cleared to show d_9a1e4c0b2f31.")
-        self.assertEqual(j["trail"]["stats"][2]["pressed"], "false")
-        self.assertEqual({r["id"]: r["flash"] for r in j["trail"]["rows"]}["d_9a1e4c0b2f31"], "true")
-        self.assertEqual(sum(r["flash"] == "true" for r in j["trail"]["rows"]), 1)
-        self.assertEqual(j["scroll"], [["trail-d_9a1e4c0b2f31", {"block": "center", "behavior": "smooth"}]])
-        self.assertEqual(j["focus"], ["trail-d_9a1e4c0b2f31"])
-        v = d["jumpVisible"]
-        self.assertEqual(v["trail"]["live"], "Jumped to d_c4f08e2a91b7.")
-        self.assertEqual({r["id"]: r["flash"] for r in v["trail"]["rows"]}["d_c4f08e2a91b7"], "true")
-        self.assertEqual(v["focus"], ["trail-d_c4f08e2a91b7"])
-        self.assertEqual(d["supShownAgain"][2]["pressed"], "true")
+        c = d["auditCollapsed"]
+        self.assertIsNone(c["auditClean"])
+        a = c["audit"]
+        self.assertEqual(a["expanded"], "false")
+        self.assertTrue(a["head"].startswith("3 audit findings need attention"))
+        self.assertTrue(a["head"].endswith("trail --audit · 8 inspected"))
+        self.assertEqual(a["cats"], [["gate_loosening", "gate loosening 1", "bad"], ["weak_evidence", "weak evidence 1", "warn"], ["missing_evidence", "missing evidence 1", "warn"]])
+        self.assertEqual(a["items"], [])
+        flagged = self._row(c, "d_f012c8a47b99")
+        self.assertEqual((flagged["tier"], flagged["accent"]), ("1", "bad"))
+        self.assertEqual([p["text"] for p in flagged["pills"] if p["ev"] == "audit"], ["audit · gate loosening"])
+        self.assertEqual(c["bar"]["presets"][1]["text"], "Attention 4")
+        o = d["auditOpen"]["audit"]
+        self.assertEqual(o["expanded"], "true")
+        self.assertEqual([i["id"] for i in o["items"]], ["d_f012c8a47b99", "d_9a1e4c0b2f31", "d_6f19b3d28e45"])
+        self.assertTrue(o["items"][0]["text"].startswith("high A required hook was removed"))
+        # A holdout-referencing message is replaced by its category label.
+        self.assertEqual(o["items"][2]["text"], "medium weak evidence weak evidence · d_6f19b3d28e45 Show decision")
+        self.assertEqual(d["auditBarrier"], [])
+        s = d["showDecision"]
+        self.assertEqual(s["trail"]["live"], "Filters cleared · showing the flagged decision")
+        self.assertEqual(s["trail"]["preset"], "all")
+        self.assertEqual(s["trail"]["bar"]["selects"]["repo"]["value"], "")
+        self.assertTrue(s["trail"]["bar"]["sup"]["checked"], "a superseded target turns Show superseded on")
+        self.assertEqual([(r["id"], r["expanded"]) for r in s["trail"]["rows"] if r["flash"] == "true"], [("d_9a1e4c0b2f31", "true")])
+        self.assertEqual(s["scroll"], [["trail-d_9a1e4c0b2f31", {"block": "center", "behavior": "smooth"}]])
+        self.assertEqual(s["focus"], ["Collapse evidence for PR gate wait"])
+        # Older backend without /trail/audit: no banner, no clean pill, ledger unaffected.
+        old = d["audit404"]
+        self.assertIsNone(old["audit"])
+        self.assertIsNone(old["auditClean"])
+        self.assertEqual(len(old["rows"]), 7)
+        self.assertEqual(self._row(old, "d_f012c8a47b99")["tier"], "2")
 
-    def _landed(self, snap, target):
-        rows = {r["id"]: r for r in snap["trail"]["rows"]}
-        self.assertIn(target, rows, "target row is rendered in the ledger")
-        self.assertEqual(rows[target]["flash"], "true")
-        self.assertEqual(sum(r["flash"] == "true" for r in snap["trail"]["rows"]), 1)
-        self.assertEqual(snap["scroll"], [[f"trail-{target}", {"block": "center", "behavior": "smooth"}]])
-        self.assertEqual(snap["focus"], [f"trail-{target}"])
+    def test_trail_dashboard_routine_ticks_fold(self):
+        d = self.report["trail"]["dashboard"]
+        k = d["routineKey"]
+        self.assertEqual(self._rows(k), ["d_rk01", "d_rk02", "d_rt08"])  # failing routine codes stay visible
+        self.assertEqual(k["bar"]["meta"], "3 shown · 5 routine ticks hidden")
+        self.assertEqual(k["folds"], [])
+        self.assertEqual(self._row(k, "d_rk02")["title"], "Human gate override")
+        a = d["routineAll"]
+        self.assertEqual(a["folds"], [{"key": "fold:d_rt01", "expanded": "false", "text": "gate 4 routine pr_gate checks · 3 passed, 1 blocked · 17:34–17:52 Expand", "phase": "gate", "rows": []}])
+        self.assertEqual(self._rows(a), ["d_rk01", "d_rk02", "d_rt07", "d_rt08"])
+        self.assertEqual(self._row(a, "d_rt07")["tier"], "3")
+        u = d["routineUnfolded"]
+        self.assertEqual(u["folds"][0]["expanded"], "true")
+        self.assertEqual(u["folds"][0]["rows"], ["d_rt01", "d_rt02", "d_rt03", "d_rt04"])
+        self.assertTrue(all(self._row(u, rid)["inFold"] for rid in u["folds"][0]["rows"]))
+        self.assertTrue(all(self._row(u, rid)["pills"] == [] for rid in u["folds"][0]["rows"]), "tier-3 rows carry no scan pills")
 
-    def test_trail_lineage_jump_loads_target_beyond_loaded_window(self):
+    def test_trail_dashboard_log_human_decision_modal(self):
+        lg = self.report["trail"]["dashboard"]["logModal"]
+        o = lg["open"]
+        self.assertEqual((o["id"], o["role"], o["modal"], o["labelledBy"], o["title"]), ("fc-hd", "dialog", "true", "fc-hd-t", "Log human decision"))
+        self.assertEqual(list(o["fields"]), ["phase", "decision", "why", "result", "repo", "tenant", "card_id", "evidence"])
+        self.assertEqual(o["fields"]["phase"]["value"], "gate")
+        self.assertIn("retro", o["text"])
+        self.assertFalse(o["confirm"])
+        self.assertEqual(o["go"], {"text": "Confirm & append to trail.db", "disabled": True, "action": "append-decision"})
+        self.assertEqual(lg["initialFocus"], ["fc-hd-phase"])
+        # Disabled Confirm is skipped: Shift+Tab wraps to Cancel, never stalls on the guard and escapes.
+        self.assertEqual(lg["trapUnchecked"]["start"], ["Cancel"])
+        self.assertEqual(lg["trapUnchecked"]["end"], ["Close dialog"])
+        self.assertEqual(lg["trapChecked"]["start"], ["Confirm & append to trail.db"])
+        self.assertEqual(lg["trapChecked"]["end"], ["Close dialog"])
+        self.assertEqual(lg["trapChecked"]["shiftTabOnDialog"], {"focus": ["Confirm & append to trail.db"], "prevented": True})
+        self.assertEqual(lg["trapChecked"]["tabOnDialog"], {"focus": ["Close dialog"], "prevented": True})
+        # Busy: every control is disabled, so focus stays on the dialog (tabIndex -1) in both directions.
+        self.assertEqual(lg["busyFocus"], ["dialog"], "going busy disables the focused button; focus moves to the dialog")
+        for k in ("start", "end"):
+            self.assertEqual(lg["trapBusy"][k], ["dialog"], k)
+        for k in ("shiftTabOnDialog", "tabOnDialog"):
+            self.assertEqual(lg["trapBusy"][k], {"focus": ["dialog"], "prevented": True}, k)
+        u = lg["unconfirmed"]
+        self.assertEqual(u["fields"]["decision"]["err"], "A decision code is required.")
+        self.assertEqual(u["fields"]["why"]["invalid"], "true")
+        self.assertEqual(lg["invalid"]["fields"]["evidence"]["err"], "Evidence must be a JSON object.")
+        self.assertEqual(lg["restsInvalid"], 0, "nothing is sent until the form is valid and confirmed")
+        b = lg["busy"]
+        self.assertEqual((b["busy"], b["go"]["text"], b["go"]["disabled"]), ("true", "Appending…", True))
+        self.assertTrue(lg["escWhileBusy"], "Escape cannot close an in-flight modal")
+        self.assertEqual(lg["body"], [{"method": "POST", "body": {"decision": "override_gate", "phase": "gate", "why": "Flaky e2e accepted by owner.", "confirmed": True, "card_id": "t_bcf5502a", "evidence": {"pr_number": 12}}}])
+        self.assertNotIn("actor", lg["body"][0]["body"])
+        after = lg["after"]
+        self.assertIsNone(after["modal"])
+        self.assertEqual(after["live"], "Appended override_gate (actor: human)")
+        self.assertEqual((after["rows"][0]["id"], after["rows"][0]["flash"]), ("d_human00001", "true"))
+        self.assertEqual(lg["notified"], [{"kind": "info", "message": "Appended override_gate to trail.db"}])
+        self.assertIn("factonio/trail", lg["invalidated"])
+        err = lg["error"]
+        self.assertEqual(err["banner"], {"tone": "bad", "text": "Not recorded (422). phase is not allowed Nothing was appended. Your entries are kept."})
+        self.assertEqual((err["fields"]["decision"]["value"], err["fields"]["why"]["value"]), ("note", "Context."))
+        self.assertIsNone(lg["closed"])
+        sp = lg["supersede"]
+        self.assertEqual(sp["title"], "Supersede decision")
+        self.assertEqual(sp["quote"]["target"], "d_2d67a4e8f012")
+        self.assertEqual((sp["fields"]["phase"]["value"], sp["fields"]["decision"]["value"], sp["fields"]["card_id"]["value"]), ("watchdog", "override_stall_detected", "t_caf57a3b"))
+        self.assertEqual(lg["supersedeBody"][0]["supersedes_id"], "d_2d67a4e8f012")
+        self.assertTrue(lg["supersedeBody"][0]["confirmed"])
+        sa = lg["supersedeAfter"]
+        self.assertNotIn("d_2d67a4e8f012", self._rows(sa), "the original folds under its correction")
+        top = sa["rows"][0]
+        self.assertEqual((top["id"], top["chain"]["expanded"], [i["id"] for i in top["chain"]["items"]]), ("d_human00002", "true", ["d_2d67a4e8f012"]))
+
+    def test_trail_lineage_chain_loads_prior_beyond_loaded_window(self):
         lin = self.report["trail"]["lineage"]
         w = lin["window"]
-        # Real trail.db: 1 original + 200 intervening + 1 correction; /trail?limit=200 excludes the original.
         self.assertEqual(w["api"], {"total": 202, "loaded": 200, "target_loaded": False})
-        self.assertEqual(w["before"]["rows"], 200)
-        self.assertFalse(w["before"]["hasTarget"])
-        self.assertEqual([lk["kind"] for lk in w["before"]["link"]], ["supersedes"])
-        target = w["before"]["link"][0]["jump"]
-        self.assertTrue(w["loadingMsg"].startswith(f"Loading {target}"))
+        self.assertEqual((w["before"]["text"], w["before"]["expanded"]), ("Supersedes 1 prior decision · original → corrected", "false"))
+        self.assertEqual(w["loading"]["items"], [{"id": None, "missing": w["original"], "text": f"Loading prior decision {w['original']} …"}])
         a = w["after"]
-        self.assertEqual(a["rests"], [f"/trail/{target}"])
-        self._landed(a, target)
-        self.assertEqual(a["trail"]["live"], f"Jumped to {target}.")
-        self.assertEqual(len(a["trail"]["rows"]), 201)
-        self.assertEqual(a["trail"]["rows"][-1]["id"], target, "the older target sorts last, newest-first")
-        row = a["trail"]["rows"][-1]
-        self.assertEqual(row["superseded"], "true")
-        self.assertEqual([lk["kind"] for lk in row["links"]], ["superseded-by"])
+        self.assertEqual(a["rests"], [f"/trail/{w['original']}"])
+        self.assertEqual([i["id"] for i in a["chain"]["items"]], [w["original"]])
+        self.assertIn("PR gate wait — inconclusive (superseded)", a["chain"]["items"][0]["text"])
         self.assertEqual(a["query"]["key"], ["factonio", "trail", 200])
-        again = lin["windowAgain"]
-        self.assertEqual(again["rests"], [])
-        self._landed(again, target)
+        self.assertEqual(a["rows"], 60, "the ledger paginates the loaded window")
+        self.assertEqual(lin["windowAgain"]["rests"], [], "a pinned prior needs no refetch")
 
-    def test_trail_lineage_jump_falls_back_to_wide_page_on_older_hosts(self):
-        f = self.report["trail"]["lineage"]["fallback"]
-        target = self.report["trail"]["lineage"]["window"]["before"]["link"][0]["jump"]
-        self.assertEqual(f["rests"], [f"/trail/{target}", "/trail?limit=1000"])
-        self._landed(f, target)
+    def test_trail_lineage_chain_falls_back_to_wide_page_on_older_hosts(self):
+        lin = self.report["trail"]["lineage"]
+        f = lin["fallback"]
+        self.assertEqual(f["rests"], [f"/trail/{lin['window']['original']}", "/trail?limit=1000"])
+        self.assertEqual([i["id"] for i in f["chain"]["items"]], [lin["window"]["original"]])
 
-    def test_trail_lineage_jump_leaves_server_scope_for_other_tenant_target(self):
+    def test_trail_lineage_chain_resolves_prior_from_another_tenant_without_leaving_scope(self):
         s = self.report["trail"]["lineage"]["scope"]
-        target = s["original"]
-        self.assertNotIn(target, s["api"]["scoped_ids"])
-        self.assertEqual(s["api"]["filters"]["tenant"], "lineage-b")
+        self.assertNotIn(s["original"], s["api"]["scoped_ids"])
         self.assertEqual(s["before"]["query"]["key"], ["factonio", "trail", 200, "tenant", "lineage-b"])
         self.assertEqual(s["before"]["tenant"], "lineage-b")
-        self.assertNotIn(target, s["before"]["rows"])
         a = s["after"]
-        self.assertEqual(a["rests"], [f"/trail/{target}"])
-        self.assertEqual(a["query"]["key"], ["factonio", "trail", 200], "server tenant scope dropped")
-        self.assertEqual(a["trail"]["bar"]["selects"]["tenant"]["value"], "")
-        self.assertEqual(a["trail"]["live"], f"Filters cleared to show {target}.")
-        self._landed(a, target)
-        self.assertEqual(len(a["trail"]["rows"]), 3)
+        self.assertEqual(a["rests"], [f"/trail/{s['original']}"])
+        self.assertEqual([i["id"] for i in a["chain"]["items"]], [s["original"]])
+        self.assertEqual(a["query"]["key"], ["factonio", "trail", 200, "tenant", "lineage-b"])
+        self.assertEqual(a["tenant"], "lineage-b")
 
-    def test_trail_lineage_jump_missing_target_announces_cleanly(self):
+    def test_trail_lineage_chain_missing_prior_announces_cleanly(self):
         m = self.report["trail"]["lineage"]["missing"]
         self.assertIsNone(m["threw"])
         self.assertEqual(m["rests"], ["/trail/d_missing00000"])
-        self.assertEqual(m["trail"]["live"], "Could not load decision d_missing00000.")
-        self.assertEqual(m["scroll"], [])
-        self.assertEqual(m["focus"], [])
-        self.assertEqual([r["id"] for r in m["trail"]["rows"]], ["d_dangling0001"])
-        self.assertEqual(m["trail"]["rows"][0]["flash"], "false")
+        self.assertEqual(m["chain"]["items"], [{"id": None, "missing": "d_missing00000", "text": "Prior decision d_missing00000 could not be loaded."}])
 
-    def test_trail_lineage_jump_drops_stale_lookup(self):
+    def test_trail_show_decision_beyond_first_page_renders_scrolls_and_focuses(self):
+        lin = self.report["trail"]["lineage"]
+        a = lin["deepLoaded"]
+        self.assertEqual(a["before"], 60, "only the first page renders initially")
+        self.assertEqual(a["rests"], [], "a loaded target needs no fetch")
+        self.assertEqual(a["rendered"], 91, "the page grows to include row 90")
+        self.assertEqual(a["targetIndex"], 90)
+        self.assertEqual(a["row"], ["d_probe_090", "true", "true"])
+        self.assertEqual(a["scroll"], [["trail-d_probe_090", {"block": "center", "behavior": "smooth"}]])
+        self.assertEqual(a["focus"], ["Collapse evidence for Design approved"], "the row's open chevron takes focus")
+        self.assertEqual(a["live"], "Filters cleared · showing the flagged decision")
+        b = lin["deepFetched"]
+        self.assertEqual(b["before"], 60)
+        self.assertEqual(b["rests"], ["/trail/d_probe_450"])
+        self.assertEqual((b["rendered"], b["targetIndex"]), (201, 200), "the fetched row renders after the 200 loaded ones")
+        self.assertEqual(b["row"], ["d_probe_450", "true", "true"])
+        self.assertEqual(b["scroll"], [["trail-d_probe_450", {"block": "center", "behavior": "smooth"}]])
+        self.assertEqual(b["focus"], ["Collapse evidence for Design approved"], "the row's open chevron takes focus")
+
+    def test_trail_base_poll_refreshes_audit_and_filtered_page_without_timers(self):
+        p = self.report["trail"]["lineage"]["poll"]
+        self.assertEqual(p["before"]["auditClean"], "Audit clean")
+        self.assertIsNone(p["before"]["audit"])
+        self.assertEqual(p["before"]["rows"], ["d_f012c8a47b99"])
+        self.assertEqual(p["refetchedBefore"], [], "the first load triggers no extra refresh")
+        self.assertIsNone(p["after"]["auditClean"])
+        self.assertIn("audit findings need attention", p["after"]["audit"])
+        self.assertEqual(p["after"]["rows"], ["d_sig_new0001", "d_f012c8a47b99"])
+        self.assertEqual(sorted(p["refetched"]), ["audit", "signal/key/q/graphql"], "exactly one refresh each; no loop")
+        self.assertEqual(p["intervals"], [], "no setInterval")
+        self.assertEqual(p["queryIntervals"], ["factonio/trail/200=30000"], "the base query keeps the only interval")
+
+    def test_trail_show_decision_drops_stale_lookup(self):
         r = self.report["trail"]["lineage"]["race"]
+        self.assertEqual(r["loadingMsg"], "Loading d_orig_a00001…")
         self.assertEqual(r["rests"], ["/trail/d_orig_a00001", "/trail/d_orig_b00001"])
-        self._landed(r, "d_orig_b00001")
-        self.assertNotIn("d_orig_a00001", [x["id"] for x in r["trail"]["rows"]])
-        self.assertEqual(r["trail"]["live"], "Jumped to d_orig_b00001.")
+        self.assertEqual(r["rows"], [["d_live_000001", "false", "false"], ["d_orig_b00001", "true", "true"]])
+        self.assertEqual(r["scroll"], [["trail-d_orig_b00001", {"block": "center", "behavior": "smooth"}]])
+        self.assertEqual(r["live"], "Filters cleared · showing the flagged decision")
 
     def test_trail_dashboard_empty_state(self):
         e = self.report["trail"]["dashboard"]["empty"]
         self.assertEqual(e["state"], "empty")
         self.assertIsNone(e["bar"])
-        self.assertEqual(e["stats"], [])
         self.assertEqual(e["box"]["kind"], "empty")
-        self.assertEqual(e["box"]["title"], "No decisions recorded yet")
+        self.assertEqual(e["box"]["title"], "No decisions yet")
         self.assertEqual(e["box"]["cmd"], "hermes factonio trail --limit 20")
         self.assertIsNone(e["box"]["clear"])
+        self.assertFalse(e["logBtn"]["disabled"], "a human decision can be logged into an empty ledger")
 
     def test_trail_dashboard_api_error_states(self):
         d = self.report["trail"]["dashboard"]
         e = d["error"]
-        self.assertEqual(e["state"], "error")
-        self.assertEqual(e["rows"], [])
-        self.assertEqual(e["skeletons"], 0)
+        self.assertEqual((e["state"], e["rows"], e["skeletons"]), ("error", [], 0))
         self.assertEqual(e["bar"]["disabled"], "true")
-        self.assertIn("Couldn’t load the decision trail.", e["alert"]["text"])
-        self.assertIn("503", e["alert"]["text"])
+        self.assertIn("Couldn’t load the ledger.", e["alert"]["text"])
+        self.assertIn("GET /trail returned 503", e["alert"]["text"])
         self.assertIn("Nothing was changed.", e["alert"]["text"])
         self.assertTrue(e["alert"]["retry"])
         self.assertEqual(d["errorRetry"], ["dash"])
         s = d["errorStale"]
-        self.assertEqual(len(s["rows"]), 8)  # stale rows stay visible under the alert
+        self.assertEqual(len(s["rows"]), 7)  # stale rows stay visible under the alert
+        self.assertIn("Couldn’t refresh the ledger.", s["alert"]["text"])
         self.assertIn("could not be reached", s["alert"]["text"])
         self.assertEqual(s["bar"]["disabled"], "false")
 
@@ -3270,11 +4098,11 @@ class TestDesktopPlugin(unittest.TestCase):
         d = self.report["trail"]["dashboard"]
         dl = d["deepLink"]
         self.assertEqual(dl["query"]["key"], ["factonio", "trail", 200, "tenant", "acme-api-i42"])
-        self.assertEqual(dl["rest"], "/trail?tenant=acme-api-i42&limit=200")
+        self.assertEqual(dl["rests"], ["/trail?tenant=acme-api-i42&limit=200", "/trail/audit?tenant=acme-api-i42"])
         self.assertEqual(dl["trail"]["bar"]["selects"]["tenant"]["value"], "acme-api-i42")
         self.assertEqual(self._rows(dl["trail"]), ["d_11aa82b90c3e"])
         self.assertEqual(dl["scroll"][0][0], "fc-trail-h")
-        self.assertEqual(d["deepLinkCleared"], {"query": {"key": ["factonio", "trail", 200], "interval": 30000}, "rows": 8})
+        self.assertEqual(d["deepLinkCleared"], {"query": {"key": ["factonio", "trail", 200], "interval": 30000}, "rows": 7})
 
     # --- Decision Trail: sidebar strips + CardDrawer -----------------------------
     def test_trail_sidebar_query_is_visibility_aware(self):
@@ -3366,7 +4194,7 @@ class TestDesktopPlugin(unittest.TestCase):
             self.assertNotRegex(line, r"#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(", line)
         block = styles[styles.index("/* Decision Trail — dashboard") :]
         self.assertNotRegex(block, r"#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(")
-        self.assertIn(".fc-trail *, .fc-trail-row { animation: none !important; transition: none !important; }", block)
+        self.assertIn(".fc-trail * { animation: none !important; transition: none !important; }", block)
 
     # --- Registered Repositories editor ----------------------------------------
     def _ed_vals(self, editor):
@@ -3391,7 +4219,8 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual(
             r["subs"],
             ["Global defaults: design provider auto · design approval ask · rigor standard",
-             "New repos start with merge auto · publish ask , set per repo."],
+             "New repos start with merge auto · publish ask , set per repo.",
+         "Audit runs the harness check live, read-only. It never edits repo files or .git/index ."],
         )
         self.assertTrue(r["wrapped"])  # .fc-repos-wrap scrolls the 992px table on narrow containers
         self.assertEqual(r["legend"], "value · global inherited value override")
@@ -3403,14 +4232,14 @@ class TestDesktopPlugin(unittest.TestCase):
         )
         self.assertEqual(
             [h["text"] for h in r["headers"]],
-            ["Repository Local path", "Branch", "Merge policy", "Publish policy", "Max fix rounds", "Design provider", "Design approval", "Rigor", "Actions"],
+            ["Repository Local path", "Branch", "Merge policy", "Publish policy", "Max fix rounds", "Design provider", "Design approval", "Rigor", "Harness & actions"],
         )
         self.assertEqual(r["headers"][4]["className"], "fc-num")
         self.assertEqual(r["headers"][8]["className"], "fc-act")
         self.assertEqual(r["order"], ["row:tozes-factonio", "row:acme-web-dashboard", "row:acme-cli-tools"])
         self.assertIsNone(r["editor"])
         # No Add / Remove repository controls: only one Edit button per row.
-        self.assertEqual(r["buttons"], ["Edit", "Edit", "Edit"])
+        self.assertEqual(r["buttons"], ["Audit", "Edit"] * 3)
 
     def test_repos_rows_show_all_parameters_and_inherited_vs_override(self):
         rows = {row["slug"]: row for row in self.report["repos"]["read"]["rows"]}
@@ -3789,31 +4618,28 @@ class TestDesktopPlugin(unittest.TestCase):
 
     def test_trail_publish_phase_tone_and_branch_pill(self):
         t = self.report["trail"]["dashboard"]["publish"]
-        # publish sits between verify and gate/merge in the phase filter.
-        self.assertEqual([p["text"] for p in t["bar"]["phases"] if not p["text"].endswith(" 0")], ["All", "verify 1", "publish 4", "merge 1"])
+        self.assertIn(["publish", "publish (3)", False], t["bar"]["selects"]["phase"]["groups"][0][1])
         rows = {r["id"]: r for r in t["rows"]}
+        self.assertNotIn("dec_7f2e1d84c1", rows, "the refused attempt nests under its correction")
         pub = rows["dec_9a8c4f10b2"]
-        self.assertEqual((pub["phase"], pub["result"], pub["tone"], pub["title"]), ("publish", "published", "ok", "Publish PR"))
+        self.assertEqual((pub["phase"], pub["result"], pub["tone"], pub["title"], pub["human"]), ("publish", "published", "ok", "Publish PR", "true"))
         self.assertEqual(
             [(p["ev"], p["text"], p["title"]) for p in pub["pills"]],
             [
                 ("pr_number", "PR #42", "Open omnim-ai/factonio#42"),
-                ("head_sha", "8f2c1a9", "head_sha 8f2c1a9e77"),
                 ("branch", "branch feat/publish-policy → main", "branch feat/publish-policy → base main"),
+                ("head_sha", "8f2c1a9", "head_sha 8f2c1a9e77"),
+                ("more", "+1 in inspector", None),
             ],
-        )  # draft: false renders no pill; base_branch folds into the branch pill
-        refused = rows["dec_7f2e1d84c1"]
-        self.assertEqual((refused["result"], refused["tone"]), ("refused", "bad"))
-        self.assertEqual([p["ev"] for p in refused["pills"]], ["head_sha", "branch"])
+        )  # fixed scan order: PR, branch → base, sha; base_branch folds into the branch pill
+        self.assertEqual([i["id"] for i in pub["chain"]["items"]], [])
         long_ = rows["dec_draftlong01"]
         self.assertEqual(long_["pills"][0]["text"], "branch " + "b" * 48 + " → develop")
         self.assertEqual(long_["pills"][0]["title"], "branch " + "b" * 60 + " → base develop")
         self.assertEqual((long_["pills"][1]["ev"], long_["pills"][1]["text"]), ("draft", "draft"))
-        base_only = rows["dec_baseonly01"]
-        self.assertEqual([(p["ev"], p["text"]) for p in base_only["pills"]], [("base_branch", "base branch main")])
         only = self.report["trail"]["dashboard"]["publishOnly"]
-        self.assertEqual([r["phase"] for r in only["rows"]], ["publish"] * 4)
-        self.assertEqual([p["pressed"] for p in only["bar"]["phases"] if p["phase"] == "publish"], ["true"])
+        self.assertEqual([r["phase"] for r in only["rows"]], ["publish"] * 2)
+        self.assertEqual(only["bar"]["selects"]["phase"]["value"], "publish")
 
     def test_publish_policy_styles_and_layout_rules(self):
         source = PLUGIN_JS.read_text(encoding="utf-8")
@@ -3823,6 +4649,7 @@ class TestDesktopPlugin(unittest.TestCase):
         for needed in (
             ".fc-repos-wrap { overflow-x: auto; max-width: 100%; }",
             ".fc-repos { table-layout: fixed; min-width: 992px; }",
+            ".fc-col-act { width: 15%; }",  # harness badge + Audit + Edit share one line
             "position: sticky; left: 0; max-width: 100cqi; box-sizing: border-box;",
             '@container (max-width: 640px) { .fc-ed-grid > .fc-field[data-field="default_branch"] { grid-column: 1 / -1; } }',
             ".fc-pol::before",
@@ -3834,7 +4661,7 @@ class TestDesktopPlugin(unittest.TestCase):
         widths = dict(re.findall(r"\.fc-col-([a-z]+) \{ width: (\d+)%; \}", styles))
         self.assertEqual(
             widths,
-            {"repo": "21", "branch": "9", "merge": "8", "publish": "8", "rounds": "7", "prov": "13", "appr": "12", "rigor": "15", "act": "7"},
+            {"repo": "19", "branch": "8", "merge": "7", "publish": "7", "rounds": "6", "prov": "12", "appr": "12", "rigor": "14", "act": "15"},
         )
         self.assertIn("const TRAIL_TONE = {\n  merged: 'ok', pass: 'ok', approved: 'ok', ready: 'ok', published: 'ok',", source)
         self.assertIn(
@@ -3964,7 +4791,7 @@ class TestDesktopPlugin(unittest.TestCase):
         d = self.report["polish"]["dash"]
         self.assertEqual(d["historyQuery"], {"key": ["factonio", "metrics-history", "30d"], "interval": 30000})
         self.assertEqual(d["historyRest"], "/metrics/history?since=30d&limit=100")
-        self.assertEqual(d["populated"]["order"], ["Trends", "Phase Durations", "Decision Trail", "Phase Model Configuration", "Registered Repositories"])
+        self.assertEqual(d["populated"]["order"], ["Trends", "Phase Durations", "Decision History", "Phase Model Configuration", "Registered Repositories"])
 
     def test_trend_strip_populated_inline_svg(self):
         t = self.report["polish"]["dash"]["populated"]["trend"]
@@ -4235,7 +5062,7 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertIn("--fc-sb-warn: var(--fc-warn);", styles)
         self.assertNotIn("#f59e0b", styles)
         for needed in (".fc-grid--6", ".fc-kpi-bar", ".fc-trend-grid", ".fc-spark-line", "vector-effect: non-scaling-stroke", ".fc-vp-warn",
-                       ".fc-col-rigor { width: 15%; }", ".fc-sb-panel", '.fc-sb-dot[data-status="inconclusive"]', '.fc-sb-card[data-attn="warn"]',
+                       ".fc-col-rigor { width: 14%; }", ".fc-sb-panel", '.fc-sb-dot[data-status="inconclusive"]', '.fc-sb-card[data-attn="warn"]',
                        "@container (max-width: 700px)", ".fc-trend-skel span, .fc-vp-skel { animation: none !important; }"):
             self.assertIn(needed, styles)
         cols = re.findall(r"\.fc-col-[a-z]+ \{ width: (\d+)%; \}", styles)
@@ -4348,7 +5175,9 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertTrue(inv["meta"].endswith("· report pending"))
         self.assertEqual(inv["label"], "cache-miss-spike workstream, active, investigate mode, read-only, report pending")
         ready = sb["reportReady"]
-        self.assertEqual((ready["report"]["ready"], ready["report"]["text"], ready["report"]["icon"]), ("true", "report ready", "check"))
+        # A ready report is a button opening the inline viewer (doc icon + chevron).
+        self.assertEqual((ready["report"]["ready"], ready["report"]["text"], ready["report"]["icon"]), ("true", "report ready", "doc"))
+        self.assertEqual(ready["report"]["title"], "Open investigation.md (read-only)")
         # bug / feature / quick / legacy stay unbadged.
         bug = s["omnim-ai-factonio-fix-login"]
         self.assertEqual((bug["mode"], bug["report"], bug["dataMode"], bug["labelRow"]), (None, None, None, ["fc-sb-ws-label"]))
@@ -4364,7 +5193,7 @@ class TestDesktopPlugin(unittest.TestCase):
         a = perf["arena"]
         self.assertEqual(a["role"], "group")
         self.assertEqual(a["label"], "Arena ar_7f2c9a10 on design: judging. 1 of 2 candidate artifacts ready. Judge google running, cross-vendor.")
-        self.assertEqual(a["topOrder"], ["fc-sb-arena-k", "fc-sb-arena-target", "fc-sb-tag", "fc-sb-panel-id fc-sb-mono", "fc-sb-panel-lanes"])
+        self.assertEqual(a["topOrder"], ["fc-sb-arena-k", "fc-sb-arena-target", "fc-sb-tag", "fc-sb-panel-id fc-sb-mono", "fc-sb-panel-lanes", "fc-sb-btn fc-sb-reeval"])
         self.assertEqual(a["lead"], {"title": "Arena · Sidebar layout", "word": "arena", "icon": "arena"})
         self.assertEqual((a["target"], a["tag"]["text"], a["tag"]["tone"], a["id"]), ("design", "judging", "info", "ar_7f2c9a10"))
         self.assertEqual(a["count"], {"text": "1/2 ready", "title": "1 of 2 candidate artifacts ready"})
@@ -4465,40 +5294,44 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual(bar["cards"]["t_h1"]["arenaTag"], {"text": "arena:unknown", "title": "Arena candidate · ar_bar01", "role": "candidate"})
         self.assertEqual(sb["stripChips"], [{"ev": "kind", "text": "mode investigate", "tone": "info"}, {"ev": "read_only", "text": "read-only", "tone": "warn"}])
 
-    def test_dashboard_repo_harness_badge_in_repository_cell(self):
+    def test_dashboard_repo_harness_badge_in_actions_cell(self):
         d = self.report["wave5"]["dashboard"]
         self.assertNotIn("error", d)
         self.assertEqual((d["colgroup"], d["headers"]), (9, 9))
         r = d["repos"]
         for slug, row in r.items():
             self.assertEqual(row["cells"], 9, slug)
-        self.assertEqual(r["omnim-ai-factonio"]["firstCell"], ["fc-trunc fc-repo-name", "fc-trunc fc-repo-path", "fc-harness"])
+        # Approved Unit 2 design: the last cell holds the harness badge, Audit and Edit.
+        self.assertEqual(r["omnim-ai-factonio"]["firstCell"], ["fc-trunc fc-repo-name", "fc-trunc fc-repo-path"])
+        self.assertEqual(r["omnim-ai-factonio"]["actions"], ["fc-harness", "fc-btn fc-btn--s", "fc-btn fc-btn--s"])
         b = r["omnim-ai-factonio"]["badge"]
         self.assertEqual((b["state"], b["key"], b["text"], b["icon"]), ("ok", "harness", "5 hooks · 1 frozen", "shieldOk"))
         self.assertEqual((r["acme-api"]["badge"]["text"], r["acme-api"]["badge"]["icon"]), ("md only", "shieldOk"))
         self.assertEqual((r["acme-web"]["badge"]["state"], r["acme-web"]["badge"]["icon"]), ("error", "attention"))
         self.assertEqual((r["acme-cli"]["badge"]["state"], r["acme-cli"]["badge"]["key"], r["acme-cli"]["badge"]["icon"]), ("absent", None, "shield"))
         self.assertIsNone(r["acme-old"]["badge"])  # legacy backend: nothing rendered
-        self.assertEqual(r["acme-old"]["firstCell"], ["fc-trunc fc-repo-name", "fc-trunc fc-repo-path"])
+        self.assertEqual(r["acme-old"]["actions"], ["fc-btn fc-btn--s", "fc-btn fc-btn--s"])
 
     def test_dashboard_trail_twelve_phase_bar_tones_and_modes(self):
         d = self.report["wave5"]["dashboard"]
         self.assertEqual(
-            d["phaseBar"],
-            ["", "define", "design", "implement", "verify·empty", "publish·empty", "gate·empty", "merge·empty", "sep", "intake", "harness", "eval", "sep", "escape·empty", "watchdog·empty"],
+            d["trail"]["phases"],
+            [
+                ["Delivery", [["define", "define (2)", False], ["design", "design (1)", False], ["implement", "implement (1)", False], ["verify", "verify (0)", True], ["publish", "publish (0)", True], ["gate", "gate (0)", True], ["merge", "merge (0)", True]]],
+                ["Factory", [["intake", "intake (2)", False], ["harness", "harness (1)", False], ["eval", "eval (2)", False]]],
+                ["Signals", [["escape", "escape (0)", True], ["watchdog", "watchdog (0)", True]]],
+            ],
         )
-        self.assertEqual(d["sepHidden"], "true")
-        self.assertEqual([p["text"] for p in d["trail"]["phases"]][8:11], ["intake 2", "harness 1", "eval 2"])
         self.assertEqual(d["trail"]["tenantOptions"][1:], [["omnim-ai-factonio-cache-miss-spike", "cache-miss-spike · investigate · read-only"], ["omnim-ai-factonio-wave-5-desktop-ui", "wave-5-desktop-ui · perf"]])
         self.assertEqual(d["evalRows"], ["d_w08", "d_w07"])
         self.assertEqual(d["evalWsPills"], ["ws wave-5-desktop-ui perf", "ws wave-5-desktop-ui perf"])
         # start_workstream rows already carry a mode pill, so the ws pill omits it.
         self.assertEqual(d["defineWsPills"], {"d_w02": "ws cache-miss-spike", "d_w01": "ws wave-5-desktop-ui"})
-        self.assertEqual(d["noMatch"]["chips"], ["workstream cache-miss-spike investigate", "phase eval"])
+        self.assertEqual(d["noMatch"]["chips"], ["preset: Key Decisions", "workstream cache-miss-spike investigate", "phase eval"])
         rows = d["trail"]["rows"]
         self.assertEqual(rows["d_w07"]["actor"], "eval")
         self.assertEqual(rows["d_w05"]["pills"][0]["href"], "https://github.com/omnim-ai/factonio/issues/412")
-        self.assertEqual([p["ev"] for p in rows["d_w03"]["pills"]], ["arena_id", "target", "candidates", "judge_vendor"])
+        self.assertEqual([p["ev"] for p in rows["d_w03"]["pills"]], ["arena_id", "target", "candidates", "more"])  # max 3 + inspector count
         self.assertEqual(
             d["tones"],
             {
@@ -4521,13 +5354,11 @@ class TestDesktopPlugin(unittest.TestCase):
         for needed in (
             "@container (max-width: 230px) { .fc-sb-mode-ro { display: none; } }",
             "@container (max-width: 270px) { .fc-sb-arena-word { display: none; } }",
-            "@container (max-width: 760px) { .fc-trail-phase-sep { display: none; } }",
             "@container (max-width: 640px) {",
             ".fc-sb-arena .fc-sb-panel-top { flex-wrap: nowrap; }",
             '.fc-sb-vendor[data-role="judge"][data-cross="false"]',
             '.fc-sb-arena .fc-sb-callout[data-kind="blocked"] { color: color-mix(in srgb, var(--dt-destructive) 48%, var(--ui-text-primary)); }',
             '.fc-sb-drawer dd[data-field="arena"] { flex-wrap: wrap;',
-            ".fc-trail-phases { order: 1; flex: 1 1 100%; align-items: center; }",
             '.fc-harness[data-state="error"]',
             '.fc-harness[data-state="absent"] { border-style: dashed;',
         ):
@@ -4537,6 +5368,263 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual(source.count("setInterval("), 0)
         for name in ("arena", "eye", "shield", "shieldOk"):
             self.assertRegex(source, rf"\n  {name}: \[\[")
+
+    # --- Control plane (Unit 2) ----------------------------------------------------
+    def test_cp_routine_fold_and_day_group_helpers(self):
+        c = self.report["cp"]
+        self.assertEqual(c["fold"], ["a", "[3:bcd|2/1/0|pr_gate]", "e", "f", "g", "h", "i"])
+        self.assertEqual(c["foldEmpty"], [])
+        self.assertEqual(c["groups"], [
+            {"key": "2026-11-27", "label": "Today · Nov 27", "count": 7, "items": ["a", "[3:bcd|2/1/0|pr_gate]", "e", "f", "g"]},
+            {"key": "2026-11-26", "label": "Yesterday · Nov 26", "count": 2, "items": ["h", "i"]},
+        ])
+        self.assertEqual(c["routine"], {"gate": True, "human": False, "supersedes": False, "escape": False, "proofFailed": False, "blocked": True, "merge": False})
+        self.assertEqual(c["attention"], {"watchdog": True, "superseded": False, "audit": True, "routineBlocked": False, "reject": True, "pass": False})
+        self.assertEqual(c["tiers"], [1, 1, 1, 3, 2])
+
+    def test_cp_supersession_chains_are_transitive_and_cycle_safe(self):
+        self.assertEqual(self.report["cp"]["chains"], {
+            "c3": {"priors": ["c2", "c1"], "missing": []},
+            "c2": {"priors": ["c1"], "missing": []},
+            "m1": {"priors": [], "missing": ["gone"]},
+            "y1": {"priors": ["y2"], "missing": []},
+            "y2": {"priors": ["y1"], "missing": []},
+        })
+
+    def test_cp_search_audit_and_barrier_helpers(self):
+        c = self.report["cp"]
+        self.assertEqual(c["query"], [True, True, True, True, False, False, True, False])
+        self.assertEqual(c["strip"], {"a": 1, "b": ["ok"], "c": {"e": "fine"}})
+        self.assertFalse(c["audit"]["unavailable404"]["available"])
+        self.assertFalse(c["audit"]["notAudit"])
+        self.assertEqual((c["audit"]["clean"]["available"], c["audit"]["clean"]["clean"], c["audit"]["clean"]["inspected"]), (True, True, 1167))
+        f = c["audit"]["findings"]
+        self.assertEqual([(x["kind"], x["decisionId"], x["message"], x["severity"]) for x in f["findings"]], [
+            ("gate_loosening", "d_1", "Removed a hook", "high"),
+            ("weak_evidence", "d_2", "weak evidence", "medium"),
+            ("unclosed_escalation", "d_2", "Open", "high"),
+        ])
+        self.assertEqual(f["counts"], [["gate_loosening", 1], ["unclosed_escalation", 1], ["weak_evidence", 1]])
+        self.assertEqual(f["ids"], ["d_1", "d_2"])
+        self.assertEqual(c["scan"], ["pr_number", "branch", "head_sha"])
+        self.assertEqual(c["scanMore"], 3)
+        self.assertEqual(c["paths"], ["/trail?limit=200", "/trail?tenant=a%20b&limit=250&signal=key&q=x%26y", "/trail?limit=200"])
+
+    def test_cp_human_decision_validation_and_body(self):
+        c = self.report["cp"]
+        self.assertEqual(set(c["draft"]["empty"]), {"decision", "why", "phase"})
+        self.assertIn("decision", c["draft"]["spaces"])
+        self.assertIn("tenant", c["draft"]["badTenant"])
+        self.assertEqual(c["draft"]["array"], {"evidence": "Evidence must be a JSON object."})
+        self.assertEqual(c["draft"]["big"], {"evidence": "Evidence must be 16 KiB or less."})
+        self.assertEqual(c["draft"]["ok"], {})
+        self.assertEqual(c["body"], {"decision": "override_gate", "phase": "gate", "why": "because", "confirmed": True, "repo": "acme", "card_id": "t_1", "supersedes_id": "d_old", "evidence": {"pr_number": 1}})
+
+    def test_cp_markdown_parser_is_safe(self):
+        c = self.report["cp"]
+        self.assertEqual(c["href"], ["https://github.com/o/r/pull/1", None, None, None, None, None, None, None, None, "https://ok.test/a"])
+        types = [t["type"] for t in c["inline"]]
+        self.assertEqual(types[:8], ["text", "code", "text", "strong", "text", "em", "text", "link"])
+        self.assertEqual([t for t in c["inline"] if t["type"] == "link"], [{"type": "link", "text": "ok", "href": "https://a.test/x"}])
+        self.assertIn("<img src=x onerror=alert(1)>", "".join(t["text"] for t in c["inline"]))
+        self.assertEqual([b["type"] for b in c["blocks"]], ["heading", "paragraph", "list", "list", "quote", "code", "table", "rule", "heading", "paragraph"])
+        self.assertEqual(c["blocks"][1]["text"], "Para one continues here.")
+        self.assertEqual(c["blocks"][3], {"type": "list", "ordered": True, "items": ["first", "second"]})
+        self.assertEqual(c["blocks"][5], {"type": "code", "lang": "js", "text": 'const x = "<script>"'})
+        self.assertEqual(c["blocks"][6], {"type": "table", "head": ["key", "value"], "rows": [["a", "`b`"], ["c", "d"]]})
+        self.assertEqual(c["blocks"][8]["level"], 4)
+        self.assertEqual(c["report"]["missing"], {"exists": False})
+        self.assertEqual(c["report"]["junk"], {"exists": False})
+        v = c["report"]["view"]
+        self.assertEqual(v["content"], "# R\n[redacted]\nok")
+        self.assertEqual((v["truncated"], v["redacted"], v["sizeBytes"]), (True, True, 300000))
+        self.assertNotIn("filename", v)
+        source = PLUGIN_JS.read_text(encoding="utf-8")
+        self.assertNotIn("dangerouslySetInnerHTML", source)
+        self.assertNotIn("innerHTML", source)
+
+    def test_cp_publish_eligibility_and_request(self):
+        p = self.report["cp"]["publish"]
+        self.assertEqual(p["ok"], {"eligible": True, "reason": None, "label": "Diff PASS · Black-Box PASS"})
+        self.assertEqual(p["panelPass"], {"eligible": True, "reason": None, "label": "Panel PASS · 2 vendors"})
+        for key, reason in (("noTarget", "no-local-target"), ("hasPr", "has-pr"), ("verifyCard", "verify-card"), ("shortSha", "invalid-target"), ("noRepo", "unknown-repo")):
+            self.assertEqual((p[key]["eligible"], p[key]["reason"]), (False, reason), key)
+        for key in ("onlyDiff", "reject", "otherSha", "running", "panelPending"):
+            self.assertEqual((p[key]["eligible"], p[key]["reason"]), (False, "unverified"), key)
+        self.assertEqual(p["reject"]["label"], "rejected")
+        body = self.report["cp"]["publishBody"]
+        self.assertEqual(body, {"repo": "omnim-ai/factonio", "branch": "feat/x", "expected_head_sha": "a" * 40, "title": "T", "draft": True, "confirmed": True, "base_branch": "main", "tenant": "ws-pub", "card_id": "t_impl"})
+        self.assertNotIn("body_file", body)
+        self.assertNotIn("remote", body)
+
+    def test_cp_harness_audit_view_model_fails_closed(self):
+        h = self.report["cp"]["harness"]
+        st = h["stale"]
+        self.assertEqual((st["severity"], st["tone"], st["mode"], st["classification"], st["classTone"]), ("stale", "warn", "advisory", "harness_gap", "bad"))
+        self.assertEqual(st["driftedFiles"], ["desktop/plugin.js", "docs/images/dashboard.png"])
+        self.assertEqual(st["staleInvariants"], ["skill-bloat — skills/a/SKILL.md"])
+        self.assertEqual(st["gateLoosening"], ["Required hook desktop-syntax removed"])
+        self.assertEqual(st["recommendations"], ["Run hermes factonio harness sync"])
+        self.assertNotIn("/home/u/dev/x", json.dumps(st))
+        self.assertEqual((h["clean"]["severity"], h["clean"]["tone"], h["clean"]["head"]), ("clean", "ok", "9c4e1a2"))
+        self.assertEqual((h["missing"]["severity"], h["missing"]["tone"], h["missing"]["mode"], h["missing"]["manifestErrors"]), ("missing", "bad", "absent", [".factonio/harness.json missing"]))
+        self.assertEqual((h["junk"]["severity"], h["junk"]["classification"]), ("unknown", "unknown"), "an unknown payload never reads as clean")
+
+    def test_cp_design_approval_state(self):
+        self.assertEqual(self.report["cp"]["design"], {
+            "awaiting": "awaiting", "running": None, "approved": "approved", "revising": "revising",
+            "supersededRevision": "awaiting", "implementExists": None, "candidate": None, "notDesign": None,
+        })
+
+    def test_cp_sidebar_publish_pr_flow(self):
+        s = self.report["cp"]["sidebar"]
+        self.assertEqual(s["publishButtons"], ["t_pimpl"], "only the verified local-only card offers Publish PR")
+        self.assertEqual(s["publishBtn"], {"text": "Publish PR", "title": "Publish feat/x at aaaaaaaaaaaa", "popup": "dialog"})
+        self.assertEqual(s["localRows"], {"branch": "feat/x → main", "head": "aaaaaaa", "verify": "Panel PASS · 2 vendors", "pr": "local only"})
+        o = s["publishOpen"]
+        self.assertTrue(o["stopped"])
+        m = o["modal"]
+        self.assertEqual((m["id"], m["role"], m["modal"], m["title"]), ("fc-publish", "dialog", "true", "Publish PR to GitHub"))
+        self.assertEqual(m["facts"], ["omnim-ai/factonio", "feat/x → main", "aaaaaaaaaaaa", "Panel PASS · 2 vendors"])
+        self.assertEqual((m["title_input"], m["body_input"], m["draft"]), ("feat(desktop): control-plane actions", "Verified locally.", False))
+        # The same 12-character SHA everywhere it is shown.
+        self.assertEqual(m["shield"], "The server re-checks that aaaaaaaaaaaa is still the verified head. If the branch moved, nothing is pushed.")
+        self.assertEqual(m["go"], {"text": "Publish to GitHub", "disabled": False, "action": "publish-go"})
+        self.assertEqual(o["focus"], ["fc-pp-title"])
+        e = s["publish409"]
+        self.assertEqual(e["banners"], [{"tone": "bad", "role": "alert", "text": "409 · Publish refused Nothing was pushed: aaaaaaaaaaaa is no longer the verified head, or its verification changed. Re-verify before publishing. Your title and body are kept. Not locally verified at " + "a" * 40 + ": head drifted"}])
+        self.assertEqual((e["title_input"], e["body_input"], e["draft"]), ("feat(desktop): control plane", "Verified locally.\n\nEdited body.", True), "edits survive a 409")
+        self.assertEqual(e["go"]["text"], "Retry publish")
+        # 409 head drift: observed and verified heads (same 12-char truncation as the modal) plus the server detail.
+        dr = s["publishDrift"]
+        self.assertEqual(dr["observed"], {"text": "b" * 12, "title": "b" * 40})
+        self.assertEqual(dr["verified"], {"text": "a" * 12, "title": "a" * 40})
+        self.assertEqual(dr["detail"], {"text": f"HEAD drifted from {'a' * 40} to {'b' * 40}; re-verify before publishing.", "title": None})
+        self.assertEqual(dr["modal"]["banners"], [{"tone": "bad", "role": "alert", "text": f"409 · Head drifted The branch is now at {'b' * 12} , not the verified {'a' * 12} . Re-verify before publishing. Your title and body are kept. HEAD drifted from {'a' * 40} to {'b' * 40}; re-verify before publishing."}])
+        self.assertEqual((dr["modal"]["title_input"], dr["modal"]["body_input"], dr["modal"]["draft"]), ("feat(desktop): control plane", "Verified locally.\n\nEdited body.", True))
+        self.assertEqual(dr["modal"]["facts"][2], "a" * 12, "the verified-head fact is unchanged")
+        self.assertEqual(dr["modal"]["go"]["text"], "Retry publish")
+        sc = s["publishDriftScrubbed"]
+        self.assertEqual((sc["observed"]["text"], sc["verified"]["text"], sc["detail"]), ("b" * 12, "a" * 12, None))
+        self.assertNotIn("holdout", json.dumps(sc["modal"]))
+        b = s["publishBusy"]
+        self.assertEqual((b["busy"], b["go"]["text"], b["go"]["disabled"]), ("true", "Publishing…", True))
+        self.assertTrue(s["publishEscBusy"])
+        d = s["publishDone"]
+        self.assertEqual(d["title"], "PR published")
+        self.assertEqual(d["facts"], ["github.com/omnim-ai/factonio/pull/47", "aaaaaaaaaaaa (unchanged)", "publish_pr · actor human"])
+        self.assertEqual(len(s["publishBodies"]), 4)
+        for body in s["publishBodies"]:
+            self.assertEqual(body, {"repo": "omnim-ai/factonio", "branch": "feat/x", "expected_head_sha": "a" * 40, "title": "feat(desktop): control plane", "draft": True, "confirmed": True, "body": "Verified locally.\n\nEdited body.", "base_branch": "main", "tenant": "omnim-ai-factonio-local-publish", "card_id": "t_pimpl"})
+        self.assertEqual(s["publishInvalidated"], ["factonio/cards", "factonio/trail"])
+        self.assertEqual(s["publishOpened"], ["https://github.com/omnim-ai/factonio/pull/47"])
+        self.assertTrue(s["publishClosed"])
+        self.assertEqual(s["oldHost"], {"publish": 0, "appr": 0})
+
+    def test_cp_sidebar_investigation_report_viewer(self):
+        s = self.report["cp"]["sidebar"]
+        self.assertEqual(s["reportBtn"], {"text": "report ready", "cls": "fc-sb-report fc-sb-report-btn", "popup": "dialog", "title": "Open investigation.md (read-only)"})
+        self.assertEqual(s["reportQueryLoading"]["state"], "loading")
+        r = s["report"]
+        self.assertEqual(r["query"], {"key": ["factonio", "report", "omnim-ai-factonio-cache-miss-spike"], "interval": None})
+        self.assertEqual(r["rests"], ["/workstreams/omnim-ai-factonio-cache-miss-spike/report"])
+        m = r["modal"]
+        self.assertEqual((m["id"], m["size"], m["state"]), ("fc-report", "wide", "truncated"))
+        self.assertEqual([b["text"] for b in m["banners"]], ["Truncated at the 256 KiB cap. The end of the report isn’t shown.", "Redacted. Lines the information barrier restricts were withheld before display."])
+        md = m["md"]
+        self.assertEqual(md["dangerous"], 0)
+        self.assertEqual(md["links"], [{"href": "https://github.com/omnim-ai/factonio/actions/runs/1", "rel": "noopener noreferrer", "text": "run"}])
+        self.assertTrue({"h1", "h2", "ul", "li", "table", "th", "td", "pre", "code", "blockquote", "a"} <= set(md["tags"]))
+        self.assertNotIn("img", md["tags"])
+        self.assertNotIn("script", md["tags"])
+        self.assertEqual(md["code"], ["<script>alert(1)</script>"])
+        self.assertIn("[redacted]", md["text"])
+        self.assertIn("<img src=x onerror=alert(1)>", md["text"], "raw HTML is shown as text")
+        self.assertIn("investigation.md", m["text"])
+        self.assertNotIn("/home/u/", m["text"])
+        self.assertEqual(s["reportLinkOpened"], ["https://github.com/omnim-ai/factonio/actions/runs/1"])
+        self.assertEqual(s["reportBarrier"], [])
+        self.assertEqual(s["reportMissing"]["state"], "missing")
+        self.assertIn("Report not written yet", s["reportMissing"]["text"])
+        self.assertEqual(s["reportError"]["state"], "error")
+        self.assertEqual(s["reportError"]["banners"][0]["text"], "Couldn’t load the report (403). The file is not a regular file, so it was not read. Retry")
+        self.assertEqual((s["drawerReport"], s["drawerReportOpens"]), ("investigation.md", "fc-report"))
+
+    def test_cp_sidebar_design_approval_strip(self):
+        s = self.report["cp"]["sidebar"]
+        self.assertEqual(s["designOnlyDesign"], ["t_dsg"])
+        self.assertEqual(s["designStrip"], {"state": "awaiting", "text": "awaiting approval Approve Design Request Revision"})
+        self.assertEqual(s["reviseOpen"], {"text": "awaiting approval What needs to change? (required) Appends an immutable human decision · request_design_revision Send revision request Cancel", "confirmDisabled": True})
+        self.assertEqual(s["approveOpen"], "awaiting approval Note (optional) Appends an immutable human decision · approve_design Confirm approval Cancel")
+        a = s["approved"]
+        self.assertEqual(a["state"], "approved")
+        self.assertEqual(a["text"], "approved Design approved by you · just now · d_appr0001 appended to trail.db")
+        self.assertEqual(a["rests"], [{"decision": "approve_design", "phase": "design", "why": "Ship it.", "confirmed": True, "tenant": "omnim-ai-factonio-design-review", "card_id": "t_dsg"}])
+        self.assertEqual(a["invalidated"], ["factonio/trail"])
+
+    def test_cp_sidebar_panel_and_arena_reevaluate(self):
+        s = self.report["cp"]["sidebar"]
+        self.assertEqual(s["arenaReeval"], {"label": "Re-evaluate arena", "text": "Re-evaluate", "inTop": True})
+        self.assertEqual(s["arenaBusy"], {"text": "Evaluating", "disabled": True, "stopped": True})
+        self.assertEqual(s["arenaDone"], {"msg": "Updated just now", "rests": [{"path": "/arenas/evaluate", "body": {"arena_id": "ar_7f2c9a10", "tenant": "omnim-ai-factonio-design-review"}}]})
+        self.assertEqual(s["panelError"], {"text": "Evaluate failed (404: panel not found). Retry", "role": "alert", "retry": True, "rests": [{"path": "/panels/evaluate", "body": {"panel_id": "vp_9a1", "tenant": "omnim-ai-factonio-local-publish"}}]})
+        self.assertEqual(s["queries"]["other"], [], "no new polled queries")
+        self.assertEqual(s["queries"]["polling"], ["factonio/cards/all"])
+        self.assertEqual(s["barrier"], [])
+
+    def test_cp_repo_harness_audit_drawer(self):
+        a = self.report["cp"]["repoAudit"]
+        self.assertEqual(a["headers"], ["Harness & actions"])
+        self.assertEqual(a["actions"], [["audit-repo", "edit-repo"]])
+        self.assertEqual(a["note"], "Audit runs the harness check live, read-only. It never edits repo files or .git/index .")
+        b = a["busy"]
+        self.assertEqual(b["drawer"]["colSpan"], 9)
+        self.assertEqual(b["drawer"]["status"], "busy")
+        self.assertIn("read-only, no repo files touched", b["drawer"]["text"])
+        self.assertEqual(b["btn"], {"disabled": True, "expanded": "true", "controls": "fc-repo-au-tozes-factonio"})
+        self.assertEqual(b["rowAudit"], "true")
+        st = a["stale"]
+        self.assertEqual((st["status"], st["id"], st["label"]), ("done", "fc-repo-au-tozes-factonio", "Harness audit result for tozes/factonio"))
+        self.assertEqual(st["chips"], [["severity", "stale", "warn"], ["mode", "mode advisory", None], ["drift", "drift harness_gap", "bad"]])
+        self.assertEqual(st["sections"]["drifted"], {"title": "Drifted files · 1", "items": ["desktop/plugin.js"]})
+        self.assertEqual(st["sections"]["stale"]["items"], ["skill-bloat"])
+        self.assertEqual(st["sections"]["gate"]["items"], [])
+        self.assertEqual(st["sections"]["recs"], {"title": "Recommendations", "items": ["Run `hermes factonio harness sync`."]})
+        self.assertEqual(a["rests"], [{"path": "/repos/tozes-factonio/harness/audit", "method": "POST", "body": {}}])
+        self.assertIn("factonio/repos", a["invalidated"])
+        self.assertIn("factonio/trail", a["invalidated"])
+        self.assertEqual(a["barrierPath"], [], "repo_path is never rendered")
+        self.assertEqual(a["missing"]["status"], "error")
+        self.assertIn("409 · Local checkout missing.", a["missing"]["banner"])
+        self.assertEqual(a["rowOrder"], ["tozes-factonio", "tozes-factonio:audit", "acme-web-dashboard", "acme-cli-tools", "acme-cli-tools:audit"])
+        self.assertEqual(a["closed"], {"drawer": False, "expanded": "false"})
+
+    def test_cp_styles_tokens_only_and_design_rules(self):
+        source = PLUGIN_JS.read_text(encoding="utf-8")
+        start = source.index("const STYLES = `")
+        styles = source[start : source.index("`", start + len("const STYLES = `"))]
+        block = styles[styles.index("/* Decision History + control plane") :]
+        self.assertNotRegex(block, r"#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(")
+        self.assertNotIn(".pv-", block)
+        for needed in (
+            ".fc-dh-scroll { max-height: 720px; overflow: auto;",
+            ".fc-dh-day { position: sticky; top: 0;",
+            ".fc-dh-main { display: grid; grid-template-columns: 52px 78px minmax(0, 1fr) auto;",
+            ".fc-dh-fold { display: grid; grid-template-columns: 52px 78px minmax(0, 1fr) auto;",
+            ".fc-dh-foldrows {",
+            ".fc-repos tr[data-audit=\"true\"] > td:first-child { box-shadow: inset 2px 0 0 var(--ui-accent); }",
+            "@container (max-width: 270px) { .fc-sb-reeval-l { display: none; } }",
+            ".fc-sb-report-btn {",
+            ".fc-btn--primary:disabled { opacity: 1;",
+            "@container (max-width: 760px) {",
+            "@container (max-width: 640px) {",
+            "@media (prefers-reduced-motion: reduce) {",
+        ):
+            self.assertIn(needed, block)
+        self.assertEqual(source.count("setInterval("), 0)
+        imports = re.findall(r"^import .* from '([^']+)'", source, re.M) + re.findall(r"^} from '([^']+)'", source, re.M)
+        self.assertEqual(sorted(set(imports)), ["@hermes/plugin-sdk", "react", "react/jsx-runtime"])
+
 
 if __name__ == "__main__":
     unittest.main()

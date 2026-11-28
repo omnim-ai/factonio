@@ -783,9 +783,21 @@ export const trailDecision = o => ({
   supersedes_id: null, superseded_by: [], is_superseded: false, ...o,
 });
 
-// Fill superseded_by / is_superseded from supersedes_id, sort newest first, apply ?tenant=/&repo=/&phase=.
-export function trailPayload(list, path = '') {
+// Mirrors trail.py's signal filters: routine gate ticks (key) and attention rows.
+const ROUTINE_CODES = new Set(['pr_gate', 'bootstrap_verify']);
+const ROUTINE_KEEP = new Set(['proof_failed', 'product_regression', 'error', 'refused', 'escalated']);
+const ATTN_RESULTS = new Set(['reject', 'blocked', 'escalated', 'needs_input', 'inconclusive', 'conflict', 'proof_failed', 'refused', 'error', 'stalled', 'dead_worker', 'stop_the_line', 'product_regression', 'changes_requested', 'fix_incomplete']);
+const isRoutineRow = d => ROUTINE_CODES.has(d.decision) && d.actor !== 'human' && !d.supersedes_id && d.phase !== 'escape' && d.phase !== 'retro' && !ROUTINE_KEEP.has(d.result);
+
+// GET /trail/audit ({ok, clean, inspected, findings}; trail.audit_trail_evidence) for the Attention banner.
+export function trailAudit(list, findings) {
+  return { ok: true, clean: findings.length === 0, inspected: list.length, active_inspected: list.length, counts: findings.reduce((a, f) => ({ ...a, [f.kind]: (a[f.kind] || 0) + 1 }), {}), findings, filters: {} };
+}
+
+// Fill superseded_by / is_superseded from supersedes_id, sort newest first, apply ?tenant=/&repo=/&phase=/&signal=/&q=.
+export function trailPayload(list, path = '', audit = null) {
   const params = new URLSearchParams(String(path).split('?')[1] || '');
+  if (String(path).startsWith('/trail/audit')) return audit || trailAudit(list, []);
   const by = {};
   for (const d of list) if (d.supersedes_id) (by[d.supersedes_id] = by[d.supersedes_id] || []).push(d.id);
   let rows = list.map(d => ({ ...d, superseded_by: by[d.id] || [], is_superseded: !!by[d.id] }))
@@ -802,6 +814,12 @@ export function trailPayload(list, path = '') {
     const v = params.get(k);
     if (v) rows = rows.filter(d => d[field] === v);
   }
+  const signal = params.get('signal');
+  const flagged = new Set((audit?.findings || []).map(f => f.decision_id));
+  if (signal === 'key') rows = rows.filter(d => !isRoutineRow(d));
+  if (signal === 'attention') rows = rows.filter(d => !d.is_superseded && (flagged.has(d.id) || (!isRoutineRow(d) && (d.phase === 'escape' || d.phase === 'watchdog' || ATTN_RESULTS.has(d.result)))));
+  const q = (params.get('q') || '').toLowerCase();
+  if (q) rows = rows.filter(d => [d.decision, d.why, d.result, d.card_id, d.tenant, d.repo_slug, JSON.stringify(d.evidence)].some(v => String(v || '').toLowerCase().includes(q)));
   const count = key => rows.reduce((acc, d) => ({ ...acc, [d[key] || 'unknown']: (acc[d[key] || 'unknown'] || 0) + 1 }), {});
   const superseded = rows.filter(d => d.is_superseded).length;
   return {
@@ -831,7 +849,16 @@ export const DASHBOARD_TRAIL = [
   d({ id: 'd_11aa82b90c3e', ts: trailIso(110), tenant: ACME, repo_slug: 'acme-payments-api', phase: 'implement', card_id: 't_77d0e3a1', actor: 'worker', decision: 'spawn_implement', why: 'Spawned the implement worker for issue #42 (rate-limit headers) once the define card closed.', evidence: { card_id: 't_77d0e3a1' }, result: 'spawned' }),
   d({ id: 'd_6f19b3d28e45', ts: trailIso(134), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'design', card_id: 't_8bee4979', actor: 'human', decision: 'design_approved', why: 'Approved the Decision Trail dashboard section and sidebar disclosure after checking both themes at 344px and 300px.', evidence: { card_id: 't_8bee4979', design_provider: 'claude-design' }, result: 'approved' }),
   d({ id: 'd_4b81e2c0a119', ts: trailIso(167), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'define', card_id: 't_5a2c91e0', actor: 'worker', decision: 'attack_the_premise_pivot', why: 'Attack the Premise: a trail table inside the fenced kanban.db would tie audit writes to board locks. Pivoted to a dedicated append-only trail.db.', evidence: { card_id: 't_5a2c91e0', rejected: 'kanban.db table' }, result: 'pivot' }),
+  d({ id: 'd_7be44a19c0aa', ts: trailIso(5), tenant: W5, repo_slug: 'omnim-ai-factonio', phase: 'harness', card_id: 't_4ab36a0d', actor: 'worker', decision: 'gate_policy_change', why: 'Removed `node --check desktop/plugin.js` from the required drive commands to unblock a flaky runner.', evidence: { file: '.factonio/harness.json', removed_command: 'node --check desktop/plugin.js', hook: 'desktop-syntax' }, result: 'applied' }),
+  // Routine gate ticks: hidden under Key Decisions, folded into one summary chip under All.
+  ...[13, 14, 15, 17, 18, 19, 20].map((m, i) => d({ id: `d_9d0c4e1b20${i}`, ts: trailIso(m), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'gate', card_id: 't_bcf5502a', decision: 'pr_gate', why: 'Merge gate tick on the exact head.', evidence: { pr_number: 12, head_sha: '5d178304e1' }, result: i === 3 ? 'blocked' : 'pass' })),
+  ...[22, 23, 24].map((m, i) => d({ id: `d_9d0c4e1b30${i}`, ts: trailIso(m), tenant: W2, repo_slug: 'omnim-ai-factonio', phase: 'verify', card_id: `t_bcf550${i}b`, decision: 'bootstrap_verify', why: 'Bootstrap probe confirmed the worktree, tools and harness doctor.', evidence: {}, result: 'pass' })),
 ];
+// GET /trail/audit findings for the dashboard Attention banner.
+export const DASHBOARD_AUDIT = trailAudit(DASHBOARD_TRAIL, [
+  { kind: 'gate_loosening', severity: 'high', decision_id: 'd_7be44a19c0aa', decision: 'gate_policy_change', message: 'A required drive command (node --check desktop/plugin.js) was removed from .factonio/harness.json without a human countersign.' },
+  { kind: 'weak_evidence', severity: 'medium', decision_id: 'd_c4f08e2a91b7', decision: 'verify_carryover', message: 'Carryover pass cites a patch-id match but records no rerun of the touched files.' },
+]);
 
 const SB_WS = 'omnim-ai-factonio-docked-sidebar-tab';
 const SB_META = 'omnim-ai-factonio-enrich-cards-metadata';
@@ -846,7 +873,7 @@ export const SIDEBAR_TRAIL = [
   d({ id: 'd_5b10c2e4a807', ts: trailIso(53), tenant: SB_WS, repo_slug: 'omnim-ai-factonio', phase: 'implement', card_id: 't_4ab36a14', decision: 'spawn_fix_round', why: 'Fix Round 1 of 3 for the focus-order finding.', evidence: { pr_number: 44, fix_round: 1 }, result: 'spawned' }),
   d({ id: 'd_5b10c2e4a808', ts: trailIso(38), tenant: SB_WS, repo_slug: 'omnim-ai-factonio', phase: 'watchdog', card_id: 't_4ab36a14', actor: 'watchdog', decision: 'needs_input', why: 'Worker paused on a product question; no side effects since.', evidence: { worker_pid: 48219, side_effect_age_s: 1380 }, result: 'blocked' }),
   d({ id: 'd_7d21c0e5a901', ts: trailIso(95), tenant: SB_META, repo_slug: 'omnim-ai-factonio', phase: 'implement', card_id: 't_a1b2c3d4', actor: 'worker', decision: 'spawn_implement', why: 'Enrich /cards metadata.', evidence: { card_id: 't_a1b2c3d4' }, result: 'spawned' }),
-  d({ id: 'd_7d21c0e5a902', ts: trailIso(12), tenant: SB_META, repo_slug: 'omnim-ai-factonio', phase: 'verify', card_id: 't_a1b2c3d4', decision: 'spawn_verify', why: 'PR #42 reworked; re-verifying.', evidence: { pr_number: 42, head_sha: 'e4a1d90b7c' }, result: 'spawned' }),
+  d({ id: 'd_7d21c0e5a902', ts: trailIso(12), tenant: SB_META, repo_slug: 'omnim-ai-factonio', phase: 'verify', card_id: 't_a1b2c3d4', decision: 'spawn_verify', why: 'publish_policy is ask: verifying feat/cards-enrichment locally before any push.', evidence: { branch: 'feat/cards-enrichment', base_branch: 'main', head_sha: 'e4a1d90b7c' }, result: 'spawned' }),
 ];
 
 // Workflow demo ledger: each entry appears from `step` onward (index into WORKFLOW_DEMO_HTML STEPS).
@@ -942,7 +969,7 @@ DASHBOARD_HTML = f"""<!doctype html>
   </div>
   <script type="module">
     import {{ __mount }} from 'react';
-    import {{ MODELS_DATA, METRICS_BY_RANGE, initialReposState, bootPlugin, trailPayload, DASHBOARD_TRAIL, metricsHistory }} from '/__harness/mock-data.js';
+    import {{ MODELS_DATA, METRICS_BY_RANGE, initialReposState, bootPlugin, trailPayload, DASHBOARD_TRAIL, DASHBOARD_AUDIT, metricsHistory }} from '/__harness/mock-data.js';
 
     const reposState = initialReposState();
     window.__fcMock = {{ sessionId: 'sess_dash', visible: true, __version: 1 }};
@@ -957,11 +984,25 @@ DASHBOARD_HTML = f"""<!doctype html>
       if (path === '/models') return MODELS_DATA;
       if (path === '/repos') return reposState;
       if (path === '/status') return {{ ok: true, repos_count: 3, counts: {{ running: 2, blocked: 0, triage: 0 }} }};
-      if (path.startsWith('/trail')) return trailPayload(DASHBOARD_TRAIL, path);
+      if (path.startsWith('/trail')) return trailPayload(DASHBOARD_TRAIL, path, DASHBOARD_AUDIT);
+      if (path.startsWith('/repos/') && path.endsWith('/harness/audit')) return {{
+        ok: true, severity: 'stale', drifted: true, mode: 'advisory', present: true, head_commit: '9c4e1a27d3',
+        drift_classification: {{ classification: 'doc_drift' }},
+        uncovered_changed_files: ['desktop/plugin.js', 'tools/capture_readme_media.py'],
+        stale_invariants: [{{ name: 'readme-media', changed_files: ['docs/images/dashboard.png'] }}],
+        gate_loosening: {{ loosened: false, findings: [] }}, manifest_errors: [],
+        recommendations: ['Run `hermes factonio harness sync` to refresh the feature map.'],
+      }};
       return {{}};
     }});
 
     __mount(document.getElementById('page-mount'), () => regs.page.render());
+    // Open the Attention banner and the publish correction's supersession chain.
+    await new Promise(r => setTimeout(r, 80));
+    document.querySelector('[data-action="toggle-audit"]')?.click();
+    await new Promise(r => setTimeout(r, 40));
+    document.querySelector('li[data-id="d_3c5e7a9b1d20"] [data-action="toggle-chain"]')?.click();
+    await new Promise(r => setTimeout(r, 40));
     // Also render status pill separately
     const pillEl = document.getElementById('pill-mount');
     pillEl.innerHTML = '<button type="button" class="fc-pill"><span class="fc-dot fc-dot-green"></span><span>Factonio 2 run · 0 attn</span></button>';
@@ -1042,6 +1083,8 @@ SIDEBAR_HTML = f"""<!doctype html>
     const META = 'omnim-ai-factonio-enrich-cards-metadata';
     const PILL = 'omnim-ai-factonio-statusbar-pill-counts';
     const INV = 'omnim-ai-factonio-cache-miss-spike';
+    const DH = 'omnim-ai-factonio-control-plane';
+    const LOCAL = {{ repo: 'omnim-ai/factonio', branch: 'feat/cards-enrichment', base_branch: 'main', head_sha: 'e4a1d90b7c3f5a2e8d61b0c9f47a3e2d1b5c8a90', source: 'metadata', pr_title: 'feat(metrics): enrich /cards metadata', pr_body: 'Adds additive card fields. Verified locally: Diff PASS · Black-Box PASS.' }};
     const PR44 = {{ repo: 'omnim-ai/factonio', number: 44, url: 'https://github.com/omnim-ai/factonio/pull/44' }};
     const PR42 = {{ repo: 'omnim-ai/factonio', number: 42, url: 'https://github.com/omnim-ai/factonio/pull/42' }};
     const PR39 = {{ repo: 'omnim-ai/factonio', number: 39, url: 'https://github.com/omnim-ai/factonio/pull/39' }};
@@ -1062,9 +1105,12 @@ SIDEBAR_HTML = f"""<!doctype html>
       c({{ id: 't_4ab36a12', tenant: SIDEBAR, session_id: 'sess_demo', phase: 'verify-blackbox', status: 'done', verdict: 'pass', title: '[verify-blackbox] Keyboard and theme acceptance run', model: 'gemini-2.5-pro', provider: 'google', panel_id: 'vp_9a4c1e', panel_vendor: 'google', parents: ['t_4ab36a0d'], pr: PR44, created_at: T(4500), started_at: T(4470), completed_at: T(3420), elapsed_seconds: 1050, active_duration_seconds: 880, summary: 'All 12 keyboard and theme scenarios pass in dark and light.' }}),
       c({{ id: 't_4ab36a14', tenant: SIDEBAR, session_id: 'sess_demo', phase: 'implement', status: 'blocked', block_kind: 'needs_input', block_reason: 'Should expanded/collapsed workstreams persist across app restarts?', last_outcome: null, title: '[implement] Fix round 1: focus order and callout contrast', parents: ['t_4ab36a11'], pr: PR44, created_at: T(3200), started_at: T(3190), elapsed_seconds: 3190, active_duration_seconds: 212 }}),
       c({{ id: 't_7d21c0e5', tenant: META, session_id: 'sess_demo', phase: 'define', status: 'done', title: '[define] Spec: additive /cards metadata fields', created_at: T(6200), started_at: T(6190), completed_at: T(5900), elapsed_seconds: 290, active_duration_seconds: 240 }}),
-      c({{ id: 't_a1b2c3d4', tenant: META, session_id: 'sess_demo', phase: 'implement', status: 'done', runs: 2, title: '[implement] Enrich /cards metadata in metrics.py', parents: ['t_7d21c0e5'], pr: PR42, created_at: T(5100), started_at: T(1200), completed_at: T(800), elapsed_seconds: 412, active_duration_seconds: 185, summary: 'Added additive card fields and updated unit tests.' }}),
-      c({{ id: 't_a1b2c3e0', tenant: META, session_id: 'sess_demo', phase: 'verify-diff', status: 'running', runs: 1, title: '[verify-diff] Review PR #42 against spec.md', model: 'gpt-5', provider: 'openai', parents: ['t_a1b2c3d4'], pr: PR42, created_at: T(700), started_at: T(220), elapsed_seconds: 220, active_duration_seconds: 96 }}),
-      c({{ id: 't_a1b2c3e1', tenant: META, session_id: 'sess_demo', phase: 'verify-blackbox', status: 'running', title: '[verify-blackbox] API contract run for /cards', model: 'gpt-5', provider: 'openai', parents: ['t_a1b2c3d4'], pr: PR42, created_at: T(700), started_at: T(210), elapsed_seconds: 210, active_duration_seconds: 108 }}),
+      // publish_policy: ask -- verified locally at the exact head, waiting for an explicit Publish PR.
+      c({{ id: 't_a1b2c3d4', tenant: META, session_id: 'sess_demo', phase: 'implement', status: 'done', runs: 2, title: '[implement] Enrich /cards metadata in metrics.py', parents: ['t_7d21c0e5'], local_target: LOCAL, created_at: T(5100), started_at: T(1200), completed_at: T(800), elapsed_seconds: 412, active_duration_seconds: 185, summary: 'Added additive card fields and updated unit tests.' }}),
+      c({{ id: 't_a1b2c3e0', tenant: META, session_id: 'sess_demo', phase: 'verify-diff', status: 'done', verdict: 'pass', title: '[verify-diff] Review feat/cards-enrichment against spec.md', model: 'gpt-5', provider: 'openai', parents: ['t_a1b2c3d4'], local_target: LOCAL, created_at: T(700), started_at: T(620), completed_at: T(420), elapsed_seconds: 200, active_duration_seconds: 96 }}),
+      c({{ id: 't_a1b2c3e1', tenant: META, session_id: 'sess_demo', phase: 'verify-blackbox', status: 'done', verdict: 'pass', title: '[verify-blackbox] API contract run for /cards', model: 'gpt-5', provider: 'openai', parents: ['t_a1b2c3d4'], local_target: LOCAL, created_at: T(700), started_at: T(610), completed_at: T(400), elapsed_seconds: 210, active_duration_seconds: 108 }}),
+      c({{ id: 't_c0f2d001', tenant: DH, session_id: 'sess_demo', phase: 'define', status: 'done', title: '[define] Spec: interactive control-plane actions', created_at: T(2600), started_at: T(2590), completed_at: T(2300), elapsed_seconds: 290, active_duration_seconds: 240 }}),
+      c({{ id: 't_c0f2d002', tenant: DH, session_id: 'sess_demo', phase: 'design', status: 'done', title: '[design] Phase 1b: Decision History + control plane', parents: ['t_c0f2d001'], created_at: T(2200), started_at: T(2190), completed_at: T(1500), elapsed_seconds: 690, active_duration_seconds: 512 }}),
       c({{ id: 't_39c1aa01', tenant: PILL, session_id: 'sess_demo', phase: 'define', status: 'done', title: '[define] Status pill counts spec', created_at: T(90000), started_at: T(89990), completed_at: T(89700), elapsed_seconds: 290, active_duration_seconds: 210 }}),
       c({{ id: 't_39c1aa03', tenant: PILL, session_id: 'sess_demo', phase: 'implement', status: 'done', pr: PR39, title: '[implement] Running/blocked counts in status bar', created_at: T(88900), started_at: T(88890), completed_at: T(87000), elapsed_seconds: 1890, active_duration_seconds: 1220 }}),
       c({{ id: 't_39c1aa04', tenant: PILL, session_id: 'sess_demo', phase: 'verify-diff', status: 'done', verdict: 'pass', pr: PR39, title: '[verify-diff] Review PR #39', created_at: T(86900), started_at: T(86890), completed_at: T(86500), elapsed_seconds: 390, active_duration_seconds: 330 }}),
@@ -1076,7 +1122,7 @@ SIDEBAR_HTML = f"""<!doctype html>
       [SIDEBAR]: {{ kind: 'perf', read_only: false, report_path: null, report_exists: false }},
       [META]: {{ kind: 'feature', read_only: false, report_path: null, report_exists: false }},
       [PILL]: {{ kind: 'refactor', read_only: false, report_path: null, report_exists: false }},
-      [INV]: {{ kind: 'investigate', read_only: true, report_path: '~/.hermes/plugin-data/factonio/runs/omnim-ai-factonio-cache-miss-spike/investigation.md', report_exists: false }},
+      [INV]: {{ kind: 'investigate', read_only: true, report_path: '~/.hermes/plugin-data/factonio/runs/omnim-ai-factonio-cache-miss-spike/investigation.md', report_exists: true }},
     }};
     const ARENAS = [
       {{
@@ -1094,16 +1140,17 @@ SIDEBAR_HTML = f"""<!doctype html>
     const {{ regs }} = await bootPlugin((path) => {{
       if (path.startsWith('/cards')) return {{ cards: CARDS, counts: {{ running: 3, blocked: 1, triage: 0, rejected: 1, attention: 2, done: 14, total: 18 }}, workstreams: WORKSTREAMS, arenas: ARENAS }};
       if (path.startsWith('/trail')) return trailPayload(SIDEBAR_TRAIL, path);
+      if (path === `/workstreams/${{INV}}/report`) return {{
+        ok: true, exists: true, tenant: INV, filename: 'investigation.md', size_bytes: 1184, truncated: false, redacted: false,
+        content: '# Cache-miss spike\\n\\n## Finding\\n\\nThe `/cards` cache key omits `session_id`, so every thread switch misses.\\n\\n| Metric | Before | After fix |\\n| --- | --- | --- |\\n| hit rate | 41% | 93% |\\n\\n## Next step\\n\\n- Key the cache on `(tenant, session_id)`.\\n- Add a regression test in `tests/test_watchdog_metrics_api.py`.\\n',
+      }};
       return {{}};
     }});
 
     __mount(document.getElementById('pane-mount'), () => regs.pane.render());
-    // Expand the rejected blackbox card so its detail drawer is visible
     await new Promise(r => setTimeout(r, 60));
-    const cardBtn = document.querySelector('article[data-id="t_4ab36a11"] button[data-action="toggle-card"]');
-    if (cardBtn) cardBtn.click();
-    await new Promise(r => setTimeout(r, 60));
-    // Scroll so the workstream header (mode pill), its /arena + verification panel strips and the opened lane's drawer share the frame.
+    // Scroll so the arena + panel strips (Re-evaluate), the clickable report ready pill, Publish PR and the
+    // design approval strip share the frame.
     const sbBody = document.querySelector('.fc-sb-body');
     const panelStrip = document.querySelector(`section[data-tenant="${{SIDEBAR}}"]`);
     if (sbBody && panelStrip) {{
@@ -1857,7 +1904,7 @@ def capture_selected(out_dir: Path, targets: list[str], qa_dir: Path | None = No
             print(f"Wrote {dest} ({dest.stat().st_size} bytes)")
         if "sidebar" in targets:
             dest = out_dir / "sidebar.png"
-            capture_url(chrome, f"{base}/__harness/sidebar.html", dest, 1100, 1160, scale=2)
+            capture_url(chrome, f"{base}/__harness/sidebar.html", dest, 1100, 1560, scale=2)
             print(f"Wrote {dest} ({dest.stat().st_size} bytes)")
         if "settings" in targets:
             dest = out_dir / "settings.png"

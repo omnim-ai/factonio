@@ -60,9 +60,9 @@ Factonio ships a zero-build Hermes Desktop UI (`desktop/plugin.js`) using only p
 
 ### Metrics Dashboard (`/factonio`)
 
-Track workstream throughput, Diff vs Black-Box pass rates, rework rate, post-merge escape rate, high-rigor verification panel outcomes (with disagreements highlighted), a Trends strip of long-term `trail.db` snapshots (inline-SVG sparklines for pass rate, escape rate and throughput), per-phase median/P90 durations, the append-only Decision Trail (filterable by repository, workstream and phase, with evidence pills and superseded ↔ superseding links), phase model assignments with the configured verify panel's readiness and vendor diversity, and registered repositories in one place:
+Track workstream throughput, Diff vs Black-Box pass rates, rework rate, post-merge escape rate, high-rigor verification panel outcomes (with disagreements highlighted), a Trends strip of long-term `trail.db` snapshots (inline-SVG sparklines for pass rate, escape rate and throughput), per-phase median/P90 durations, the append-only Decision History (Key Decisions / Attention / All presets, search, an audit Attention banner, folded routine gate ticks, inline supersession chains, an Evidence Inspector and confirmation-gated human decisions), phase model assignments with the configured verify panel's readiness and vendor diversity, and registered repositories in one place:
 
-![Factonio Dashboard showing KPI cards including Verification Panels, the Trends strip, Phase Durations, the 12-phase Decision Trail ledger with Wave 5 eval, intake and harness evidence pills and supersede lineage, and Phase Model Configuration](docs/images/dashboard.png)
+![Factonio Dashboard showing KPI cards including Verification Panels, the Trends strip, Phase Durations, and the Decision History with its audit Attention banner, Key Decisions preset, search and grouped phase filter, and tiered decision rows with evidence pills](docs/images/dashboard.png)
 
 ### Inline Repository Settings Editor
 
@@ -76,7 +76,7 @@ Monitor active workstreams beside your chat transcript in the hideable **Factoni
 
 | Docked Factonio Sidebar Tab | Settings → Plugins → Factonio |
 |:---:|:---:|
-| ![Factonio Right Sidebar tab beside Files with a perf mode badge, workstream pipeline, a synthesized arena strip above a verification panel strip with a disagreement callout, an open card drawer listing its panel lane and decisions, and per-workstream decision counts](docs/images/sidebar.png) | ![Settings Plugins Factonio landing page showing Phase Models and Agent settings](docs/images/settings.png) |
+| ![Factonio Right Sidebar tab beside Files with a perf mode badge, workstream pipeline, synthesized arena and verification panel strips with Re-evaluate buttons and a disagreement callout, a clickable report ready pill on an investigate workstream, and a Publish PR action on a locally verified card](docs/images/sidebar.png) | ![Settings Plugins Factonio landing page showing Phase Models and Agent settings](docs/images/settings.png) |
 
 ## Quick start
 
