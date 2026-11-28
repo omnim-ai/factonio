@@ -45,6 +45,7 @@ let rootComponent = null;
 let hookStore = new Map();
 let refStore = new Map();
 let effectStore = new Map();
+let memoStore = new Map();
 let activePath = 'root';
 let hookIdx = 0;
 let pendingEffects = [];
@@ -67,6 +68,7 @@ export function __reset() {
   hookStore = new Map();
   refStore = new Map();
   effectStore = new Map();
+  memoStore = new Map();
 }
 
 export function useState(init) {
@@ -103,6 +105,18 @@ export function useEffect(fn, deps) {
   if (changed) {
     pendingEffects.push({ key, fn, deps: Array.isArray(deps) ? [...deps] : null });
   }
+}
+
+export function useMemo(factory, deps) {
+  const key = activePath + '#m' + (hookIdx++);
+  const prev = memoStore.get(key);
+  if (prev && Array.isArray(deps) && Array.isArray(prev.deps) && deps.length === prev.deps.length
+      && deps.every((d, i) => Object.is(d, prev.deps[i]))) {
+    return prev.value;
+  }
+  const value = factory();
+  memoStore.set(key, { value, deps: Array.isArray(deps) ? [...deps] : null });
+  return value;
 }
 
 function setRef(ref, el) {
@@ -235,7 +249,7 @@ export function __mount(container, componentFn) {
   renderNow();
 }
 
-export default { useState, useRef, useEffect };
+export default { useState, useRef, useEffect, useMemo };
 """
 
 JSX_RUNTIME_SHIM_JS = r"""

@@ -1808,6 +1808,9 @@ async function runTrailMemoScenarios(report) {
     M.poll = { recomputed: delta(snap), chainSame: rowProps[CHAINED].chain === chain0, chainPriors: rowProps[CHAINED].chain.priors.map(p => p.id) }
   } finally {
     globalThis.__fcOnRender = undefined
+    trailState = { data: undefined, isLoading: true, isError: false }
+    globalThis.__fcReposState = undefined
+    globalThis.__fcQueryClient = undefined
   }
   M.components = [...rendered].filter(n => /^Trail/.test(n)).sort()
 }
@@ -5760,6 +5763,92 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertEqual(source.count("setInterval("), 0)
         imports = re.findall(r"^import .* from '([^']+)'", source, re.M) + re.findall(r"^} from '([^']+)'", source, re.M)
         self.assertEqual(sorted(set(imports)), ["@hermes/plugin-sdk", "react", "react/jsx-runtime"])
+
+
+CAPTURE_SHIM_SCRIPT = r"""
+import { registerHooks } from 'node:module'
+const SHIMS = JSON.parse(process.env.FC_SHIMS)
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (Object.hasOwn(SHIMS, specifier)) return { url: 'shim:' + specifier, shortCircuit: true, format: 'module' }
+    return nextResolve(specifier, context)
+  },
+  load(url, context, nextLoad) {
+    if (url.startsWith('shim:')) return { format: 'module', source: SHIMS[url.slice(5)], shortCircuit: true }
+    return nextLoad(url, context)
+  }
+})
+globalThis.window = globalThis
+globalThis.document = { createTextNode: t => ({ t }) }
+const React = await import('react')
+const out = { exports: Object.keys(React).sort(), defaultKeys: Object.keys(React.default).sort() }
+try {
+  const plugin = await import(process.env.FC_PLUGIN_URL)
+  out.plugin = { ok: typeof plugin.default?.register === 'function' || typeof plugin.register === 'function' }
+} catch (e) {
+  out.plugin = { ok: false, error: String(e) }
+}
+// useMemo caching across real shim re-renders (per-slot, Object.is deps).
+let runs = 0
+const deps = { a: 1, b: NaN }
+function Probe() {
+  React.useMemo(() => { runs++; return {} }, [deps.a, deps.b])
+  return ''
+}
+const counts = []
+React.__mount({ replaceChildren() {} }, () => ({ type: Probe, props: {}, key: null }))
+counts.push(runs)
+React.__rerender(); counts.push(runs)
+deps.a = 2; React.__rerender(); counts.push(runs)
+React.__rerender(); counts.push(runs)
+out.memoRuns = counts
+process.stdout.write(JSON.stringify(out))
+"""
+
+
+@unittest.skipUnless(shutil.which("node"), "node is required for desktop plugin checks")
+class TestCaptureHarnessReactShim(unittest.TestCase):
+    """The README capture harness must serve every React export desktop/plugin.js imports."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("capture_readme_media", PLUGIN_ROOT / "tools" / "capture_readme_media.py")
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        shims = {
+            "react": mod.REACT_SHIM_JS,
+            "react/jsx-runtime": mod.JSX_RUNTIME_SHIM_JS,
+            "@hermes/plugin-sdk": mod.PLUGIN_SDK_SHIM_JS,
+        }
+        proc = subprocess.run(
+            ["node", "--input-type=module"],
+            input=CAPTURE_SHIM_SCRIPT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={"PATH": os.environ.get("PATH", ""), "FC_PLUGIN_URL": PLUGIN_JS.as_uri(), "FC_SHIMS": json.dumps(shims)},
+        )
+        if proc.returncode != 0:
+            raise AssertionError(f"capture shim probe failed ({proc.returncode}):\n{proc.stderr}\n{proc.stdout}")
+        cls.report = json.loads(proc.stdout)
+
+    def test_shim_exports_every_react_import_of_plugin(self):
+        source = PLUGIN_JS.read_text()
+        named = set()
+        for clause in re.findall(r"^import\s*\{([^}]*)\}\s*from\s*'react'", source, re.M):
+            named.update(part.split(" as ")[0].strip() for part in clause.split(",") if part.strip())
+        self.assertIn("useMemo", named)
+        self.assertLessEqual(named, set(self.report["exports"]))
+        self.assertLessEqual(named, set(self.report["defaultKeys"]))
+
+    def test_plugin_imports_cleanly_against_capture_shims(self):
+        self.assertEqual(self.report["plugin"], {"ok": True})
+
+    def test_shim_use_memo_caches_until_deps_change(self):
+        self.assertEqual(self.report["memoRuns"], [1, 1, 2, 2])
 
 
 if __name__ == "__main__":

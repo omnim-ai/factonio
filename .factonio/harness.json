@@ -423,6 +423,7 @@
       "scenarios": [
         "Manifest, skill frontmatter and local doc links stay valid",
         "README media regenerates with tools/capture_readme_media.py",
+        "tools/capture_readme_media.py serves a react.js shim exporting every React hook desktop/plugin.js imports (useState, useRef, useEffect, useMemo), so --serve-only and --capture mount the plugin instead of rendering blank pages",
         "CHANGELOG Unreleased, docs/architecture.md and THIRD_PARTY_NOTICES.md document each Wave 4 and Wave 5 unit",
         "CHANGELOG Unreleased and docs/architecture.md document the Wave 4 polish trail-audit, malformed-pr_number and lock-budget changes",
         "CHANGELOG Unreleased and docs/architecture.md document whole-field fail-closed recall redaction",
@@ -445,6 +446,7 @@
       ],
       "scenarios": [
         "Full suite passes from any checkout or worktree directory name",
+        "tests.test_desktop_plugin.TestCaptureHarnessReactShim imports desktop/plugin.js against the real capture shims and fails if a React import is missing from the capture react.js shim",
         "Sidebar missing-lane regressions (shrunk or extended live lane sets) fail closed in tests.test_desktop_plugin",
         "silent_start, trail audit and skill prose contracts are covered in tests.test_watchdog_liveness, tests.test_trail and tests.test_plugin_registration",
         "Trail-audit false positives, PR-scoped closure, malformed pr_number evidence and the cold-init lock-budget regression are covered in tests.test_trail, tests.test_pr_gate_hardening and tests.test_metrics_history",
