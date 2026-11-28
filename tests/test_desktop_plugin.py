@@ -712,8 +712,8 @@ function attachRefs(tree, focusLog) {
   walk(tree, n => {
     const ref = n.props.ref
     if (!ref) return
-    const name = n.props.id || n.props['aria-label'] || text(n).trim()
-    const el = { tag: n.type, name, focus: () => focusLog.push(name), scrollIntoView: opts => scrollLog.push([name, opts || null]) }
+    const name = n.props.role === 'dialog' ? 'dialog' : n.props.id || n.props['aria-label'] || text(n).trim()
+    const el = { tag: n.type, name, disabled: !!n.props.disabled, focus: () => focusLog.push(name), scrollIntoView: opts => scrollLog.push([name, opts || null]) }
     if (typeof ref === 'function') ref(el)
     else ref.current = el
   })
@@ -1474,9 +1474,29 @@ async function runTrailScenarios(report) {
   const lg = dash.logModal = {}
   lg.open = readModal(tree)
   lg.initialFocus = [...m.focusLog]
+  // Focus guards: Shift+Tab past the first control lands on the last ENABLED one; Tab past the last on the
+  // first; with every control disabled (busy) the dialog itself takes focus. Native focus() ignores disabled.
+  const trapProbe = t => {
+    const md = modalOf(t).node
+    const out = {}
+    for (const edge of ['start', 'end']) {
+      m.focusLog.length = 0
+      find(md, n => n.props['data-focus-guard'] === edge).node.props.onFocus()
+      out[edge] = [...m.focusLog]
+    }
+    for (const shiftKey of [false, true]) {
+      m.focusLog.length = 0
+      let prevented = false
+      md.props.onKeyDown({ key: 'Tab', shiftKey, target: md.props.ref.current, preventDefault() { prevented = true }, stopPropagation() {} })
+      out[shiftKey ? 'shiftTabOnDialog' : 'tabOnDialog'] = { focus: [...m.focusLog], prevented }
+    }
+    return out
+  }
+  lg.trapUnchecked = trapProbe(tree)
   modalAction(tree, 'append-decision'); tree = m.render()
   lg.unconfirmed = readModal(tree)
   setField(tree, 'confirm', true); tree = m.render()
+  lg.trapChecked = trapProbe(tree)
   setField(tree, 'evidence', '[1, 2]'); tree = m.render()
   await Promise.all(modalAction(tree, 'append-decision').results); tree = m.render()
   lg.invalid = readModal(tree)
@@ -1490,8 +1510,11 @@ async function runTrailScenarios(report) {
     }
     return { ok: true }
   })
+  m.focusLog.length = 0
   const pend = Promise.all(modalAction(tree, 'append-decision').results); tree = m.render()
   lg.busy = readModal(tree)
+  lg.busyFocus = [...m.focusLog]
+  lg.trapBusy = trapProbe(tree)
   const esc = { key: 'Escape', preventDefault() {}, stopPropagation() {} }
   modalOf(tree).node.props.onKeyDown(esc); tree = m.render()
   lg.escWhileBusy = !!modalOf(tree)
@@ -3924,6 +3947,19 @@ class TestDesktopPlugin(unittest.TestCase):
         self.assertFalse(o["confirm"])
         self.assertEqual(o["go"], {"text": "Confirm & append to trail.db", "disabled": True, "action": "append-decision"})
         self.assertEqual(lg["initialFocus"], ["fc-hd-phase"])
+        # Disabled Confirm is skipped: Shift+Tab wraps to Cancel, never stalls on the guard and escapes.
+        self.assertEqual(lg["trapUnchecked"]["start"], ["Cancel"])
+        self.assertEqual(lg["trapUnchecked"]["end"], ["Close dialog"])
+        self.assertEqual(lg["trapChecked"]["start"], ["Confirm & append to trail.db"])
+        self.assertEqual(lg["trapChecked"]["end"], ["Close dialog"])
+        self.assertEqual(lg["trapChecked"]["shiftTabOnDialog"], {"focus": ["Confirm & append to trail.db"], "prevented": True})
+        self.assertEqual(lg["trapChecked"]["tabOnDialog"], {"focus": ["Close dialog"], "prevented": True})
+        # Busy: every control is disabled, so focus stays on the dialog (tabIndex -1) in both directions.
+        self.assertEqual(lg["busyFocus"], ["dialog"], "going busy disables the focused button; focus moves to the dialog")
+        for k in ("start", "end"):
+            self.assertEqual(lg["trapBusy"][k], ["dialog"], k)
+        for k in ("shiftTabOnDialog", "tabOnDialog"):
+            self.assertEqual(lg["trapBusy"][k], {"focus": ["dialog"], "prevented": True}, k)
         u = lg["unconfirmed"]
         self.assertEqual(u["fields"]["decision"]["err"], "A decision code is required.")
         self.assertEqual(u["fields"]["why"]["invalid"], "true")

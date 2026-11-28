@@ -2245,6 +2245,8 @@ function errorLine(error) {
 
 // Shared modal shell: role=dialog + aria-modal, Escape and × close (blocked while busy), focus guards
 // keep Tab / Shift+Tab inside (no DOM queries), focus restored to the trigger on close.
+// lastRef may be one ref or a list (preferred first); guards skip disabled controls because native
+// focus() is a no-op on them, and fall back to the dialog itself (tabIndex -1) when all are disabled.
 function ConfirmModal({ id, title, sub, size, busy, onClose, initialFocusRef, lastRef, children, foot }) {
   const dialogRef = useRef(null)
   const closeBtnRef = useRef(null)
@@ -2262,7 +2264,24 @@ function ConfirmModal({ id, title, sub, size, busy, onClose, initialFocusRef, la
       if (el && typeof el.value === 'string' && typeof el.setSelectionRange === 'function' && el.tagName !== 'SELECT') el.setSelectionRange(el.value.length, el.value.length)
     } catch { /* focus is best-effort */ }
   }, [])
+  useEffect(() => {
+    // Disabling the focused control drops focus to <body>; keep it on the dialog while in flight.
+    if (busy) try { dialogRef.current?.focus?.() } catch { /* focus is best-effort */ }
+  }, [busy])
+  const lastRefs = [].concat(lastRef || [])
+  const focusEnabled = refs => {
+    const el = refs.map(r => r?.current).find(c => c && !c.disabled) || dialogRef.current
+    try { el?.focus?.() } catch { /* focus is best-effort */ }
+  }
+  const focusLast = () => focusEnabled([...lastRefs, closeBtnRef])
+  const focusFirst = () => focusEnabled([closeBtnRef, initialFocusRef, ...lastRefs])
   const onKeyDown = e => {
+    if (e?.key === 'Tab' && e.target && e.target === dialogRef.current) {
+      e.preventDefault?.()
+      if (e.shiftKey) focusLast()
+      else focusFirst()
+      return
+    }
     if (e?.key !== 'Escape') return
     e.preventDefault?.()
     e.stopPropagation?.()
@@ -2274,10 +2293,7 @@ function ConfirmModal({ id, title, sub, size, busy, onClose, initialFocusRef, la
     'aria-hidden': 'true',
     'data-focus-guard': edge,
     className: 'fc-m-guard',
-    onFocus: () => {
-      const el = edge === 'start' ? lastRef?.current || closeBtnRef.current : closeBtnRef.current
-      try { el?.focus?.() } catch { /* focus is best-effort */ }
-    }
+    onFocus: edge === 'start' ? focusLast : focusFirst
   })
   return jsx('div', {
     className: 'fc-m-scrim',
@@ -2331,6 +2347,7 @@ function LogDecisionModal({ ctx, target, tenant, onClose, onAppended }) {
   const [state, run] = useAction()
   const phaseRef = useRef(null)
   const goRef = useRef(null)
+  const cancelRef = useRef(null)
   const busy = state.status === 'busy'
   const errors = tried ? validateDecisionDraft(form) : {}
   const set = (k, v) => setForm(prev => ({ ...prev, [k]: v }))
@@ -2373,11 +2390,11 @@ function LogDecisionModal({ ctx, target, tenant, onClose, onAppended }) {
     busy,
     onClose,
     initialFocusRef: phaseRef,
-    lastRef: goRef,
+    lastRef: [goRef, cancelRef],
     foot: close => [
       jsxs('span', { key: 'n', className: 'fc-m-note', children: [jsx(Icon, { name: 'person', size: 12 }), 'Appends immutable human decision (actor: human)'] }),
       jsx('span', { key: 's', className: 'fc-spacer' }),
-      jsx('button', { key: 'c', type: 'button', className: 'fc-btn', 'data-action': 'cancel-modal', disabled: busy, onClick: close, children: 'Cancel' }),
+      jsx('button', { key: 'c', type: 'button', className: 'fc-btn', ref: cancelRef, 'data-action': 'cancel-modal', disabled: busy, onClick: close, children: 'Cancel' }),
       jsxs('button', {
         key: 'go',
         type: 'button',
