@@ -4189,7 +4189,7 @@ class TestDesktopPlugin(unittest.TestCase):
         start = source.index("const STYLES = `")
         styles = source[start : source.index("`", start + len("const STYLES = `"))]
         trail_rules = [line for line in styles.splitlines() if "fc-trail" in line or "fc-sb-trail" in line or 'fc-sb-tag[data-tone="info"]' in line]
-        self.assertGreater(len(trail_rules), 40)
+        self.assertGreater(len(trail_rules), 60)
         for line in trail_rules:
             self.assertNotRegex(line, r"#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(", line)
         block = styles[styles.index("/* Decision Trail — dashboard") :]
