@@ -445,20 +445,25 @@ def log_human_decision(payload: Any = Body(None), profile: Optional[str] = Query
 
 _REPORT_NAME = "investigation.md"
 _REPORT_MAX_BYTES = 256 * 1024
-# Fail-closed line policy: span-parsing paths inside free-form prose cannot cover every legal
-# filename (Unicode, spaces, `+`), so a line holding any absolute-path marker (file://, drive,
-# UNC, or a slash-delimited root segment) is withheld whole once http(s) URLs are stripped.
-_HTTP_URL_RE = re.compile(r"(?i:https?)://[^\s`'\"<>)\]]+")
-_ABS_PATH_LINE_RE = re.compile(
-    r"(?i:file)://"
-    r"|(?<![A-Za-z0-9_])[A-Za-z]:[\\/]"
-    r"|(?<![\w./\\])(?:\\\\|//)[^\s/\\]+[/\\]"
-    r"|(?<![\w./\\])/[^\n/]+/"
-)
+# Fail-closed line policy (decision d_fc009afdf6ad): prose is never parsed for paths. A line is
+# withheld whole when it names holdout, carries a raw terminal control character (which could
+# disguise anything), or echoes this Hermes home / the Factonio runs root.
+_RUNS_MARKER = "plugin-data/factonio/runs"
 
 
-def _line_is_sensitive(line: str) -> bool:
-    return _trail.contains_holdout_reference(line) or bool(_ABS_PATH_LINE_RE.search(_HTTP_URL_RE.sub("", line)))
+def _has_terminal_ctrl(line: str) -> bool:
+    return any((ord(c) < 0x20 and c not in ("\t", "\r")) or 0x7F <= ord(c) <= 0x9F for c in line)
+
+
+def _hermes_path_markers() -> tuple[str, ...]:
+    home = _config.get_root_hermes_home_path()
+    markers = {str(home), str(home.resolve()), _RUNS_MARKER}
+    return tuple(m.replace("\\", "/").casefold() for m in markers if m.strip(" /\\."))
+
+
+def _contains_hermes_path(line: str, markers: tuple[str, ...]) -> bool:
+    folded = line.replace("\\", "/").casefold()
+    return any(marker in folded for marker in markers)
 
 
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -477,9 +482,18 @@ def _trim_utf8_bytes(value: str | bytes, max_bytes: int = _REPORT_MAX_BYTES) -> 
 
 
 def _redact_report(text: str) -> tuple[str, bool]:
-    """Withhold every line naming holdout or an absolute path (the whole report if holdout spans lines)."""
+    """Withhold every line naming holdout, a terminal control char, or the Hermes home / runs root.
+
+    The whole report is withheld if a holdout reference survives across line joins.
+    """
+    markers = _hermes_path_markers()
     lines = text.split("\n")
-    kept = ["[redacted]" if _line_is_sensitive(line) else line for line in lines]
+    kept = [
+        "[redacted]"
+        if _trail.contains_holdout_reference(line) or _has_terminal_ctrl(line) or _contains_hermes_path(line, markers)
+        else line
+        for line in lines
+    ]
     out = "\n".join(kept)
     if _trail.contains_holdout_reference(out):
         return "[redacted]", True

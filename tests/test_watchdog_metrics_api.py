@@ -1656,49 +1656,84 @@ class TestInvestigationReportApi(unittest.TestCase):
             self.assertLessEqual(len(body["content"].encode("utf-8")), cap)
             self.assertNotIn("holdout", body["content"])
 
-            report.write_text("/tmp/x\n" * 50000, encoding="utf-8")
+            report.write_text("\x07\n" * 50000, encoding="utf-8")
             body = client.get(f"{_CP}/workstreams/ws-u/report").json()
             self.assertEqual((body["truncated"], body["redacted"]), (True, True))
             self.assertLessEqual(len(body["content"].encode("utf-8")), cap)
+            self.assertNotIn("\x07", body["content"])
 
-            text = ("See /home/alice/private/case.md and `src/app.py`.\n"
-                    "Edit dashboard/plugin_api.py; see https://github.com/a/b\n"
-                    "(/var/log/x.log) and C:\\Users\\bob\\notes.txt\n")
-            report.write_text(text, encoding="utf-8")
-            body = client.get(f"{_CP}/workstreams/ws-u/report").json()
-            self.assertEqual((body["content"], body["redacted"]),
-                             ("[redacted]\nEdit dashboard/plugin_api.py; see https://github.com/a/b\n[redacted]\n", True))
-            report.write_text("plain src/app.py https://github.com/a/b\n", encoding="utf-8")
-            self.assertFalse(client.get(f"{_CP}/workstreams/ws-u/report").json()["redacted"])
+    def _report(self, client, report: Path, text: str) -> dict:
+        report.write_text(text, encoding="utf-8", newline="")
+        return client.get(f"{_CP}/workstreams/ws-r/report").json()
 
-    def test_root_independent_absolute_paths_redacted(self):
+    def test_holdout_and_terminal_control_lines_redacted(self):
         with isolated_hermes_home() as home:
-            client = _cp_client("factonio_test_cp_report_roots")
+            client = _cp_client("factonio_test_cp_report_ctrl")
             run = self._runs(home) / "ws-r"
             run.mkdir(parents=True)
             report = run / "investigation.md"
             leaks = (
-                "See /data/customer/private.txt now.", "Open /workspace/project/secrets.txt.",
-                "[key](/srv2/app/key.pem)", "Home /home/alice/private/case.md", "Config in /etc/",
-                "Root /\u5ba2\u6237/private.txt", "Root /a+b/private.txt", "Root /my data/private.txt",
-                'Quoted "/my data/private.txt"', 'Quoted "/my data/sub dir/secret.txt"',
-                "\uff08/\u5ba2\u6237/private.txt\uff09", "src/app.py https://example.com/a/b /my data/x",
-                "Log at C:/Users/alice/private.txt", "Notes C:\\Program Files\\secret.txt", "Log at D:/\u5ba2\u6237/x",
-                "Share \\\\fileserver\\share\\secret.txt", "Share //fileserver/share/secret.txt",
-                "Link file:///my data/secret.md here", "Link FILE://host/share/x.md here",
+                "see holdout/scenario-1.md", "see \x1b[1mhold\x1b[0mout/x.md", "see hold out/x.md",
+                "\x1b[31m/home/alice/secret.txt\x1b[0m", "\x1b]8;;file:///etc/passwd\x07link\x1b]8;;\x07",
+                "\x9b31m\\\\fileserver\\share\\secret.txt", "bell \x07 here", "nul-free \x0b vertical tab",
+                "delete \x7f char", "c1 \x85 next-line",
             )
             for leak in leaks:
                 with self.subTest(text=leak):
-                    report.write_text(f"intro src/app.py\n{leak}\noutro\n", encoding="utf-8")
-                    body = client.get(f"{_CP}/workstreams/ws-r/report").json()
+                    body = self._report(client, report, f"intro src/app.py\n{leak}\noutro\n")
                     self.assertEqual((body["content"], body["redacted"]), ("intro src/app.py\n[redacted]\noutro\n", True))
-            kept = ("Edit src/app.py and dashboard/plugin_api.py; see https://github.com/omnim-ai/factonio/pull/47,\n"
-                    "http://localhost:8000/api/plugins/factonio/cards, foo/bar prose, v1/v2 and the /factonio page.\n"
-                    "# Heading\n`code` [link](https://example.com/a/b)\n./a/b ../a/b\n"
-                    "src/app.py https://example.com/a/b /factonio\n// ordinary comment\n")
-            report.write_text(kept, encoding="utf-8")
-            body = client.get(f"{_CP}/workstreams/ws-r/report").json()
+            kept = "col\tvalue\r\nsecond line\r\n"
+            body = self._report(client, report, kept)
             self.assertEqual((body["content"], body["redacted"]), (kept, False))
+
+    def test_hermes_home_and_runs_root_lines_redacted(self):
+        import os as _os
+        from unittest import mock
+
+        with isolated_hermes_home() as home:
+            real = home.parent / "real-home"
+            real.mkdir()
+            link = home.parent / "linked-home"
+            link.symlink_to(real, target_is_directory=True)
+            with mock.patch.dict(_os.environ, {"HERMES_HOME": str(link)}):
+                client = _cp_client("factonio_test_cp_report_home")
+                run = self._runs(link) / "ws-r"
+                run.mkdir(parents=True)
+                report = run / "investigation.md"
+                back = chr(92)
+                leaks = (
+                    f"wrote {link}/notes.txt", f"resolved {real.resolve()}/notes.txt",
+                    f"upper {str(link).upper()}/x", f"windows {str(real.resolve()).replace('/', back)}{back}x",
+                    "see ~/.hermes/plugin-data/factonio/runs/ws-r/spec.md",
+                    "see C:\\Users\\a\\Plugin-Data\\Factonio\\Runs\\ws\\spec.md",
+                    "|https://github.com/org/repo|/srv/plugin-data/factonio/runs/x|",
+                )
+                for leak in leaks:
+                    with self.subTest(text=leak):
+                        body = self._report(client, report, f"intro\n{leak}\noutro\n")
+                        self.assertEqual((body["content"], body["redacted"]), ("intro\n[redacted]\noutro\n", True))
+                        self.assertNotIn(str(real.resolve()), json.dumps(body))
+                        self.assertNotIn(str(link), json.dumps(body))
+                        self.assertEqual(body["filename"], "investigation.md")
+
+    def test_ordinary_markdown_prose_preserved(self):
+        with isolated_hermes_home() as home:
+            client = _cp_client("factonio_test_cp_report_prose")
+            run = self._runs(home) / "ws-r"
+            run.mkdir(parents=True)
+            kept = ("# Investigation\n"
+                    "| source | route |\n|---|---|\n"
+                    "|https://github.com/org/repo|/api/plugins/factonio/cards|\n"
+                    "Edit src/app.py and dashboard/plugin_api.py; see https://github.com/omnim-ai/factonio/pull/47\n"
+                    "Traceback (most recent call last):\n"
+                    '  File "src/app.py", line 12, in main\n'
+                    "ValueError: bad input\n"
+                    "Open the /factonio page; ./a/b ../a/b v1/v2\n"
+                    "We should hold out for review.\n"
+                    "`code` [link](https://example.com/a/b) \u65e5\u672c \U0001F680\n")
+            body = self._report(client, run / "investigation.md", kept)
+            self.assertEqual((body["content"], body["redacted"], body["filename"]), (kept, False, "investigation.md"))
+
 
 class TestHarnessAuditApi(unittest.TestCase):
     def test_validation_status_codes_and_read_only_audit(self):
