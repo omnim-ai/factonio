@@ -377,7 +377,7 @@
         "Registered Repositories show a `.factonio/` harness badge (hooks / frozen, md only, manifest error, absent) in the actions cell of the 9-column table next to Audit and Edit, and nothing when an older backend omits `harness`",
         "Decision History: 720px ledger with sticky day headers; Attention banner from GET /trail/audit (Audit clean pill, category counts, Show decision jumps that clear filters, grow the rendered page past the first 60 rows (loaded, or fetched via GET /trail/{id}) and scroll to, focus and flash the row; hidden on 404/503); Key Decisions (default) / Attention / All presets via `signal=` and `q` search on non-polling query keys with client fallbacks; each successful 30s base /trail poll refetches /trail/audit and the active signal/q page (no extra timer, no loop); Show superseded",
         "Decision History folds consecutive routine pr_gate / bootstrap_verify rows into one `N routine <code> checks · X passed, Y blocked · HH:MM–HH:MM` chip (foldRoutineDecisions), nests superseded rows under their correction via cycle-safe buildSupersessionChains (missing priors load via GET /trail/{id}), and opens a Fields | JSON Evidence Inspector",
-        "Log Human Decision / Supersede… modals validate (decision, phase, why required; evidence a <= 16 KiB JSON object) and POST /trail/decisions with `confirmed: true` and no `actor`; a 422 keeps the entries; Escape cannot close an in-flight modal and focus returns to the trigger",
+        "Log Human Decision / Supersede… modals validate (decision, phase, why required; evidence a <= 16 KiB JSON object) and POST /trail/decisions with `confirmed: true` and no `actor`; a 422 keeps the entries; Escape cannot close an in-flight modal and focus returns to the trigger; Tab / Shift+Tab stay inside the dialog with Confirm disabled (unchecked), enabled (checked) and every control disabled (busy, focus on the tabIndex=-1 dialog)",
         "Publish PR appears only on a non-verify card whose `local_target` passed local verification at its full head SHA with no PR; POST /publish-pr sends the exact verified target with `confirmed: true`; 409/422/502 keep edits and the same 12-char SHA shows everywhere; a 409 head drift shows the verified vs observed head_sha and the scrubbed server detail.error; success links the live PR",
         "`report ready` pill and drawer Report row open GET /workstreams/{tenant}/report in a read-only modal: Markdown rendered as React elements only (no innerHTML, https-only links, HTML as text), Truncated / Redacted notices, missing and error states",
         "Design cards awaiting approval show Approve Design / Request Revision confirm groups that only POST approve_design / request_design_revision trail decisions; panel and arena strips Re-evaluate via POST /panels/evaluate / POST /arenas/evaluate with busy, Updated just now and Retry states; no new polling (zero setInterval)",
@@ -429,7 +429,8 @@
         "README.md, SECURITY.md, docs/architecture.md and CHANGELOG Unreleased document publish_policy / default_publish_policy, the exact-SHA fail-closed publish_pr gate, `hermes factonio publish-pr`, and `publish` / `published` in trail --audit",
         "README.md keeps the `## Setting this up for your team` consulting section (mailto:tony@omnim.ai and LinkedIn links, no omnim.ai site link) immediately before `## Affiliation and trademarks`",
         "AGENTS.md carries the 7-row `## Rule-to-Enforcer Ledger` (`| Rule | Enforcer | Rung | Occurrences | Last seen |`) read by the retro blueprint; CHANGELOG Unreleased and docs/architecture.md document the skill-bloat hook, design arena preview switcher and trail year padding",
-        "CHANGELOG Unreleased and docs/architecture.md document Unit 2 fix round 1 (deep Show decision jumps, base-poll audit/signal refresh, 409 drift heads)"
+        "CHANGELOG Unreleased and docs/architecture.md document Unit 2 fix round 1 (deep Show decision jumps, base-poll audit/signal refresh, 409 drift heads)",
+        "CHANGELOG Unreleased and docs/architecture.md document Unit 2 fix round 2 (ConfirmModal focus trap across disabled and busy controls)"
       ]
     },
     {
@@ -459,7 +460,8 @@
         "publish_policy prompt, skill, docs and plugin.yaml contracts are covered in tests.test_plugin_registration",
         "Malformed GraphQL open-PR and closing-reference nodes (inline and follow-up pages) fail closed across triage, CLI and tool entrypoints in tests.test_issue_intake.TestMalformedGraphqlNodes",
         "Rule-to-Enforcer ledger, orchestrator/design skill budgets and the design arena switcher contract are covered in tests.test_plugin_registration and tests.test_arena; sub-1000-year `_iso` / `resolve_since` / `_now_iso` formatting in tests.test_trail; the required `skill-bloat` hook in tests.test_verify_harness",
-        "Unit 2 fix round 1 regressions (Show decision to row 90 of 100 and to a row fetched beyond the 200-row window, base-poll audit/signal refetch without timers or loops, 409 drift verified/observed heads with scrubbed detail and kept edits) are covered in tests.test_desktop_plugin"
+        "Unit 2 fix round 1 regressions (Show decision to row 90 of 100 and to a row fetched beyond the 200-row window, base-poll audit/signal refetch without timers or loops, 409 drift verified/observed heads with scrubbed detail and kept edits) are covered in tests.test_desktop_plugin",
+        "Unit 2 fix round 2 regressions (ConfirmModal start/end guards and Tab on the dialog skip a disabled Confirm to Cancel / Close, and fall back to the dialog when busy) are covered in tests.test_desktop_plugin"
       ]
     }
   ],
